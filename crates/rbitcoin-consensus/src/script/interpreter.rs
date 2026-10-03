@@ -18,8 +18,8 @@ use std::cell::{Cell, RefCell};
 
 use bitcoin::hashes::Hash;
 use bitcoin::script::{Instruction, Script};
-use bitcoin::sighash::{Prevouts, SighashCache};
-use bitcoin::{Amount, Sequence, Transaction, TxOut};
+use bitcoin::sighash::SighashCache;
+use bitcoin::{Amount, Sequence, Transaction};
 
 use super::crypto;
 use crate::error::ConsensusError;
@@ -145,7 +145,6 @@ pub(crate) struct EvalContext<'a> {
     pub tx: &'a Transaction,
     pub input_index: usize,
     pub amount: Amount,
-    pub prevouts: &'a [TxOut],
     /// scriptCode for sighash (redeem / witness script).
     pub script_code: &'a Script,
     pub sig_version: SigVersion,
@@ -182,12 +181,14 @@ pub(crate) struct EvalContext<'a> {
     ///
     /// BIP143 / legacy CHECKSIG use this truncated script as `scriptCode`.
     codeseparator_script_off: Cell<Option<usize>>,
-    /// Legacy / taproot midstate. Created on first use (WitnessV0 uses `pre` only).
+    /// Legacy midstate. Created on first use (WitnessV0 uses `pre`, tapscript `tapscript`).
     cache: RefCell<Option<SighashCache<&'a Transaction>>>,
     /// Structure/lookup midstates (WitnessV0 BIP143).
     pre: Cow<'a, rbitcoin_query::TxPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
     validation_weight_left: Cell<i64>,
+    /// Tapscript only: per-input sighash facts from the script-path spend.
+    tapscript: Option<crypto::TapscriptExecData<'a>>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -196,7 +197,6 @@ impl<'a> EvalContext<'a> {
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
-        prevouts: &'a [TxOut],
         script_code: &'a Script,
         sig_version: SigVersion,
     ) -> Self {
@@ -204,7 +204,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            prevouts,
             script_code,
             sig_version,
             true,
@@ -219,7 +218,6 @@ impl<'a> EvalContext<'a> {
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
-        prevouts: &'a [TxOut],
         script_code: &'a Script,
         sig_version: SigVersion,
         bip65_active: bool,
@@ -230,7 +228,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            prevouts,
             script_code,
             sig_version,
             bip65_active,
@@ -245,7 +242,6 @@ impl<'a> EvalContext<'a> {
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
-        prevouts: &'a [TxOut],
         script_code: &'a Script,
         sig_version: SigVersion,
         bip65_active: bool,
@@ -257,7 +253,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            prevouts,
             script_code,
             sig_version,
             bip65_active,
@@ -276,7 +271,14 @@ impl<'a> EvalContext<'a> {
             cache: RefCell::new(None),
             pre,
             validation_weight_left: Cell::new(tapscript_init_weight(tx, input_index, sig_version)),
+            tapscript: None,
         }
+    }
+
+    /// Attach the tapleaf and annex facts of a BIP341 script-path spend.
+    pub(crate) fn with_tapscript(mut self, exec: crypto::TapscriptExecData<'a>) -> Self {
+        self.tapscript = Some(exec);
+        self
     }
 
     /// Copy standardness / fixture flags from a [`crate::block::ScriptCheckJob`].
@@ -316,7 +318,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            &job.prevouts,
             script_code,
             sig_version,
             job.bip65_active,
@@ -383,6 +384,53 @@ pub(crate) fn eval_script_sig_pushes(
     Ok(())
 }
 
+/// Core `ConditionStack`: IF/NOTIF/ELSE nesting as a depth plus the index of
+/// the first false entry, so the per-opcode "executing" check is O(1).
+///
+/// Tapscript has no opcode limit; a `Vec<bool>` scanned on every opcode is
+/// quadratic in nesting depth. Toggling an entry above the first false one
+/// is unobservable, so only that index is tracked.
+#[derive(Default)]
+struct ConditionStack {
+    size: usize,
+    first_false: Option<usize>,
+}
+
+impl ConditionStack {
+    fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    fn all_true(&self) -> bool {
+        self.first_false.is_none()
+    }
+
+    fn push(&mut self, value: bool) {
+        if self.first_false.is_none() && !value {
+            self.first_false = Some(self.size);
+        }
+        self.size += 1;
+    }
+
+    /// Caller checks [`Self::is_empty`] first (`OP_ENDIF` without `OP_IF`).
+    fn pop(&mut self) {
+        self.size -= 1;
+        if self.first_false == Some(self.size) {
+            self.first_false = None;
+        }
+    }
+
+    /// Caller checks [`Self::is_empty`] first (`OP_ELSE` without `OP_IF`).
+    fn toggle_top(&mut self) {
+        let top = self.size - 1;
+        match self.first_false {
+            None => self.first_false = Some(top),
+            Some(pos) if pos == top => self.first_false = None,
+            Some(_) => {}
+        }
+    }
+}
+
 /// Evaluate `script`. On success returns `true` if cleanstack must still be
 /// checked; `false` if the script already fully succeeded (e.g. OP_SUCCESS).
 pub(crate) fn eval_script(
@@ -412,7 +460,7 @@ pub(crate) fn eval_script(
     }
 
     let mut altstack: Vec<Vec<u8>> = Vec::new();
-    let mut if_stack: Vec<bool> = Vec::new();
+    let mut cond_stack = ConditionStack::default();
     let mut op_count = 0usize;
     let enforce_op_limit = ctx.sig_version != SigVersion::TapScript;
     // TapScript always MINIMALIF. SCRIPT_VERIFY_MINIMALIF applies to witness v0
@@ -427,7 +475,7 @@ pub(crate) fn eval_script(
         let (byte_index, ins) = item.map_err(|_| ConsensusError::Script("script parse".into()))?;
         let this_pos = opcode_pos;
         opcode_pos = opcode_pos.saturating_add(1);
-        let executing = if_stack.iter().all(|&x| x);
+        let executing = cond_stack.all_true();
 
         match ins {
             Instruction::PushBytes(b) => {
@@ -471,7 +519,7 @@ pub(crate) fn eval_script(
                             }
                             cond = cast_to_bool(&v);
                         }
-                        if_stack.push(executing && cond);
+                        cond_stack.push(executing && cond);
                         continue;
                     }
                     0x64 => {
@@ -483,21 +531,21 @@ pub(crate) fn eval_script(
                             }
                             cond = !cast_to_bool(&v);
                         }
-                        if_stack.push(executing && cond);
+                        cond_stack.push(executing && cond);
                         continue;
                     }
                     0x67 => {
-                        if if_stack.is_empty() {
+                        if cond_stack.is_empty() {
                             return Err(ConsensusError::Script("OP_ELSE".into()));
                         }
-                        let last = if_stack.last_mut().unwrap();
-                        *last = !*last;
+                        cond_stack.toggle_top();
                         continue;
                     }
                     0x68 => {
-                        if if_stack.pop().is_none() {
+                        if cond_stack.is_empty() {
                             return Err(ConsensusError::Script("OP_ENDIF".into()));
                         }
+                        cond_stack.pop();
                         continue;
                     }
                     _ => {}
@@ -887,7 +935,7 @@ pub(crate) fn eval_script(
         }
     }
 
-    if !if_stack.is_empty() {
+    if !cond_stack.is_empty() {
         return Err(ConsensusError::Script("unbalanced IF".into()));
     }
     Ok(true)
@@ -1397,32 +1445,11 @@ fn checksig_schnorr(
         Ok(s) => s,
         Err(_) => return Ok(false),
     };
-    let prevouts = Prevouts::All(ctx.prevouts);
-    use bitcoin::sighash::Annex;
-    use bitcoin::taproot::LeafVersion;
-    use bitcoin::TapLeafHash;
-    let leaf = TapLeafHash::from_script(ctx.script_code, LeafVersion::TapScript);
-    // BIP341/BIP342: include last OP_CODESEPARATOR instruction index (default
-    // 0xFFFFFFFF). `taproot_script_spend_signature_hash` hard-codes the default
-    // and would reject multisig leaves that use CODESEPARATOR (signet 90719).
-    // Annex (if present on the witness) must also enter the sighash.
-    let codesep = ctx.codeseparator_pos.get();
-    let annex = super::p2tr::bip341_annex(&ctx.tx.input[ctx.input_index].witness)
-        .map(Annex::new)
-        .transpose()
-        .map_err(|_| ConsensusError::Script("tapscript annex".into()))?;
-    let mut slot = ctx.cache.borrow_mut();
-    let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
-    let sighash = cache
-        .taproot_signature_hash(
-            ctx.input_index,
-            &prevouts,
-            annex,
-            Some((leaf, codesep)),
-            sighash_ty,
-        )
-        .map_err(|_| ConsensusError::Script("tapscript sighash".into()))?;
-    let msg = bitcoin::secp256k1::Message::from_digest(sighash.to_byte_array());
+    let exec = ctx.tapscript.as_ref().ok_or_else(|| {
+        ConsensusError::Script("invariant: tapscript spend without tapleaf hash".into())
+    })?;
+    let sighash = exec.signature_hash(sighash_ty, ctx.codeseparator_pos.get())?;
+    let msg = bitcoin::secp256k1::Message::from_digest(sighash);
     Ok(crypto::SECP.with(|secp| secp.verify_schnorr(&schnorr, &msg, &xonly).is_ok()))
 }
 
@@ -1570,20 +1597,9 @@ mod success_and_disabled_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         // script_code points into script_bytes via Script::from_bytes
         let script = Script::from_bytes(script_bytes);
-        let ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(50_000),
-            &prevouts,
-            script,
-            sig_version,
-        );
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(50_000), script, sig_version);
         let mut stack = Vec::new();
         eval_script(script, &mut stack, &ctx)
     }
@@ -1884,10 +1900,6 @@ mod success_and_disabled_tests {
         // Script: push 1, CSV, DROP, OP_TRUE — v1 must fail CSV version gate.
         let script_bytes = [0x51u8, 0xb2, 0x75, 0x51]; // 1 CSV DROP TRUE
         let script = Script::from_bytes(&script_bytes);
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let mk = |ver: i32| Transaction {
             version: bitcoin::transaction::Version(ver),
             lock_time: LockTime::ZERO,
@@ -1908,7 +1920,6 @@ mod success_and_disabled_tests {
             &tx1,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -1928,7 +1939,6 @@ mod success_and_disabled_tests {
             &tx2,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -2044,10 +2054,6 @@ mod success_and_disabled_tests {
         // locktime height vs time type mismatch
         let script_bytes = [0x51u8, 0xb1, 0x75, 0x51]; // 1 CLTV DROP TRUE
         let script = Script::from_bytes(&script_bytes);
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let tx = Transaction {
             version: bitcoin::transaction::Version::ONE,
             lock_time: LockTime::from_time(500_000_001).unwrap(),
@@ -2066,7 +2072,6 @@ mod success_and_disabled_tests {
             &tx,
             0,
             Amount::from_sat(1),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -2097,7 +2102,6 @@ mod success_and_disabled_tests {
             &tx2,
             0,
             Amount::from_sat(1),
-            &prevouts,
             script2,
             SigVersion::Base,
             true,
@@ -2249,10 +2253,6 @@ mod success_and_disabled_tests {
         // OP_1NEGATE CLTV …
         let script_bytes = [0x4fu8, 0xb1, 0x75, 0x51];
         let script = Script::from_bytes(&script_bytes);
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let tx = Transaction {
             version: bitcoin::transaction::Version::ONE,
             lock_time: LockTime::from_height(10).unwrap(),
@@ -2271,7 +2271,6 @@ mod success_and_disabled_tests {
             &tx,
             0,
             Amount::from_sat(1),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -2350,19 +2349,8 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let script = Script::from_bytes(script_bytes);
-        let mut ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(50_000),
-            &prevouts,
-            script,
-            SigVersion::Base,
-        );
+        let mut ctx = EvalContext::new(&tx, 0, Amount::from_sat(50_000), script, SigVersion::Base);
         ctx.minimal_data = md;
         let mut stack = Vec::new();
         eval_script(script, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
@@ -2438,19 +2426,8 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let script = Script::from_bytes(&[0x51]);
-        let ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(1),
-            &prevouts,
-            script,
-            SigVersion::Base,
-        );
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), script, SigVersion::Base);
         assert!(!ctx.minimal_data);
         assert!(!ctx.nullfail && !ctx.low_s && !ctx.strictenc && !ctx.null_dummy);
     }
@@ -2474,16 +2451,11 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let sc = Script::from_bytes(&script);
         let ctx_on = EvalContext::new_with_flags(
             &tx,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             sc,
             SigVersion::Base,
             true,
@@ -2498,7 +2470,6 @@ mod minimal_data_tests {
             &tx,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             sc,
             SigVersion::Base,
             true,
@@ -2535,16 +2506,11 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let sc = Script::from_bytes(&script);
         let mut ctx = EvalContext::new_with_flags(
             &tx,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             sc,
             SigVersion::Base,
             true,
@@ -2583,17 +2549,13 @@ mod p2sh_redeem_parse_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let sc = Script::from_bytes(&ss);
-        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, sc, SigVersion::Base);
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), sc, SigVersion::Base);
         let mut stack = Vec::new();
         eval_script(sc, &mut stack, &ctx).expect("scriptSig");
         let redeem = stack.pop().unwrap();
         let rs = Script::from_bytes(&redeem);
-        let ctx2 = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, rs, SigVersion::Base);
+        let ctx2 = EvalContext::new(&tx, 0, Amount::from_sat(1), rs, SigVersion::Base);
         let r = eval_script(rs, &mut stack, &ctx2);
         assert!(r.is_ok(), "{r:?}");
     }

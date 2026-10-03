@@ -23,6 +23,7 @@ pub(crate) fn verify(
     input_index: usize,
     tx: &Transaction,
     cache: &mut SighashCache<&Transaction>,
+    tap_spent: &crypto::TapSpentHashes,
 ) -> Result<(), ConsensusError> {
     let spk = job.prevouts[input_index].script_pubkey.as_bytes();
     debug_assert!(spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20);
@@ -39,13 +40,11 @@ pub(crate) fn verify(
     if wit_len == 1 || (wit_len == 2 && bip341_annex(&input.witness).is_some()) {
         return verify_key_path(job, input_index, tx, output_key, cache);
     }
-    verify_script_path(job, input_index, tx, output_key)
+    verify_script_path(job, input_index, tx, output_key, tap_spent)
 }
 
 /// BIP341 annex: last witness item, only when `len ≥ 2` and first byte is `0x50`.
-///
-/// Shared with tapscript CHECKSIG sighash (must include annex when present).
-pub(crate) fn bip341_annex(witness: &Witness) -> Option<&[u8]> {
+fn bip341_annex(witness: &Witness) -> Option<&[u8]> {
     if witness.len() < 2 {
         return None;
     }
@@ -113,12 +112,12 @@ const CONTROL_BASE: usize = 33;
 const CONTROL_NODE: usize = 32;
 const CONTROL_MAX_NODES: usize = 128;
 
-/// BIP341 commitment. Returns the even leaf version byte.
+/// BIP341 commitment. Returns the even leaf version byte and the tapleaf hash.
 fn verify_control_commitment(
     control: &[u8],
     output_key_bytes: &[u8],
     script: &Script,
-) -> Result<u8, ConsensusError> {
+) -> Result<(u8, TapLeafHash), ConsensusError> {
     if control.len() < CONTROL_BASE {
         return Err(ConsensusError::Script("TAPROOT_WRONG_CONTROL_SIZE".into()));
     }
@@ -144,7 +143,8 @@ fn verify_control_commitment(
     script
         .consensus_encode(&mut eng)
         .expect("hash engines do not error");
-    let mut curr = TapNodeHash::from_byte_array(TapLeafHash::from_engine(eng).to_byte_array());
+    let tapleaf_hash = TapLeafHash::from_engine(eng);
+    let mut curr = TapNodeHash::from_byte_array(tapleaf_hash.to_byte_array());
     for i in 0..nodes {
         let start = CONTROL_BASE + i * CONTROL_NODE;
         let node = TapNodeHash::from_byte_array(
@@ -159,14 +159,15 @@ fn verify_control_commitment(
     if !ok {
         return Err(ConsensusError::Script("WITNESS_PROGRAM_MISMATCH".into()));
     }
-    Ok(leaf)
+    Ok((leaf, tapleaf_hash))
 }
 
-fn verify_script_path(
-    job: &ScriptCheckJob,
+fn verify_script_path<'a>(
+    job: &'a ScriptCheckJob,
     input_index: usize,
-    tx: &Transaction,
+    tx: &'a Transaction,
     output_key_bytes: &[u8],
+    tap_spent: &'a crypto::TapSpentHashes,
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
     let mut items: Vec<Vec<u8>> = (0..input.witness.len())
@@ -174,7 +175,8 @@ fn verify_script_path(
         .collect();
 
     // Strip annex from the initial stack (still included in CHECKSIG sighash).
-    if bip341_annex(&input.witness).is_some() {
+    let annex = bip341_annex(&input.witness);
+    if annex.is_some() {
         items.pop();
     }
     if items.len() < 2 {
@@ -187,7 +189,7 @@ fn verify_script_path(
     let script = Script::from_bytes(&script_bytes);
     // Leaf byte is raw consensus (`c[0] & 0xfe`). `LeafVersion::from_consensus`
     // rejects 0x50, which Core accepts as a future leaf.
-    let leaf = verify_control_commitment(&control_bytes, output_key_bytes, script)?;
+    let (leaf, tapleaf_hash) = verify_control_commitment(&control_bytes, output_key_bytes, script)?;
 
     if leaf != TAPSCRIPT_LEAF {
         if job.flags.discourage_upgradable_witness {
@@ -198,7 +200,17 @@ fn verify_script_path(
         return Ok(());
     }
 
-    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript);
+    let exec = crypto::TapscriptExecData::new(
+        tx,
+        input_index,
+        &job.prevouts,
+        job.pre(),
+        tap_spent,
+        tapleaf_hash,
+        annex,
+    );
+    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript)
+        .with_tapscript(exec);
     if interpreter::eval_script(script, &mut stack, &ctx)? {
         interpreter::require_clean_true(&stack)?;
     }
@@ -414,6 +426,31 @@ mod bip341_tests {
         script::verify_job_all_inputs(&job).expect("1 CHECKSIG within budget");
     }
 
+    /// Tapscript has no opcode limit, so `(OP_1 OP_IF)×K OP_1 OP_ENDIF×K` must
+    /// cost O(K) like Core's `ConditionStack`, not O(K²). At this depth a
+    /// per-opcode scan of the condition stack runs for tens of seconds.
+    #[test]
+    fn script_path_deep_if_nesting_verifies_in_linear_time() {
+        const DEPTH: usize = 100_000;
+        let mut leaf = [0x51u8, 0x63].repeat(DEPTH);
+        leaf.push(0x51);
+        leaf.extend(std::iter::repeat_n(0x68u8, DEPTH));
+
+        let (job, _) = make_script_path_spend_with(&leaf, &[]);
+        let started = std::time::Instant::now();
+        script::verify_job_all_inputs(&job).expect("deep nested IF");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "deep IF nesting took {elapsed:?}"
+        );
+
+        leaf.pop();
+        let (job, _) = make_script_path_spend_with(&leaf, &[]);
+        let err = script::verify_job_all_inputs(&job).expect_err("one ENDIF short");
+        assert!(format!("{err}").contains("unbalanced IF"), "{err}");
+    }
+
     /// Core ExecuteWitnessScript: every initial tapscript witness element ≤ 520.
     #[test]
     fn script_path_rejects_initial_element_over_520() {
@@ -595,12 +632,12 @@ mod bip341_tests {
             pre: std::sync::OnceLock::new(),
         };
         let mut cache = SighashCache::new(&*job.tx);
-        assert!(verify(&job, 0, &job.tx, &mut cache).is_err());
+        assert!(verify(&job, 0, &job.tx, &mut cache, &Default::default()).is_err());
 
         let mut job2 = job;
         job2.tx.input[0].witness = Witness::from_slice(&[vec![0u8; 10]]);
         let mut cache2 = SighashCache::new(&*job2.tx);
-        assert!(verify(&job2, 0, &job2.tx, &mut cache2).is_err());
+        assert!(verify(&job2, 0, &job2.tx, &mut cache2, &Default::default()).is_err());
     }
 
     #[test]
@@ -1034,6 +1071,211 @@ mod bip341_tests {
             pre: std::sync::OnceLock::new(),
         };
         script::verify_job_all_inputs(&job).expect("script path + annex CHECKSIG");
+    }
+
+    /// Core hashes the tapleaf, the annex, and the SIGHASH_SINGLE output once
+    /// per input (`ScriptExecutionData`). Rehashing them on every signature
+    /// opcode makes a large leaf, annex, or output cost O(sigs × size), and
+    /// the validation weight budget grows with that same witness size.
+    #[test]
+    fn script_path_many_sigs_hash_leaf_annex_and_output_once() {
+        use bitcoin::sighash::Annex;
+        use bitcoin::taproot::LeafVersion;
+
+        const SIGS: usize = 1_000;
+        const PAD: usize = 1 << 20;
+
+        let secp = Secp256k1::new();
+        let kp = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[11u8; 32]).unwrap());
+        let pk = kp.x_only_public_key().0.serialize();
+        let mut push_pk = vec![0x20];
+        push_pk.extend_from_slice(&pk);
+
+        let mut leaf_bytes = Vec::with_capacity(PAD + SIGS * 36);
+        let mut drop_520 = vec![0x4d, 0x08, 0x02];
+        drop_520.extend_from_slice(&[0xab; 520]);
+        drop_520.push(0x75);
+        while leaf_bytes.len() < PAD {
+            leaf_bytes.extend_from_slice(&drop_520);
+        }
+        for _ in 1..SIGS {
+            leaf_bytes.push(0x76);
+            leaf_bytes.extend_from_slice(&push_pk);
+            leaf_bytes.push(0xad);
+        }
+        leaf_bytes.extend_from_slice(&push_pk);
+        leaf_bytes.push(0xac);
+        let leaf = ScriptBuf::from_bytes(leaf_bytes);
+
+        let internal =
+            Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[12u8; 32]).unwrap())
+                .x_only_public_key()
+                .0;
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .expect("leaf")
+            .finalize(&secp, internal)
+            .expect("finalize");
+        let control = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .expect("control");
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(spend_info.output_key().to_x_only_public_key()),
+        };
+        let mut annex_bytes = vec![0x50];
+        annex_bytes.resize(PAD, 0xcd);
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x6a; PAD]),
+            }],
+        };
+        let sighash = SighashCache::new(&tx)
+            .taproot_signature_hash(
+                0,
+                &Prevouts::All(std::slice::from_ref(&prevout)),
+                Some(Annex::new(&annex_bytes).unwrap()),
+                Some((
+                    TapLeafHash::from_script(&leaf, LeafVersion::TapScript),
+                    0xFFFF_FFFF,
+                )),
+                TapSighashType::Single,
+            )
+            .unwrap();
+        let mut sig = secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(sighash.to_byte_array()), &kp)
+            .as_ref()
+            .to_vec();
+        sig.push(TapSighashType::Single as u8);
+        tx.input[0].witness = Witness::from_slice(&[
+            sig.as_slice(),
+            leaf.as_bytes(),
+            control.serialize().as_slice(),
+            annex_bytes.as_slice(),
+        ]);
+        let job = ScriptCheckJob::new(
+            vec![prevout],
+            tx,
+            crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
+        );
+
+        let started = std::time::Instant::now();
+        script::verify_job_all_inputs(&job).expect("many sigs over large leaf, annex, output");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "{SIGS} sigs took {elapsed:?}"
+        );
+    }
+
+    /// Core hashes the spent amounts and scriptPubKeys once per tx
+    /// (`PrecomputedTransactionData`). Rehashing them for every script-path
+    /// input that checks a signature costs O(inputs × spent script bytes).
+    #[test]
+    fn script_path_many_inputs_hash_spent_outputs_once() {
+        const TAP_INPUTS: usize = 500;
+        const BIG_INPUTS: usize = 200;
+
+        let secp = Secp256k1::new();
+        let kp = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[13u8; 32]).unwrap());
+        let mut leaf_bytes = vec![0x20];
+        leaf_bytes.extend_from_slice(&kp.x_only_public_key().0.serialize());
+        leaf_bytes.push(0xac);
+        let leaf = ScriptBuf::from_bytes(leaf_bytes);
+        let internal =
+            Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[14u8; 32]).unwrap())
+                .x_only_public_key()
+                .0;
+        let spend_info = TaprootBuilder::new()
+            .add_leaf(0, leaf.clone())
+            .expect("leaf")
+            .finalize(&secp, internal)
+            .expect("finalize");
+        let control = spend_info
+            .control_block(&(leaf.clone(), LeafVersion::TapScript))
+            .expect("control")
+            .serialize();
+        let tap_prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: p2tr_spk(spend_info.output_key().to_x_only_public_key()),
+        };
+        // `OP_0 OP_IF <520-byte push>×19 OP_ENDIF OP_1`: a 9941-byte bare
+        // scriptPubKey that an empty scriptSig spends.
+        let mut big_spk = vec![0x00, 0x63];
+        for _ in 0..19 {
+            big_spk.extend_from_slice(&[0x4d, 0x08, 0x02]);
+            big_spk.extend_from_slice(&[0xab; 520]);
+        }
+        big_spk.extend_from_slice(&[0x68, 0x51]);
+        let big_prevout = TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(big_spk),
+        };
+
+        let prevouts: Vec<TxOut> = std::iter::repeat_n(tap_prevout, TAP_INPUTS)
+            .chain(std::iter::repeat_n(big_prevout, BIG_INPUTS))
+            .collect();
+        let mut tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..prevouts.len())
+                .map(|i| TxIn {
+                    previous_output: OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([1; 32]),
+                        vout: i as u32,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
+        let mut cache = SighashCache::new(tx.clone());
+        let witnesses: Vec<Witness> = (0..TAP_INPUTS)
+            .map(|i| {
+                let sighash = cache
+                    .taproot_script_spend_signature_hash(
+                        i,
+                        &Prevouts::All(&prevouts),
+                        leaf_hash,
+                        TapSighashType::Default,
+                    )
+                    .unwrap();
+                let sig = secp
+                    .sign_schnorr_no_aux_rand(&Message::from_digest(sighash.to_byte_array()), &kp);
+                Witness::from_slice(&[sig.as_ref().as_slice(), leaf.as_bytes(), &control])
+            })
+            .collect();
+        for (input, witness) in tx.input.iter_mut().zip(witnesses) {
+            input.witness = witness;
+        }
+        let job = ScriptCheckJob::new(
+            prevouts,
+            tx,
+            crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
+        );
+
+        let started = std::time::Instant::now();
+        script::verify_job_all_inputs(&job).expect("many script-path inputs, large spent scripts");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "{TAP_INPUTS} script-path inputs took {elapsed:?}"
+        );
     }
 
     #[test]
