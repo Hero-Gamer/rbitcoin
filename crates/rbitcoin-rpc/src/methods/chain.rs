@@ -842,6 +842,14 @@ pub(crate) fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
     tip.saturating_sub(height.0).saturating_add(1)
 }
 
+/// Core's `ConnectBlock` returns before adding the genesis coinbase output
+/// to the coins view, so it is never an unspent coin.
+fn genesis_coinbase_txid(ctx: &RpcContext) -> [u8; 32] {
+    bitcoin::blockdata::constants::genesis_block(rpc_btc_network(ctx.network)).txdata[0]
+        .compute_txid()
+        .to_byte_array()
+}
+
 /// Descriptor scan over the scripthash index. `txouts` is always `-1`.
 pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["action", "scanobjects"])?;
@@ -895,9 +903,10 @@ pub(crate) fn scantxoutset(ctx: &RpcContext, params: &RpcParams) -> Result<Value
         .query
         .scan_unspent_scripts(&scripts)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let genesis_txid = genesis_coinbase_txid(ctx);
     let mut unspents = Vec::with_capacity(found.len());
     let mut total_sat = 0u64;
-    for u in found {
+    for u in found.into_iter().filter(|u| u.txid != genesis_txid) {
         total_sat = total_sat.saturating_add(u.value);
         let blockhash = ctx
             .query
@@ -978,6 +987,9 @@ pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     let n = params.req_u64(1, "n")? as u32;
     let include_mempool = params.opt_bool(2, "include_mempool")?.unwrap_or(true);
     let want = parse_hash32_display(hex)?;
+    if want == genesis_coinbase_txid(ctx) {
+        return Ok(Value::Null);
+    }
     let connected = ctx
         .query
         .tx_fk_by_txid_tip(&want)
