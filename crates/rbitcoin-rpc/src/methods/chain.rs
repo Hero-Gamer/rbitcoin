@@ -192,6 +192,13 @@ pub(crate) fn core_f64_json(v: f64) -> Value {
     Value::Number(s.parse().expect("core double decimal"))
 }
 
+/// `getblockchaininfo.difficulty`: [`difficulty_from_bits`] at 16 significant digits.
+pub fn difficulty_rpc_f64(bits: u32) -> f64 {
+    core_f64_json(difficulty_from_bits(bits))
+        .as_f64()
+        .expect("core difficulty decimal")
+}
+
 pub(crate) fn difficulty_at_tip(ctx: &RpcContext) -> Result<f64, Value> {
     let tip = ctx
         .query

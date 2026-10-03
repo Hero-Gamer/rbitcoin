@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+pub use chain::difficulty_rpc_f64;
 pub(crate) use chain::{tip_hash_height, wait_timeout_ms};
 pub(crate) use mine::gbt_longpoll_id;
 pub use mine::{gbt_template, submit_received_block};
