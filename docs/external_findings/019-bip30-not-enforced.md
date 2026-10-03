@@ -11,7 +11,9 @@
 A new block may contain a txid already on the best chain with **unspent**
 outputs. Without BIP30 the new instance overwrites the old in indexes.
 
-Fully-spent earlier instances may be duplicated. Mainnet also **grandfathers**
+Fully-spent earlier instances may be duplicated. Unspendable outputs
+(`OP_RETURN` first byte, or a script over 10,000 bytes) never enter
+Core's coin view, so they do not count as unspent. Mainnet also **grandfathers**
 two overwrites of **unspent** coinbases (Core `IsBIP30Repeat`): **91842**
 (`d5d27987…` from 91812, still immature) and **91880** (`e3bf3d07…` from
 91722). Those UTXOs were overwritten, not spent — do not `bad-txns-BIP30`

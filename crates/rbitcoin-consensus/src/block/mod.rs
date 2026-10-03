@@ -2075,7 +2075,8 @@ fn structural_bip68(
 
 /// MTP for write structural. Prefers assemble-carried `prev_mtp` (seeded into
 /// `cache`). Misses go to durable headers only — never `get_header_plan`.
-/// BIP30: a connected instance with any unspent output may not be overwritten.
+/// BIP30: a connected instance with any unspent spendable output may not be
+/// overwritten.
 /// Skipped for the two mainnet repeats, and when the header at BIP34 height
 /// is this network's BIP34 hash and the block is below
 /// [`crate::params::BIP34_IMPLIES_BIP30_LIMIT`]. Signet and regtest have no
@@ -2113,9 +2114,17 @@ fn reject_bip30_unspent_overwrite(
         {
             continue;
         }
-        let rec = query.store().get_tx(old_fk).map_err(ConsensusError::from)?;
+        let (_, outs) = query
+            .store()
+            .get_tx_meta_and_outputs(old_fk)
+            .map_err(ConsensusError::from)?;
         let mut unspent = false;
-        for v in 0..rec.output_count {
+        for (v, out) in (0u32..).zip(&outs) {
+            // Core's AddCoins never stores an unspendable output, so it is
+            // not a coin that the overwrite could clobber.
+            if crate::policy::is_unspendable(&out.script) {
+                continue;
+            }
             let spent = query
                 .store()
                 .has_confirmed_strong_spender_create(old_fk, v, None)
