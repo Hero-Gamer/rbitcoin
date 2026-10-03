@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 use bitcoin::hashes::Hash;
 use bitcoin::script::{Instruction, Script};
 use bitcoin::sighash::SighashCache;
-use bitcoin::{Amount, Sequence, Transaction, TxOut};
+use bitcoin::{Amount, Sequence, Transaction};
 
 use super::crypto;
 use crate::error::ConsensusError;
@@ -145,7 +145,6 @@ pub(crate) struct EvalContext<'a> {
     pub tx: &'a Transaction,
     pub input_index: usize,
     pub amount: Amount,
-    pub prevouts: &'a [TxOut],
     /// scriptCode for sighash (redeem / witness script).
     pub script_code: &'a Script,
     pub sig_version: SigVersion,
@@ -189,7 +188,7 @@ pub(crate) struct EvalContext<'a> {
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
     validation_weight_left: Cell<i64>,
     /// Tapscript only: per-input sighash facts from the script-path spend.
-    tapscript: Option<crypto::TapscriptExecData>,
+    tapscript: Option<crypto::TapscriptExecData<'a>>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -198,7 +197,6 @@ impl<'a> EvalContext<'a> {
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
-        prevouts: &'a [TxOut],
         script_code: &'a Script,
         sig_version: SigVersion,
     ) -> Self {
@@ -206,7 +204,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            prevouts,
             script_code,
             sig_version,
             true,
@@ -221,7 +218,6 @@ impl<'a> EvalContext<'a> {
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
-        prevouts: &'a [TxOut],
         script_code: &'a Script,
         sig_version: SigVersion,
         bip65_active: bool,
@@ -232,7 +228,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            prevouts,
             script_code,
             sig_version,
             bip65_active,
@@ -247,7 +242,6 @@ impl<'a> EvalContext<'a> {
         tx: &'a Transaction,
         input_index: usize,
         amount: Amount,
-        prevouts: &'a [TxOut],
         script_code: &'a Script,
         sig_version: SigVersion,
         bip65_active: bool,
@@ -259,7 +253,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            prevouts,
             script_code,
             sig_version,
             bip65_active,
@@ -283,7 +276,7 @@ impl<'a> EvalContext<'a> {
     }
 
     /// Attach the tapleaf and annex facts of a BIP341 script-path spend.
-    pub(crate) fn with_tapscript(mut self, exec: crypto::TapscriptExecData) -> Self {
+    pub(crate) fn with_tapscript(mut self, exec: crypto::TapscriptExecData<'a>) -> Self {
         self.tapscript = Some(exec);
         self
     }
@@ -325,7 +318,6 @@ impl<'a> EvalContext<'a> {
             tx,
             input_index,
             amount,
-            &job.prevouts,
             script_code,
             sig_version,
             job.bip65_active,
@@ -1456,14 +1448,7 @@ fn checksig_schnorr(
     let exec = ctx.tapscript.as_ref().ok_or_else(|| {
         ConsensusError::Script("invariant: tapscript spend without tapleaf hash".into())
     })?;
-    let sighash = exec.signature_hash(
-        ctx.tx,
-        ctx.input_index,
-        ctx.prevouts,
-        ctx.pre.as_ref(),
-        sighash_ty,
-        ctx.codeseparator_pos.get(),
-    )?;
+    let sighash = exec.signature_hash(sighash_ty, ctx.codeseparator_pos.get())?;
     let msg = bitcoin::secp256k1::Message::from_digest(sighash);
     Ok(crypto::SECP.with(|secp| secp.verify_schnorr(&schnorr, &msg, &xonly).is_ok()))
 }
@@ -1612,20 +1597,9 @@ mod success_and_disabled_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         // script_code points into script_bytes via Script::from_bytes
         let script = Script::from_bytes(script_bytes);
-        let ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(50_000),
-            &prevouts,
-            script,
-            sig_version,
-        );
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(50_000), script, sig_version);
         let mut stack = Vec::new();
         eval_script(script, &mut stack, &ctx)
     }
@@ -1926,10 +1900,6 @@ mod success_and_disabled_tests {
         // Script: push 1, CSV, DROP, OP_TRUE — v1 must fail CSV version gate.
         let script_bytes = [0x51u8, 0xb2, 0x75, 0x51]; // 1 CSV DROP TRUE
         let script = Script::from_bytes(&script_bytes);
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let mk = |ver: i32| Transaction {
             version: bitcoin::transaction::Version(ver),
             lock_time: LockTime::ZERO,
@@ -1950,7 +1920,6 @@ mod success_and_disabled_tests {
             &tx1,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -1970,7 +1939,6 @@ mod success_and_disabled_tests {
             &tx2,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -2086,10 +2054,6 @@ mod success_and_disabled_tests {
         // locktime height vs time type mismatch
         let script_bytes = [0x51u8, 0xb1, 0x75, 0x51]; // 1 CLTV DROP TRUE
         let script = Script::from_bytes(&script_bytes);
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let tx = Transaction {
             version: bitcoin::transaction::Version::ONE,
             lock_time: LockTime::from_time(500_000_001).unwrap(),
@@ -2108,7 +2072,6 @@ mod success_and_disabled_tests {
             &tx,
             0,
             Amount::from_sat(1),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -2139,7 +2102,6 @@ mod success_and_disabled_tests {
             &tx2,
             0,
             Amount::from_sat(1),
-            &prevouts,
             script2,
             SigVersion::Base,
             true,
@@ -2291,10 +2253,6 @@ mod success_and_disabled_tests {
         // OP_1NEGATE CLTV …
         let script_bytes = [0x4fu8, 0xb1, 0x75, 0x51];
         let script = Script::from_bytes(&script_bytes);
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let tx = Transaction {
             version: bitcoin::transaction::Version::ONE,
             lock_time: LockTime::from_height(10).unwrap(),
@@ -2313,7 +2271,6 @@ mod success_and_disabled_tests {
             &tx,
             0,
             Amount::from_sat(1),
-            &prevouts,
             script,
             SigVersion::Base,
             true,
@@ -2392,19 +2349,8 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let script = Script::from_bytes(script_bytes);
-        let mut ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(50_000),
-            &prevouts,
-            script,
-            SigVersion::Base,
-        );
+        let mut ctx = EvalContext::new(&tx, 0, Amount::from_sat(50_000), script, SigVersion::Base);
         ctx.minimal_data = md;
         let mut stack = Vec::new();
         eval_script(script, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
@@ -2480,19 +2426,8 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let script = Script::from_bytes(&[0x51]);
-        let ctx = EvalContext::new(
-            &tx,
-            0,
-            Amount::from_sat(1),
-            &prevouts,
-            script,
-            SigVersion::Base,
-        );
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), script, SigVersion::Base);
         assert!(!ctx.minimal_data);
         assert!(!ctx.nullfail && !ctx.low_s && !ctx.strictenc && !ctx.null_dummy);
     }
@@ -2516,16 +2451,11 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let sc = Script::from_bytes(&script);
         let ctx_on = EvalContext::new_with_flags(
             &tx,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             sc,
             SigVersion::Base,
             true,
@@ -2540,7 +2470,6 @@ mod minimal_data_tests {
             &tx,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             sc,
             SigVersion::Base,
             true,
@@ -2577,16 +2506,11 @@ mod minimal_data_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let sc = Script::from_bytes(&script);
         let mut ctx = EvalContext::new_with_flags(
             &tx,
             0,
             Amount::from_sat(50_000),
-            &prevouts,
             sc,
             SigVersion::Base,
             true,
@@ -2625,17 +2549,13 @@ mod p2sh_redeem_parse_tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
-        let prevouts = vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }];
         let sc = Script::from_bytes(&ss);
-        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, sc, SigVersion::Base);
+        let ctx = EvalContext::new(&tx, 0, Amount::from_sat(1), sc, SigVersion::Base);
         let mut stack = Vec::new();
         eval_script(sc, &mut stack, &ctx).expect("scriptSig");
         let redeem = stack.pop().unwrap();
         let rs = Script::from_bytes(&redeem);
-        let ctx2 = EvalContext::new(&tx, 0, Amount::from_sat(1), &prevouts, rs, SigVersion::Base);
+        let ctx2 = EvalContext::new(&tx, 0, Amount::from_sat(1), rs, SigVersion::Base);
         let r = eval_script(rs, &mut stack, &ctx2);
         assert!(r.is_ok(), "{r:?}");
     }

@@ -426,10 +426,6 @@ fn eval_bare_pair(
     flags: &CoreFlags,
     cleanstack: bool,
 ) -> Result<(), String> {
-    let prevouts = [TxOut {
-        value: amount,
-        script_pubkey: ScriptBuf::from_bytes(script_pubkey.to_vec()),
-    }];
     let mut stack: Vec<Vec<u8>> = Vec::new();
     let ss = Script::from_bytes(script_sig);
     if !script_sig.is_empty() {
@@ -437,7 +433,6 @@ fn eval_bare_pair(
             spend,
             0,
             amount,
-            &prevouts,
             ss,
             SigVersion::Base,
             flags.cltv,
@@ -456,7 +451,6 @@ fn eval_bare_pair(
         spend,
         0,
         amount,
-        &prevouts,
         spk,
         SigVersion::Base,
         flags.cltv,
@@ -487,7 +481,6 @@ fn eval_bare_pair(
             spend,
             0,
             amount,
-            &prevouts,
             redeem_script,
             SigVersion::Base,
             flags.cltv,
