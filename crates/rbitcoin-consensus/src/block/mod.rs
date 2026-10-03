@@ -1071,6 +1071,7 @@ pub(crate) fn assemble_block_prevouts(
         }
         if ti > 0 {
             tx_fees[ti] = assemble_non_cb_tx(
+                ctx.params,
                 block,
                 tx,
                 ti,
@@ -1179,6 +1180,7 @@ fn money_range_out_sum(out_sum: u64) -> i64 {
 
 #[allow(clippy::too_many_arguments)]
 fn assemble_non_cb_tx(
+    params: &ChainParams,
     block: &Block,
     tx: &Transaction,
     ti: usize,
@@ -1211,6 +1213,7 @@ fn assemble_non_cb_tx(
         return Err(ConsensusError::BadTx("no inputs"));
     }
     let (value_in, prevouts, tx_in_sigops) = assemble_non_cb_inputs(
+        params,
         block,
         tx,
         ti,
@@ -1291,6 +1294,7 @@ fn assemble_tx_value_out(
 
 #[allow(clippy::too_many_arguments)]
 fn assemble_non_cb_inputs(
+    params: &ChainParams,
     block: &Block,
     tx: &Transaction,
     ti: usize,
@@ -1323,6 +1327,11 @@ fn assemble_non_cb_inputs(
     for (ii, input) in tx.input.iter().enumerate() {
         let op = input.previous_output;
         let key = (op.txid.to_byte_array(), op.vout);
+        // The genesis coinbase stays indexed for RPC and Electrum, but it is
+        // not a coin (Core `ConnectBlock` genesis early return).
+        if params.is_genesis_coinbase(&key.0) {
+            return Err(ConsensusError::MissingPrevout);
+        }
         if !pending_spent.insert(key) {
             return Err(ConsensusError::BadTx("double spend in block"));
         }

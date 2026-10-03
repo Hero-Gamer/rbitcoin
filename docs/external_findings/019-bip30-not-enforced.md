@@ -29,3 +29,11 @@ Gate: if `bip34_active_at(height)` skip (hot path). Else if
 `is_bip30_repeat(height, hash)` (91842 / 91880 mainnet hashes) skip. Else
 TipOnly connected sibling + durable spentness. Never treat just-archived self
 as a conflict.
+
+Known gap: the genesis coinbase is not a coin in Core, and assemble
+rejects spends of its txid as a missing prevout. But
+`reject_bip30_unspent_overwrite` still counts the genesis instance's
+outputs as unspent, so a later byte-identical genesis coinbase would be
+`bad-txns-BIP30` here and accepted by Core. This is unreachable: after
+BIP34 its height push matches only height 486,604,799, where the subsidy
+no longer covers its 50 BTC output.

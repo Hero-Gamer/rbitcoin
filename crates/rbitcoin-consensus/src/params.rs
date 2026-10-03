@@ -19,6 +19,9 @@ fn bip34_block_hash(display_hex: &str) -> BlockHash {
 pub struct ChainParams {
     pub network: Network,
     pub genesis_hash: BlockHash,
+    /// Core's `ConnectBlock` returns before adding the genesis block's
+    /// coinbase to the coin view, so its outputs are never spendable.
+    genesis_coinbase_txid: [u8; 32],
     pub pow_limit: Target,
     pub checkpoints: Vec<Checkpoint>,
     /// rust-bitcoin consensus params (retarget spacing, no_pow_retargeting, …).
@@ -63,6 +66,7 @@ impl ChainParams {
         Self {
             network: Network::Regtest,
             genesis_hash: genesis.block_hash(),
+            genesis_coinbase_txid: genesis.txdata[0].compute_txid().to_byte_array(),
             pow_limit: Target::MAX_ATTAINABLE_REGTEST,
             checkpoints: vec![],
             btc,
@@ -79,6 +83,7 @@ impl ChainParams {
         Self {
             network: Network::Bitcoin,
             genesis_hash: genesis.block_hash(),
+            genesis_coinbase_txid: genesis.txdata[0].compute_txid().to_byte_array(),
             pow_limit: Target::MAX_ATTAINABLE_MAINNET,
             checkpoints: mainnet_checkpoints(genesis.block_hash()),
             btc: BtcParams::new(Network::Bitcoin),
@@ -98,6 +103,7 @@ impl ChainParams {
         Self {
             network: Network::Testnet,
             genesis_hash: genesis.block_hash(),
+            genesis_coinbase_txid: genesis.txdata[0].compute_txid().to_byte_array(),
             pow_limit: Target::MAX_ATTAINABLE_TESTNET,
             checkpoints: vec![],
             btc: BtcParams::new(Network::Testnet),
@@ -130,6 +136,7 @@ impl ChainParams {
         Ok(Self {
             network: Network::Signet,
             genesis_hash: genesis.block_hash(),
+            genesis_coinbase_txid: genesis.txdata[0].compute_txid().to_byte_array(),
             pow_limit: Target::MAX_ATTAINABLE_SIGNET,
             checkpoints: vec![],
             btc,
@@ -139,6 +146,12 @@ impl ChainParams {
             subsidy_halving_overlay: None,
             bip34_hash: None,
         })
+    }
+
+    /// True for the genesis coinbase txid, which is never a coin.
+    #[inline]
+    pub(crate) fn is_genesis_coinbase(&self, txid: &[u8; 32]) -> bool {
+        *txid == self.genesis_coinbase_txid
     }
 
     pub fn checkpoint_at(&self, height: Height) -> Option<BlockHash> {

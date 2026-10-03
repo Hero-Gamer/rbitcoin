@@ -1260,14 +1260,16 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
 #[test]
 fn optimistic_assemble_unstamped_parent_is_invariant() {
     use super::assemble_block_prevouts;
-    use crate::accept_and_connect_block;
+    use crate::{accept_and_connect_block, mine_empty_regtest};
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::{BatchParents, OutPointSet, SpendEdges};
     let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("assemble-unstamped");
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
     accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let parent_txid = genesis.txdata[0].compute_txid();
+    let b1 = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let parent_txid = b1.txdata[0].compute_txid();
     let spend = Transaction {
         version: TxVersion::ONE,
         lock_time: LockTime::ZERO,
@@ -1288,17 +1290,17 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
     let mut block = Block {
         header: Header {
             version: Version::from_consensus(4),
-            prev_blockhash: genesis.block_hash(),
+            prev_blockhash: b1.block_hash(),
             merkle_root: TxMerkleNode::from_byte_array([0; 32]),
-            time: genesis.header.time + 600,
+            time: b1.header.time + 600,
             bits: CompactTarget::from_consensus(0x207f_ffff),
             nonce: 0,
         },
-        txdata: vec![coinbase(1), spend],
+        txdata: vec![coinbase(2), spend],
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
     let p = Box::leak(Box::new(params));
-    let ctx = ValidationContext::at(p, Height(1), Milestone::height(840_000));
+    let ctx = ValidationContext::at(p, Height(2), Milestone::height(840_000));
     let parents = BatchParents::new();
     let thin = SpendEdges::default();
     let mut spent = OutPointSet::default();
@@ -1309,7 +1311,7 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
         .map(|t| t.compute_txid().to_byte_array())
         .collect();
     let bh = block.header.block_hash().to_byte_array();
-    let spend_fks = [Fk(1), Fk(2)];
+    let spend_fks = [Fk(3), Fk(4)];
     let err = assemble_block_prevouts(
         &q,
         &block,
@@ -1320,9 +1322,9 @@ fn optimistic_assemble_unstamped_parent_is_invariant() {
         &parents,
         &thin,
         &create_txids,
-        genesis.header.time,
+        b1.header.time,
         &bh,
-        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, genesis.header.time),
+        bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, b1.header.time),
         None,
         None,
     )
@@ -1447,6 +1449,72 @@ fn accept_rejects_connect_spend_rules() {
         matches!(err, ConsensusError::BadTx(s) if s.contains("immature")),
         "4-deep immature: {err:?}"
     );
+}
+
+/// Core never adds the genesis coinbase to the coin view. A spend of it is a
+/// missing prevout at any depth, with or without script checks.
+#[test]
+fn genesis_coinbase_is_never_a_coin() {
+    use crate::{
+        accept_and_connect_block, mine_empty_regtest, pad_empty_from, prepare_regtest_candidate,
+    };
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("genesis-cb-spend");
+    let params = ChainParams::regtest();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+    let op = OutPoint {
+        txid: genesis.txdata[0].compute_txid(),
+        vout: 0,
+    };
+    let spend_genesis = |tip: BlockHash, time: u32, h: u32| {
+        let mut b = mine_empty_regtest(tip, time + 600, h);
+        b.txdata.push(Transaction {
+            version: TxVersion::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        });
+        prepare_regtest_candidate(&mut b, tip, time + 600);
+        b
+    };
+
+    let b1 = spend_genesis(genesis.block_hash(), genesis.header.time, 1);
+    let err = accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE)
+        .expect_err("genesis coinbase spend at height 1");
+    assert!(
+        matches!(err, ConsensusError::MissingPrevout),
+        "height 1: {err:?}"
+    );
+
+    let maturity = params.coinbase_maturity();
+    let (tip, time, _) = pad_empty_from(
+        &q,
+        &params,
+        genesis.block_hash(),
+        genesis.header.time,
+        1,
+        maturity,
+        0,
+    );
+    let h = maturity + 1;
+    let block = spend_genesis(tip, time, h);
+    for ms in [Milestone::NONE, Milestone::height(h)] {
+        let err = accept_and_connect_block(&q, &params, Height(h), &block, ms)
+            .expect_err("mature genesis coinbase spend");
+        assert!(
+            matches!(err, ConsensusError::MissingPrevout),
+            "{ms:?}: {err:?}"
+        );
+        assert_eq!(q.tip_height(), Some(Height(maturity)));
+    }
 }
 
 #[test]
