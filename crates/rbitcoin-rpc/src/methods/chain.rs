@@ -2,7 +2,7 @@ use super::*;
 use bitcoin::consensus::{deserialize, Encodable};
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, BlockHash, ScriptBuf, Txid};
-use rbitcoin_primitives::Height;
+use rbitcoin_primitives::{median_time_past_times, Height};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -226,7 +226,7 @@ pub(crate) fn getblockheader(ctx: &RpcContext, params: &RpcParams) -> Result<Val
     }
     let typed = BlockHash::from_byte_array(hash);
     if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
-        return held_header_value(&block, verbose);
+        return held_header_value(ctx, &block, verbose);
     }
     Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
 }
@@ -300,7 +300,14 @@ struct OffChainHeader {
     height: u32,
     prev_hash: Option<[u8; 32]>,
     chainwork: String,
+    /// Median of this header and up to 10 ancestors (Core `GetMedianTimePast`).
+    mediantime: u32,
 }
+
+/// Header-sync ancestry cap (`stored_header_height`). One `prev_fk` read per
+/// step; active membership is the height index. A longer stale branch errors
+/// instead of scanning the rest of the branch.
+const OFF_CHAIN_WALK_MAX: u32 = 10_000;
 
 /// Header that is stored but not on the active chain. Height and chainwork
 /// walk `prev_fk` until an active ancestor (or genesis).
@@ -314,34 +321,39 @@ fn off_chain_header(ctx: &RpcContext, hash: &[u8; 32]) -> Result<Option<OffChain
     };
     let mut cur = rec.clone();
     let mut works = Vec::new();
+    let mut times = Vec::with_capacity(11);
     let mut immediate_prev: Option<[u8; 32]> = None;
-    for step in 0..100_000 {
-        let prev_hash = if cur.prev_fk.is_null() {
-            [0u8; 32]
-        } else {
-            ctx.query
-                .get_header(cur.prev_fk)
-                .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-                .hash
-        };
-        if step == 0 && !cur.prev_fk.is_null() {
-            immediate_prev = Some(prev_hash);
-        }
+    for step in 0..OFF_CHAIN_WALK_MAX {
         works.push(work_from_bits(cur.bits));
+        if times.len() < 11 {
+            times.push(cur.timestamp);
+        }
         if cur.prev_fk.is_null() {
-            return Ok(Some(OffChainHeader {
+            return Ok(Some(off_chain_done(
                 rec,
                 header_fk,
-                height: (works.len() as u32).saturating_sub(1),
-                prev_hash: None,
-                chainwork: hex_encode(sum_header_work(works).to_be_bytes()),
-            }));
+                (works.len() as u32).saturating_sub(1),
+                None,
+                hex_encode(sum_header_work(works).to_be_bytes()),
+                &times,
+            )));
+        }
+        let parent = ctx
+            .query
+            .get_header(cur.prev_fk)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        if step == 0 {
+            immediate_prev = Some(parent.hash);
         }
         if let Some(h) = ctx
             .query
-            .height_of_hash(&prev_hash)
+            .confirmed_height_of_hash(&parent.hash)
             .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         {
+            if times.len() < 11 {
+                times.push(parent.timestamp);
+            }
+            fill_mtp_below(ctx, &mut times, h.0)?;
             let height = h.0.saturating_add(works.len() as u32);
             let extra = sum_header_work(works);
             let cw = match ctx.chain.as_ref() {
@@ -351,20 +363,77 @@ fn off_chain_header(ctx: &RpcContext, hash: &[u8; 32]) -> Result<Option<OffChain
                     .unwrap_or(extra),
                 None => extra,
             };
-            return Ok(Some(OffChainHeader {
+            return Ok(Some(off_chain_done(
                 rec,
                 header_fk,
                 height,
-                prev_hash: immediate_prev,
-                chainwork: hex_encode(cw.to_be_bytes()),
-            }));
+                immediate_prev,
+                hex_encode(cw.to_be_bytes()),
+                &times,
+            )));
         }
-        cur = ctx
-            .query
-            .get_header(cur.prev_fk)
-            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+        cur = parent;
     }
     Err(rpc_error(ERR_MISC, "side header walk exceeded"))
+}
+
+fn off_chain_done(
+    rec: rbitcoin_store::HeaderRecord,
+    header_fk: rbitcoin_primitives::Fk,
+    height: u32,
+    prev_hash: Option<[u8; 32]>,
+    chainwork: String,
+    times: &[u32],
+) -> OffChainHeader {
+    OffChainHeader {
+        rec,
+        header_fk,
+        height,
+        prev_hash,
+        chainwork,
+        mediantime: median_time_past_times(times),
+    }
+}
+
+/// Ancestors strictly below an active parent, until the 11-timestamp window is full.
+fn fill_mtp_below(ctx: &RpcContext, times: &mut Vec<u32>, parent_height: u32) -> Result<(), Value> {
+    let mut h = parent_height;
+    while times.len() < 11 && h > 0 {
+        h -= 1;
+        let Some((_, rec)) = ctx
+            .query
+            .header_at_height(Height(h))
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        else {
+            break;
+        };
+        times.push(rec.timestamp);
+    }
+    Ok(())
+}
+
+/// MTP when the block is not a stored header row: at most 10 parent reads.
+fn median_time_from_wire(ctx: &RpcContext, time: u32, prev_hash: [u8; 32]) -> Result<u32, Value> {
+    let mut times = vec![time];
+    if prev_hash != [0u8; 32] {
+        if let Some((_, rec)) = ctx
+            .query
+            .get_header_by_hash(&prev_hash)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        {
+            times.push(rec.timestamp);
+            let mut fk = rec.prev_fk;
+            while times.len() < 11 && !fk.is_null() {
+                let parent = ctx
+                    .query
+                    .get_header(fk)
+                    .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+                times.push(parent.timestamp);
+                fk = parent.prev_fk;
+            }
+        }
+    }
+    Ok(median_time_past_times(&times))
 }
 
 fn work_from_bits(bits: u32) -> bitcoin::Work {
@@ -421,7 +490,7 @@ fn off_chain_header_value(
         "versionHex": format!("{:08x}", loc.rec.version),
         "merkleroot": hash_hex_display(&loc.rec.merkle_root),
         "time": loc.rec.timestamp,
-        "mediantime": loc.rec.timestamp,
+        "mediantime": loc.mediantime,
         "nonce": loc.rec.nonce,
         "bits": format!("{:08x}", loc.rec.bits),
         "difficulty": core_f64_json(difficulty_from_bits(loc.rec.bits)),
@@ -435,13 +504,14 @@ fn off_chain_header_value(
     Ok(obj)
 }
 
-fn held_header_value(block: &Block, verbose: bool) -> Result<Value, Value> {
+fn held_header_value(ctx: &RpcContext, block: &Block, verbose: bool) -> Result<Value, Value> {
     if !verbose {
         return Ok(json!(header_hex(&block.header)?));
     }
     let bits = block.header.bits.to_consensus();
     let version = block.header.version.to_consensus();
     let prev = block.header.prev_blockhash.to_byte_array();
+    let mediantime = median_time_from_wire(ctx, block.header.time, prev)?;
     let mut obj = json!({
         "hash": hash_hex_display(&block.block_hash().to_byte_array()),
         "confirmations": -1,
@@ -449,7 +519,7 @@ fn held_header_value(block: &Block, verbose: bool) -> Result<Value, Value> {
         "versionHex": format!("{:08x}", version),
         "merkleroot": hash_hex_display(&block.header.merkle_root.to_byte_array()),
         "time": block.header.time,
-        "mediantime": block.header.time,
+        "mediantime": mediantime,
         "nonce": block.header.nonce,
         "bits": format!("{:08x}", bits),
         "difficulty": core_f64_json(difficulty_from_bits(bits)),
@@ -711,13 +781,17 @@ fn disconnected_block_value(
         .as_ref()
         .map(|l| l.chainwork.clone())
         .unwrap_or_else(|| held_chainwork_hex(ctx, block));
+    let mediantime = match &loc {
+        Some(loc) => loc.mediantime,
+        None => median_time_from_wire(ctx, block.header.time, prev)?,
+    };
     let mut obj = json!({
         "hash": hash_hex_display(hash),
         "confirmations": -1,
         "version": version,
         "merkleroot": hash_hex_display(&block.header.merkle_root.to_byte_array()),
         "time": block.header.time,
-        "mediantime": block.header.time,
+        "mediantime": mediantime,
         "nonce": block.header.nonce,
         "bits": format!("{:08x}", bits),
         "nTx": block.txdata.len(),

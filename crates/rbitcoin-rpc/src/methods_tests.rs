@@ -1373,6 +1373,34 @@ fn getblock_named_verbose_genesis_and_hex() {
     assert!(!body["tx"].as_array().unwrap().is_empty(), "{body}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Core `mediantime` on an inactive header is the median of that header and
+/// up to 10 ancestors, not the header's own timestamp.
+#[test]
+fn inactive_header_mediantime_is_branch_median() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let addr = p2wpkh_regtest().0;
+    let mut hashes = Vec::new();
+    for i in 0..12u32 {
+        let t = 1_700_000_000u64 + u64::from(i) * 1_000;
+        dispatch(&ctx, "setmocktime", vec![json!(t)]).unwrap();
+        let mined = dispatch(&ctx, "generatetoaddress", vec![json!(1), json!(addr)]).unwrap();
+        hashes.push(mined.as_array().unwrap()[0].clone());
+    }
+    let old_tip = hashes[11].clone();
+    dispatch(&ctx, "invalidateblock", vec![hashes[9].clone()]).unwrap();
+    let gone = dispatch(&ctx, "getblockheader", vec![old_tip.clone()]).unwrap();
+    assert_eq!(gone["confirmations"], json!(-1), "{gone}");
+    assert_eq!(gone["height"], json!(12), "{gone}");
+    assert_eq!(gone["previousblockhash"], hashes[10], "{gone}");
+    // Heights 2..=12. Sorted median is height 7: 1_700_000_000 + 6*1000.
+    assert_eq!(gone["mediantime"], json!(1_700_006_000u64), "{gone}");
+    let body = dispatch(&ctx, "getblock", vec![old_tip, json!(1)]).unwrap();
+    assert_eq!(body["confirmations"], json!(-1), "{body}");
+    assert_eq!(body["mediantime"], gone["mediantime"], "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn miniwallet_raw_scan_and_gettxout() {
     let (ctx, dir, _hub) = ctx_regtest_hub();
