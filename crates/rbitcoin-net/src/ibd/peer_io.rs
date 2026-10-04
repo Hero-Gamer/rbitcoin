@@ -169,8 +169,13 @@ impl PeerSlot {
     }
 
     pub(crate) fn track_retain(&mut self, mut keep: impl FnMut(&BlockHash) -> bool) {
+        // Judge each hash once, before taking the reader mutex. The shared
+        // set then matches that decision. `has_block` does not run while the
+        // IBD reader is blocked in `note_solicited_block`.
         self.in_flight.retain(|h| keep(h));
-        self.requested_set().retain(|h| keep(h));
+        let mut set = self.requested_set();
+        set.clear();
+        set.extend(self.in_flight.iter().copied());
     }
 
     pub(crate) fn track_drain(&mut self) -> Vec<BlockHash> {
@@ -933,6 +938,25 @@ mod tests {
         note_block_progress(std::slice::from_mut(&mut s), 99);
         note_block_rx(std::slice::from_mut(&mut s), 99, 1);
         assert!(ibd_mono_ms() > 0);
+    }
+
+    #[test]
+    fn track_retain_judges_each_hash_once() {
+        let mut slot = dummy_slot(3);
+        let keep_hash = BlockHash::from_byte_array([1u8; 32]);
+        let drop_hash = BlockHash::from_byte_array([2u8; 32]);
+        slot.track_insert(keep_hash);
+        slot.track_insert(drop_hash);
+        let mut calls = 0usize;
+        slot.track_retain(|hash| {
+            calls += 1;
+            *hash != drop_hash
+        });
+        assert_eq!(calls, 2, "one judgment per in-flight hash");
+        assert!(slot.in_flight.contains(&keep_hash));
+        assert!(!slot.in_flight.contains(&drop_hash));
+        let requested = slot.requested.lock().unwrap().clone();
+        assert_eq!(requested, slot.in_flight);
     }
 
     #[test]
