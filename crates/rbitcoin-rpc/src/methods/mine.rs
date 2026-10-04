@@ -1063,7 +1063,8 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
         Err(e) if e.is_local_fault() => SubmitBlockOutcome::Error(e.to_string()),
         Err(e) => {
             let reason = submit_reject_reason(&e);
-            if !e.is_mutated() && reason != "bad-txnmrklroot"
+            if !e.is_mutated()
+                && reason != "bad-txnmrklroot"
                 && reason != "high-hash"
                 && reason != "prev-blk-not-found"
             {
