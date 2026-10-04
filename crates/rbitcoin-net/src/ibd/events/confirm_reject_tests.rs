@@ -2709,6 +2709,7 @@ fn ibd_flag_zero_tx_block_is_consensus_invalid() {
                 class,
                 err,
                 batch_len,
+                sender: _,
             }) => break (height, hash, class, err, batch_len),
             Ok(ConfirmEvent::Accepted { .. }) => panic!("a block with an empty tx connected"),
             Err(RecvTimeoutError::Timeout) => {
@@ -2734,6 +2735,7 @@ fn ibd_flag_zero_tx_block_is_consensus_invalid() {
         class,
         err,
         batch_len,
+        sender: None,
     })
     .unwrap();
     drop(tx);
@@ -2843,6 +2845,7 @@ fn ibd_refused_body_is_asked_again() {
         class: ConfirmRejectClass::SoftWire,
         err: "body queue wire does not decode".into(),
         batch_len: 1,
+        sender: None,
     })
     .unwrap();
     drop(tx);
