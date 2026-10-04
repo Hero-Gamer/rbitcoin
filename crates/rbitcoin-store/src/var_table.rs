@@ -129,7 +129,7 @@ impl VarTable {
         }
         let n = usize::try_from(len).map_err(|_| StoreError::Corrupt("body span too large"))?;
         let mut buf = vec![0u8; n];
-        self.read_body_pread(self.body_published_len(), offset, &mut buf)?;
+        self.read_body_pread(self.body.logical_len(), offset, &mut buf)?;
         Ok(buf)
     }
 
@@ -155,7 +155,8 @@ impl VarTable {
         len: u64,
         f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        self.with_bytes_at_published(self.body_published_len(), offset, len, f)
+        // HWM, not `published_meta`. The locator publish can trail `publish_body_hwm`.
+        self.with_bytes_at_published(self.body.logical_len(), offset, len, f)
     }
 
     /// [`Self::with_bytes_at`] against a published end the caller already took.
@@ -182,7 +183,7 @@ impl VarTable {
         buf: &mut Vec<u8>,
         f: impl FnOnce(&[u8]) -> Result<R, StoreError>,
     ) -> Result<R, StoreError> {
-        self.with_bytes_at_into_published(self.body_published_len(), offset, len, buf, f)
+        self.with_bytes_at_into_published(self.body.logical_len(), offset, len, buf, f)
     }
 
     fn with_bytes_at_into_published<R>(
@@ -227,7 +228,7 @@ impl VarTable {
             return f(&[]);
         }
         let mut buf = vec![0u8; len as usize];
-        self.read_body_pread(self.body_published_len(), offset, &mut buf)?;
+        self.read_body_pread(self.body.logical_len(), offset, &mut buf)?;
         f(&buf)
     }
 
@@ -629,6 +630,49 @@ mod tests {
         let err = t
             .with_bytes_at(off, 16, |_| Ok(()))
             .expect_err("fresh published end is the shrink");
+        match err {
+            StoreError::Corrupt(msg) => assert!(msg.contains("published"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `publish_body_hwm` stores the file end before `finish_prepared` releases
+    /// the locator count. Point reads follow that HWM. A caller-supplied
+    /// seqlock end still rejects the same bytes.
+    #[test]
+    fn point_read_follows_body_hwm_ahead_of_the_locator_seqlock() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let id = N.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rbitcoin-var-hwm-{id}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let t = VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
+        let seqlock_end = t.body_published_len();
+        assert_eq!(seqlock_end, FILE_HEADER_LEN as u64);
+        let payload = [0x11u8; 16];
+        t.write_body_blob_bulk(seqlock_end, &payload).unwrap();
+        assert_eq!(t.body_published_len(), seqlock_end);
+        assert!(t.body_logical_len() >= seqlock_end + payload.len() as u64);
+
+        let got = t
+            .with_bytes_at(seqlock_end, 16, |b| Ok(b.to_vec()))
+            .unwrap();
+        assert_eq!(got, payload);
+        let mut buf = vec![0u8; 32];
+        let got = t
+            .with_bytes_at_into(seqlock_end, 16, &mut buf, |b| Ok(b.to_vec()))
+            .unwrap();
+        assert_eq!(got, payload);
+        let got = t
+            .with_bytes_at_pread(seqlock_end, 16, |b| Ok(b.to_vec()))
+            .unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(t.pread_span(seqlock_end, 16).unwrap(), payload);
+
+        let err = t
+            .with_bytes_at_published(seqlock_end, seqlock_end, 16, |_| Ok(()))
+            .expect_err("seqlock end still excludes the HWM bytes");
         match err {
             StoreError::Corrupt(msg) => assert!(msg.contains("published"), "{msg}"),
             other => panic!("{other:?}"),

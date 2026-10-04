@@ -288,6 +288,13 @@ impl CreateLoc {
                         .ok_or(StoreError::Corrupt("invariant: create.off checkpoint"))?
                 }
             };
+            let buf_len = n * 2;
+            let end = loc_file_off(win_first, SLOT).saturating_add(buf_len as u64);
+            if end > published {
+                return Err(StoreError::Corrupt(
+                    "invariant: body read past published end",
+                ));
+            }
             windows.push(LocWinRead {
                 job_lo: w_i,
                 job_hi: w_j,
@@ -295,7 +302,7 @@ impl CreateLoc {
                 n,
                 tx0,
                 sp0,
-                buf: vec![0u8; n * 2],
+                buf: vec![0u8; buf_len],
             });
             w_i = w_j;
         }
@@ -381,10 +388,7 @@ impl CreateLoc {
                 Ok(true) => {}
                 Ok(false) => {
                     drop(ops);
-                    for w in windows.iter_mut() {
-                        self.loc
-                            .pread_at(loc_file_off(w.win_first, SLOT), &mut w.buf)?;
-                    }
+                    self.read_planned_windows(windows)?;
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -400,12 +404,22 @@ impl CreateLoc {
         }
         drop(ops);
         for i in shorts {
-            self.loc.pread_at(
-                loc_file_off(windows[i].win_first, SLOT),
-                &mut windows[i].buf,
-            )?;
+            self.read_one_planned_window(&mut windows[i])?;
         }
         Ok(())
+    }
+
+    /// Fill windows whose planned end was already checked. No second HWM load.
+    fn read_planned_windows(&self, windows: &mut [LocWinRead]) -> Result<(), StoreError> {
+        for w in windows {
+            self.read_one_planned_window(w)?;
+        }
+        Ok(())
+    }
+
+    fn read_one_planned_window(&self, w: &mut LocWinRead) -> Result<(), StoreError> {
+        self.loc
+            .pread_exact(loc_file_off(w.win_first, SLOT), &mut w.buf)
     }
 }
 
@@ -633,6 +647,9 @@ mod tests {
         loc.loc.set_logical_len(FILE_HEADER_LEN as u64).unwrap();
         loc.pread_windows(&mut IoCtx::none(), &mut plan)
             .expect("in-snapshot window stays readable after a shrink");
+        // The short-read fallback must not load `logical_len` again.
+        loc.read_planned_windows(&mut plan.windows)
+            .expect("planned window pread keeps the snapshot end");
         let got = loc.finish_range_batch(&plan).unwrap();
         assert_eq!(
             got[0],
@@ -644,13 +661,16 @@ mod tests {
         );
 
         loc.loc.set_logical_len(FILE_HEADER_LEN as u64).unwrap();
-        let mut short = loc.plan_range_batch(&[Fk(1)]).unwrap();
-        loc.loc.set_logical_len(full).unwrap();
-        match loc.pread_windows(&mut IoCtx::none(), &mut short) {
+        match loc.plan_range_batch(&[Fk(1)]) {
             Err(StoreError::Corrupt(msg)) => assert!(msg.contains("published"), "{msg}"),
-            Ok(()) => panic!("a later grow widened the planned published end"),
+            Ok(_) => panic!("a short published end still planned a window"),
             Err(other) => panic!("{other}"),
         }
+        loc.loc.set_logical_len(full).unwrap();
+        let mut again = loc.plan_range_batch(&[Fk(1)]).unwrap();
+        loc.pread_windows(&mut IoCtx::none(), &mut again).unwrap();
+        let got = loc.finish_range_batch(&again).unwrap();
+        assert_eq!(got[0].unwrap().n_out, 1);
     }
 
     #[test]

@@ -239,6 +239,16 @@ fn missing(what: &'static str) -> StoreError {
     StoreError::Corrupt(what)
 }
 
+/// `hi` is the end of a `txout.body` span taken from locators.
+fn require_body_hwm(hwm: u64, hi: u64) -> Result<(), StoreError> {
+    if hi > hwm {
+        return Err(StoreError::Corrupt(
+            "invariant: body read past published end",
+        ));
+    }
+    Ok(())
+}
+
 /// Parent fk → (txid, outputs).
 type Parents = U64Map<([u8; 32], Vec<OutputRecord>)>;
 /// Create fk → `(block, tx)` within a window.
@@ -372,6 +382,8 @@ fn read_blocks(
             .max()
             .unwrap_or(0);
         spans.push((jobs.len(), lo, pairs));
+        // One compare against the body HWM. Not a fresh `published_meta` pair.
+        require_body_hwm(table.body.body_logical_len(), hi)?;
         jobs.push(ReadJob::new(files.body, lo, hi - lo));
         let (abs, len) = table.input.edges_body_read(plan)?;
         jobs.push(ReadJob::new(files.input_body, abs, len));
@@ -552,4 +564,20 @@ fn read_parents(
         parents.insert(*fk, (txid, outs));
     }
     Ok(parents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::require_body_hwm;
+    use crate::error::StoreError;
+
+    #[test]
+    fn txout_span_past_the_body_hwm_is_corrupt() {
+        require_body_hwm(80, 80).unwrap();
+        match require_body_hwm(80, 81) {
+            Err(StoreError::Corrupt(msg)) => assert!(msg.contains("published"), "{msg}"),
+            Ok(()) => panic!("a span past the body HWM was accepted"),
+            Err(other) => panic!("{other}"),
+        }
+    }
 }
