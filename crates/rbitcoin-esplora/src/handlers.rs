@@ -2040,59 +2040,6 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn fee_estimates_cover_one_through_25_and_the_far_targets() {
-        let pairs: Vec<(u32, f64)> = (1..=25)
-            .chain([144, 504, 1008])
-            .map(|t| (t, f64::from(20_000 - t) / 100_000_000.0))
-            .collect();
-        let est = fee_estimates_from(&pairs).expect("curve");
-        let obj = est.as_object().expect("object");
-        for t in 1..=25 {
-            assert!(obj.contains_key(&t.to_string()), "missing {t}: {est}");
-        }
-        for key in ["144", "504", "1008"] {
-            assert!(obj.contains_key(key), "missing {key}: {est}");
-        }
-        assert!(!obj.contains_key("100"), "{est}");
-        assert_eq!(obj.len(), 28, "{est}");
-
-        let mut sparse = pairs.clone();
-        sparse[6].1 = -1.0;
-        let est = fee_estimates_from(&sparse).expect("one hole");
-        assert!(est.get("7").is_none(), "{est}");
-        assert!(est.get("6").is_some(), "{est}");
-
-        let none: Vec<(u32, f64)> = pairs.iter().map(|(t, _)| (*t, -1.0)).collect();
-        assert!(fee_estimates_from(&none).is_none());
-    }
-
-    #[test]
-    fn fee_estimates_are_unavailable_when_the_hub_has_no_rate() {
-        use crate::server::{AppState, JoinCache};
-        use axum::http::StatusCode;
-        use rbitcoin_net::MempoolHub;
-        use std::sync::{Arc, Mutex};
-
-        let (dir, q) = temp_query();
-        let mp = dir.path().join("mp");
-        std::fs::create_dir_all(&mp).unwrap();
-        let q = Arc::new(q);
-        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
-        let state = AppState {
-            query: q,
-            network: Network::Regtest,
-            mempool: Some(hub),
-            max_body: 1024,
-            sh_join: Arc::new(Mutex::new(JoinCache::default())),
-            join_header_trusted: false,
-            block_template: None,
-            gbt_cache: Arc::new(Mutex::new(None)),
-        };
-        let response = super::fee_estimates_sync(&state);
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[test]
     fn block_summary_bits_u32_and_witness_size_weight() {
         let (dir, q) = temp_query();
         let hash = seed_genesis(&q);

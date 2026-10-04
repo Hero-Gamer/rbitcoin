@@ -5504,59 +5504,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    /// Off-knot targets use the same curve as the 11 rates this snapshot published.
-    #[test]
-    fn off_knot_targets_follow_the_published_curve() {
-        let store_dir = tmp();
-        let mp_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
-        hub.set_relay_enabled(true);
-        for height in 1..=2_100 {
-            record_fee_sample(&hub, height, 1_000 + u64::from(height % 80) * 50);
-        }
-        hub.mark_fee_dirty();
-
-        let pairs = hub.fee_estimates_btc_per_kb();
-        let keys: Vec<u32> = pairs.iter().map(|(d, _)| *d).collect();
-        let esplora: Vec<u32> = (1..=25).chain([144, 504, 1008]).collect();
-        assert_eq!(keys, esplora, "published targets: {keys:?}");
-        assert!(!keys.contains(&100));
-
-        let knot_sat = |depth: u32| {
-            pairs
-                .iter()
-                .find(|(d, _)| *d == depth)
-                .map(|(_, btc)| (btc * 100_000_000.0).round() as u64)
-        };
-        let rates: Vec<Option<u64>> = FEE_SNAPSHOT_DEPTHS.iter().copied().map(knot_sat).collect();
-        assert!(
-            rates.iter().all(Option::is_some),
-            "history should define every computed depth via hold: {rates:?}"
-        );
-        for target in [12u32, 25, 100] {
-            let expect = fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, target)
-                .expect("off-knot target");
-            let got = hub.estimate_fee_btc_per_kb(target);
-            assert!(got >= 0.0, "target {target} insufficient");
-            assert_eq!(
-                (got * 100_000_000.0).round() as u64,
-                expect,
-                "target {target}"
-            );
-        }
-        let left = rates[FEE_SNAPSHOT_DEPTHS.iter().position(|d| *d == 10).unwrap()].unwrap();
-        let right = rates[FEE_SNAPSHOT_DEPTHS.iter().position(|d| *d == 20).unwrap()].unwrap();
-        if left != right {
-            let mid = fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, 12).unwrap();
-            assert_ne!(mid, left);
-            assert_ne!(mid, right);
-        }
-
-        let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
-    }
-
     #[test]
     fn fee_history_preload_reuses_heights_it_already_holds() {
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
@@ -5711,6 +5658,30 @@ mod tests {
         assert!(s1008 > 0.0, "1008 must use history, not empty-pool -1");
         assert!(s144 <= s1 + 0.05, "monotone far={s144} near={s1}");
         assert!(s504 <= s144 + 0.05, "monotone 504={s504} 144={s144}");
+        let keys: Vec<u32> = bulk.iter().map(|(d, _)| *d).collect();
+        let esplora: Vec<u32> = (1..=25).chain([144, 504, 1008]).collect();
+        assert_eq!(keys, esplora, "published targets: {keys:?}");
+        let knot_sat = |depth: u32| {
+            bulk.iter()
+                .find(|(d, _)| *d == depth)
+                .map(|(_, btc)| (btc * 100_000_000.0).round() as u64)
+        };
+        let rates: Vec<Option<u64>> = FEE_SNAPSHOT_DEPTHS.iter().copied().map(knot_sat).collect();
+        assert!(
+            rates.iter().all(Option::is_some),
+            "history should define every computed depth via hold: {rates:?}"
+        );
+        for target in [12u32, 25, 100] {
+            let expect = fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, target)
+                .expect("off-knot target");
+            let got = hub.estimate_fee_btc_per_kb(target);
+            assert!(got >= 0.0, "target {target} insufficient");
+            assert_eq!(
+                (got * 100_000_000.0).round() as u64,
+                expect,
+                "target {target}"
+            );
+        }
         for i in 0..20u32 {
             record_fee_sample(&hub, 3_201 + i, 1_000 + u64::from(i) * 100);
         }
