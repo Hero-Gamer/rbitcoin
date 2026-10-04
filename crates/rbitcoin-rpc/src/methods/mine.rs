@@ -1039,9 +1039,14 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
         Err(e) => return SubmitBlockOutcome::Error(format!("store: {e}")),
         Ok(Some(reason)) => {
             // `bad-txns-duplicate` and `bad-txnmrklroot` are mutated-block needles.
-            // Cache every other cheap consensus reason so a second submit is
+            // A coinbase-less 64-byte body is too: it can be the header's inner
+            // nodes, so `bad-cb-missing` must not stick to the hash. Cache
+            // every other cheap consensus reason so a second submit is
             // `duplicate-invalid`.
-            if reason != "bad-txns-duplicate" && reason != "bad-txnmrklroot" {
+            if reason != "bad-txns-duplicate"
+                && reason != "bad-txnmrklroot"
+                && !rbitcoin_consensus::block_mutated_without_coinbase(&block)
+            {
                 hub.note_invalid_block(hash);
                 let _ = hub.ensure_header(&block.header);
             }
