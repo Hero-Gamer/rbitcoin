@@ -284,59 +284,6 @@ fn cached_confirming_hash_loads_once_per_height() {
     assert_eq!(loads, 2, "same height must not load twice");
 }
 
-/// A subscribe that answered `null` (no history) dedups a later push that is
-/// still empty, and an empty status goes out as `null`, never `""`.
-#[test]
-fn null_status_is_recorded_and_deduplicated() {
-    assert_eq!(status_json(String::new()), Value::Null);
-    assert_eq!(status_json("ab".into()), json!("ab"));
-    let sh = [7u8; 32];
-    let subs: HashSet<[u8; 32]> = [sh].into_iter().collect();
-    let mut last = HashMap::new();
-    record_sent_status(&mut last, sh, &Value::Null);
-    assert!(take_new_status(&mut last, &subs, sh, String::new()).is_none());
-    assert_eq!(
-        take_new_status(&mut last, &subs, sh, "cd".into()).as_deref(),
-        Some("cd")
-    );
-    record_sent_status(&mut last, sh, &json!("ef"));
-    assert!(take_new_status(&mut last, &subs, sh, "ef".into()).is_none());
-    assert_eq!(
-        take_new_status(&mut last, &subs, sh, String::new()).as_deref(),
-        Some("")
-    );
-}
-
-/// The block/reorg restatus push sends `null` when a watched script's status
-/// was last sent non-empty and its history is now empty, once: the next pass
-/// is deduplicated.
-#[tokio::test]
-async fn block_restatus_pushes_null_for_emptied_history() {
-    let (_dir, q) = tmp_store();
-    let q = Arc::new(q);
-    let sh = script_hash(&[0x51]);
-    let subs: HashSet<[u8; 32]> = [sh].into_iter().collect();
-    let mut last = HashMap::from([(sh, "aa".to_string())]);
-    let mut out = Vec::new();
-    emit_sh_notes(&mut out, &q, None, &subs, &mut last, None)
-        .await
-        .unwrap();
-    let lines: Vec<Value> = std::str::from_utf8(&out)
-        .unwrap()
-        .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
-        .collect();
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    assert_eq!(lines[0]["method"], "blockchain.scripthash.subscribe");
-    assert_eq!(lines[0]["params"][0], json!(hash_hex_rev(&sh)));
-    assert_eq!(lines[0]["params"][1], Value::Null, "{lines:?}");
-    let mut again = Vec::new();
-    emit_sh_notes(&mut again, &q, None, &subs, &mut last, None)
-        .await
-        .unwrap();
-    assert!(again.is_empty(), "still empty: no second push");
-}
-
 #[test]
 fn drop_unsubscribed_status_clears_idle_hashes() {
     let mut last = HashMap::new();
@@ -1051,6 +998,58 @@ async fn chain_view_reorg_notifies_dropped_scripthash() {
     assert_eq!(
         next["id"], 3,
         "no push for the still-empty fresh script: {next}"
+    );
+
+    // Header notify is written before the scripthash restatus, so it is the
+    // barrier: the silence window starts after this tip handler has begun.
+    let mut line = serde_json::to_string(&json!({
+        "jsonrpc":"2.0","id":4,"method":"blockchain.headers.subscribe","params":[]
+    }))
+    .unwrap();
+    line.push('\n');
+    reader.get_mut().write_all(line.as_bytes()).await.unwrap();
+    resp.clear();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        reader.read_line(&mut resp),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let hdr_sub: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(hdr_sub["id"], 4, "{hdr_sub}");
+    assert!(hdr_sub.get("result").is_some(), "{hdr_sub}");
+
+    tip_tx
+        .send(TipNotify {
+            height: 0,
+            header_hex: "bb".repeat(80),
+            reorg_from_height: Some(0),
+        })
+        .unwrap();
+    resp.clear();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        reader.read_line(&mut resp),
+    )
+    .await
+    .expect("second tip must notify headers")
+    .unwrap();
+    let hdr_push: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(
+        hdr_push["method"].as_str(),
+        Some("blockchain.headers.subscribe"),
+        "{hdr_push}"
+    );
+    resp.clear();
+    let again = tokio::time::timeout(
+        std::time::Duration::from_millis(400),
+        reader.read_line(&mut resp),
+    )
+    .await;
+    assert!(
+        again.is_err(),
+        "emptied history stays null and is not pushed again: {resp}"
     );
 
     handle.shutdown().await;
