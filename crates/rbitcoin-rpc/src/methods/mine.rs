@@ -1087,9 +1087,7 @@ fn cheap_spend_height(
     if query.tip_header_fk()? == Some(parent_fk) {
         return Ok(query.tip_height().map(|h| h.0.saturating_add(1)));
     }
-    Ok(query
-        .height_of_hash(&prev)?
-        .map(|h| h.0.saturating_add(1)))
+    Ok(query.height_of_hash(&prev)?.map(|h| h.0.saturating_add(1)))
 }
 
 /// Core `CheckTxInputs`: a coinbase spend inside the maturity window is
@@ -1125,11 +1123,11 @@ fn read_confirmed_prevout(
 ) -> Result<Option<(rbitcoin_primitives::Fk, bitcoin::TxOut)>, rbitcoin_store::StoreError> {
     use rbitcoin_store::StoreError;
     let tid = op.txid.to_byte_array();
-    let Some((fk, rec)) = match query.get_tx_by_txid(&tid) {
+    let Some((fk, rec)) = (match query.get_tx_by_txid(&tid) {
         Ok(v) => v,
         Err(StoreError::NotFound) => None,
         Err(e) => return Err(e),
-    } else {
+    }) else {
         return Ok(None);
     };
     if op.vout >= rec.output_count {
