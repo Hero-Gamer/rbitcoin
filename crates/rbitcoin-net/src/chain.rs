@@ -5567,6 +5567,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[allow(clippy::cognitive_complexity)] // one hub: tip rejects, 64-byte body, in-block duplicates
     #[test]
     fn hostile_peer_session() {
         let (dir, hub) = tmp_hub();
