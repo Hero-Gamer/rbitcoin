@@ -30,6 +30,10 @@ use tokio::sync::broadcast;
 use crate::fee_history::{FeeHistory, HistoricalFeeBlock};
 use crate::fee_history_file;
 
+#[path = "parent_req.rs"]
+mod parent_req;
+pub(crate) use parent_req::{DueParent, ParentNote};
+
 /// Max age of a published fee snapshot before refresh (request path is still Arc-load only
 /// after a concurrent refresh has finished; see [`MempoolHub::maybe_refresh_fee_snapshot`]).
 const FEE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(1);
@@ -471,13 +475,6 @@ pub(crate) const GETDATA_TX_INTERVAL_SECS: u64 = 60;
 /// Core `MAX_PEER_TX_REQUEST_IN_FLIGHT`.
 const MAX_PARENTS_PER_PARK: usize = 100;
 
-struct ParentAnn {
-    peer: u64,
-    preferred: bool,
-    reqtime: u64,
-    requested_until: Option<u64>,
-    failed: bool,
-}
 /// INV AlreadyHave for recently confirmed txid/wtxid (Core rolling bloom is ~100k).
 const RECENT_CONFIRMED_CAP: usize = 65_536;
 
@@ -633,6 +630,11 @@ pub struct MempoolHub {
     accept_gen: Mutex<HashMap<Wtxid, u64>>,
     /// Mempool expiry in seconds (default 336h).
     expiry_secs: AtomicU64,
+    /// Accept-time order for expiry: `(accept_at, wtxid) → txid`, one row per
+    /// live tx. Extra RAM beside `accept_at` (key + txid, plus tree nodes;
+    /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
+    /// and does not walk `wtxid_by_txid`.
+    expiry_order: Mutex<BTreeMap<(u64, Wtxid), Txid>>,
     /// Min-relay overlay (sat/kvB). Session FeeFilter reads this
     /// without taking `inner`.
     min_relay_sat_kvb: AtomicU64,
@@ -642,8 +644,26 @@ pub struct MempoolHub {
     min_live_accept_at: AtomicU64,
     /// Cached tip MTP for accept (`{header_fk, ctx}`).
     tip_ctx: Mutex<Option<(Fk, ChainTipCtx)>>,
-    /// TxRequestTracker-shaped missing-parent GETDATA (txid hash → announcers).
-    parent_req: Mutex<HashMap<[u8; 32], Vec<ParentAnn>>>,
+    /// TxRequestTracker-shaped missing-parent GETDATA.
+    parent_req: Mutex<parent_req::ParentTracker>,
+}
+
+const EXPIRE_SCAN: usize = 256;
+
+/// Oldest expired accepts, at most [`EXPIRE_SCAN`]. The map is ordered by
+/// accept time, so the first still-young key ends the scan.
+fn expired_roots_in(order: &BTreeMap<(u64, Wtxid), Txid>, now: u64, lim: u64) -> Vec<Txid> {
+    let mut roots = Vec::new();
+    for (&(at, _), txid) in order.iter() {
+        if now.saturating_sub(at) < lim {
+            break;
+        }
+        roots.push(*txid);
+        if roots.len() == EXPIRE_SCAN {
+            break;
+        }
+    }
+    roots
 }
 
 impl MempoolHub {
@@ -766,6 +786,7 @@ impl MempoolHub {
             next_accept_gen: AtomicU64::new(1),
             accept_gen: Mutex::new(HashMap::new()),
             expiry_secs: AtomicU64::new(DEFAULT_MEMPOOL_EXPIRY_SECS),
+            expiry_order: Mutex::new(BTreeMap::new()),
             min_relay_sat_kvb: AtomicU64::new(
                 rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
             ),
@@ -774,7 +795,7 @@ impl MempoolHub {
             age_inv: Mutex::new(BTreeMap::new()),
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
-            parent_req: Mutex::new(HashMap::new()),
+            parent_req: Mutex::new(parent_req::ParentTracker::new()),
         };
         // Schema ≤ 2 records carry no sigop cost: fill (or evict) before serving.
         hub.lock_write()
@@ -943,11 +964,17 @@ impl MempoolHub {
         let mut ats = self.accept_at.lock().unwrap();
         let mut gens = self.accept_gen.lock().unwrap();
         let mut age = self.age_inv.lock().unwrap();
-        by_tx.insert(txid, wtxid);
+        let mut order = self.expiry_order.lock().unwrap();
+        if let Some(prev_w) = by_tx.insert(txid, wtxid) {
+            if let Some(prev_at) = ats.get(&prev_w).copied() {
+                order.remove(&(prev_at, prev_w));
+            }
+        }
         seqs.insert(wtxid, seq);
         ats.insert(wtxid, at);
         gens.insert(wtxid, gen);
         age.insert((due, gen), (txid, wtxid));
+        order.insert((at, wtxid), txid);
         self.min_live_accept_at.fetch_min(at, Ordering::Relaxed);
     }
 
@@ -957,12 +984,16 @@ impl MempoolHub {
         let mut ats = self.accept_at.lock().unwrap();
         let mut gens = self.accept_gen.lock().unwrap();
         let mut age = self.age_inv.lock().unwrap();
+        let mut order = self.expiry_order.lock().unwrap();
         if let Some(w) = by_tx.remove(txid) {
             seqs.remove(&w);
             let at = ats.remove(&w);
             let gen = gens.remove(&w);
             if let (Some(at), Some(gen)) = (at, gen) {
                 age.remove(&(at.saturating_add(30), gen));
+            }
+            if let Some(at) = at {
+                order.remove(&(at, w));
             }
             let min = ats.values().copied().min().unwrap_or(u64::MAX);
             self.min_live_accept_at.store(min, Ordering::Relaxed);
@@ -1145,6 +1176,16 @@ impl MempoolHub {
     /// Drop live txs (and in-mempool descendants) older than `-mempoolexpiry`.
     /// Called when a new tx is admitted so expiry is checked on the accept path.
     pub fn expire_stale(&self) -> usize {
+        self.expire_stale_inner(true)
+    }
+
+    /// Same scan as [`Self::expire_stale`]. A busy accept-time index skips
+    /// this tick instead of waiting.
+    pub(crate) fn try_expire_stale(&self) -> usize {
+        self.expire_stale_inner(false)
+    }
+
+    fn expire_stale_inner(&self, block: bool) -> usize {
         let now = self.relay_now_secs();
         let lim = self.expiry_secs.load(Ordering::Relaxed);
         if lim == 0 || now == 0 {
@@ -1154,29 +1195,29 @@ impl MempoolHub {
         if min_at == u64::MAX || now.saturating_sub(min_at) < lim {
             return 0;
         }
-        self.meter_expire_full_scans.fetch_add(1, Ordering::Relaxed);
-        let expired_roots: Vec<Txid> = {
-            let ats = self.accept_at.lock().unwrap();
-            let by_tx = self.wtxid_by_txid.lock().unwrap();
-            by_tx
-                .iter()
-                .filter_map(|(txid, wtxid)| {
-                    let at = ats.get(wtxid)?;
-                    if now.saturating_sub(*at) >= lim {
-                        Some(*txid)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        let expired_roots = {
+            let order = if block {
+                self.expiry_order.lock().unwrap()
+            } else {
+                let Ok(order) = self.expiry_order.try_lock() else {
+                    return 0;
+                };
+                order
+            };
+            self.meter_expire_full_scans.fetch_add(1, Ordering::Relaxed);
+            expired_roots_in(&order, now, lim)
         };
-        if expired_roots.is_empty() {
+        self.remove_expired_roots(&expired_roots)
+    }
+
+    fn remove_expired_roots(&self, roots: &[Txid]) -> usize {
+        if roots.is_empty() {
             return 0;
         }
-        let mut kill = std::collections::BTreeSet::new();
+        let mut kill = BTreeSet::new();
         {
             let g = self.lock_read();
-            for t in &expired_roots {
+            for t in roots {
                 if let Some(set) = g.graph.descendant_set(t) {
                     kill.extend(set);
                 } else {
@@ -1196,6 +1237,17 @@ impl MempoolHub {
             self.note_template_update();
         }
         n
+    }
+
+    /// Headers poll runs on `tokio-rt-worker`. Expiry takes mempool locks, so
+    /// it has to enter a [`crate::reactor::BlockingRegion`] on the blocking pool.
+    /// A busy index skips the tick.
+    pub fn expire_stale_from_session(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _g = crate::reactor::BlockingRegion::enter();
+            hub.try_expire_stale()
+        });
     }
 
     pub fn subscribe_inv_flush(&self) -> broadcast::Receiver<()> {
@@ -1577,7 +1629,7 @@ impl MempoolHub {
             return;
         };
         if g.len() >= 4_096 {
-            g.clear();
+            return;
         }
         g.insert(wtxid);
     }
@@ -2521,130 +2573,55 @@ impl MempoolHub {
             if self.parent_already_have(p) {
                 continue;
             }
-            let anns = g.entry(p.to_byte_array()).or_default();
-            if anns.iter().any(|a| a.peer == peer) {
-                continue;
-            }
-            anns.push(ParentAnn {
-                peer,
-                preferred,
-                reqtime,
-                requested_until: None,
-                failed: false,
-            });
+            g.schedule(p.to_byte_array(), peer, preferred, reqtime);
         }
     }
 
-    pub(crate) fn note_inv_tx_requested(&self, peer: u64, hash: [u8; 32], inbound: bool, now: u64) {
-        let mut g = self.parent_req.lock().unwrap();
-        let anns = g.entry(hash).or_default();
-        if let Some(a) = anns.iter_mut().find(|a| a.peer == peer) {
-            if a.requested_until.is_none() && !a.failed {
-                a.requested_until = Some(now.saturating_add(GETDATA_TX_INTERVAL_SECS));
-            }
-            return;
-        }
-        anns.push(ParentAnn {
-            peer,
-            preferred: !inbound,
-            reqtime: now,
-            requested_until: Some(now.saturating_add(GETDATA_TX_INTERVAL_SECS)),
-            failed: false,
-        });
+    /// `wtxid` records that this announcement is a wtxid inv.
+    /// [`ParentNote::PeerCapped`] is this peer's own cap. [`ParentNote::GlobalFull`]
+    /// skips the row and is not misbehavior.
+    pub(crate) fn note_inv_tx_requested(
+        &self,
+        peer: u64,
+        hash: [u8; 32],
+        inbound: bool,
+        now: u64,
+        wtxid: bool,
+    ) -> ParentNote {
+        self.parent_req
+            .lock()
+            .unwrap()
+            .note_inv(peer, hash, inbound, now, wtxid)
     }
 
     pub(crate) fn forget_parent_anns_for_peer(&self, peer: u64) {
-        let mut g = self.parent_req.lock().unwrap();
-        g.retain(|_, anns| {
-            anns.retain(|a| a.peer != peer);
-            !anns.is_empty()
-        });
+        self.parent_req.lock().unwrap().forget_peer(peer);
     }
 
     pub(crate) fn announcer_peers_for(&self, txid: &Txid, wtxid: &Wtxid) -> Vec<u64> {
-        let g = self.parent_req.lock().unwrap();
-        let mut peers = Vec::new();
-        for hash in [txid.to_byte_array(), wtxid.to_byte_array()] {
-            if let Some(anns) = g.get(&hash) {
-                for a in anns {
-                    if !a.failed && !peers.contains(&a.peer) {
-                        peers.push(a.peer);
-                    }
-                }
-            }
-        }
-        peers
+        self.parent_req
+            .lock()
+            .unwrap()
+            .announcer_peers([txid.to_byte_array(), wtxid.to_byte_array()])
     }
 
     pub(crate) fn resolve_tx_request(&self, txid: &Txid, wtxid: &Wtxid, admitted: bool) {
-        let mut g = self.parent_req.lock().unwrap();
-        for hash in [txid.to_byte_array(), wtxid.to_byte_array()] {
-            if admitted {
-                g.remove(&hash);
-                continue;
-            }
-            let Some(anns) = g.get_mut(&hash) else {
-                continue;
-            };
-            for a in anns.iter_mut() {
-                if a.requested_until.is_some() {
-                    a.requested_until = None;
-                    a.failed = true;
-                }
-            }
-            if anns.iter().all(|a| a.failed) {
-                g.remove(&hash);
-            }
-        }
+        self.parent_req
+            .lock()
+            .unwrap()
+            .resolve([txid.to_byte_array(), wtxid.to_byte_array()], admitted);
     }
 
-    pub(crate) fn take_due_parent_getdata(&self, peer: u64, now: u64) -> Vec<Txid> {
+    pub(crate) fn take_due_parent_getdata(&self, peer: u64, now: u64) -> Vec<DueParent> {
         let mut g = self.parent_req.lock().unwrap();
-        let hashes: Vec<[u8; 32]> = g.keys().copied().collect();
-        let mut out = Vec::new();
-        let mut drop_keys = Vec::new();
-        for hash in hashes {
-            let Some(anns) = g.get_mut(&hash) else {
-                continue;
-            };
-            for a in anns.iter_mut() {
-                if let Some(exp) = a.requested_until {
-                    if exp <= now {
-                        a.requested_until = None;
-                        a.failed = true;
-                    }
-                }
+        g.take_due(peer, now, |hash, wtxid| {
+            if wtxid {
+                let w = Wtxid::from_byte_array(*hash);
+                self.try_contains_wtxid(&w) || self.try_recent_reject(&w)
+            } else {
+                self.parent_already_have(&Txid::from_byte_array(*hash))
             }
-            if anns.iter().all(|a| a.failed) {
-                drop_keys.push(hash);
-                continue;
-            }
-            let txid = Txid::from_byte_array(hash);
-            if self.parent_already_have(&txid) {
-                drop_keys.push(hash);
-                continue;
-            }
-            if anns.iter().any(|a| a.requested_until.is_some()) {
-                continue;
-            }
-            let has_pref = anns
-                .iter()
-                .any(|a| a.preferred && !a.failed && a.reqtime <= now);
-            let chosen = anns.iter_mut().find(|a| {
-                !a.failed && a.reqtime <= now && a.peer == peer && (!has_pref || a.preferred)
-            });
-            if let Some(a) = chosen {
-                a.requested_until = Some(now.saturating_add(GETDATA_TX_INTERVAL_SECS));
-                out.push(txid);
-                if out.len() >= MAX_PARENTS_PER_PARK {
-                    break;
-                }
-            }
-        }
-        for k in drop_keys {
-            g.remove(&k);
-        }
-        out
+        })
     }
 
     /// Re-admit txs after reorg disconnect (best-effort).
@@ -3769,6 +3746,110 @@ mod tests {
         std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
     }
 
+    #[test]
+    fn recent_reject_at_the_cap_does_not_clear() {
+        let dir = tmp();
+        let mdir = tmp();
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let hub = MempoolHub::open(&mdir, std::sync::Arc::new(q)).unwrap();
+        let first = bitcoin::Wtxid::from_byte_array({
+            let mut b = [0u8; 32];
+            b[0] = 1;
+            b
+        });
+        hub.note_recent_reject(first);
+        // 2..4097 is 4095 ids and does not collide with `first` (byte 0 == 1).
+        for i in 2..4_097u32 {
+            let mut b = [0u8; 32];
+            b[0..4].copy_from_slice(&i.to_le_bytes());
+            hub.note_recent_reject(bitcoin::Wtxid::from_byte_array(b));
+        }
+        let extra = bitcoin::Wtxid::from_byte_array([0xff; 32]);
+        hub.note_recent_reject(extra);
+        assert!(hub.try_recent_reject(&first));
+        assert!(!hub.try_recent_reject(&extra));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mdir);
+    }
+
+    #[test]
+    fn expire_stale_drops_old_tx_without_a_new_accept() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        let tid = tx.compute_txid();
+        hub.accept_tx(&tx).expect("admit");
+        assert_eq!(hub.live_count(), 1);
+        hub.set_expiry_hours(1);
+        hub.note_mock_now(hub.relay_now_secs() + 3600 + 5);
+        assert_eq!(hub.expire_stale(), 1);
+        assert_eq!(hub.live_count(), 0);
+        assert!(!hub.contains(&tid));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// One scan visits 256 live txs. With more than that expired, the survivors
+    /// are the newest accepts, and the next call continues from there.
+    #[test]
+    fn expire_stale_drops_oldest_accepts_within_one_scan() {
+        const N: u32 = 257;
+        let (store_dir, q, cbs) = pad_cbs(N);
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let mut ids = Vec::with_capacity(N as usize);
+        for (i, cb) in cbs.iter().enumerate() {
+            hub.note_mock_now((i as u64) + 1);
+            // Regtest halves every 150 blocks, so later coinbases are under 50 BTC.
+            let mut tx = spend_true(*cb, 0, ScriptBuf::from_bytes(vec![0x51]));
+            tx.output[0].value = Amount::from_sat(1_000_000);
+            hub.accept_tx(&tx).expect("admit");
+            ids.push(tx.compute_txid());
+        }
+        assert_eq!(hub.live_count(), N as usize);
+        hub.set_expiry_hours(0);
+        hub.note_mock_now(N as u64 + 1);
+        let newest = *ids.last().unwrap();
+        assert_eq!(hub.expire_stale(), 256);
+        assert_eq!(hub.live_count(), 1);
+        assert!(hub.contains(&newest), "newest accept must survive the cap");
+        for id in &ids[..ids.len() - 1] {
+            assert!(
+                !hub.contains(id),
+                "older accept must leave in the first scan"
+            );
+        }
+        assert_eq!(hub.expire_stale(), 1);
+        assert_eq!(hub.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn try_expire_stale_skips_when_the_order_lock_is_held() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(1);
+        let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        let tid = tx.compute_txid();
+        hub.accept_tx(&tx).expect("admit");
+        hub.set_expiry_hours(0);
+        hub.note_mock_now(hub.relay_now_secs() + 5);
+        let held = hub.expiry_order.lock().unwrap();
+        assert_eq!(hub.try_expire_stale(), 0);
+        assert!(hub.contains(&tid));
+        drop(held);
+        assert_eq!(hub.expire_stale(), 1);
+        assert!(!hub.contains(&tid));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     fn record_fee_sample(hub: &MempoolHub, height: u32, rate_sat_kvb: u64) {
         let block = HistoricalFeeBlock {
             p10_sat_kvb: Some(rate_sat_kvb),
@@ -4674,8 +4755,12 @@ mod tests {
         );
         {
             let mut ats = hub.accept_at.lock().unwrap();
+            let mut order = hub.expiry_order.lock().unwrap();
             let at = ats.get_mut(&w).expect("accept_at");
+            let old = *at;
             *at = at.saturating_sub(30);
+            let tid = order.remove(&(old, w)).expect("expiry order");
+            order.insert((*at, w), tid);
             hub.min_live_accept_at.store(*at, Ordering::Relaxed);
         }
         assert!(
@@ -5042,6 +5127,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    fn parent_hash(i: u32) -> [u8; 32] {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&i.to_le_bytes());
+        h
+    }
+
+    #[test]
+    fn parent_req_stops_at_per_peer_cap() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let cap = parent_req::MAX_PARENT_ANN_PER_PEER;
+        for i in 0..(cap as u32 + 10) {
+            let accepted = hub.note_inv_tx_requested(7, parent_hash(i), false, 1_000, false);
+            if i < cap as u32 {
+                assert_eq!(
+                    accepted,
+                    ParentNote::Accepted,
+                    "announcement {i} under the cap"
+                );
+            } else {
+                assert_eq!(
+                    accepted,
+                    ParentNote::PeerCapped,
+                    "announcement {i} past this peer's cap"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn parent_req_stops_at_global_cap() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let per_peer = parent_req::MAX_PARENT_ANN_PER_PEER as u32;
+        let global = parent_req::MAX_PARENT_ANN_GLOBAL as u32;
+        let mut n = 0u32;
+        let mut peer = 1u64;
+        while n < global {
+            assert_eq!(
+                hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
+                ParentNote::Accepted
+            );
+            n += 1;
+            if n.is_multiple_of(per_peer) {
+                peer += 1;
+            }
+        }
+        assert_eq!(
+            hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
+            ParentNote::GlobalFull,
+            "a peer under its own cap is not misbehavior when the table is full"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn second_peer_take_due_does_not_drop_other_peers_keys() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let hash = [0x91; 32];
+        let txid = Txid::from_byte_array(hash);
+        let wtxid = Wtxid::from_byte_array(hash);
+        assert_eq!(
+            hub.note_inv_tx_requested(1, hash, false, 1_000, false),
+            ParentNote::Accepted
+        );
+        hub.note_recent_reject(wtxid);
+        assert_eq!(hub.announcer_peers_for(&txid, &wtxid), vec![1]);
+        assert!(hub.take_due_parent_getdata(2, 2_000).is_empty());
+        assert_eq!(
+            hub.announcer_peers_for(&txid, &wtxid),
+            vec![1],
+            "peer 2's heartbeat must not walk peer 1's keys"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn wtxid_followup_is_requested_as_wtx() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let hash = [0xab; 32];
+        assert_eq!(
+            hub.note_inv_tx_requested(1, hash, false, 1_000, true),
+            ParentNote::Accepted
+        );
+        assert_eq!(
+            hub.note_inv_tx_requested(3, hash, false, 1_000, true),
+            ParentNote::Accepted,
+            "the wtxid follow-up is its own row"
+        );
+        let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
+        hub.schedule_orphan_parents(&missing, 2, false, 1_000);
+        let expired = 1_000 + GETDATA_TX_INTERVAL_SECS;
+        assert!(hub.take_due_parent_getdata(1, expired).is_empty());
+        let follow = hub.take_due_parent_getdata(3, expired);
+        assert_eq!(follow.len(), 1);
+        assert_eq!(follow[0].hash, hash);
+        assert!(follow[0].wtxid, "wtxid follow-up must stay WTx");
+        assert!(
+            hub.take_due_parent_getdata(2, expired).is_empty(),
+            "a txid parent waits while those bytes are in flight"
+        );
+        let parent = hub.take_due_parent_getdata(2, expired + GETDATA_TX_INTERVAL_SECS);
+        assert_eq!(parent.len(), 1);
+        assert_eq!(parent[0].hash, hash);
+        assert!(
+            !parent[0].wtxid,
+            "a txid parent is not fetched as a wtxid because another peer announced these bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn same_peer_wtxid_inflight_expires_back_to_txid_parent() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let hash = [0xbc; 32];
+        let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
+        let t0 = 1_000u64;
+        hub.schedule_orphan_parents(&missing, 2, false, t0);
+        assert_eq!(
+            hub.note_inv_tx_requested(2, hash, false, t0, true),
+            ParentNote::Accepted,
+            "the same peer's wtxid inv is a second announcement"
+        );
+        let due = t0 + TXID_RELAY_DELAY_SECS;
+        assert!(
+            hub.take_due_parent_getdata(2, due).is_empty(),
+            "the txid parent waits while this peer's wtxid request is in flight"
+        );
+        let expired = t0 + GETDATA_TX_INTERVAL_SECS;
+        let parent = hub.take_due_parent_getdata(2, expired);
+        assert_eq!(
+            parent.len(),
+            1,
+            "the txid parent is requested once the wtxid window ends"
+        );
+        assert_eq!(parent[0].hash, hash);
+        assert!(
+            !parent[0].wtxid,
+            "after the window the parent is requested as a txid"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     #[test]
     fn take_due_parent_getdata_waits_inbound_txid_delay() {
         let dir = tmp();
@@ -5090,7 +5337,7 @@ mod tests {
         let hash = [0x44; 32];
         let txid = Txid::from_byte_array(hash);
         let wtxid = Wtxid::from_byte_array(hash);
-        hub.note_inv_tx_requested(1, hash, true, 1_000);
+        hub.note_inv_tx_requested(1, hash, true, 1_000, false);
         let missing = BTreeSet::from([txid]);
         hub.schedule_orphan_parents(&missing, 2, true, 1_000);
         let due = 1_000 + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS;
@@ -5102,7 +5349,9 @@ mod tests {
         hub.schedule_orphan_parents(&missing, 2, true, due);
         let got = hub
             .take_due_parent_getdata(2, due + NONPREF_PEER_TX_DELAY_SECS + TXID_RELAY_DELAY_SECS);
-        assert_eq!(got, vec![txid]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].hash, txid.to_byte_array());
+        assert!(!got[0].wtxid);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -5156,6 +5405,11 @@ mod tests {
     }
 
     fn pad_one_cb() -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
+        pad_cbs(1)
+    }
+
+    /// Coinbases at heights `1..=n`, each with 100 confirmations.
+    fn pad_cbs(n: u32) -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
         use rbitcoin_primitives::Height;
         let store_dir = tmp();
@@ -5163,15 +5417,17 @@ mod tests {
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let last = n + params.coinbase_maturity();
         let (_tip, _t, cbs) = rbitcoin_consensus::pad_empty_from(
             &q,
             &params,
             genesis.block_hash(),
             genesis.header.time,
             1,
-            101,
-            1,
+            last,
+            n,
         );
+        assert_eq!(cbs.len(), n as usize);
         (store_dir, Arc::new(q), cbs)
     }
 

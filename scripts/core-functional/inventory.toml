@@ -605,7 +605,9 @@ reason = "core-net-policy"
 
 [[test]]
 name = "p2p_eviction.py"
-status = "run"
+status = "skip"
+reason = "core-net-policy"
+analog = "21 inbound peers (4 block, 5 slow, 4 tx, 8 fast ping) are all protected, including longest-connected; the extra inbound is rejected (eviction::tests::eviction_protects_block_tx_ping_and_netgroup). Core accepts that peer and evicts one slow peer."
 
 [[test]]
 name = "p2p_feefilter.py"

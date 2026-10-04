@@ -241,7 +241,7 @@ impl CreateLoc {
         ctx: &mut IoCtx<'_>,
     ) -> Result<Vec<Option<CreateLocPair>>, StoreError> {
         let mut plan = self.plan_range_batch(fks)?;
-        self.pread_windows(ctx, &mut plan.windows)?;
+        self.pread_windows(ctx, &mut plan)?;
         self.finish_range_batch(&plan)
     }
 
@@ -250,7 +250,10 @@ impl CreateLoc {
     /// A completion machine pushes [`LocPlan::reads`] on its own session,
     /// then calls [`Self::finish_range_batch`].
     pub(crate) fn plan_range_batch(&self, fks: &[Fk]) -> Result<LocPlan, StoreError> {
+        // Pair `count` with one published-end load. Window preads compare
+        // that integer and do not load `logical_len` again.
         let count = self.count.load(Ordering::Acquire);
+        let published = self.loc.logical_len();
         let mut jobs: Vec<(usize, u64)> = Vec::new();
         for (i, fk) in fks.iter().enumerate() {
             let Some(id) = fk.get() else { continue };
@@ -285,6 +288,13 @@ impl CreateLoc {
                         .ok_or(StoreError::Corrupt("invariant: create.off checkpoint"))?
                 }
             };
+            let buf_len = n * 2;
+            let end = loc_file_off(win_first, SLOT).saturating_add(buf_len as u64);
+            if end > published {
+                return Err(StoreError::Corrupt(
+                    "invariant: body read past published end",
+                ));
+            }
             windows.push(LocWinRead {
                 job_lo: w_i,
                 job_hi: w_j,
@@ -292,7 +302,7 @@ impl CreateLoc {
                 n,
                 tx0,
                 sp0,
-                buf: vec![0u8; n * 2],
+                buf: vec![0u8; buf_len],
             });
             w_i = w_j;
         }
@@ -300,6 +310,7 @@ impl CreateLoc {
             out_len: fks.len(),
             jobs,
             windows,
+            published,
         })
     }
 
@@ -336,13 +347,25 @@ impl CreateLoc {
         }
     }
 
-    fn pread_windows(
-        &self,
-        ctx: &mut IoCtx<'_>,
-        windows: &mut [LocWinRead],
-    ) -> Result<(), StoreError> {
+    fn pread_windows(&self, ctx: &mut IoCtx<'_>, plan: &mut LocPlan) -> Result<(), StoreError> {
+        let windows = &mut plan.windows;
         if windows.is_empty() {
             return Ok(());
+        }
+        // The end `plan_range_batch` paired with `count`. Not a fresh load.
+        let published = plan.published;
+        if published == 0 {
+            return Err(StoreError::Corrupt(
+                "invariant: body read missing published end",
+            ));
+        }
+        for w in windows.iter() {
+            let end = loc_file_off(w.win_first, SLOT).saturating_add(w.buf.len() as u64);
+            if end > published {
+                return Err(StoreError::Corrupt(
+                    "invariant: body read past published end",
+                ));
+            }
         }
         let fd = self.loc.read_fd();
         let mut ops: Vec<ReadOp<'_>> = Vec::with_capacity(windows.len());
@@ -365,10 +388,7 @@ impl CreateLoc {
                 Ok(true) => {}
                 Ok(false) => {
                     drop(ops);
-                    for w in windows.iter_mut() {
-                        self.loc
-                            .pread_at(loc_file_off(w.win_first, SLOT), &mut w.buf)?;
-                    }
+                    self.read_planned_windows(windows)?;
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -384,12 +404,22 @@ impl CreateLoc {
         }
         drop(ops);
         for i in shorts {
-            self.loc.pread_at(
-                loc_file_off(windows[i].win_first, SLOT),
-                &mut windows[i].buf,
-            )?;
+            self.read_one_planned_window(&mut windows[i])?;
         }
         Ok(())
+    }
+
+    /// Fill windows whose planned end was already checked. No second HWM load.
+    fn read_planned_windows(&self, windows: &mut [LocWinRead]) -> Result<(), StoreError> {
+        for w in windows {
+            self.read_one_planned_window(w)?;
+        }
+        Ok(())
+    }
+
+    fn read_one_planned_window(&self, w: &mut LocWinRead) -> Result<(), StoreError> {
+        self.loc
+            .pread_exact(loc_file_off(w.win_first, SLOT), &mut w.buf)
     }
 }
 
@@ -398,6 +428,8 @@ pub(crate) struct LocPlan {
     out_len: usize,
     jobs: Vec<(usize, u64)>,
     windows: Vec<LocWinRead>,
+    /// `create.loc` published end paired with the count this plan resolved.
+    published: u64,
 }
 
 impl LocPlan {
@@ -588,6 +620,57 @@ mod tests {
         blob[8..16].copy_from_slice(&logical.to_le_bytes());
         blob.extend_from_slice(&payload);
         std::fs::write(dir.join("create.loc.ovf"), blob).unwrap();
+    }
+
+    #[test]
+    fn create_loc_read_past_published_end_is_corrupt() {
+        let dir = TempDir::labeled("create-loc-pub").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&[1], &[16])).unwrap();
+        loc.loc.set_logical_len(FILE_HEADER_LEN as u64).unwrap();
+        match loc.range_batch(&[Fk(1)]) {
+            Err(StoreError::Corrupt(msg)) => assert!(msg.contains("published"), "{msg}"),
+            Ok(v) => panic!("read past published end returned {v:?}"),
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    /// The window pread compares the end `plan_range_batch` paired with
+    /// `count`. A later publish must not change that integer.
+    #[test]
+    fn create_loc_window_read_uses_the_planned_published_end() {
+        let dir = TempDir::labeled("create-loc-snap").unwrap();
+        let loc = CreateLoc::create(dir.path()).unwrap();
+        loc.append(&chain(&[1], &[16])).unwrap();
+        let full = loc.loc.logical_len();
+        let mut plan = loc.plan_range_batch(&[Fk(1)]).unwrap();
+        loc.loc.set_logical_len(FILE_HEADER_LEN as u64).unwrap();
+        loc.pread_windows(&mut IoCtx::none(), &mut plan)
+            .expect("in-snapshot window stays readable after a shrink");
+        // The short-read fallback must not load `logical_len` again.
+        loc.read_planned_windows(&mut plan.windows)
+            .expect("planned window pread keeps the snapshot end");
+        let got = loc.finish_range_batch(&plan).unwrap();
+        assert_eq!(
+            got[0],
+            Some(CreateLocPair {
+                txout: (FILE_HEADER_LEN as u64, 16),
+                spent: (FILE_HEADER_LEN as u64, 8),
+                n_out: 1,
+            })
+        );
+
+        loc.loc.set_logical_len(FILE_HEADER_LEN as u64).unwrap();
+        match loc.plan_range_batch(&[Fk(1)]) {
+            Err(StoreError::Corrupt(msg)) => assert!(msg.contains("published"), "{msg}"),
+            Ok(_) => panic!("a short published end still planned a window"),
+            Err(other) => panic!("{other}"),
+        }
+        loc.loc.set_logical_len(full).unwrap();
+        let mut again = loc.plan_range_batch(&[Fk(1)]).unwrap();
+        loc.pread_windows(&mut IoCtx::none(), &mut again).unwrap();
+        let got = loc.finish_range_batch(&again).unwrap();
+        assert_eq!(got[0].unwrap().n_out, 1);
     }
 
     #[test]

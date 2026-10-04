@@ -56,6 +56,38 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [044](./044-local-auth.md) | low | Tor SAFECOOKIE, datadir `0700`, socket mode, overlay permissions | fixed | `tor_control_onion_lifecycle` |
 | [043](./043-peer-send-buffer.md) | high | Unbounded per-peer outbound queue | fixed | `hostile_peer_session` |
 | [040](./040-corrupt-bounds.md) | medium | Corrupt uleb128, seqsigwit lengths, and BDZ modulus | fixed | `read_packed_zero_modulus_or_vertices_is_corrupt` |
+| [052](./052-livera-review-index.md) | — | Livera review index | index | Q-72 |
+| [053](./053-parent-req-cap.md) | critical | Parent-request tracker cap | fixed | `parent_req_stops_at_per_peer_cap` |
+| [054](./054-wtxid-getdata.md) | low | Wtxid follow-up is a wtxid getdata | fixed | `wtxid_followup_is_requested_as_wtx` |
+| [055](./055-decoy-rate.md) | high | Decoy packets count toward the rate window | fixed | `decoy_packet_is_handed_to_the_rate_hook` |
+| [056](./056-inv-getdata-budget.md) | medium | Inv getdata charges the send budget | fixed | `inv_getdata_charges_send_budget` |
+| [057](./057-block-getdata-budget.md) | medium | Block serving stops when the send budget is over | fixed | `getdata_stops_when_send_budget_is_already_over` |
+| [058](./058-tx-inv-batch.md) | medium | Mempool announcements batch into one inv | fixed | `tx_inv_over_one_thousand_is_two_messages` |
+| [059](./059-rate-window-boundary.md) | low | Rate window keeps the previous second | fixed | `rate_limiter_boundary_does_not_grant_a_second_budget` |
+| [060](./060-evict-newest-netgroup.md) | high | Evict the newest inbound in the largest netgroup | fixed | `eviction_drops_the_newest_in_the_largest_netgroup` |
+| [061](./061-misbehavior-remembered.md) | high | Misbehavior disconnect is remembered in memory | fixed | `misbehavior_disconnect_refuses_the_same_address` |
+| [062](./062-ibd-requested-progress.md) | high | Only a requested block moves the IBD stall clock | fixed | `unsolicited_block_does_not_refresh_progress` |
+| [063](./063-rest-own-queue.md) | high | REST is off unless --rest is set | fixed | `rest_is_404_without_the_flag` |
+| [064](./064-api-log-redaction.md) | medium | API logs redact scan secrets and extended keys | fixed | `api_call_redacts_scan_secrets_and_ext_privkeys` |
+| [065](./065-sp-scan-window.md) | medium | Silent-payment scan stays inside 256 blocks | fixed | `parse_sub_labels_start_and_networks` |
+| [066](./066-rpc-wait-cap.md) | medium | RPC accept times out and long-polls release the permit | fixed | `long_poll_does_not_hold_the_work_queue` |
+| [067](./067-fuse8-segment.md) | medium | fuse8 segment length must be a power of two | fixed | `fuse8_segment_length_must_be_power_of_two` |
+| [068](./068-published-end.md) | medium | Body reads compare the caller's published end | fixed | `body_read_past_published_end_is_corrupt` |
+| [069](./069-uring-drop-drain.md) | high | io_uring drop does not free a buffer still in the kernel | fixed | `drain_guard_drop_with_leftover_pending_does_not_abort` |
+| [070](./070-manifest-length.md) | low | Manifest and txstat lengths must fit the file | fixed | `manifest_length_past_the_file_is_corrupt` |
+| [071](./071-datadir-lock-symlink.md) | low | Datadir lock does not follow a symlink | fixed | `lock_file_does_not_follow_a_symlink` |
+| [072](./072-pool-write-slice.md) | low | Pool write jobs use a shared slice | fixed | `pool write arm uses a shared slice` |
+| [073](./073-testnet-milestone-scripts.md) | medium | Omitted testnet milestone checks every script | fixed | `p3_default_milestone_heights` |
+| [074](./074-tip-body-orphan-bytes.md) | medium | Tip-follow bodies and one peer's orphans are bounded | fixed | `pending_block_over_four_megabytes_is_not_parked` |
+| [075](./075-secret-debug.md) | low | Secret debug output is redacted | fixed | `debug_does_not_print_secret_bytes` |
+| [076](./076-bip68-genesis-median.md) | low | Height 0 is a genesis coin for BIP68 | fixed | `bip68_height_zero_time_lock_uses_the_median` |
+| [077](./077-empty-median.md) | low | Empty median time is an error | fixed | `empty_median_time_is_an_error` |
+| [078](./078-version-nonce.md) | low | Version nonce comes from the CSPRNG | fixed | `rand_nonce_changes` |
+| [079](./079-recent-reject-cap.md) | low | Recent-reject set stops at 4096 | fixed | `recent_reject_at_the_cap_does_not_clear` |
+| [080](./080-tor-control-password.md) | low | Tor control password rejects a line break | fixed | `tor_control_password_rejects_a_line_break` |
+| [081](./081-conf-error-line.md) | low | Conf errors name the file and line | fixed | `conf_error_names_the_file_and_line` |
+| [082](./082-invalid-hash-cap.md) | low | Invalid-hash set stops at 4096 | fixed | `invalid_hash_set_stops_at_the_cap` |
+| [083](./083-mempool-expiry-cursor.md) | low | Mempool expiry runs without a new admission | fixed | `expire_stale_drops_old_tx_without_a_new_accept` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

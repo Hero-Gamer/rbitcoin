@@ -239,6 +239,16 @@ fn missing(what: &'static str) -> StoreError {
     StoreError::Corrupt(what)
 }
 
+/// `hi` is the exclusive end of a span in a published body.
+fn require_body_hwm(hwm: u64, hi: u64) -> Result<(), StoreError> {
+    if hi > hwm {
+        return Err(StoreError::Corrupt(
+            "invariant: body read past published end",
+        ));
+    }
+    Ok(())
+}
+
 /// Parent fk → (txid, outputs).
 type Parents = U64Map<([u8; 32], Vec<OutputRecord>)>;
 /// Create fk → `(block, tx)` within a window.
@@ -372,6 +382,8 @@ fn read_blocks(
             .max()
             .unwrap_or(0);
         spans.push((jobs.len(), lo, pairs));
+        // One compare against the body HWM. Not a fresh `published_meta` pair.
+        require_body_hwm(table.body.body_logical_len(), hi)?;
         jobs.push(ReadJob::new(files.body, lo, hi - lo));
         let (abs, len) = table.input.edges_body_read(plan)?;
         jobs.push(ReadJob::new(files.input_body, abs, len));
@@ -492,10 +504,13 @@ fn read_witnesses_and_parent_locs(
         .filter(|(_, (_, h))| h.tweaks)
         .flat_map(|(bi, (b, _))| (0..b.txs.len()).map(move |ti| (bi, ti)));
     let mut sws_jobs = Vec::new();
+    let sws_hwm = table.seqsigwit.body_logical_len();
     for ((bi, ti), range) in tweak_txs.zip(sws_ranges) {
         if blocks[bi].txs[ti].need_seqsigwit {
             let (off, len) =
                 range.ok_or_else(|| missing("invariant: index build seqsigwit loc missing"))?;
+            // One compare against the seqsigwit HWM. Not a fresh `published_meta` pair.
+            require_body_hwm(sws_hwm, off.saturating_add(len))?;
             sws_jobs.push((bi, ti, jobs.len()));
             jobs.push(ReadJob::new(files.seqsigwit, off, len));
         }
@@ -540,6 +555,11 @@ fn read_parents(
         .iter()
         .map(|p| p.ok_or_else(|| missing("invariant: index build parent loc missing")))
         .collect::<Result<Vec<_>, _>>()?;
+    let hwm = table.body.body_logical_len();
+    for p in &pairs {
+        // One compare against the body HWM. Not a fresh `published_meta` pair.
+        require_body_hwm(hwm, p.txout.0.saturating_add(p.txout.1))?;
+    }
     let mut jobs: Vec<ReadJob<'_>> = pairs
         .iter()
         .map(|p| ReadJob::new(files.body, p.txout.0, p.txout.1))
@@ -552,4 +572,131 @@ fn read_parents(
         parents.insert(*fk, (txid, outs));
     }
     Ok(parents)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_index_window, require_body_hwm, IndexHeight, IndexWindow};
+    use crate::error::StoreError;
+    use crate::tx_table::{InputRecord, OutputRecord, TxRecord, TxTable};
+    use rbitcoin_primitives::{Fk, Height};
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-index-hwm-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn tx(mark: u8) -> TxRecord {
+        let mut txid = [0u8; 32];
+        txid[0] = mark;
+        TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        }
+    }
+
+    fn spend(parent: Fk) -> InputRecord {
+        InputRecord {
+            prev_txid: [0u8; 32],
+            create_fk: parent,
+            prev_index: 0,
+            sequence: u32::MAX,
+            script_sig: vec![1],
+            witness: vec![],
+        }
+    }
+
+    /// Child fk 1 spends parent fk 2, and the parent body is written second.
+    fn child_then_parent(script: Vec<u8>) -> (std::path::PathBuf, TxTable) {
+        let dir = tmp("window");
+        let t = TxTable::create_tiny(&dir).unwrap();
+        let fks = t
+            .put_full_batch_indexed(
+                &[
+                    (
+                        tx(1),
+                        vec![spend(Fk(2))],
+                        vec![OutputRecord::unspent(1, script)],
+                    ),
+                    (
+                        tx(2),
+                        vec![InputRecord::coinbase(u32::MAX, vec![2], vec![])],
+                        vec![OutputRecord::unspent(50, vec![0x51])],
+                    ),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(fks, vec![Fk(1), Fk(2)]);
+        (dir, t)
+    }
+
+    fn one_child(tweaks: bool) -> [IndexHeight; 1] {
+        [IndexHeight {
+            height: Height(1),
+            header_fk: Fk(1),
+            first: Fk(1),
+            n: 1,
+            tweaks,
+        }]
+    }
+
+    fn expect_published(err: Result<IndexWindow, StoreError>) {
+        match err {
+            Err(StoreError::Corrupt(msg)) => assert!(msg.contains("published"), "{msg}"),
+            Ok(_) => panic!("a span past the published end was read"),
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn txout_span_past_the_body_hwm_is_corrupt() {
+        require_body_hwm(80, 80).unwrap();
+        match require_body_hwm(80, 81) {
+            Err(StoreError::Corrupt(msg)) => assert!(msg.contains("published"), "{msg}"),
+            Ok(()) => panic!("a span past the body HWM was accepted"),
+            Err(other) => panic!("{other}"),
+        }
+    }
+
+    #[test]
+    fn parent_txout_past_the_published_end_is_corrupt() {
+        let (dir, t) = child_then_parent(vec![0x51]);
+        let locs = t.create_loc.range_batch(&[Fk(1), Fk(2)]).unwrap();
+        let child = locs[0].unwrap();
+        let parent = locs[1].unwrap();
+        let child_end = child.txout.0 + child.txout.1;
+        assert!(
+            parent.txout.0 + parent.txout.1 > child_end,
+            "the parent txout must sit past the child"
+        );
+        t.body.truncate_body_to(2, child_end).unwrap();
+        expect_published(read_index_window(&t, &one_child(false)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seqsigwit_past_the_published_end_is_corrupt() {
+        let mut script = vec![0x51, 0x20];
+        script.extend_from_slice(&[0xab; 32]);
+        let (dir, t) = child_then_parent(script);
+        let range = t.seqsigwit_loc.range_batch(&[Fk(1)]).unwrap()[0].unwrap();
+        assert!(range.1 > 0, "the child seqsigwit span is non-empty");
+        t.seqsigwit.truncate_body_to(2, range.0).unwrap();
+        expect_published(read_index_window(&t, &one_child(true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

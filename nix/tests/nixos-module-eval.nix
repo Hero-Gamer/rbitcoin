@@ -168,6 +168,23 @@ let
   rbitcoinScrape = builtins.head (
     builtins.filter (j: j.job_name == "rbitcoin") prometheus.config.services.prometheus.scrapeConfigs
   );
+  # Bind the eval. `.` binds tighter than application, so
+  # `nixosSystem { ... }.config` reads `config` off the attrset argument.
+  restOnSystem = nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          rpc.enable = true;
+          rpc.rest = true;
+        };
+      }
+    ];
+  };
+  restOnExec = restOnSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart;
   failedAssertions =
     sys: map (a: a.message) (builtins.filter (a: !a.assertion) sys.config.assertions);
 in
@@ -215,6 +232,26 @@ assert builtins.match ".*--datadir-cold /srv/rbitcoin-cold.*" execStart != null;
 assert builtins.match ".*--network regtest.*" execStart != null;
 assert builtins.match ".*--listen 127.0.0.1:18444.*" execStart != null;
 assert builtins.match ".*--rpc-listen 127.0.0.1:18443.*" execStart != null;
+assert builtins.match ".*--rest.*" execStart == null;
+assert builtins.match ".*--rest.*" restOnExec != null;
+assert builtins.match ".*--milestone.*" (
+  defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
+) == null;
+assert builtins.match ".*--milestone 100.*" (
+  (nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          milestone = 100;
+        };
+      }
+    ];
+  }).config.systemd.services.rbitcoin.serviceConfig.ExecStart
+) != null;
 assert builtins.match ".*--rpc-socket /run/rbitcoin/rpc.sock.*" execStart != null;
 assert builtins.match ".*--rpc-cookie-file /run/rbitcoin/rpc.cookie.*" execStart != null;
 assert builtins.elem "/run/rbitcoin" service.serviceConfig.ReadWritePaths;

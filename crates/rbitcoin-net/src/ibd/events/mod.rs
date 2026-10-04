@@ -4,7 +4,9 @@ use super::assign::clear_hash_inflight;
 use super::assign_plan::{
     remove_from_ordered, should_enqueue_header, want_headers_beyond_soft_cap,
 };
-use super::dial::{disconnect_peer, note_dead_without_block_bytes, release_peer_block_work};
+use super::dial::{
+    disconnect_peer, note_dead_without_block_bytes, note_misbehavior_dead, release_peer_block_work,
+};
 use super::exit::{
     header_lag_behind_peers, should_advance_locator_after_known_batch,
     should_log_empty_headers_lag, should_rerequest_headers_on_empty_lag,
@@ -39,7 +41,7 @@ pub(crate) fn disconnect_all_peers(st: &mut IbdWorkState) {
     }
     st.inflight.clear();
     for s in &mut st.slots {
-        s.in_flight.clear();
+        s.track_clear();
         s.alive = false;
     }
     st.slots.clear();
@@ -553,15 +555,14 @@ fn apply_block_framed(
     payload: Vec<u8>,
 ) {
     let wire_bytes = payload.len();
-    note_block_rx(&mut st.slots, peer, wire_bytes);
-    // Unsolicited wire is not a body we asked for. Drop it before any copy.
+    // Unsolicited wire is not a body we asked for. Drop it before any copy
+    // and before it can move this peer's progress clock.
     let requested = st.inflight.contains_key(&hash);
-    if requested {
-        super::assign::note_block_len(st, wire_bytes);
-    }
     if !requested {
         return;
     }
+    note_block_rx(&mut st.slots, peer, wire_bytes);
+    super::assign::note_block_len(st, wire_bytes);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     if st.body.is_rejected(&hash) || hub.has_block(&hash) {
         return;
@@ -649,7 +650,7 @@ fn apply_notfound(st: &mut IbdWorkState, peer: usize, hashes: Vec<BlockHash>) {
     let mut freed = Vec::new();
     if let Some(s) = st.slots.iter_mut().find(|s| s.id == peer) {
         for h in &hashes {
-            s.in_flight.remove(h);
+            s.track_remove(h);
             let empty = st
                 .inflight
                 .get_mut(h)
@@ -671,13 +672,17 @@ fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, 
     warn!("ibd: peer[{peer}] dead: {reason}");
     super::header_walk::forget_walk_peer(st, peer);
     if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
-        note_dead_without_block_bytes(
-            peer_book,
-            &mut st.addr_cooldown,
-            s.addr,
-            s.first_data_ms,
-            Instant::now(),
-        );
+        if reason == "peer misbehavior threshold" {
+            note_misbehavior_dead(peer_book, &mut st.addr_cooldown, s.addr, Instant::now());
+        } else {
+            note_dead_without_block_bytes(
+                peer_book,
+                &mut st.addr_cooldown,
+                s.addr,
+                s.first_data_ms,
+                Instant::now(),
+            );
+        }
         let lat = s.first_data_ms.saturating_sub(s.connected_ms);
         peer_book.apply_ibd_dead_speed(
             s.addr,
@@ -1068,6 +1073,48 @@ pub(crate) fn parent_height(
         return Some(h.0.saturating_add(1));
     }
     None
+}
+
+#[cfg(test)]
+mod misbehavior_dead_tests {
+    use super::super::assign::tests::dummy_slot;
+    use super::super::state::IbdWorkState;
+    use super::apply_peer_dead;
+    use crate::seeds::AddrMan;
+
+    #[test]
+    fn threshold_dead_cools_after_a_body_and_other_deaths_do_not() {
+        let mut slot = dummy_slot(1);
+        slot.first_data_ms = 42;
+        let addr = slot.addr;
+        let mut st = IbdWorkState::new(vec![slot], None, Some(0));
+        let mut book = AddrMan::new();
+        book.note_connected(addr);
+        apply_peer_dead(
+            &mut st,
+            &mut book,
+            1,
+            "peer misbehavior threshold".to_string(),
+        );
+        assert!(
+            st.addr_cooldown.contains_key(&addr),
+            "misbehavior cools the dial after a block body"
+        );
+        assert!(book.flags(&addr).failed_last_connect());
+
+        let mut other = dummy_slot(2);
+        other.first_data_ms = 42;
+        let other_addr = other.addr;
+        let mut st = IbdWorkState::new(vec![other], None, Some(0));
+        let mut book = AddrMan::new();
+        book.note_connected(other_addr);
+        apply_peer_dead(&mut st, &mut book, 2, "bye".to_string());
+        assert!(
+            !st.addr_cooldown.contains_key(&other_addr),
+            "a body already counted keeps an ordinary death off the cooldown"
+        );
+        assert!(!book.flags(&other_addr).failed_last_connect());
+    }
 }
 
 #[cfg(test)]

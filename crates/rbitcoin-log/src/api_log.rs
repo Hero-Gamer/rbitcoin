@@ -23,7 +23,14 @@ pub fn init_api_log(path: impl AsRef<Path>) -> std::io::Result<()> {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let f = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -54,8 +61,10 @@ fn compact_params(params: &str) -> String {
 
 /// Record one Electrum / Esplora / RPC call.
 ///
-/// `params` should already be compact (see [`compact_params`]). `err` is
-/// `None` on success.
+/// Extended private keys and silent-payment scan secrets that overlap the
+/// logged prefix are stripped here, then the params blob is compacted.
+/// A large body with no secret in that prefix is truncated without copying
+/// the tail. `err` is `None` on success.
 pub fn api_call(
     surface: &str,
     peer: &str,
@@ -64,7 +73,7 @@ pub fn api_call(
     wall_ms: u64,
     err: Option<&str>,
 ) {
-    let params = compact_params(params);
+    let params = logged_params(method, params);
     match err {
         None => trace!("api: {surface} peer={peer} {method} {params} wall_ms={wall_ms} ok"),
         Some(e) => trace!("api: {surface} peer={peer} {method} {params} wall_ms={wall_ms} err={e}"),
@@ -89,6 +98,126 @@ pub fn api_call(
     );
     let _ = file.write_all(line.as_bytes());
     let _ = file.flush();
+}
+
+fn logged_params(method: &str, params: &str) -> String {
+    let cap = char_floor(params, PARAMS_MAX);
+    let Some(end) = secret_cover_end(method, params, cap) else {
+        return compact_params(params);
+    };
+    let mut redacted = redact_ext_privkeys(&params[..end]);
+    if method.contains("silentpayment") {
+        redacted = redact_quoted_hex64(&redacted);
+    }
+    compact_params(&redacted)
+}
+
+fn char_floor(s: &str, max: usize) -> usize {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+/// Exclusive end of the slice to redact, covering each secret that starts
+/// inside the logged prefix plus `PARAMS_MAX` bytes after it. `None` when
+/// that prefix has no secret, so the caller truncates without a full copy.
+fn secret_cover_end(method: &str, params: &str, cap: usize) -> Option<usize> {
+    let b = params.as_bytes();
+    let scan_hex = method.contains("silentpayment");
+    let mut cover = None;
+    let mut i = 0;
+    while i < cap && i < b.len() {
+        if i + 4 <= b.len() {
+            let tag = &b[i..i + 4];
+            if matches!(tag, b"xprv" | b"tprv" | b"yprv" | b"zprv") {
+                let mut j = i + 4;
+                while j < b.len() && is_base58(b[j]) {
+                    j += 1;
+                }
+                if j > i + 4 {
+                    let need = j.saturating_add(PARAMS_MAX).min(b.len());
+                    cover = Some(cover.unwrap_or(0).max(need));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        if scan_hex
+            && b[i] == b'"'
+            && i + 66 <= b.len()
+            && b[i + 65] == b'"'
+            && b[i + 1..i + 65].iter().copied().all(is_hex)
+        {
+            let need = (i + 66).saturating_add(PARAMS_MAX).min(b.len());
+            cover = Some(cover.unwrap_or(0).max(need));
+            i += 66;
+            continue;
+        }
+        i += 1;
+    }
+    cover
+}
+
+fn is_base58(b: u8) -> bool {
+    matches!(
+        b,
+        b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z' | b'a'..=b'k' | b'm'..=b'z'
+    )
+}
+
+fn is_hex(b: u8) -> bool {
+    b.is_ascii_hexdigit()
+}
+
+/// `xprv` / `tprv` / `yprv` / `zprv` plus the following base58 key material.
+fn redact_ext_privkeys(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if i + 4 <= b.len() {
+            let tag = &b[i..i + 4];
+            if matches!(tag, b"xprv" | b"tprv" | b"yprv" | b"zprv") {
+                let mut j = i + 4;
+                while j < b.len() && is_base58(b[j]) {
+                    j += 1;
+                }
+                if j > i + 4 {
+                    out.push_str("<redacted>");
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// A quoted 64-hex string is a silent-payment scan secret on that method.
+fn redact_quoted_hex64(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'"'
+            && i + 65 < b.len()
+            && b[i + 65] == b'"'
+            && b[i + 1..i + 65].iter().copied().all(is_hex)
+        {
+            out.push_str("\"<redacted>\"");
+            i += 66;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn json_escape(s: &str) -> String {
@@ -188,5 +317,97 @@ mod tests {
     #[test]
     fn json_escape_quotes() {
         assert_eq!(json_escape("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    #[test]
+    fn api_call_redacts_scan_secrets_and_ext_privkeys() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let scan = "ab".repeat(32);
+        let xprv = format!("xprv{}", "1".repeat(40));
+        let tprv = format!("tprv{}", "A".repeat(20));
+        let path = std::env::temp_dir().join(format!(
+            "rbitcoin-api-redact-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_file(&path);
+        init_api_log(&path).unwrap();
+        crate::capture_logs(true);
+        api_call(
+            "electrum",
+            "127.0.0.1:1",
+            "blockchain.silentpayments.unsubscribe",
+            &format!("[\"{scan}\",\"02ff\",1]"),
+            4,
+            None,
+        );
+        api_call(
+            "rpc",
+            "-",
+            "scantxoutset",
+            &format!("[\"start\",[\"{xprv}\",\"{tprv}\"]]"),
+            5,
+            None,
+        );
+        let logs = crate::take_logs();
+        crate::capture_logs(false);
+        close_api_log();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let trace = logs
+            .iter()
+            .map(|(_, msg)| msg.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let all = format!("{body}\n{trace}");
+        assert!(!all.contains(&scan), "{all}");
+        assert!(!all.contains(&xprv), "{all}");
+        assert!(!all.contains(&tprv), "{all}");
+        assert!(all.contains("<redacted>"), "{all}");
+    }
+
+    #[test]
+    fn logged_prefix_redacts_a_straddling_secret_and_drops_one_past_the_cap() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = format!("xprv{}", "1".repeat(40));
+        let hex_secret = "ab".repeat(32);
+        let straddle = format!("{}{key}{}", "a".repeat(PARAMS_MAX - 10), "b".repeat(40));
+        let far = format!("{}{key}", "c".repeat(PARAMS_MAX + 80));
+        let hex_params = format!("{}\"{hex_secret}\"tail", "d".repeat(PARAMS_MAX - 8));
+        crate::capture_logs(true);
+        api_call("rpc", "-", "submitblock", &straddle, 1, None);
+        api_call("rpc", "-", "submitblock", &far, 1, None);
+        api_call(
+            "electrum",
+            "127.0.0.1:1",
+            "blockchain.silentpayments.unsubscribe",
+            &hex_params,
+            1,
+            None,
+        );
+        let logs = crate::take_logs();
+        crate::capture_logs(false);
+        let trace = logs
+            .iter()
+            .map(|(_, msg)| msg.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!trace.contains(&key), "{trace}");
+        assert!(!trace.contains(&hex_secret), "{trace}");
+        assert!(trace.contains("<redacted>"), "{trace}");
+        let far_mark = "c".repeat(40);
+        let far_line = logs
+            .iter()
+            .map(|(_, msg)| msg.as_str())
+            .find(|msg| msg.contains(&far_mark))
+            .expect("far submitblock line");
+        assert!(
+            !far_line.contains("<redacted>"),
+            "a secret past the cap is not part of the logged prefix: {far_line}"
+        );
+        assert!(!far_line.contains("xprv"), "{far_line}");
     }
 }

@@ -554,6 +554,17 @@ impl TableFile {
         handle_pwrite_all(&self.read_file, &self.path, offset, bytes)
     }
 
+    /// Pread `buf` with no logical-end load.
+    ///
+    /// The caller already compared `offset + len` to a published end. A second
+    /// `logical_len` load can disagree with that snapshot.
+    pub(crate) fn pread_exact(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.pread_all(offset, buf)
+    }
+
     /// Positional pread (page cache / disk). Preferred for Class A `tx.body`.
     pub fn pread_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
         if buf.is_empty() {

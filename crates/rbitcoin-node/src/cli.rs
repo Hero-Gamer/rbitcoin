@@ -146,6 +146,15 @@ fn apply_operator_kvs(config: &mut NodeConfig, kvs: Vec<(String, String)>) -> Re
             config.listen.seednodes.clear();
             saw_seednode = true;
         }
+        if key == "tor_control_password" {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                rbitcoin_log::warn!(
+                    "node: --tor-control-password puts the password on the command line"
+                );
+            }
+        }
         match config.apply_kv(&key, &val) {
             Ok(ConfApply::Applied) => {}
             Ok(ConfApply::Unknown(k)) => {
@@ -304,7 +313,7 @@ fn operator_usage() -> String {
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
     [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--electrum-max-subs N] [--esplora-block-template] \\\n\
-    [--rpc] [--rpc-listen [ADDR]] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-work-queue N] \\\n\
+    [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
     [--max-outbound N] [--max-inbound N] \\\n\
     [--mempool-size-mb N] [--mempool-expiry HOURS] \\\n\
@@ -325,7 +334,7 @@ Asmap: --asmap PATH loads a Core ip_asn.dat (relative to datadir). Unset tries {
 Milestone: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet 840000 anchored to block 0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5\n\
   (skip only on that header path, and only when header work meets min chain work),\n\
-  signet 0, testnet 2500000, regtest 0. Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
+  signet 0, testnet 0, regtest 0. Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
@@ -358,7 +367,7 @@ Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progre
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\
   second of startup (default 127.0.0.1:9332). Unauthenticated; keep it on loopback or a\n\
   probe-only network. --metrics adds Prometheus GET /metrics there (needs --health-listen).\n\
-RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer); --rpc-cookie-file opts TCP into Core cookie HTTP Basic. No --rpcuser.\n\
+RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer); --rpc-cookie-file opts TCP into Core cookie HTTP Basic. No --rpcuser. --rest turns on unauthenticated /rest/ on those listeners (off unless set).\n\
 Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
@@ -414,6 +423,7 @@ fn is_bool_key(key: &str) -> bool {
             | "i2p_accept_incoming"
             | "inhibit_suspend"
             | "metrics"
+            | "rest"
             | "trusted"
             | "always_relay"
             | "relay"
@@ -626,6 +636,7 @@ mod tests {
             "--esplora-onion",
             "--rpc",
             "--rpc-listen",
+            "--rest",
             "--rpc-socket",
             "--rpc-token-file",
             "--rpc-cookie-file",
@@ -826,6 +837,12 @@ mod tests {
         let signet = ready_config(["rbitcoin-node", "--network=signet"]);
         assert_eq!(signet.milestone_height, 0);
         assert!(!signet.milestone().skips_scripts_at(1));
+        let testnet = ready_config(["rbitcoin-node", "--network=testnet"]);
+        assert_eq!(testnet.milestone_height, 0);
+        assert!(
+            !testnet.milestone().skips_scripts_at(1),
+            "omitted testnet milestone checks scripts"
+        );
         let signet_skip = ready_config([
             "rbitcoin-node",
             "--network=signet",

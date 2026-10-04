@@ -180,6 +180,7 @@ Shim-only scripts that used to be `run` stay skip: `feature_help.py`
 still exists so `rpc_getblockstats.py`'s rename-file needle can run; the rest
 of that script is `submitblock` + archive `getblockstats`. `feature_port.py`
 is `run`: `-bind`/`-port` become `--listen` on those sockets.
+`p2p_eviction.py` is skip (`core-net-policy`): the 21-peer set in that script is fully protected, including a share of the longest-connected peers, so the extra inbound is rejected. Core accepts it and evicts one slow peer.
 `feature_filelock.py` is skip (`harness`): the node exclusive-locks `{datadir}`
 (unit + shim InitError tests). Core `-wallet` SQLite flock and `-blocksdir`
 `blocks/.lock` are not product. `rpc_orphans.py` is `run`: hidden

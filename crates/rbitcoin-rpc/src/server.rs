@@ -16,16 +16,22 @@ use axum::Router;
 pub const RPC_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
 /// Core `-rpcworkqueue`. Omitted or `0` is this finite queue.
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
+/// Accept cap, copied from the Electrum public listener. Not a knob.
+const RPC_MAX_CONNECTIONS: usize = 256;
 use rbitcoin_log::info;
 use rbitcoin_net::{BlockingRegion, MempoolHub};
 use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(unix)]
 fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
@@ -35,6 +41,81 @@ fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::n
     Ok(listener)
 }
 use tokio::task::JoinHandle;
+
+/// One accepted connection. The permit is the accept slot and dies with the socket.
+struct HeldConn<S> {
+    io: S,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HeldConn<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HeldConn<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// Drops a new socket when [`RPC_MAX_CONNECTIONS`] are already open.
+struct AcceptCap<L> {
+    listener: L,
+    sem: Arc<Semaphore>,
+}
+
+impl<L> axum::serve::Listener for AcceptCap<L>
+where
+    L: axum::serve::Listener,
+    L::Io: AsyncRead + AsyncWrite + Unpin,
+    L::Addr: std::fmt::Debug,
+{
+    type Io = HeldConn<L::Io>;
+    type Addr = L::Addr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (io, addr) = axum::serve::Listener::accept(&mut self.listener).await;
+            match self.sem.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    return (
+                        HeldConn {
+                            io,
+                            _permit: permit,
+                        },
+                        addr,
+                    )
+                }
+                Err(_) => {
+                    info!("rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})");
+                    drop(io);
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
 
 /// RPC listen configuration.
 #[derive(Clone, Debug)]
@@ -55,6 +136,8 @@ pub struct RpcConfig {
     pub subversion: Option<String>,
     /// HTTP occupancy cap. `None` and `0` are [`DEFAULT_RPC_WORK_QUEUE`].
     pub work_queue: Option<usize>,
+    /// `GET`/`POST /rest/` on this listener. Off unless `--rest` / `rest=`.
+    pub rest: bool,
     /// `--alert-notify` (`%s` = warning text).
     pub alert_notify: Option<String>,
 }
@@ -91,6 +174,9 @@ struct AppState {
     auth: RpcAuth,
     cookie: Option<RpcCookie>,
     work_queue: Arc<tokio::sync::Semaphore>,
+    /// Separate from [`Self::work_queue`]. REST must not take an RPC slot.
+    rest_queue: Arc<tokio::sync::Semaphore>,
+    rest: bool,
     require_auth: bool,
 }
 
@@ -156,7 +242,9 @@ pub async fn run_rpc(
 
     let n = work_queue_permits(config.work_queue);
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
+    let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let accept_sem = Arc::new(Semaphore::new(RPC_MAX_CONNECTIONS));
     let mut tasks = Vec::new();
     let mut local_addr = None;
 
@@ -173,19 +261,28 @@ pub async fn run_rpc(
             auth: auth.clone(),
             cookie: cookie.clone(),
             work_queue: work_queue.clone(),
+            rest_queue: rest_queue.clone(),
+            rest: config.rest,
             require_auth: true,
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
+        let accept_sem = Arc::clone(&accept_sem);
         tasks.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    while !shutdown_w.load(Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .ok();
+            axum::serve(
+                AcceptCap {
+                    listener,
+                    sem: accept_sem,
+                },
+                app,
+            )
+            .with_graceful_shutdown(async move {
+                while !shutdown_w.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .ok();
         }));
         info!(
             "rpc: HTTP JSON-RPC on {bound} (bearer token {})",
@@ -207,19 +304,28 @@ pub async fn run_rpc(
             auth: auth.clone(),
             cookie,
             work_queue,
+            rest_queue,
+            rest: config.rest,
             require_auth: false,
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
+        let accept_sem = Arc::clone(&accept_sem);
         tasks.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    while !shutdown_w.load(Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .ok();
+            axum::serve(
+                AcceptCap {
+                    listener,
+                    sem: accept_sem,
+                },
+                app,
+            )
+            .with_graceful_shutdown(async move {
+                while !shutdown_w.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .ok();
         }));
         info!("rpc: unix JSON-RPC on {}", sock.display());
         Some(sock.clone())
@@ -265,7 +371,17 @@ fn rpc_app(state: AppState) -> Router {
 }
 
 async fn rest_entry(State(state): State<AppState>, req: axum::extract::Request) -> Response {
-    let _permit = match state.work_queue.try_acquire() {
+    if !state.rest {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Body first, then the REST queue. A slow client must not hold an RPC slot,
+    // and REST does not use the RPC work queue.
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().unwrap_or("").to_string();
+    let body = axum::body::to_bytes(req.into_body(), RPC_MAX_HTTP_BODY)
+        .await
+        .unwrap_or_default();
+    let _permit = match state.rest_queue.try_acquire() {
         Ok(p) => p,
         Err(_) => {
             return (
@@ -275,11 +391,6 @@ async fn rest_entry(State(state): State<AppState>, req: axum::extract::Request) 
                 .into_response();
         }
     };
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().unwrap_or("").to_string();
-    let body = axum::body::to_bytes(req.into_body(), RPC_MAX_HTTP_BODY)
-        .await
-        .unwrap_or_default();
     let ctx = Arc::clone(&state.ctx);
     let reply = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
@@ -358,7 +469,12 @@ async fn satisfy_http_wait(
         rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");
         let _active = crate::methods::ActiveCall::enter(&ctx.active, method);
         let ctx = Arc::clone(ctx);
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(crate::methods::RPC_WAIT_TIMEOUT_MS);
         loop {
+            if ctx.stop.load(Ordering::SeqCst) || tokio::time::Instant::now() >= deadline {
+                return true;
+            }
             let ready = {
                 let ctx = Arc::clone(&ctx);
                 let want = want.clone();
@@ -368,11 +484,14 @@ async fn satisfy_http_wait(
                 .await
                 .unwrap_or(true)
             };
-            if ready {
+            if ready || tokio::time::Instant::now() >= deadline {
                 return true;
             }
+            let slice = deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .min(std::time::Duration::from_millis(50));
             tokio::select! {
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                _ = tokio::time::sleep(slice) => {}
                 _ = recv_tip(&mut tips) => {}
             }
         }
@@ -460,6 +579,15 @@ async fn recv_tip(tips: &mut Option<tokio::sync::broadcast::Receiver<rbitcoin_ne
 }
 
 async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
+    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return parse_error_response();
+        }
+    };
+    let ctx = Arc::clone(&state.ctx);
+    // The long-poll must not sit on the only work-queue slot.
+    let waited = satisfy_http_wait(&ctx, &parsed).await;
     let _permit = match state.work_queue.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -470,14 +598,6 @@ async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
                 .into_response();
         }
     };
-    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            return parse_error_response();
-        }
-    };
-    let ctx = Arc::clone(&state.ctx);
-    let waited = satisfy_http_wait(&ctx, &parsed).await;
     let joined = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         if waited {
@@ -803,6 +923,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: true,
 
             alert_notify: None,
         };
@@ -888,6 +1009,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn rest_is_404_without_the_flag() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-rest-off").expect("temp dir");
+        let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: None,
+            subversion: None,
+            work_queue: None,
+            rest: false,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut rest = tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap();
+        let get = b"GET /rest/chaininfo.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+        rest.write_all(get).await.unwrap();
+        let mut buf = Vec::new();
+        rest.read_to_end(&mut buf).await.unwrap();
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains("404"), "REST is off unless --rest: {text}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     async fn post_raw(
         addr: SocketAddr,
         auth: &RpcAuth,
@@ -937,6 +1091,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
 
             alert_notify: None,
         };
@@ -1018,6 +1173,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
@@ -1058,6 +1214,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
@@ -1124,6 +1281,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
@@ -1233,6 +1391,114 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The two-minute cap is inside the handler. The response is the JSON-RPC
+    /// tip, not an empty 408.
+    #[tokio::test]
+    async fn long_poll_at_the_cap_returns_a_json_body() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-cap").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: None,
+            subversion: None,
+            work_queue: None,
+            rest: false,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        let missing = "00".repeat(32);
+        let req = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 1,
+            "method": "waitforblock",
+            "params": [missing, crate::methods::RPC_WAIT_TIMEOUT_MS]
+        });
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(150),
+            post_raw(tcp_addr(&handle), &handle.auth, req.to_string().as_bytes()),
+        )
+        .await
+        .expect("capped long-poll must return");
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json-rpc body");
+        assert!(
+            body.get("result").is_some_and(|r| !r.is_null()),
+            "cap returns the tip, got {body}"
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn extra_rpc_accept_is_dropped() {
+        use tokio::io::AsyncReadExt;
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-accept-cap").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: None,
+            subversion: None,
+            work_queue: None,
+            rest: false,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let addr = tcp_addr(&handle);
+        let mut held = Vec::with_capacity(RPC_MAX_CONNECTIONS);
+        for _ in 0..RPC_MAX_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 8];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), extra.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "an accept past the cap must be dropped, got {read:?}"
+        );
+        drop(held);
+        drop(extra);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (st, body) = post_raw(
+            addr,
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn waitfor_does_not_hold_the_blocking_pool() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1262,6 +1528,7 @@ mod tests {
                 cookie_path: None,
                 subversion: None,
                 work_queue: None,
+                rest: false,
                 alert_notify: None,
             };
             let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
@@ -1310,6 +1577,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn long_poll_does_not_hold_the_work_queue() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-queue").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: None,
+            subversion: None,
+            work_queue: Some(1),
+            rest: false,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let addr = tcp_addr(&handle);
+        let auth = handle.auth.clone();
+        let waiter = tokio::spawn(async move {
+            let body = serde_json::json!({
+                "jsonrpc": "1.0",
+                "id": "w",
+                "method": "waitfornewblock",
+                "params": [5_000]
+            })
+            .to_string();
+            let _ = post_raw(addr, &auth, body.as_bytes()).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_raw(
+                tcp_addr(&handle),
+                &handle.auth,
+                br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+            ),
+        )
+        .await
+        .expect("getblockcount while a long-poll is in flight");
+        assert_eq!(st, 200, "{body:?}");
+        assert_eq!(body.expect("json")["result"], 0);
+        assert!(
+            !waiter.is_finished(),
+            "waitfornewblock returned before the queue probe"
+        );
+        waiter.abort();
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn rpc_work_queue_exceeded() {
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wq").expect("temp dir");
         let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
@@ -1325,6 +1654,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: Some(1),
+            rest: false,
 
             alert_notify: None,
         };
@@ -1407,6 +1737,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
@@ -1577,6 +1908,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let handle = run_rpc(
@@ -1617,6 +1949,7 @@ mod tests {
             cookie_path: Some(cookie_path.clone()),
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         // The cookie is TCP-only: a socket-only listener must not silently ignore it.
@@ -1765,6 +2098,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let err = run_rpc(cfg, q, None, None, None, None, None)
@@ -1792,6 +2126,7 @@ mod tests {
             cookie_path: None,
             subversion: None,
             work_queue: None,
+            rest: false,
             alert_notify: None,
         };
         let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();

@@ -6,14 +6,16 @@ use crate::chain::{
     received_getdata_wtx_log, received_tx_log, synchronizing_blockheaders_log, AcceptOutcome,
     ChainHub,
 };
-use crate::codec::{FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ};
+use crate::codec::{
+    FramedMessage, MAX_HEADERS_RESULTS, MAX_INV_SIZE, MAX_LOCATOR_SZ, TX_INV_BATCH,
+};
 use crate::error::NetError;
 use crate::msg_decode::decode_framed_offload;
 use crate::peer_dos::{PeerRateLimiter, OVERSIZE_BAN_SCORE, RATE_LIMIT_BAN_SCORE};
 use crate::peers::{CappedSet, PeerOut, PingAction};
 use crate::v2::{
-    open_v2, open_v2_with_wire, read_v2_contents, read_v2_frame, write_v2_contents, write_v2_msg,
-    write_v2_msg_offload, V2Reader, V2Writer,
+    open_v2, open_v2_with_wire, read_v2_contents, read_v2_frame, read_v2_frame_with_progress,
+    write_v2_contents, write_v2_msg, write_v2_msg_offload, V2Reader, V2Writer,
 };
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::hashes::Hash;
@@ -28,7 +30,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -138,6 +140,35 @@ async fn accept_received_from_peer(
     })
 }
 
+/// One-day in-memory refusal. Noban peers are not recorded.
+/// A loopback address is every local connection, so Core disconnects that
+/// peer and does not discourage the address.
+fn note_threshold_refusal(session: Option<&crate::peers::LivePeer>) {
+    let Some(s) = session.filter(|s| !s.session_noban()) else {
+        return;
+    };
+    if local_addr_skips_discourage(s.addr.ip()) {
+        return;
+    }
+    if let Some(hub) = s.peer_hub() {
+        hub.note_misbehavior_addr(s.addr.ip());
+    }
+}
+
+fn local_addr_skips_discourage(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => v.is_loopback() || v.octets()[0] == 0,
+        std::net::IpAddr::V6(v) => v.is_loopback(),
+    }
+}
+
+/// Disconnect error for a score that is already at the misbehavior line.
+/// Records the address, including when the caller is not [`punish_disconnect`].
+fn threshold_disconnect(session: Option<&crate::peers::LivePeer>) -> NetError {
+    note_threshold_refusal(session);
+    NetError::Protocol("peer misbehavior threshold")
+}
+
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session.filter(|s| s.session_noban()) {
         rbitcoin_log::info!("Warning: not punishing noban peer {}!", s.id);
@@ -146,6 +177,7 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
     *ban_score = ban_score.saturating_add(BAN_SCORE_THRESHOLD);
     if let Some(s) = session {
         s.request_disconnect();
+        note_threshold_refusal(Some(s));
     }
 }
 
@@ -174,6 +206,10 @@ fn admit_pending_header(
 /// `ChainHub::accept_received_block` (see `docs/architecture.md`).
 /// Inflight `getdata` is [`MAX_SERVE_BLOCKS`] (peer reconstruct cap).
 const MAX_PENDING_BLOCKS: usize = 128;
+/// Honest maximum block serialization. One larger body is not parked.
+const MAX_BLOCK_SERIALIZED: usize = 4_000_000;
+/// Byte ceiling for the tip-session map: the count cap times one max block.
+const MAX_PENDING_BLOCK_BYTES: usize = MAX_PENDING_BLOCKS * MAX_BLOCK_SERIALIZED;
 /// Max reconstructed full bodies queued on one session writer, and the
 /// matching catch-up `getdata` window (extra hashes stick in `requested`).
 pub const MAX_SERVE_BLOCKS: usize = 16;
@@ -197,6 +233,7 @@ pub(crate) const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
 pub struct PendingBlocks {
     map: HashMap<BlockHash, bitcoin::Block>,
     fifo: VecDeque<BlockHash>,
+    bytes: usize,
 }
 
 impl PendingBlocks {
@@ -224,6 +261,7 @@ impl PendingBlocks {
 
     pub(crate) fn remove(&mut self, hash: &BlockHash) -> Option<bitcoin::Block> {
         let b = self.map.remove(hash)?;
+        self.bytes = self.bytes.saturating_sub(block_wire_len(&b));
         if let Some(i) = self.fifo.iter().position(|h| h == hash) {
             self.fifo.remove(i);
         }
@@ -231,15 +269,44 @@ impl PendingBlocks {
     }
 }
 
+fn block_wire_len(block: &bitcoin::Block) -> usize {
+    block.total_size()
+}
+
 fn stash_pending_block(pending: &mut PendingBlocks, hash: BlockHash, block: bitcoin::Block) {
-    if pending.map.len() >= MAX_PENDING_BLOCKS && !pending.map.contains_key(&hash) {
-        if let Some(k) = pending.fifo.pop_front() {
-            pending.map.remove(&k);
+    let nbytes = block_wire_len(&block);
+    if nbytes > MAX_BLOCK_SERIALIZED {
+        return;
+    }
+    if let Some(old) = pending.map.get(&hash) {
+        let next = pending
+            .bytes
+            .saturating_sub(block_wire_len(old))
+            .saturating_add(nbytes);
+        if next > MAX_PENDING_BLOCK_BYTES {
+            return;
+        }
+        pending.bytes = next;
+        pending.map.insert(hash, block);
+        return;
+    }
+    while pending.map.len() >= MAX_PENDING_BLOCKS
+        || pending.bytes.saturating_add(nbytes) > MAX_PENDING_BLOCK_BYTES
+    {
+        let Some(k) = pending.fifo.pop_front() else {
+            break;
+        };
+        if let Some(old) = pending.map.remove(&k) {
+            pending.bytes = pending.bytes.saturating_sub(block_wire_len(&old));
         }
     }
-    if !pending.map.contains_key(&hash) {
-        pending.fifo.push_back(hash);
+    if pending.map.len() >= MAX_PENDING_BLOCKS
+        || pending.bytes.saturating_add(nbytes) > MAX_PENDING_BLOCK_BYTES
+    {
+        return;
     }
+    pending.fifo.push_back(hash);
+    pending.bytes = pending.bytes.saturating_add(nbytes);
     pending.map.insert(hash, block);
 }
 
@@ -1108,17 +1175,9 @@ fn framed_cmd(frame: &FramedMessage) -> String {
 }
 
 fn rand_nonce() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    // Concurrent dials often share the same wall-clock instant; a counter keeps
-    // version nonces unique (Core self-connect / loop detection uses nonce).
-    static N: AtomicU64 = AtomicU64::new(1);
-    let seq = N.fetch_add(1, Ordering::Relaxed);
-    let tick = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    tick.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(seq.wrapping_mul(0xBF58_476D_1CE4_E5B9))
+    let mut buf = [0u8; 8];
+    getrandom::fill(&mut buf).expect("CSPRNG for version nonce");
+    u64::from_le_bytes(buf)
 }
 
 /// Bidirectional peer session: serve history, tip follow, announce our tip.
@@ -1348,6 +1407,9 @@ fn on_headers_poll(
     if !skip {
         let _ = queue_getheaders(out_tx, hub, session, false, None);
     }
+    if let Some(mp) = hub.mempool() {
+        mp.expire_stale_from_session();
+    }
 }
 
 fn on_tx_announce(
@@ -1566,6 +1628,8 @@ pub async fn peer_session_with(
     }
     let mut requested_since: Option<std::time::Instant> = None;
     let mut rate = PeerRateLimiter::default_limits();
+    let decoy_score = AtomicU32::new(0);
+    let mut logged_invalid_v2 = false;
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
     let mut inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
     let mut headers_poll = tokio::time::interval(Duration::from_secs(HEADERS_POLL_SECS));
@@ -1587,6 +1651,7 @@ pub async fn peer_session_with(
                 }
             }
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
+            decoy_score.store(follow.ban_score, Ordering::Relaxed);
             tokio::select! {
                 biased;
                 // Peer half-close / write failure: tear down so getpeerinfo
@@ -1597,12 +1662,30 @@ pub async fn peer_session_with(
                 }
                 // Inbound before local tip announce so GetData during a
                 // generate burst is not queued behind hundreds of cmpctblocks.
-                frame = read_v2_frame(&mut reader, magic) => {
+                frame = read_v2_frame_with_progress(&mut reader, magic, |_| {}, |n| {
+                    let mut score = decoy_score.load(Ordering::Relaxed);
+                    let keep = crate::peer_dos::decoy_stays(
+                        &mut rate,
+                        &mut score,
+                        n,
+                        BAN_SCORE_THRESHOLD,
+                    );
+                    decoy_score.store(score, Ordering::Relaxed);
+                    if keep {
+                        Ok(())
+                    } else {
+                        Err(NetError::Protocol("peer misbehavior threshold"))
+                    }
+                }) => {
+                    follow.ban_score = decoy_score.load(Ordering::Relaxed);
                     let frame = match frame {
                         Ok(f) => f,
                         // Any socket Io means the peer is gone — exit cleanly so
                         // unregister runs inside the Core disconnect_nodes 5s wait.
                         Err(NetError::Io(_)) => return Ok(()),
+                        Err(NetError::Protocol("peer misbehavior threshold")) => {
+                            return Err(threshold_disconnect(session.as_deref()));
+                        }
                         Err(NetError::MessageTooLarge(n)) => {
                             follow.ban_score = follow.ban_score.saturating_add(OVERSIZE_BAN_SCORE);
                             rbitcoin_log::warn!(
@@ -1610,17 +1693,32 @@ pub async fn peer_session_with(
                                 follow.ban_score
                             );
                             if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                                return Err(NetError::Protocol("peer misbehavior threshold"));
+                                return Err(threshold_disconnect(session.as_deref()));
                             }
                             return Err(NetError::MessageTooLarge(n));
                         }
                         Err(NetError::InvalidV2Type { contents_len }) => {
                             // Core stays connected; counts raw v2 size as `*other*`.
+                            if !logged_invalid_v2 {
+                                logged_invalid_v2 = true;
+                                rbitcoin_log::debug!("{}", crate::v2::v2_invalid_message_type_log());
+                            }
                             if let Some(ref sess) = session {
                                 sess.note_recv_raw(
                                     "*other*",
                                     crate::v2::v2_other_recv_bytes(contents_len),
                                 );
+                            }
+                            if !rate.note(contents_len) {
+                                follow.ban_score =
+                                    follow.ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
+                                rbitcoin_log::warn!(
+                                    "p2p: {peer_s} rate limit exceeded misbehavior={}",
+                                    follow.ban_score
+                                );
+                                if follow.ban_score >= BAN_SCORE_THRESHOLD {
+                                    return Err(threshold_disconnect(session.as_deref()));
+                                }
                             }
                             continue;
                         }
@@ -1637,7 +1735,7 @@ pub async fn peer_session_with(
                             follow.ban_score
                         );
                         if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                            return Err(NetError::Protocol("peer misbehavior threshold"));
+                            return Err(threshold_disconnect(session.as_deref()));
                         }
                         continue;
                     }
@@ -1676,7 +1774,7 @@ pub async fn peer_session_with(
                             "{}",
                             misbehavior_disconnect_log(&peer_s, follow.ban_score)
                         );
-                        return Err(NetError::Protocol("peer misbehavior threshold"));
+                        return Err(threshold_disconnect(session.as_deref()));
                     }
                 }
                 tip = tip_rx.recv() => {
@@ -1978,7 +2076,14 @@ fn maybe_expire_pending_cmpct(
     }
     for hash in stale {
         drop_pending_cmpct(follow, session, hash);
-        queue_block_getdata(hub, out, &mut follow.requested_blocks, &[hash], false)?;
+        queue_block_getdata(
+            hub,
+            out,
+            session,
+            &mut follow.requested_blocks,
+            &[hash],
+            false,
+        )?;
     }
     Ok(true)
 }
@@ -1986,6 +2091,7 @@ fn maybe_expire_pending_cmpct(
 fn queue_block_getdata(
     hub: &ChainHub,
     out: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
     requested_blocks: &mut HashSet<BlockHash>,
     want: &[BlockHash],
     compact: bool,
@@ -2008,7 +2114,7 @@ fn queue_block_getdata(
         hub.note_asked_block(*h);
     }
     for chunk in inv.chunks(MAX_INV_SIZE.min(500)) {
-        queue_out(out, NetworkMessage::GetData(chunk.to_vec()))?;
+        queue_accounted(session, out, NetworkMessage::GetData(chunk.to_vec()))?;
     }
     Ok(())
 }
@@ -2157,7 +2263,7 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
             continue;
         };
         s.note_announced_wtx(w);
-        let _ = queue_out(&out, NetworkMessage::Inv(vec![Inventory::WTx(w)]));
+        queue_tx_inv_batches(&s, &out, vec![Inventory::WTx(w)]);
         if let Some(seq) = mp.relay_seq_of(&w) {
             s.note_tx_inv_seq(s.last_inv_sequence().max(seq.saturating_add(1)));
         }
@@ -2287,6 +2393,7 @@ fn queue_due_tx_invs(
         let Some(live_wtx) = mp.try_list_live_wtxids() else {
             return;
         };
+        let mut due = Vec::new();
         for (txid, w) in live_wtx {
             if !tx_inv_candidate_ok(
                 mp,
@@ -2300,12 +2407,13 @@ fn queue_due_tx_invs(
                 continue;
             }
             session.note_announced_wtx(w);
-            let _ = queue_out(out_tx, NetworkMessage::Inv(vec![Inventory::WTx(w)]));
+            due.push(Inventory::WTx(w));
             n += 1;
             if let Some(seq) = mp.relay_seq_of(&w) {
                 max_ann = max_ann.max(seq.saturating_add(1));
             }
         }
+        queue_tx_inv_batches(session, out_tx, due);
         if let Some((due, gen)) = mp.try_age_inv_watermark(mp_now) {
             session.note_age_inv_seen(due, gen);
         }
@@ -2314,6 +2422,7 @@ fn queue_due_tx_invs(
             return;
         };
         session.note_age_inv_seen(last.0, last.1);
+        let mut due = Vec::new();
         for (txid, w) in due_wtx {
             if !tx_inv_candidate_ok(
                 mp,
@@ -2327,12 +2436,13 @@ fn queue_due_tx_invs(
                 continue;
             }
             session.note_announced_wtx(w);
-            let _ = queue_out(out_tx, NetworkMessage::Inv(vec![Inventory::WTx(w)]));
+            due.push(Inventory::WTx(w));
             n += 1;
             if let Some(seq) = mp.relay_seq_of(&w) {
                 max_ann = max_ann.max(seq.saturating_add(1));
             }
         }
+        queue_tx_inv_batches(session, out_tx, due);
     }
     if n > 0 {
         // Only INV txs that existed when this INV was built.
@@ -2487,11 +2597,12 @@ fn on_compact_filters(
     payload: &NetworkMessage,
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
     match payload {
-        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, m),
-        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, m),
-        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, m),
+        NetworkMessage::GetCFilters(m) => on_getcfilters(hub, out_tx, session, m),
+        NetworkMessage::GetCFHeaders(m) => on_getcfheaders(hub, out_tx, session, m),
+        NetworkMessage::GetCFCheckpt(m) => on_getcfcheckpt(hub, out_tx, session, m),
         _ => Ok(()),
     }
 }
@@ -2533,6 +2644,7 @@ fn within_filter_watermark(hub: &ChainHub, stop: u32) -> Result<bool, NetError> 
 fn on_getcfilters(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
     m: &bitcoin::p2p::message_filter::GetCFilters,
 ) -> Result<(), NetError> {
     use bitcoin::hashes::Hash;
@@ -2551,7 +2663,8 @@ fn on_getcfilters(
         else {
             return Ok(());
         };
-        queue_out(
+        queue_accounted(
+            session,
             out_tx,
             NetworkMessage::CFilter(bitcoin::p2p::message_filter::CFilter {
                 filter_type: 0,
@@ -2566,6 +2679,7 @@ fn on_getcfilters(
 fn on_getcfheaders(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
     m: &bitcoin::p2p::message_filter::GetCFHeaders,
 ) -> Result<(), NetError> {
     use bitcoin::bip158::FilterHeader;
@@ -2587,7 +2701,8 @@ fn on_getcfheaders(
     } else {
         (rows[0].1, &rows[1..])
     };
-    queue_out(
+    queue_accounted(
+        session,
         out_tx,
         NetworkMessage::CFHeaders(bitcoin::p2p::message_filter::CFHeaders {
             filter_type: 0,
@@ -2602,6 +2717,7 @@ fn on_getcfheaders(
 fn on_getcfcheckpt(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
     m: &bitcoin::p2p::message_filter::GetCFCheckpt,
 ) -> Result<(), NetError> {
     use bitcoin::hashes::Hash;
@@ -2620,7 +2736,8 @@ fn on_getcfcheckpt(
         filter_headers.push(row[0].1);
         h = h.saturating_add(1000);
     }
-    queue_out(
+    queue_accounted(
+        session,
         out_tx,
         NetworkMessage::CFCheckpt(bitcoin::p2p::message_filter::CFCheckpt {
             filter_type: 0,
@@ -2660,7 +2777,7 @@ fn handle_peer_inventory_msg(
         NetworkMessage::GetAddr => on_getaddr(hub, out_tx, session)?,
         NetworkMessage::GetCFilters(_)
         | NetworkMessage::GetCFHeaders(_)
-        | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx)?,
+        | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx, session)?,
         NetworkMessage::Unknown { .. }
         | NetworkMessage::GetData(_)
         | NetworkMessage::Block(_)
@@ -2915,6 +3032,9 @@ async fn serve_getdata(
     let inflight = session.map(|s| &s.serve_inflight);
     let mut notfound: Vec<Inventory> = Vec::new();
     for item in inv {
+        if session.is_some_and(|s| s.send_over_budget()) {
+            break;
+        }
         match item {
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
@@ -3129,6 +3249,7 @@ fn on_inv(
     }
     let mut want = Vec::new();
     let mut inv_tx_n = 0u64;
+    let mut parent_capped = false;
     let mut need_headers = false;
     let mut tx_inv_hex: Option<String> = None;
     let relay = !hub.in_ibd()
@@ -3149,7 +3270,7 @@ fn on_inv(
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(txid.to_string());
                 }
-                if let Some(inv) = on_inv_txid(hub, session, relay, txid) {
+                if let Some(inv) = on_inv_txid(hub, session, relay, txid, &mut parent_capped) {
                     want.push(inv);
                     inv_tx_n = inv_tx_n.saturating_add(1);
                 }
@@ -3158,7 +3279,7 @@ fn on_inv(
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(wtxid.to_string());
                 }
-                if let Some(inv) = on_inv_wtxid(hub, session, relay, wtxid) {
+                if let Some(inv) = on_inv_wtxid(hub, session, relay, wtxid, &mut parent_capped) {
                     want.push(inv);
                     inv_tx_n = inv_tx_n.saturating_add(1);
                 }
@@ -3181,6 +3302,10 @@ fn on_inv(
             .count() as u64;
         mp.note_getdata_tx(gd_tx);
     }
+    if parent_capped {
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     if let Some(hx) = tx_inv_hex {
         if reject_unsolicited_tx(hub, session) {
             rbitcoin_log::info!(
@@ -3194,7 +3319,7 @@ fn on_inv(
         let _ = queue_getheaders(out_tx, hub, session, true, None);
     }
     if !want.is_empty() {
-        queue_out(out_tx, NetworkMessage::GetData(want))?;
+        queue_accounted(session, out_tx, NetworkMessage::GetData(want))?;
     }
     Ok(())
 }
@@ -3222,6 +3347,7 @@ fn on_inv_txid(
     session: Option<&crate::peers::LivePeer>,
     relay: bool,
     txid: &bitcoin::Txid,
+    parent_capped: &mut bool,
 ) -> Option<Inventory> {
     if !relay {
         return None;
@@ -3235,7 +3361,15 @@ fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
-        mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now());
+        match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
+        {
+            crate::tx_relay::ParentNote::Accepted => {}
+            crate::tx_relay::ParentNote::PeerCapped => {
+                *parent_capped = true;
+                return None;
+            }
+            crate::tx_relay::ParentNote::GlobalFull => return None,
+        }
     }
     Some(Inventory::WitnessTransaction(*txid))
 }
@@ -3245,6 +3379,7 @@ fn on_inv_wtxid(
     session: Option<&crate::peers::LivePeer>,
     relay: bool,
     wtxid: &bitcoin::Wtxid,
+    parent_capped: &mut bool,
 ) -> Option<Inventory> {
     if !relay {
         return None;
@@ -3252,7 +3387,20 @@ fn on_inv_wtxid(
     let mp = hub.mempool()?;
     if !mp.try_contains_wtxid(wtxid) {
         if let Some(s) = session {
-            mp.note_inv_tx_requested(s.id, wtxid.to_byte_array(), s.inbound, s.clock_now());
+            match mp.note_inv_tx_requested(
+                s.id,
+                wtxid.to_byte_array(),
+                s.inbound,
+                s.clock_now(),
+                true,
+            ) {
+                crate::tx_relay::ParentNote::Accepted => {}
+                crate::tx_relay::ParentNote::PeerCapped => {
+                    *parent_capped = true;
+                    return None;
+                }
+                crate::tx_relay::ParentNote::GlobalFull => return None,
+            }
         }
         return Some(Inventory::WTx(*wtxid));
     }
@@ -3346,6 +3494,7 @@ fn on_headers(
                 queue_block_getdata(
                     hub,
                     out_tx,
+                    session,
                     &mut follow.requested_blocks,
                     &want,
                     getdata_use_compact(hub, follow.cmpct_version),
@@ -3552,7 +3701,7 @@ async fn on_cmpctblock(
     }
     let keep = keep_pending_connecting_paths(hub, &follow.pending_headers);
     release_asks_off_path(hub, &mut follow.requested_blocks, &keep);
-    on_cmpctblock_queue_ancestors(hub, out_tx, follow, hash)?;
+    on_cmpctblock_queue_ancestors(hub, out_tx, follow, session, hash)?;
     if compact_header_low_work(hub, &hsi.header) && !follow.requested_blocks.contains(&hash) {
         let id = session.map(|s| s.id).unwrap_or(0);
         rbitcoin_log::info!("p2p: ignore low-work compact block from peer {id}");
@@ -3610,6 +3759,7 @@ fn on_cmpctblock_queue_ancestors(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
 ) -> Result<(), NetError> {
     let mut ancestors: Vec<BlockHash> = fetchable_header_path_bodies(
@@ -3626,6 +3776,7 @@ fn on_cmpctblock_queue_ancestors(
     queue_block_getdata(
         hub,
         out_tx,
+        session,
         &mut follow.requested_blocks,
         &ancestors,
         getdata_use_compact(hub, follow.cmpct_version),
@@ -3985,14 +4136,17 @@ fn queue_due_parent_getdata(
         return;
     }
     mp.note_getdata_tx(want.len() as u64);
-    let _ = queue_out(
-        out_tx,
-        NetworkMessage::GetData(
-            want.into_iter()
-                .map(Inventory::WitnessTransaction)
-                .collect(),
-        ),
-    );
+    let inv = want
+        .into_iter()
+        .map(|due| {
+            if due.wtxid {
+                Inventory::WTx(bitcoin::Wtxid::from_byte_array(due.hash))
+            } else {
+                Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(due.hash))
+            }
+        })
+        .collect();
+    let _ = queue_accounted(Some(session), out_tx, NetworkMessage::GetData(inv));
 }
 
 async fn on_tx(
@@ -4722,6 +4876,20 @@ fn queue_out(out: &mpsc::UnboundedSender<PeerOut>, msg: NetworkMessage) -> Resul
     queue_accounted(None, out, msg)
 }
 
+/// Send filtered tx announcements in [`TX_INV_BATCH`] chunks.
+///
+/// The caller already owns the filtered inventories. Chunking does not clone
+/// the live wtxid set and does not hold the mempool lock across the send.
+fn queue_tx_inv_batches(
+    session: &crate::peers::LivePeer,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    inv: Vec<Inventory>,
+) {
+    for chunk in inv.chunks(TX_INV_BATCH) {
+        let _ = queue_accounted(Some(session), out_tx, NetworkMessage::Inv(chunk.to_vec()));
+    }
+}
+
 fn queue_accounted(
     session: Option<&crate::peers::LivePeer>,
     out: &mpsc::UnboundedSender<PeerOut>,
@@ -4905,7 +5073,7 @@ async fn drain_pending(
     missing.retain(|h| !requested_blocks.contains(h));
     let room = MAX_SERVE_BLOCKS.saturating_sub(requested_blocks.len());
     missing.truncate(room);
-    queue_block_getdata(hub, out, requested_blocks, &missing, compact)?;
+    queue_block_getdata(hub, out, session, requested_blocks, &missing, compact)?;
     Ok(())
 }
 
