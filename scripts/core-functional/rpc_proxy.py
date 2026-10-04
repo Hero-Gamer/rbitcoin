@@ -109,7 +109,11 @@ def whitelist_map(lines: list[str]) -> dict[str, set[str]]:
         if parsed is None:
             continue
         user, methods = parsed
-        out.setdefault(user, set()).update(methods)
+        # Core set-intersects a later rpcwhitelist line for the same user.
+        if user in out:
+            out[user] &= methods
+        else:
+            out[user] = methods
     return out
 
 
@@ -169,16 +173,18 @@ def authenticated_user(
     if parsed is None:
         return "" if not cookie_line else None
     user, password = parsed
+    # Core keeps scanning rpcauth rows for this user (password rotation).
+    saw_user = False
     for line in rpcauth_lines:
         rec = parse_rpcauth_line(line)
         if rec is None or rec[0] != user:
             continue
+        saw_user = True
         if _hmac_ok(rec[1], password, rec[2]):
             return user
+    if saw_user or cookie_line:
         return None
-    if not cookie_line:
-        return user
-    return None
+    return user
 
 
 def rpc_methods(payload: Any) -> list[str | None]:

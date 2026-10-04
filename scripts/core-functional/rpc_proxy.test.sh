@@ -11,9 +11,11 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from rpcauth import password_to_hmac
 from rpc_proxy import (
     RpcError,
     RpcProxy,
+    authenticated_user,
     authorization_ok,
     core_btc_kvb_to_sat_vb,
     esplora_port,
@@ -23,6 +25,7 @@ from rpc_proxy import (
     rewrite_core_maxfeerate,
     rewrite_testmempoolaccept_abort,
     shim_gettxoutsetinfo,
+    whitelist_map,
 )
 
 seq = {
@@ -404,4 +407,32 @@ assert body["result"] == "generatetoaddress", body
 node2.shutdown()
 proxy2.shutdown()
 print("ok - fork-observer rpcauth whitelist and tank password")
+
+# Core keeps scanning rpcauth rows for one user. A failed HMAC on the
+# first row must not hide a later row that matches (password rotation).
+_salt_old = "11" * 16
+_salt_new = "22" * 16
+_old_line = f"rot:{_salt_old}${password_to_hmac(_salt_old, 'old-pass')}"
+_new_line = f"rot:{_salt_new}${password_to_hmac(_salt_new, 'new-pass')}"
+
+
+def _basic(user, password):
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+
+assert authenticated_user(_basic("rot", "new-pass"), TANK_COOKIE, [_old_line, _new_line]) == "rot"
+assert authenticated_user(_basic("rot", "old-pass"), TANK_COOKIE, [_old_line, _new_line]) == "rot"
+assert authenticated_user(_basic("rot", "new-pass"), None, [_old_line, _new_line]) == "rot"
+assert authenticated_user(_basic("rot", "nope"), TANK_COOKIE, [_old_line, _new_line]) is None
+assert authenticated_user(_basic("rot", "nope"), None, [_old_line, _new_line]) is None
+print("ok - later rpcauth row for the same user")
+
+# Core set-intersects repeated rpcwhitelist lines for one user.
+assert whitelist_map(
+    [
+        "alice:getblock,getnetworkinfo,getbestblockhash",
+        "alice:getblock,getchaintips",
+    ]
+) == {"alice": {"getblock"}}
+print("ok - repeated rpcwhitelist lines intersect")
 PY
