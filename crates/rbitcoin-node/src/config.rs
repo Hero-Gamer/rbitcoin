@@ -621,7 +621,9 @@ impl NodeConfig {
             return Err(NodeError::Config("--metrics needs --health-listen".into()));
         }
         if self.rpc.rest && self.rpc.listen.is_none() && !self.rpc.socket {
-            return Err(NodeError::Config("--rest needs --rpc or --rpc-listen".into()));
+            return Err(NodeError::Config(
+                "--rest needs --rpc or --rpc-listen".into(),
+            ));
         }
         self.validate_only_net()?;
         self.validate_hidden_inbound()?;

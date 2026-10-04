@@ -11,8 +11,6 @@ use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use tower::limit::ConcurrencyLimitLayer;
-use tower_http::timeout::TimeoutLayer;
 
 /// Axum's default request-body cap, named so auth and 413 share one limit.
 pub const RPC_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
@@ -26,10 +24,14 @@ use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 #[cfg(unix)]
 fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::net::UnixListener> {
@@ -39,6 +41,81 @@ fn bind_unix_mode(path: &std::path::Path, mode: u32) -> std::io::Result<tokio::n
     Ok(listener)
 }
 use tokio::task::JoinHandle;
+
+/// One accepted connection. The permit is the accept slot and dies with the socket.
+struct HeldConn<S> {
+    io: S,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HeldConn<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HeldConn<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// Drops a new socket when [`RPC_MAX_CONNECTIONS`] are already open.
+struct AcceptCap<L> {
+    listener: L,
+    sem: Arc<Semaphore>,
+}
+
+impl<L> axum::serve::Listener for AcceptCap<L>
+where
+    L: axum::serve::Listener,
+    L::Io: AsyncRead + AsyncWrite + Unpin,
+    L::Addr: std::fmt::Debug,
+{
+    type Io = HeldConn<L::Io>;
+    type Addr = L::Addr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (io, addr) = axum::serve::Listener::accept(&mut self.listener).await;
+            match self.sem.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    return (
+                        HeldConn {
+                            io,
+                            _permit: permit,
+                        },
+                        addr,
+                    )
+                }
+                Err(_) => {
+                    info!("rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})");
+                    drop(io);
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
 
 /// RPC listen configuration.
 #[derive(Clone, Debug)]
@@ -167,6 +244,7 @@ pub async fn run_rpc(
     let work_queue = Arc::new(tokio::sync::Semaphore::new(n));
     let rest_queue = Arc::new(tokio::sync::Semaphore::new(DEFAULT_RPC_WORK_QUEUE));
     let shutdown = Arc::new(AtomicBool::new(false));
+    let accept_sem = Arc::new(Semaphore::new(RPC_MAX_CONNECTIONS));
     let mut tasks = Vec::new();
     let mut local_addr = None;
 
@@ -189,15 +267,22 @@ pub async fn run_rpc(
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
+        let accept_sem = Arc::clone(&accept_sem);
         tasks.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    while !shutdown_w.load(Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .ok();
+            axum::serve(
+                AcceptCap {
+                    listener,
+                    sem: accept_sem,
+                },
+                app,
+            )
+            .with_graceful_shutdown(async move {
+                while !shutdown_w.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .ok();
         }));
         info!(
             "rpc: HTTP JSON-RPC on {bound} (bearer token {})",
@@ -225,15 +310,22 @@ pub async fn run_rpc(
         };
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
+        let accept_sem = Arc::clone(&accept_sem);
         tasks.push(tokio::spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    while !shutdown_w.load(Ordering::SeqCst) {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                })
-                .await
-                .ok();
+            axum::serve(
+                AcceptCap {
+                    listener,
+                    sem: accept_sem,
+                },
+                app,
+            )
+            .with_graceful_shutdown(async move {
+                while !shutdown_w.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .ok();
         }));
         info!("rpc: unix JSON-RPC on {}", sock.display());
         Some(sock.clone())
@@ -275,11 +367,6 @@ fn rpc_app(state: AppState) -> Router {
         .route("/rest/{*path}", get(rest_entry).post(rest_entry))
         .layer(DefaultBodyLimit::max(RPC_MAX_HTTP_BODY))
         .layer(from_fn_with_state(state.clone(), reject_unauthorized))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_millis(crate::methods::RPC_WAIT_TIMEOUT_MS),
-        ))
-        .layer(ConcurrencyLimitLayer::new(RPC_MAX_CONNECTIONS))
         .with_state(state)
 }
 
@@ -1300,6 +1387,114 @@ mod tests {
             "stale getblocktemplate longpoll slept {:?}",
             t3.elapsed()
         );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The two-minute cap is inside the handler. The response is the JSON-RPC
+    /// tip, not an empty 408.
+    #[tokio::test]
+    async fn long_poll_at_the_cap_returns_a_json_body() {
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-cap").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: None,
+            subversion: None,
+            work_queue: None,
+            rest: false,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        let missing = "00".repeat(32);
+        let req = serde_json::json!({
+            "jsonrpc": "1.0",
+            "id": 1,
+            "method": "waitforblock",
+            "params": [missing, crate::methods::RPC_WAIT_TIMEOUT_MS]
+        });
+        let (st, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(150),
+            post_raw(tcp_addr(&handle), &handle.auth, req.to_string().as_bytes()),
+        )
+        .await
+        .expect("capped long-poll must return");
+        assert_eq!(st, 200, "{body:?}");
+        let body = body.expect("json-rpc body");
+        assert!(
+            body.get("result").is_some_and(|r| !r.is_null()),
+            "cap returns the tip, got {body}"
+        );
+        handle.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn extra_rpc_accept_is_dropped() {
+        use tokio::io::AsyncReadExt;
+        let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-accept-cap").expect("dir");
+        let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+        let hub = rbitcoin_net::ChainHub::new(
+            q,
+            rbitcoin_consensus::ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        );
+        hub.ensure_genesis().unwrap();
+        let query = Arc::clone(&hub.query);
+        let cfg = RpcConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            socket_path: None,
+            socket_shared: false,
+            datadir: dir.path().to_path_buf(),
+            network: Network::Regtest,
+            token_path: None,
+            cookie_path: None,
+            subversion: None,
+            work_queue: None,
+            rest: false,
+            alert_notify: None,
+        };
+        let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        let addr = tcp_addr(&handle);
+        let mut held = Vec::with_capacity(RPC_MAX_CONNECTIONS);
+        for _ in 0..RPC_MAX_CONNECTIONS {
+            held.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 8];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), extra.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "an accept past the cap must be dropped, got {read:?}"
+        );
+        drop(held);
+        drop(extra);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let (st, body) = post_raw(
+            addr,
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 200, "{body:?}");
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
