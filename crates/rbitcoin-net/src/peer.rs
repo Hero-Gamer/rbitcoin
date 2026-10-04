@@ -140,6 +140,23 @@ async fn accept_received_from_peer(
     })
 }
 
+/// One-day in-memory refusal. Noban peers are not recorded.
+fn note_threshold_refusal(session: Option<&crate::peers::LivePeer>) {
+    let Some(s) = session.filter(|s| !s.session_noban()) else {
+        return;
+    };
+    if let Some(hub) = s.peer_hub() {
+        hub.note_misbehavior_addr(s.addr.ip());
+    }
+}
+
+/// Disconnect error for a score that is already at the misbehavior line.
+/// Records the address, including when the caller is not [`punish_disconnect`].
+fn threshold_disconnect(session: Option<&crate::peers::LivePeer>) -> NetError {
+    note_threshold_refusal(session);
+    NetError::Protocol("peer misbehavior threshold")
+}
+
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session.filter(|s| s.session_noban()) {
         rbitcoin_log::info!("Warning: not punishing noban peer {}!", s.id);
@@ -148,9 +165,7 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
     *ban_score = ban_score.saturating_add(BAN_SCORE_THRESHOLD);
     if let Some(s) = session {
         s.request_disconnect();
-        if let Some(hub) = s.peer_hub() {
-            hub.note_misbehavior_addr(s.addr.ip());
-        }
+        note_threshold_refusal(Some(s));
     }
 }
 
@@ -1626,6 +1641,9 @@ pub async fn peer_session_with(
                         // Any socket Io means the peer is gone — exit cleanly so
                         // unregister runs inside the Core disconnect_nodes 5s wait.
                         Err(NetError::Io(_)) => return Ok(()),
+                        Err(NetError::Protocol("peer misbehavior threshold")) => {
+                            return Err(threshold_disconnect(session.as_deref()));
+                        }
                         Err(NetError::MessageTooLarge(n)) => {
                             follow.ban_score = follow.ban_score.saturating_add(OVERSIZE_BAN_SCORE);
                             rbitcoin_log::warn!(
@@ -1633,7 +1651,7 @@ pub async fn peer_session_with(
                                 follow.ban_score
                             );
                             if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                                return Err(NetError::Protocol("peer misbehavior threshold"));
+                                return Err(threshold_disconnect(session.as_deref()));
                             }
                             return Err(NetError::MessageTooLarge(n));
                         }
@@ -1657,7 +1675,7 @@ pub async fn peer_session_with(
                                     follow.ban_score
                                 );
                                 if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                                    return Err(NetError::Protocol("peer misbehavior threshold"));
+                                    return Err(threshold_disconnect(session.as_deref()));
                                 }
                             }
                             continue;
@@ -1675,7 +1693,7 @@ pub async fn peer_session_with(
                             follow.ban_score
                         );
                         if follow.ban_score >= BAN_SCORE_THRESHOLD {
-                            return Err(NetError::Protocol("peer misbehavior threshold"));
+                            return Err(threshold_disconnect(session.as_deref()));
                         }
                         continue;
                     }
@@ -1714,7 +1732,7 @@ pub async fn peer_session_with(
                             "{}",
                             misbehavior_disconnect_log(&peer_s, follow.ban_score)
                         );
-                        return Err(NetError::Protocol("peer misbehavior threshold"));
+                        return Err(threshold_disconnect(session.as_deref()));
                     }
                 }
                 tip = tip_rx.recv() => {

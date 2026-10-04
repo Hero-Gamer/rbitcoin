@@ -607,6 +607,17 @@ pub(crate) fn note_dead_without_block_bytes(
     addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
 }
 
+/// Misbehavior-threshold death. Cools the dial even after a block body was counted.
+pub(crate) fn note_misbehavior_dead(
+    book: &mut AddrMan,
+    addr_cooldown: &mut HashMap<SocketAddr, Instant>,
+    addr: SocketAddr,
+    now: Instant,
+) {
+    book.note_connect_failed(addr, false);
+    addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
+}
+
 /// One stall rule: if a peer has outstanding block getdata and no **block**
 /// progress for `stall`, disconnect it and free its work for reassignment.
 ///
@@ -984,6 +995,26 @@ mod tests {
             "peer that sent block bytes keeps its connected rank"
         );
         assert!(!cooldown.contains_key(&good));
+    }
+
+    #[test]
+    fn misbehavior_dead_cools_after_a_block_body() {
+        let mut book = AddrMan::new();
+        let lemon = addr(6);
+        book.note_connected(lemon);
+        let mut cooldown = HashMap::new();
+        let now = Instant::now();
+        note_misbehavior_dead(&mut book, &mut cooldown, lemon, now);
+        assert!(
+            book.flags(&lemon).failed_last_connect(),
+            "a misbehavior death is a failed connect"
+        );
+        assert!(cooldown.contains_key(&lemon));
+        let blocked = dial_blocked_addrs(&[], &cooldown, now);
+        assert!(
+            blocked.contains(&crate::NetAddr::Ip(lemon)),
+            "the dial stays cooled after a body was counted"
+        );
     }
 
     fn samp(id: usize, bps: u64, inflight: bool) -> RelativeSlowSample {

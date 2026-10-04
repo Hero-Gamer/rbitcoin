@@ -3039,6 +3039,50 @@ fn misbehavior_disconnect_refuses_the_same_address() {
 }
 
 #[test]
+fn threshold_exit_refuses_the_address_without_punish_disconnect() {
+    let peers = crate::peers::PeerHub::new();
+    let now = 1_700_000_100u64;
+    peers.set_mock_now(now);
+    let addr = std::net::SocketAddr::from(([8, 8, 4, 4], 8333));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 4,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let err = threshold_disconnect(Some(peer.as_ref()));
+    assert!(matches!(
+        err,
+        crate::error::NetError::Protocol("peer misbehavior threshold")
+    ));
+    let other_port = std::net::SocketAddr::from(([8, 8, 4, 4], 9999));
+    assert!(
+        peers.inbound_discouraged(other_port),
+        "a rate-limit or score-threshold exit refuses that address"
+    );
+
+    peers.set_noban(true);
+    let noban = peers.register(
+        std::net::SocketAddr::from(([1, 2, 3, 4], 8333)),
+        std::net::SocketAddr::from(([1, 2, 3, 4], 8333)),
+        &ver,
+        true,
+        crate::peers::PeerConnType::Inbound,
+    );
+    let _ = threshold_disconnect(Some(noban.as_ref()));
+    assert!(
+        !peers.inbound_discouraged(std::net::SocketAddr::from(([1, 2, 3, 4], 1))),
+        "noban is not recorded"
+    );
+}
+
+#[test]
 fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     let peers = crate::peers::PeerHub::new();
     let now = 1_800_000_000u64;
