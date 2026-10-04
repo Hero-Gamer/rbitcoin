@@ -283,8 +283,8 @@ Release / multi-day work = ordered stories. One agent turn ≈ one step
 
 | Prefer for Red | When |
 |----------------|------|
-| Extend an existing default [catalog](../TESTING.md#scenario-catalog) journey | Operator/peer-visible RPC, Electrum, Esplora, BIP324 P2P |
-| Focused unit next to shipped fn | Pure helper, fast loop, expensive full path |
+| Extend an existing default [catalog](../TESTING.md#scenario-catalog) journey | Operator/peer-visible RPC, Electrum, Esplora, BIP324 P2P. This is the default |
+| Narrow unit ([`TESTING.md`](../TESTING.md)) | The return is the consensus or schema result, and a session cannot reach it without an absurd chain |
 | Slim scenario / integration | Stage boundaries, IBD/confirm wiring, store publish order |
 | One pin per contract | Not unit + twin integration for the same lines |
 
@@ -297,7 +297,7 @@ until it passes — do not use that CI job as the inner loop
 | Plan-time rules | |
 |-----------------|--|
 | Each step declares Red tests **before** Green work | |
-| New scenarios must justify cost (what unit cannot catch) | |
+| The journey is the default. A new unit must be the narrow [`TESTING.md`](../TESTING.md) exception | |
 | No step that “adds coverage later” | |
 | Prefer synthetic `/tmp` fixtures; no agent-VM mainnet open | |
 | Hot-path Contract includes the cost model | [`CONTRIBUTING.md`](../CONTRIBUTING.md) principle 9 |
@@ -321,7 +321,8 @@ even if the slices are “vertical.”
   (return value, store after reopen, peer / RPC / log line). It fails with
   the same class of error the bug would produce, not a compile error.
 - Prefer extending a default [catalog](../TESTING.md#scenario-catalog)
-  journey. A unit belongs next to a pure helper. One pin per contract.
+  journey. A new unit is the narrow [`TESTING.md`](../TESTING.md) exception.
+  One pin per client-visible result.
 - Watch it fail once. A test that never failed proves nothing.
 
 ### Green: smallest change that passes
@@ -356,7 +357,17 @@ Test moves ([`TESTING.md`](../TESTING.md) owns the budget):
 
 - Lift guts asserts up to the journey once the journey hits the same shipped
   path, then delete the twin unit.
+- If the journey cannot hit the line, delete the production branch in this
+  refactor and delete the test that only painted it. The 92% floor still
+  applies. It passes because the dead lines left both `LH` and `LF`, or
+  because the journey hits them.
+- A CRAP failure on a function this step made more branched is a simplify,
+  not a new test and not a new allowlist row.
 - Delete tests that pin implementation shape rather than behavior.
+- Dropping the twin after the journey hits the path, and dropping the test
+  that only painted a deleted branch, are the duplicate and empty pins the
+  plan-time rule allows. Dropping the only witness of a live line is not a
+  refactor.
 - Replace a `*_for_test` hook or hot-path probe with an instance stat or an
   on-disk assert, then delete the hook.
 - Fold duplicate fixtures into the shared `testutil`; shrink N to the
@@ -367,6 +378,7 @@ Test moves ([`TESTING.md`](../TESTING.md) owns the budget):
 | After Green | Refactor move |
 |-------------|---------------|
 | A unit drove a private helper; the journey now covers that path | Move the assert to the journey, delete the unit, inline or `pub(crate)` the helper |
+| The journey cannot execute the line | Delete that production branch and the test that only painted it. The 92% floor still applies |
 | Green added a second branch beside the old one | Collapse to one path and delete the old; the same test still passes |
 | Green needed a test-only hook on production | Assert the session/table stat or file state instead; delete the hook |
 | A new scenario re-mines a pad the journey already has | Reuse that journey’s pad; one open per binary |
