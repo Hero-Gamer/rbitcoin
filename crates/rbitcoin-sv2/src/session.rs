@@ -159,6 +159,7 @@ pub(crate) async fn serve(
         built_at: None,
         rebuild_at: None,
         superseded: 0,
+        holding: false,
         held_logged: false,
     };
     s.run(&mut frames, deadline).await
@@ -181,6 +182,9 @@ struct Session {
     rebuild_at: Option<Instant>,
     /// Budgets that replaced a queued rebuild's since the last build.
     superseded: u32,
+    /// Last `publish` returned without a template because the node was in IBD.
+    /// Cleared when a template is sent.
+    holding: bool,
     held_logged: bool,
 }
 
@@ -238,13 +242,15 @@ impl Session {
                     c.coinbase_output_max_additional_size,
                     c.coinbase_output_max_additional_sigops,
                 ));
-                // A resend of the budget already built on (or queued) skips
-                // the mempool read lock; tip events rebuild when the prev
-                // hash moves.
-                if c == self.constraints && self.templates.current_prev.is_some() {
+                // Same budget: the last publish already applied it. A new
+                // budget while holding for IBD waits for the tip that leaves
+                // IBD; that tip calls `publish` and must not find a queued
+                // rebuild or a flood close in its place.
+                let same = c == self.constraints;
+                self.constraints = c;
+                if same || self.holding {
                     return Ok(true);
                 }
-                self.constraints = c;
                 match self.built_at.map(|t| t + CONSTRAINTS_COOLDOWN) {
                     Some(at) if at > Instant::now() => {
                         if self.rebuild_at.replace(at).is_some() {
@@ -287,12 +293,14 @@ impl Session {
         .await
         .map_err(io::Error::other)??;
         let Some(mut t) = t else {
+            self.holding = true;
             if !self.held_logged {
                 rbitcoin_log::info!("sv2: holding templates until the node leaves IBD");
                 self.held_logged = true;
             }
             return Ok(());
         };
+        self.holding = false;
         self.templates.last_id += 1;
         let template_id = self.templates.last_id;
         // sv2-spec 07 §7.3: a template on a new prev hash is future, then activated.

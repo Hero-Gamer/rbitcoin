@@ -337,6 +337,68 @@ async fn sync_gate_holds_constraints_until_a_fresh_tip() {
     tp.shutdown().await;
 }
 
+/// A constraints flood while the node is in IBD must not close the session.
+/// Nothing is queued to build, so the post-template 8-replacement close does
+/// not apply. The tip that leaves IBD builds the last budget.
+#[tokio::test(flavor = "multi_thread")]
+async fn constraints_while_ibd_keep_the_last_budget() {
+    let tc = padded_chain("sv2-ibd-hold", 1);
+    // 16_000 sigop cost: excluded under a u16::MAX client reserve.
+    let heavy = spend(
+        tc.coinbases[0],
+        20_000,
+        ScriptBuf::from_bytes(vec![OP_CHECKSIG; 4_000]),
+    );
+    tc.mempool.accept_tx(&heavy).expect("mempool accept");
+    let tp = run_sv2_tp(Sv2TpConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        chain: Arc::clone(&tc.chain),
+        authority_secret: [7; 32],
+        cert_validity: Duration::from_secs(3600),
+        stale_grace: Duration::from_secs(10),
+        setup_timeout: SETUP_TIMEOUT,
+        write_timeout: WRITE_TIMEOUT,
+    })
+    .await
+    .expect("listen");
+    let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
+        .await
+        .expect("handshake");
+    c.setup_connection(2, 2, 2, 0).await.unwrap();
+    c.recv().await.expect("setup reply");
+
+    // Past the flood limit, including a repeat of the last budget. The
+    // template after the tip must be the u16::MAX reserve (heavy excluded).
+    c.coinbase_output_constraints(0, 0).await.unwrap();
+    for sigops in [1u16, 2, 3, 4, 5, 6, 7, 8, 9, u16::MAX, u16::MAX] {
+        c.coinbase_output_constraints(0, sigops)
+            .await
+            .expect("session stays up");
+    }
+
+    let first = {
+        let recv = c.recv();
+        tokio::pin!(recv);
+        let held = tokio::time::timeout(Duration::from_millis(500), &mut recv).await;
+        assert!(held.is_err(), "no template while the stale tip keeps IBD");
+
+        let tip = tc.chain.tip_header().expect("tip header");
+        let height = tc.chain.query.tip_height().unwrap().0 + 1;
+        let now = tc.chain.clock.now_secs() as u32;
+        let fresh = mine_empty_regtest(tip.block_hash(), now, height);
+        tc.chain.accept_block(fresh).expect("accept fresh block");
+        tokio::time::timeout(Duration::from_secs(10), recv)
+            .await
+            .expect("template after the fresh tip")
+            .expect("message")
+    };
+    check_template(&mut c, &tc, first, &[], true).await;
+    let extra = tokio::time::timeout(Duration::from_millis(500), c.recv()).await;
+    assert!(extra.is_err(), "one template for the last budget");
+
+    tp.shutdown().await;
+}
+
 /// A connected session's first template, with a coinbase paying the whole
 /// value and an unground header over it.
 struct FirstTemplate {
