@@ -40,9 +40,10 @@ Core clone, not a soak badge, not a desktop wallet.
 ## Not 1.0
 
 Things people sometimes expect from “a Bitcoin node” that we are **not**
-taking on for 1.0:
+taking on for 1.0. `--prune-seqsigwit` is in (seqsigwit-window prune,
+`NETWORK_LIMITED`). Core block-file prune is out.
 
-- Wallet keys, GUI, prune, ZMQ, IPC, plaintext v1 P2P
+- Wallet keys, GUI, Core block-file prune (`-prune` of `blk` files), ZMQ, IPC, plaintext v1 P2P
 - Explorer-search APIs (address-prefix), Liquid, in-binary `/api/v1/`
   catalogue. **0.8** is electrs HTTP drop-in (except prefix):
   [`COMPAT.md`](../COMPAT.md) (**Q-68**)
@@ -164,7 +165,8 @@ warnings: [`OPERATOR.md`](../OPERATOR.md) § P2P. Inbound protect stays
 prefix groups (asmap is outbound-only).
 
 Still 1.0: Dedicated Core `anchors.dat` can wait if
-`{datadir}/peers` already ranks last-good outbounds. Tor can wait.
+`{datadir}/peers` already ranks last-good outbounds. Overlay listen and dial
+have shipped.
 
 | Done | Step |
 |:----:|------|

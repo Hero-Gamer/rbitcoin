@@ -127,11 +127,13 @@ Full map (one owner per fact): **[`docs/README.md`](./docs/README.md)**.
 Design uniqueness: [`docs/architecture.md`](./docs/architecture.md).
 Security contact: [`SECURITY.md`](./SECURITY.md).
 
+Seqsigwit-window prune (`--prune-seqsigwit`), BIP158 filters, silent-payment
+tweaks, GBT, and the SV2 template provider are product.
+
 ## What this is not
 
 - Production multi-tenant Electrum or “drop-in Core”
-- Wallet, mining, GUI, or pruning
-- Full Core JSON-RPC surface
+- A wallet, a GUI, Core `-prune` of `blk` files, or a full Core RPC clone
 - A claim of complete mainnet script validation under the **default** milestone
   (use `--milestone 0` for full scripts)
 - A multi-OS port — **Linux is the supported IO target** today

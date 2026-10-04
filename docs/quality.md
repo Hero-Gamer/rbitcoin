@@ -86,7 +86,6 @@ just not the current product. COMPAT/OPERATOR stay the shipped contract.
 | ID | Item | Why parked | Reopen when |
 |----|------|------------|-------------|
 | **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx (`OPERATOR.md`). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
-| **Q-65** | BIP157/158 compact block filters | Shipped as optional `--block-filter-index` (basic / type 0). `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip. Serving follows the filter watermark, not the scripthash watermark. | — |
 
 ---
 
