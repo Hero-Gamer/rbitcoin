@@ -1591,21 +1591,30 @@ impl Store {
     /// `sync_data` and publishes that height only.
     ///
     /// Stores `min(tip, confirmed tip)`. The caller may have read `tip` before
-    /// a disconnect lowered the chain and the snapshot, and a reconnect above
-    /// the new tip is not annotated yet. The confirmed tip is read inside the
-    /// update, so a clamp that lands first makes this retry against the
-    /// lowered tip.
+    /// a disconnect lowered the chain. A clamp that does not change the
+    /// snapshot word does not retry a CAS, so after a successful store this
+    /// reads the tip again and lowers the word when the chain moved.
     pub fn note_spend_snapshot(&self, tip: u32) {
         use std::sync::atomic::Ordering;
-        let _ = self
-            .spend_snapshot
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                let want = self
-                    .confirmed
-                    .tip_height()
-                    .map_or(0, |h| u64::from(tip.min(h.0)) + 1);
-                (want != cur).then_some(want)
-            });
+        let want_at = |live: Option<u32>| match live {
+            Some(h) => u64::from(tip.min(h)) + 1,
+            None => 0,
+        };
+        loop {
+            let want = want_at(self.confirmed.tip_height().map(|h| h.0));
+            let prev = self.spend_snapshot.load(Ordering::Acquire);
+            if prev != want
+                && self
+                    .spend_snapshot
+                    .compare_exchange(prev, want, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                continue;
+            }
+            if want_at(self.confirmed.tip_height().map(|h| h.0)) == want {
+                return;
+            }
+        }
     }
 
     pub fn spend_snapshot_height(&self) -> Option<u32> {
@@ -1618,30 +1627,70 @@ impl Store {
 
     /// A confirm write from `height` may connect blocks before their spends
     /// are annotated. Keeps the lowest pending height.
-    pub fn note_spend_annotate_pending(&self, height: u32) {
+    ///
+    /// The returned token is the word this note stored. A later note bumps
+    /// the generation in the high 32 bits, so a clear of this token does not
+    /// drop the later one. The low 32 bits are `height + 1`.
+    pub fn note_spend_annotate_pending(&self, height: u32) -> u64 {
         use std::sync::atomic::Ordering;
         let v = u64::from(height).saturating_add(1);
-        let _ = self
-            .spend_annotate_from
+        self.spend_annotate_from
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                (cur == 0 || v < cur).then_some(v)
-            });
+                let cur_h = cur & 0xffff_ffff;
+                let new_h = if cur_h == 0 { v } else { cur_h.min(v) };
+                let mut gen = (cur >> 32).wrapping_add(1);
+                if gen == 0 {
+                    gen = 1;
+                }
+                let next = (gen << 32) | new_h;
+                (next != cur).then_some(next)
+            })
+            .map_or(0, |prev| {
+                let cur_h = prev & 0xffff_ffff;
+                let new_h = if cur_h == 0 { v } else { cur_h.min(v) };
+                let mut gen = (prev >> 32).wrapping_add(1);
+                if gen == 0 {
+                    gen = 1;
+                }
+                let next = (gen << 32) | new_h;
+                if next == prev {
+                    prev
+                } else {
+                    next
+                }
+            })
     }
 
     /// Lowest height whose spend annotate did not finish in this process.
     pub fn spend_annotate_pending(&self) -> Option<u32> {
-        use std::sync::atomic::Ordering;
-        match self.spend_annotate_from.load(Ordering::Acquire) {
+        let v = self.spend_annotate_token() & 0xffff_ffff;
+        match v {
             0 => None,
-            v => Some(v.saturating_sub(1) as u32),
+            h => Some(h.saturating_sub(1) as u32),
         }
     }
 
-    /// Every connected height has its spends annotated. Call only after the
-    /// annotate or replay through the tip has returned `Ok`.
-    pub fn clear_spend_annotate_pending(&self) {
+    /// Full in-process pending word, including the generation.
+    pub fn spend_annotate_token(&self) -> u64 {
         use std::sync::atomic::Ordering;
-        self.spend_annotate_from.store(0, Ordering::Release);
+        self.spend_annotate_from.load(Ordering::Acquire)
+    }
+
+    /// Drop the pending word only when it is still `token`.
+    ///
+    /// A confirm write that finished its own annotate must not clear a
+    /// replacement that noted a later failure. Call only after this write's
+    /// annotate or replay returned `Ok`.
+    pub fn clear_spend_annotate_pending(&self, token: u64) {
+        use std::sync::atomic::Ordering;
+        if token == 0 {
+            return;
+        }
+        let _ = self
+            .spend_annotate_from
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                (cur == token).then_some(0)
+            });
     }
 
     /// `sync_data` the replay stems, then publish `A = D = height` when the
@@ -1676,11 +1725,13 @@ impl Store {
     /// the old snapshot over it.
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        let new_tip = self.confirmed.tip_height().map(|h| u64::from(h.0) + 1);
         let _ = self
             .spend_snapshot
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                let low = cur.min(new_tip.unwrap_or(0));
+                let low = self
+                    .confirmed
+                    .tip_height()
+                    .map_or(0, |h| cur.min(u64::from(h.0) + 1));
                 (low != cur).then_some(low)
             });
         let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {

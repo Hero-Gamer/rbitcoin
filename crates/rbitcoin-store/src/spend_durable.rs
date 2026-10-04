@@ -262,10 +262,32 @@ mod tests {
         s.checkpoint_spend_through(7).unwrap();
         assert!(SpendDurable::load(s.path()).unwrap().is_none());
 
-        s.clear_spend_annotate_pending();
+        let token = s.spend_annotate_token();
+        s.clear_spend_annotate_pending(token);
         s.checkpoint_spend_through(7).unwrap();
         let m = SpendDurable::load(s.path()).unwrap().unwrap();
         assert_eq!((m.annotated_through(), m.durable_through()), (7, 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replacement notes the same height after the write that is about to
+    /// clear. The earlier token must leave the replacement pending.
+    #[test]
+    fn stale_annotate_clear_keeps_a_later_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "rbitcoin-spend-pending-token-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = crate::Store::create_tiny(&dir).unwrap();
+        let old = s.note_spend_annotate_pending(5);
+        let newer = s.note_spend_annotate_pending(5);
+        assert_ne!(old, newer);
+        s.clear_spend_annotate_pending(old);
+        assert_eq!(s.spend_annotate_pending(), Some(5));
+        s.clear_spend_annotate_pending(newer);
+        assert_eq!(s.spend_annotate_pending(), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -222,9 +222,10 @@ pub fn confirm_write_phase(
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
         let n_blocks = batch.prepared.len();
-        if let Some(first) = batch.prepared.first() {
-            query.store().note_spend_annotate_pending(first.height.0);
-        }
+        let pending_token = batch
+            .prepared
+            .first()
+            .map(|first| query.store().note_spend_annotate_pending(first.height.0));
         let cc0 = query.confirm_stats().class_c_ns.load(Ordering::Relaxed);
         let t_cc = Instant::now();
         let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
@@ -250,7 +251,9 @@ pub fn confirm_write_phase(
         }
 
         let spend_ann_ns = post_commit(query, &slots)?;
-        query.store().clear_spend_annotate_pending();
+        if let Some(token) = pending_token {
+            query.store().clear_spend_annotate_pending(token);
+        }
         if let Some(tip) = query.tip_height() {
             query.store().note_spend_snapshot(tip.0);
         }
@@ -413,6 +416,7 @@ fn rewrite_spend_heights(query: &Query, annotated: u32, tip: u32) -> Result<u32,
 /// The next batch's spentness reads those slots, so it must not run until they
 /// are written. A replay that fails returns the error and the batch does not run.
 fn annotate_pending_spends(query: &Query) -> Result<(), ConsensusError> {
+    let token = query.store().spend_annotate_token();
     let Some(from) = query.store().spend_annotate_pending() else {
         return Ok(());
     };
@@ -427,7 +431,7 @@ fn annotate_pending_spends(query: &Query) -> Result<(), ConsensusError> {
             t.elapsed().as_nanos() as u64,
         );
     }
-    query.store().clear_spend_annotate_pending();
+    query.store().clear_spend_annotate_pending(token);
     Ok(())
 }
 
