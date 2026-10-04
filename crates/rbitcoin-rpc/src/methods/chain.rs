@@ -343,7 +343,7 @@ fn off_chain_header(ctx: &RpcContext, hash: &[u8; 32]) -> Result<Option<OffChain
                 None,
                 hex_encode(sum_header_work(works).to_be_bytes()),
                 &times,
-            )));
+            )?));
         }
         let parent = ctx
             .query
@@ -377,7 +377,7 @@ fn off_chain_header(ctx: &RpcContext, hash: &[u8; 32]) -> Result<Option<OffChain
                 immediate_prev,
                 hex_encode(cw.to_be_bytes()),
                 &times,
-            )));
+            )?));
         }
         cur = parent;
     }
@@ -391,15 +391,15 @@ fn off_chain_done(
     prev_hash: Option<[u8; 32]>,
     chainwork: String,
     times: &[u32],
-) -> OffChainHeader {
-    OffChainHeader {
+) -> Result<OffChainHeader, Value> {
+    Ok(OffChainHeader {
         rec,
         header_fk,
         height,
         prev_hash,
         chainwork,
-        mediantime: median_time_past_times(times),
-    }
+        mediantime: median_time_past_times(times).map_err(|e| rpc_error(ERR_MISC, e))?,
+    })
 }
 
 /// Ancestors strictly below an active parent, until the 11-timestamp window is full.
@@ -440,7 +440,7 @@ fn median_time_from_wire(ctx: &RpcContext, time: u32, prev_hash: [u8; 32]) -> Re
             }
         }
     }
-    Ok(median_time_past_times(&times))
+    median_time_past_times(&times).map_err(|e| rpc_error(ERR_MISC, e))
 }
 
 fn work_from_bits(bits: u32) -> bitcoin::Work {
