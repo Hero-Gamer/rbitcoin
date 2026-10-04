@@ -3039,6 +3039,36 @@ fn misbehavior_disconnect_refuses_the_same_address() {
 }
 
 #[test]
+fn misbehavior_disconnect_does_not_refuse_loopback() {
+    let peers = crate::peers::PeerHub::new();
+    peers.set_mock_now(1_700_000_000);
+    let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 8333));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(addr, addr, &ver, true, crate::peers::PeerConnType::Inbound);
+    let mut score = 0u32;
+    punish_disconnect(&mut score, Some(peer.as_ref()));
+    assert!(
+        score >= BAN_SCORE_THRESHOLD,
+        "a loopback peer is still disconnected"
+    );
+    let other_port = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 18444));
+    assert!(
+        !peers.inbound_discouraged(other_port),
+        "one loopback disconnect must not refuse every local connection"
+    );
+}
+
+#[test]
 fn threshold_exit_refuses_the_address_without_punish_disconnect() {
     let peers = crate::peers::PeerHub::new();
     let now = 1_700_000_100u64;

@@ -141,12 +141,24 @@ async fn accept_received_from_peer(
 }
 
 /// One-day in-memory refusal. Noban peers are not recorded.
+/// A loopback address is every local connection, so Core disconnects that
+/// peer and does not discourage the address.
 fn note_threshold_refusal(session: Option<&crate::peers::LivePeer>) {
     let Some(s) = session.filter(|s| !s.session_noban()) else {
         return;
     };
+    if local_addr_skips_discourage(s.addr.ip()) {
+        return;
+    }
     if let Some(hub) = s.peer_hub() {
         hub.note_misbehavior_addr(s.addr.ip());
+    }
+}
+
+fn local_addr_skips_discourage(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v) => v.is_loopback() || v.octets()[0] == 0,
+        std::net::IpAddr::V6(v) => v.is_loopback(),
     }
 }
 

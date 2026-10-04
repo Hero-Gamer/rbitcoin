@@ -5,9 +5,11 @@ Security
   fixed when the peer is accepted.
 - A misbehavior disconnect refuses that address for one day, in memory
   only. Rate-limit, oversize, and score-threshold exits record the same
-  refusal. During initial download, that death cools the dial even after
-  a block body. A netgroup that just lost an inbound slot waits ten
-  minutes. The set does not grow past its cap.
+  refusal. A loopback peer is disconnected and is not recorded, so one
+  local failure does not block every other local connection. During
+  initial download, that death cools the dial even after a block body. A
+  netgroup that just lost an inbound slot waits ten minutes. The set
+  does not grow past its cap.
 - During initial download, only a block this node requested moves the
   stall clock or is queued. Other frames are rate-limited. Light
   decodes do not wait on the reader.
