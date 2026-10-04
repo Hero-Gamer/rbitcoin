@@ -600,18 +600,6 @@ fn class_a_body_occupied(dir: &Path, stem: &str) -> bool {
     }
 }
 
-fn refuse_schema15_packed_tx_body(dir: &Path) -> Result<(), StoreError> {
-    if dir.join("tx.body").exists()
-        && !dir.join("txout.body").exists()
-        && class_a_body_occupied(dir, "tx")
-    {
-        return Err(StoreError::Corrupt(
-            "schema 15 refuses packed tx.body with creates; wipe datadir and redo IBD",
-        ));
-    }
-    Ok(())
-}
-
 fn open_or_create_create_loc(dir: &Path) -> Result<crate::create_loc::CreateLoc, StoreError> {
     if dir.join("create.loc").exists() {
         crate::create_loc::CreateLoc::open(dir)
@@ -906,7 +894,6 @@ impl TxTable {
         crate::store::rename_legacy_input_files(dir)?;
         crate::store::rename_legacy_inwit_files(seqsigwit_dir)?;
         crate::store::rename_legacy_input_files(seqsigwit_dir)?;
-        refuse_schema15_packed_tx_body(dir)?;
         let (seal_bits, workers) = Self::resolve_open_opts(opts);
         unlink_leftover_class_a_idx(dir)?;
         if seqsigwit_dir != dir {

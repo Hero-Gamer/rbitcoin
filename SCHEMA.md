@@ -19,15 +19,11 @@ Class A `{txout,spent,seqsigwit}.idx`), LAYOUT17 without `output_count`, and spe
 slots flags + u40 spend fk + u16 vin (still 8 bytes). `txout` amount is flags bits
 4–7 = decimal exponent (0–9) + ULEB mantissa (`sats = mantissa × 10^e`). Encoding
 is canonical compact: strip trailing tens up to `e=9` (`e<9` and mantissa
-divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Occupied
-15–21 LAYOUT17 Class A with creates is **refused**
-(wipe datadir and redo IBD). Empty 15–24 rewrite `meta` to 25 and unlink leftover
-`spent.off` and leftover `*.idx`. A 23 binary refuses 24 `meta`. Occupied schema
-18/19 `tx.head` or `scripthash*` (empty Class A) is **refused** (wipe those index
-dirs, keep Class A). Empty 18/19 indexes rewrite `meta` to 25; `tx.head` rebuilds
-from Class A; SH rematerializes with `--sh-index`. An 19 binary refuses 20+
-`meta`. A 17 datadir with populated `tx.head` or `scripthash*` and empty
-Class A is **refused**. Empty 17 indexes rewrite `meta` to 25.
+divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Meta older than 22
+is one refuse, empty or occupied: `schema before 22 refuses this datadir;
+wipe datadir and redo IBD`. That is the last time `tx.body`, `txout.body`,
+or `inwit.body` / `seqsigwit.body` had to be deleted rather than rewritten.
+`schema_file_openable` is 22 through 26. A 23 binary refuses 24 `meta`.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
@@ -75,33 +71,14 @@ format code:
 | **`SCHEMA_VERSION` bump** | Class A / OA / body layout change, or anything that cannot soft-open prior files |
 | **Explicit refuse** | Hard error with a one-line wipe/reindex message (which files) |
 
-**13/14→17 open:** Empty Class A (no creates) + empty/missing SH may silently
-rewrite `meta` to 17. A packed `tx.body` **with creates**, or a durable page-era
-(or schema-13 slab) SH index, is refused (wipe + IBD). Schema 15 Class A is
-`txout` + `seqsigwit` + `spent` (not a single packed `tx.body`).  
-**15→17 open:** leftover `tx_height.body` is unlinked (RAM fence). Class A
-with creates in the 16-byte-meta / 9-byte-spent layout is **refused**
-(wipe datadir and redo IBD). Empty Class A may rewrite `meta`.  
-**16→17 open:** Soft migrate when `scripthash.runs` is missing/empty or every
-run has `key_len=40`. Leftover schema-16 catalogs (`key_len=32`) and leftover
-raw-u64 megakey pages are **refused** (wipe `store/scripthash.runs` and
-rematerialize). Sealed SH head/body kept only if pages are already delta
-(`ver=1`). Class A with 16-layout creates is refused the same as 15→17.
-Leftover single-file `sp_tweaks.idx` / `sp_tweaks.body` are unlinked
-(schema 17 uses directories; `--sptweaks` backfill regenerates).  
-**17→18/19 open:** If `tx.head` occupancy or any `scripthash*` data exists:
-`schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)`.
-Empty 17 indexes rewrite `meta` to 24 **before** `TxTable::open` (so a following
-head rebuild cannot trip the refuse). Occupied 17 Class A with creates is the
-schema-22 Class A refuse (not an index wipe).  
-**18/19→22 open:** Occupied Class A with creates is the schema-22 Class A refuse.
-If Class A is empty and `tx.head` occupancy or any `scripthash*` data exists:
-`schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)`.
-Empty 18/19 indexes rewrite `meta` to 24 **before** `ScriptHashTable::open` /
-`TxTable::open`. `meta=22` is BDZ3 SH (no schema-20 SH was written as BDZ1).  
-**18→19 open (19 binary):** Rewrite `meta` to 19 even with populated `tx.head` / `scripthash*`.
-A **20** binary refuses leftover pack8 Paged (mode 10).  
-**Schema-20 leftover index layouts (empty Class A, occupied `meta=20`):** fuse8 **v1**, flat `tx.head.meta`, flat `*.idx.meta`, Shared file `scripthash.body`, and pack8 **Paged** (mode 10) **refuse** (no always-probe, no rename, no Shared read). Occupied 20 Class A with creates is the schema-22 Class A refuse. Errors:
+**Before 22:** `meta` below 22, empty or occupied, returns
+`schema before 22 refuses this datadir; wipe datadir and redo IBD` before
+any table parser runs. There is no per-version rewrite for 13–21. Layouts
+from those versions are in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md); the
+code that opened them is gone.
+**Leftover index layouts a meta ≥ 22 datadir can still hit:** fuse8 **v1**,
+flat `tx.head.meta`, flat `*.idx.meta`, a file (not a directory)
+`scripthash.body`, and pack8 **Paged** (mode 10) **refuse**. Errors:
 
 ```text
 index refuses fuse8 v1; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)
@@ -110,11 +87,7 @@ index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNN
 index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```  
-**21→22 open:** occupied Class A with creates:
-`schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD`.
-Empty 21 rewrites `store/meta` to 25 and unlinks leftover `spent.off`.
-Table file headers 13–25 remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
-Occupied 15–20 LAYOUT17 Class A with creates hits the same refuse (old flags+u56-fk / no vin pack). Empty 15–20 rewrite `meta` to 25.
+Table file headers **22–26** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
 **23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 26.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
