@@ -63,7 +63,6 @@ into `AGENTS.md`.
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. Retired confirm dual-path names. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
 | [`lightning.md`](./lightning.md) | CLN and LDK as Bitcoin backends: five `bcli` calls, Esplora/Electrum chain sync, `--sh-index` API matrix. Not LND. |
-| [`mutants/`](./mutants/) | Generated cargo-mutants missed/timeout snapshot. How to run / CI: [`TESTING.md`](../TESTING.md). Not a quality backlog. |
 | [`external_findings/`](./external_findings/) | Numbered audit reports + regression pointers. Do not flatten into CHANGELOG. |
 
 ## Root (stay at root)
