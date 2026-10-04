@@ -2427,6 +2427,7 @@ pub(crate) fn spawn_confirm_engine(
                                     ConfirmRejectClass::SoftWire,
                                     "body queue wire does not decode".into(),
                                     1,
+                                    None,
                                 )
                                 .is_err()
                                 {
