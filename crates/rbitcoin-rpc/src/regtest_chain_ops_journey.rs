@@ -94,6 +94,8 @@ fn rpc_regtest_chain_ops() {
     chain_ops_prioritise(&ctx, &mut cbs);
     let fee_block = chain_ops_generateblock_and_parent_first(&ctx, &mut cbs);
     chain_ops_proposal_spends(&ctx, &mut cbs);
+    chain_ops_submit_repeated_txids(&ctx, &hub, &mut cbs);
+    chain_ops_submit_overweight(&ctx, &hub, &mut cbs);
     chain_ops_maxfeerate(&ctx, &mut cbs);
     chain_ops_invalidate_and_precious(&ctx, &hub, &mut cbs, &p2wpkh);
 
@@ -526,9 +528,11 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
         )
     };
     let before = tip_count(ctx);
-    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&mine(0)))]).unwrap();
+    let good = mine(0);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&good))]).unwrap();
     assert!(r.is_null(), "good submitblock: {r}");
     assert_eq!(tip_count(ctx), before + 1);
+    let prev_cb = good.txdata[0].compute_txid();
 
     let mut bad = mine(0);
     bad.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0xab; 32]);
@@ -536,6 +540,15 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&bad))]).unwrap();
     assert_eq!(r, "bad-txnmrklroot");
 
+    // Core CheckMerkleRoot runs before every body rule, so each body below
+    // is committed to by its header first.
+    let commit = |mut block: Block| {
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .unwrap_or_else(|| bitcoin::TxMerkleNode::from_byte_array([0; 32]));
+        regrind(&mut block);
+        block
+    };
     let mut empty = mine(1);
     empty.txdata.clear();
     let mut no_cb = mine(2);
@@ -543,8 +556,8 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
         txid: Txid::from_byte_array([0x11; 32]),
         vout: 0,
     };
-    let mut dup = mine(3);
-    dup.txdata.push(dup.txdata[0].clone());
+    let mut uncommitted = mine(3);
+    uncommitted.txdata.push(uncommitted.txdata[0].clone());
     let spend = |prev: OutPoint, sat: u64| Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -568,16 +581,51 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
         vout: 0,
     };
     miss.txdata.push(spend(ghost, 1));
+    let mut no_vout = mine(6);
+    let cb = no_vout.txdata[0].compute_txid();
+    let mut burn = spend(OutPoint { txid: cb, vout: 0 }, 0);
+    burn.output.clear();
+    no_vout.txdata.push(burn);
+    let mut young = mine(7);
+    let cb = young.txdata[0].compute_txid();
+    young.txdata.push(spend(OutPoint { txid: cb, vout: 0 }, 1));
+    // CheckTransaction rejects an empty vin before CheckTxInputs compares values.
+    let mut no_vin = mine(8);
+    no_vin.txdata.push(Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    });
+    // A confirmed coinbase is still immature here. CheckTxInputs reports that
+    // before the value check, including when the outputs exceed the inputs.
+    let mut young_prev = mine(9);
+    young_prev
+        .txdata
+        .push(spend(OutPoint { txid: prev_cb, vout: 0 }, u64::MAX));
+    let no_vin = commit(no_vin);
     for (block, want) in [
-        (empty, "bad-blk-length"),
-        (no_cb, "bad-cb-missing"),
-        (dup, "bad-txns-duplicate"),
-        (below, "bad-txns-in-belowout"),
-        (miss, "bad-txns-inputs-missingorspent"),
+        (commit(empty), "bad-blk-length"),
+        (commit(no_cb), "bad-cb-missing"),
+        (uncommitted, "bad-txnmrklroot"),
+        (commit(below), "bad-txns-premature-spend-of-coinbase"),
+        (commit(miss), "bad-txns-inputs-missingorspent"),
+        (commit(no_vout), "bad-txns-vout-empty"),
+        (commit(young), "bad-txns-premature-spend-of-coinbase"),
+        (no_vin.clone(), "bad-txns-vin-empty"),
+        (commit(young_prev), "bad-txns-premature-spend-of-coinbase"),
     ] {
         let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
         assert_eq!(r, want);
     }
+    assert_eq!(
+        dispatch(ctx, "submitblock", vec![json!(block_hex(&no_vin))]).unwrap(),
+        "duplicate-invalid",
+        "a cheap consensus reject is cached"
+    );
     assert_eq!(tip_count(ctx), before + 1);
 
     // A ground block [cb, t1] has txid(cb) || txid(t1) as one 64-byte tx.
@@ -1166,8 +1214,15 @@ fn chain_ops_proposal_spends(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     let mut fat = spend.clone();
     fat.output[0].value = Amount::from_sat(cb_f + 1);
     assert_eq!(
-        propose(ctx, &proposal_on_tip(ctx, vec![fat])),
+        propose(ctx, &proposal_on_tip(ctx, vec![fat.clone()])),
         "bad-txns-in-belowout"
+    );
+    let mut fat_block = proposal_on_tip(ctx, vec![fat]);
+    regrind(&mut fat_block);
+    assert_eq!(
+        dispatch(ctx, "submitblock", vec![json!(block_hex(&fat_block))]).unwrap(),
+        "bad-txns-in-belowout",
+        "a mature coin with outputs above its inputs"
     );
     let mut locked = spend.clone();
     locked.lock_time = LockTime::from_height(tip_count(ctx) as u32 + 50).unwrap();
@@ -1189,6 +1244,79 @@ fn chain_ops_proposal_spends(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         "bad-txns-inputs-missingorspent",
         "a coin a block spent is gone from the proposal view"
     );
+}
+
+/// Core reports a repeated txid by where it fails: a repeat that keeps the
+/// merkle root is a mutated body (CheckMerkleRoot), a second coinbase is
+/// CheckBlock's `bad-cb-multiple`, and any other repeat spends a spent coin.
+fn chain_ops_submit_repeated_txids(
+    ctx: &RpcContext,
+    hub: &rbitcoin_net::ChainHub,
+    cbs: &mut TrueCoinbases,
+) {
+    let f = cbs.take();
+    let cb_f = generated_coinbase_value(ctx, f);
+    let (_, spend) = spend_generated_coinbase(ctx, f, cb_f - 1_000, true_spk());
+    let h = tip_count(ctx) as u32 + 1;
+    let time = hub.tip_header().unwrap().time + 1;
+    let mine = |height: u32, extra: Vec<Transaction>| {
+        rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            time,
+            height,
+            true_spk(),
+            extra,
+        )
+    };
+    let mut mutated = mine(h, vec![]);
+    mutated.txdata.push(mutated.txdata[0].clone());
+    mutated.header.merkle_root = mutated.compute_merkle_root().unwrap();
+    regrind(&mut mutated);
+    let other_cb = mine(h + 1, vec![]).txdata[0].clone();
+    let before = tip_count(ctx);
+    for (block, want) in [
+        (mutated, "bad-txns-duplicate"),
+        (mine(h, vec![other_cb]), "bad-cb-multiple"),
+        (
+            mine(h, vec![spend.clone(), spend.clone()]),
+            "bad-txns-inputs-missingorspent",
+        ),
+    ] {
+        let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert_eq!(r, want);
+    }
+    assert_eq!(tip_count(ctx), before);
+}
+
+/// Witness bytes weigh one unit each, so a block under the stripped-size cap
+/// can still pass MAX_BLOCK_WEIGHT: Core ContextualCheckBlock `bad-blk-weight`.
+fn chain_ops_submit_overweight(
+    ctx: &RpcContext,
+    hub: &rbitcoin_net::ChainHub,
+    cbs: &mut TrueCoinbases,
+) {
+    // Two spends: one witness may not exceed rust-bitcoin's 4 MB decode cap.
+    let heavy: Vec<Transaction> = (0..2)
+        .map(|_| {
+            let f = cbs.take();
+            let cb_f = generated_coinbase_value(ctx, f);
+            let (_, mut tx) = spend_generated_coinbase(ctx, f, cb_f - 1_000, true_spk());
+            tx.input[0].witness = bitcoin::Witness::from_slice(&vec![vec![0u8; 4_000]; 525]);
+            tx
+        })
+        .collect();
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        hub.tip_header().unwrap().time + 1,
+        tip_count(ctx) as u32 + 1,
+        true_spk(),
+        heavy,
+    );
+    assert!(block.weight().to_wu() > 4_000_000);
+    let before = tip_count(ctx);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+    assert_eq!(r, "bad-blk-weight");
+    assert_eq!(tip_count(ctx), before);
 }
 
 fn chain_ops_maxfeerate(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
