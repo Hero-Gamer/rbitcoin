@@ -403,6 +403,33 @@ fn batch_accept(hub: &ChainHub, blocks: &[(Height, Block)]) -> Result<bool, Stri
     }
 }
 
+/// Height-1 coinbase with two `OP_TRUE` outputs. The ancestor median for both
+/// is height 0 (`max(h - 1, 0)`).
+fn coinbase_two_outputs(prev: bitcoin::BlockHash, time: u32, height: u32) -> Result<Block, String> {
+    let mut coin = mine_regtest_paying(prev, time, height, op_true(), Vec::new());
+    let subsidy = coin.txdata[0].output[0].value;
+    let half = Amount::from_sat(subsidy.to_sat() / 2);
+    let rest = subsidy
+        .checked_sub(half)
+        .ok_or_else(|| format!("subsidy {subsidy}"))?;
+    coin.txdata[0].output = vec![
+        TxOut {
+            value: half,
+            script_pubkey: op_true(),
+        },
+        TxOut {
+            value: rest,
+            script_pubkey: op_true(),
+        },
+    ];
+    coin.header.merkle_root = coin
+        .compute_merkle_root()
+        .ok_or_else(|| "csv coinbase merkle".to_string())?;
+    coin.header.nonce = 0;
+    grind_regtest_pow(&mut coin.header);
+    Ok(coin)
+}
+
 fn plan_height0_csv() -> Result<Vec<PlannedSubmit>, String> {
     let params = params_bip34_off();
     let session = HubSession::open("chain-csv", params.clone(), Milestone::NONE)?;
@@ -414,48 +441,66 @@ fn plan_height0_csv() -> Result<Vec<PlannedSubmit>, String> {
     let spend_h = maturity + 1;
     let (mut tip, mut time) = genesis_tip(&params);
     time += REGTEST_BLOCK_SPACING;
-    let coin = mine_regtest_paying(tip, time, 1, op_true(), Vec::new());
+    let coin = coinbase_two_outputs(tip, time, 1)?;
     let fate_coin = hub_fate(&session.hub, coin.clone())?;
     if fate_coin != Fate::Accept {
         return Err(format!("csv coinbase: {fate_coin:?}"));
     }
-    let value = coin.txdata[0].output[0].value;
-    let prev = OutPoint {
-        txid: coin.txdata[0].compute_txid(),
-        vout: 0,
-    };
+    let txid = coin.txdata[0].compute_txid();
+    let short_value = coin.txdata[0].output[0].value;
+    let long_value = coin.txdata[0].output[1].value;
     let mut out = Vec::new();
     push_setup(&mut out, &coin);
     tip = coin.block_hash();
     time = coin.header.time;
     connect_empty(&session, &mut out, &mut tip, &mut time, 2..=maturity, "csv")?;
+    // 512s is inside `maturity` blocks of regtest spacing, so the height-0
+    // median satisfies it. Fail-closed on create height 0, or on a zero MTP,
+    // rejects it. The max time lock is not satisfied by that same median. A
+    // BIP68 skip accepts it. The pair is the lock's decision.
+    let short_seq = Sequence::from_consensus((1 << 22) | 1);
+    let long_seq = Sequence::from_consensus((1 << 22) | 0xffff);
     time += REGTEST_BLOCK_SPACING;
-    // Non-zero time lock so the height-0 median is an input to the decision.
-    let sequence = Sequence::from_consensus((1 << 22) | 1);
-    let b = mine_regtest_paying(
+    let short = mine_regtest_paying(
         tip,
         time,
         spend_h,
         op_true(),
-        vec![spend_tx(prev, value, sequence)],
+        vec![spend_tx(OutPoint { txid, vout: 0 }, short_value, short_seq)],
     );
-    let (fate, detail) = hub_verdict(&session.hub, b.clone())?;
-    if is_missing_prevout(&detail) {
+    let (short_fate, short_detail) = hub_verdict(&session.hub, short.clone())?;
+    if is_missing_prevout(&short_detail) || is_immature(&short_detail) {
         return Err(format!(
-            "csv shape stopped before BIP68 (missing prevout): {detail}"
+            "csv short lock stopped before BIP68: {short_fate:?} {short_detail}"
         ));
     }
-    if is_immature(&detail) {
+    if short_fate != Fate::Accept {
         return Err(format!(
-            "csv shape stopped before BIP68 (immature): {detail}"
+            "csv short lock was not satisfied by the height-0 median: {short_fate:?} {short_detail}"
         ));
     }
-    if fate != Fate::Accept && !detail_has(&detail, "nonfinal") {
+    push_check(&mut out, &short, short_fate);
+    tip = short.block_hash();
+    time = short.header.time + REGTEST_BLOCK_SPACING;
+    let long = mine_regtest_paying(
+        tip,
+        time,
+        spend_h + 1,
+        op_true(),
+        vec![spend_tx(OutPoint { txid, vout: 1 }, long_value, long_seq)],
+    );
+    let (fate, detail) = hub_verdict(&session.hub, long.clone())?;
+    if is_missing_prevout(&detail) || is_immature(&detail) {
         return Err(format!(
-            "csv shape was not decided by the BIP68 time lock: {fate:?} {detail}"
+            "csv long lock stopped before BIP68: {fate:?} {detail}"
         ));
     }
-    push_check(&mut out, &b, fate);
+    if fate != Fate::Reject || !detail_has(&detail, "nonfinal") {
+        return Err(format!(
+            "csv long lock was not decided by the BIP68 time lock: {fate:?} {detail}"
+        ));
+    }
+    push_check(&mut out, &long, fate);
     drop(session);
     Ok(out)
 }
