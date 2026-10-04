@@ -2790,6 +2790,12 @@ impl ScriptHashTable {
     /// packed chain. Clear ingest keys this shard's main now owns. Ingest body
     /// bytes stay; only the head slot is soft-cleared.
     fn drop_ingest_covered_by_packed_main(&self, shard: usize) -> Result<(), StoreError> {
+        // Mainnet ingest is 2^25 slots. Known-empty has no row that can hide
+        // the packed chain. Walking it once per shard holds tip entry past
+        // the RPC cookie window.
+        if self.ingest.lock().unwrap().is_known_empty() {
+            return Ok(());
+        }
         let Some(slot) = self.sorted_main.get(shard) else {
             return Ok(());
         };

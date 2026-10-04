@@ -1395,6 +1395,27 @@ fn pack_one_shard() {
     }
 }
 
+/// Mainnet ingest is 2^25 slots. Sealing a shard must not walk that table when
+/// occupancy is already known to be zero: one pass per shard holds tip entry
+/// past the RPC cookie window. A truncated ingest file makes a walk fail.
+#[test]
+fn empty_ingest_shard_seal_does_not_walk_slots() {
+    let dir = tmp();
+    let t = ScriptHashTable::create(dir.path()).unwrap();
+    assert!(t.head_is_empty());
+    let ingest = ingest_path(dir.path());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ingest)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let session = t.pack_shard_session(0).unwrap();
+    let pack = session.finish_pack().unwrap();
+    t.publish_packed_shard(0, pack)
+        .expect("known-empty ingest is not scanned");
+}
+
 fn shard0_key(i: u8) -> [u8; 32] {
     let mut k = [0u8; 32];
     k[0] = i & 0x3f;
