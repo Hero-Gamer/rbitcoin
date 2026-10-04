@@ -11,10 +11,11 @@ use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    depth_rate_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
-    hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, weight_above_from_chunks,
-    AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter,
-    SelectBudget, Selected, UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    depth_rate_sat_kvb, fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth,
+    frontier_feerate_from_chunks, hold_defined_then_monotone, min_rate_for_capacity,
+    percentile_sat, weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool,
+    ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, SelectBudget, Selected, UtxoProvider,
+    BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -55,7 +56,8 @@ fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
     let _ = std::fs::write(dir.join("unbroadcast"), buf);
 }
 
-/// Esplora `/fee-estimates` keys + common Electrum depths (after 0–2 → default map).
+/// Depths the refresh evaluates. Every other confirm target is
+/// [`fee_at_target_sat_kvb`] on this table (after 0–2 → default map).
 const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
 /// Txstat body bytes scanned and retained for historical fee estimates.
 const FEE_HISTORY_TXSTAT_BYTE_BUDGET: u64 = 1 << 30;
@@ -91,8 +93,8 @@ pub struct FeeHistoryBackfillStats {
 /// Immutable published fee table + mining chunks (request path never walks the graph).
 #[derive(Clone, Debug)]
 struct FeeSnapshot {
-    /// BTC/kB by confirm-target depth (post 0–2 mapping). Missing → treat empty.
-    by_depth_btc_per_kb: HashMap<u32, f64>,
+    /// sat/kvB at [`FEE_SNAPSHOT_DEPTHS`], same order. `None` is no rate.
+    depth_rates_sat_kvb: Vec<Option<u64>>,
     /// Best-first mining chunks from the last refresh (histogram / frontier).
     chunks: Vec<Chunk>,
     /// Per-chunk Σ raw member vsize, parallel to [`Self::chunks`] (histogram).
@@ -109,7 +111,7 @@ struct FeeSnapshot {
 impl FeeSnapshot {
     fn empty(now: Instant) -> Self {
         Self {
-            by_depth_btc_per_kb: HashMap::new(),
+            depth_rates_sat_kvb: vec![None; FEE_SNAPSHOT_DEPTHS.len()],
             chunks: Vec::new(),
             chunk_raw_vsize: Vec::new(),
             count: 0,
@@ -119,11 +121,11 @@ impl FeeSnapshot {
         }
     }
 
-    fn rate_btc_per_kb(&self, depth: u32) -> f64 {
-        self.by_depth_btc_per_kb
-            .get(&depth)
-            .copied()
-            .unwrap_or(-1.0)
+    fn rate_btc_per_kb(&self, target: u32) -> f64 {
+        match fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &self.depth_rates_sat_kvb, target) {
+            Some(sat) => sat as f64 / 100_000_000.0,
+            None => -1.0,
+        }
     }
 
     fn histogram(&self) -> Vec<(u64, u64)> {
@@ -2115,19 +2117,9 @@ impl MempoolHub {
         self.log_fee_readiness(flow_warm, &history);
         let mut held: Vec<Option<u64>> = ordered.iter().map(|(_, r)| *r).collect();
         hold_defined_then_monotone(&mut held);
-        let mut by_depth = HashMap::with_capacity(ordered.len());
-        for ((depth, _), rate) in ordered.iter().zip(held) {
-            by_depth.insert(
-                *depth,
-                match rate {
-                    None => -1.0,
-                    Some(r) => r as f64 / 100_000_000.0,
-                },
-            );
-        }
 
         self.fee_snapshot.store(Arc::new(FeeSnapshot {
-            by_depth_btc_per_kb: by_depth,
+            depth_rates_sat_kvb: held,
             chunks,
             chunk_raw_vsize,
             count,
@@ -3461,13 +3453,18 @@ impl MempoolHub {
         self.lock_read().graph.take_chunks_rebuilds()
     }
 
-    /// All Esplora `/fee-estimates` depths in one Arc load (+ optional refresh).
+    /// Esplora `/fee-estimates` targets in one Arc load (+ optional refresh):
+    /// blocks 1 through 25, then 144, 504, and 1008. Targets with no rate are
+    /// left out.
     pub fn fee_estimates_btc_per_kb(&self) -> Vec<(u32, f64)> {
         self.maybe_refresh_fee_snapshot();
         let snap = self.fee_snapshot.load_full();
-        FEE_SNAPSHOT_DEPTHS
-            .iter()
-            .map(|&d| (d, snap.rate_btc_per_kb(d)))
+        (1..=25)
+            .chain([144, 504, 1008])
+            .filter_map(|d| {
+                let rate = snap.rate_btc_per_kb(d);
+                (rate >= 0.0).then_some((d, rate))
+            })
             .collect()
     }
 
@@ -5500,14 +5497,62 @@ mod tests {
         hub.set_relay_enabled(true);
         // Empty pool: negative / unavailable for Electrum-style single target.
         assert!(hub.estimate_fee_btc_per_kb(2) < 0.0);
-        let bulk = hub.fee_estimates_btc_per_kb();
-        assert_eq!(bulk.len(), 11);
-        assert!(bulk.iter().all(|(d, v)| *d >= 1 && *v < 0.0));
-        // Second call hits cache (not dirty/stale immediately) — still consistent.
-        assert_eq!(
-            hub.estimate_fee_btc_per_kb(6),
-            hub.fee_estimates_btc_per_kb()[4].1
+        assert!(hub.estimate_fee_btc_per_kb(12) < 0.0);
+        assert!(hub.fee_estimates_btc_per_kb().is_empty());
+        assert!(hub.fee_estimates_btc_per_kb().is_empty());
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Off-knot targets use the same curve as the 11 rates this snapshot published.
+    #[test]
+    fn off_knot_targets_follow_the_published_curve() {
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        hub.set_relay_enabled(true);
+        for height in 1..=2_100 {
+            record_fee_sample(&hub, height, 1_000 + u64::from(height % 80) * 50);
+        }
+        hub.mark_fee_dirty();
+
+        let pairs = hub.fee_estimates_btc_per_kb();
+        let keys: Vec<u32> = pairs.iter().map(|(d, _)| *d).collect();
+        let esplora: Vec<u32> = (1..=25).chain([144, 504, 1008]).collect();
+        assert_eq!(keys, esplora, "published targets: {keys:?}");
+        assert!(!keys.contains(&100));
+
+        let knot_sat = |depth: u32| {
+            pairs
+                .iter()
+                .find(|(d, _)| *d == depth)
+                .map(|(_, btc)| (btc * 100_000_000.0).round() as u64)
+        };
+        let rates: Vec<Option<u64>> = FEE_SNAPSHOT_DEPTHS.iter().copied().map(knot_sat).collect();
+        assert!(
+            rates.iter().all(Option::is_some),
+            "history should define every computed depth via hold: {rates:?}"
         );
+        for target in [12u32, 25, 100] {
+            let expect = fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, target)
+                .expect("off-knot target");
+            let got = hub.estimate_fee_btc_per_kb(target);
+            assert!(got >= 0.0, "target {target} insufficient");
+            assert_eq!(
+                (got * 100_000_000.0).round() as u64,
+                expect,
+                "target {target}"
+            );
+        }
+        let left = rates[FEE_SNAPSHOT_DEPTHS.iter().position(|d| *d == 10).unwrap()].unwrap();
+        let right = rates[FEE_SNAPSHOT_DEPTHS.iter().position(|d| *d == 20).unwrap()].unwrap();
+        if left != right {
+            let mid = fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, 12).unwrap();
+            assert_ne!(mid, left);
+            assert_ne!(mid, right);
+        }
+
         let _ = std::fs::remove_dir_all(&mp_dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -5591,7 +5636,7 @@ mod tests {
         let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
         let first = hub.backfill_block_fee_history();
         assert_eq!((first.file_heights, first.retained_heights), (0, 0));
-        assert_eq!(first.total_targets, FEE_SNAPSHOT_DEPTHS.len() as u64);
+        assert_eq!(first.total_targets, 11);
         assert_eq!(first.ready_targets, 0);
         // a connect after the preload goes to the journal
         rbitcoin_consensus::pad_empty_from(&q, &params, tip, tip_time, 6, 6, 0);
@@ -5639,7 +5684,7 @@ mod tests {
         }
         hub.mark_fee_dirty();
         assert!(
-            hub.fee_estimates_btc_per_kb().iter().all(|(_, v)| *v < 0.0),
+            hub.fee_estimates_btc_per_kb().is_empty(),
             "{:?}",
             hub.fee_estimates_btc_per_kb()
         );

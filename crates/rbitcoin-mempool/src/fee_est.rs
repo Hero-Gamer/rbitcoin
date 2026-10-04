@@ -350,6 +350,61 @@ pub fn hold_defined_then_monotone(rates: &mut [Option<u64>]) {
     }
 }
 
+/// Confirm-target rate (sat/kvB) from already computed depths.
+///
+/// `depths` is ascending and the same length as `rates`. `None` is no rate.
+/// An exact depth returns that depth's rate. Between two depths that both
+/// have rates, the answer is linear in the block count: nearest sat/kvB,
+/// halves away from zero, clamped to the two endpoints. A missing side of
+/// that interval holds the nearest defined rate at or below the target. A
+/// target above the last defined depth holds that rate. A target below every
+/// defined depth has no rate.
+pub fn fee_at_target_sat_kvb(depths: &[u32], rates: &[Option<u64>], target: u32) -> Option<u64> {
+    let n = depths.len();
+    if n == 0 || rates.len() != n {
+        return None;
+    }
+    if target > depths[n - 1] {
+        return rates.iter().copied().rev().find_map(|r| r);
+    }
+    let idx = depths.partition_point(|&d| d < target);
+    if idx >= n {
+        return rates.iter().copied().rev().find_map(|r| r);
+    }
+    if depths[idx] == target {
+        return rates[idx];
+    }
+    if idx == 0 {
+        return None;
+    }
+    let lo = idx - 1;
+    match (rates[lo], rates[idx]) {
+        (Some(left), Some(right)) => {
+            Some(lerp_sat_kvb(depths[lo], left, depths[idx], right, target))
+        }
+        (Some(left), None) => Some(left),
+        (None, _) => rates[..=lo].iter().copied().rev().find_map(|r| r),
+    }
+}
+
+/// `left` at `d0`, `right` at `d1`, straight line at `target` in between.
+fn lerp_sat_kvb(d0: u32, left: u64, d1: u32, right: u64, target: u32) -> u64 {
+    let span = u128::from(d1.saturating_sub(d0));
+    if span == 0 {
+        return left;
+    }
+    let dist = u128::from(target.saturating_sub(d0)).min(span);
+    let numer = u128::from(left) * (span - dist) + u128::from(right) * dist;
+    let mut quote = numer / span;
+    let rem = numer % span;
+    if rem * 2 >= span {
+        quote += 1;
+    }
+    let lo = u128::from(left.min(right));
+    let hi = u128::from(left.max(right));
+    quote.clamp(lo, hi) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +592,87 @@ mod tests {
         let mut mid = [None, Some(200), None];
         hold_defined_then_monotone(&mut mid);
         assert_eq!(mid, [None, Some(200), Some(200)]);
+    }
+
+    /// Piecewise-linear curve over a fixed monotone table. Expected sat/kvB
+    /// values are the arithmetic line, not a second copy of the estimator.
+    #[test]
+    fn fee_curve_interpolates_between_computed_depths() {
+        let depths = [1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
+        assert_eq!(depths.len(), 11);
+        let rates = [
+            None,
+            None,
+            Some(9_000),
+            Some(8_000),
+            Some(7_000),
+            Some(6_000),
+            Some(5_000),
+            Some(4_001),
+            Some(3_000),
+            Some(2_000),
+            Some(1_000),
+        ];
+
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 3), Some(9_000));
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 10), Some(5_000));
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 1008), Some(1_000));
+
+        let slope_depths = [10, 20];
+        let slope_rates = [Some(10_000u64), Some(5_000)];
+        assert_eq!(
+            fee_at_target_sat_kvb(&slope_depths, &slope_rates, 10),
+            Some(10_000)
+        );
+        assert_eq!(
+            fee_at_target_sat_kvb(&slope_depths, &slope_rates, 20),
+            Some(5_000)
+        );
+        let steps: Vec<u64> = (10..=20)
+            .map(|t| fee_at_target_sat_kvb(&slope_depths, &slope_rates, t).unwrap())
+            .collect();
+        assert_eq!(
+            steps,
+            [10_000, 9_500, 9_000, 8_500, 8_000, 7_500, 7_000, 6_500, 6_000, 5_500, 5_000]
+        );
+        assert_ne!(steps[2], steps[0], "target 12 is not the left knot");
+        let log_w = (12f64.ln() - 10f64.ln()) / (20f64.ln() - 10f64.ln());
+        let log_12 = (10_000.0 + (5_000.0 - 10_000.0) * log_w).round() as u64;
+        assert_ne!(steps[2], log_12, "target 12 is not a log-depth blend");
+
+        // Halfway between 20 (4001) and 144 (3000) is block 82: 3500.5 → 3501.
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 82), Some(3_501));
+
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 1), None);
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 2), None);
+        assert_eq!(fee_at_target_sat_kvb(&slope_depths, &slope_rates, 9), None);
+
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 1009), Some(1_000));
+        assert_eq!(fee_at_target_sat_kvb(&depths, &rates, 5000), Some(1_000));
+
+        let hold_only = [10u32, 20, 144];
+        let hold_rates = [Some(5_000u64), None, None];
+        assert_eq!(
+            fee_at_target_sat_kvb(&hold_only, &hold_rates, 15),
+            Some(5_000)
+        );
+        assert_eq!(
+            fee_at_target_sat_kvb(&hold_only, &hold_rates, 100),
+            Some(5_000)
+        );
+        assert_eq!(fee_at_target_sat_kvb(&hold_only, &hold_rates, 20), None);
+
+        let mut prev: Option<u64> = None;
+        for target in 1..=1008 {
+            let rate = fee_at_target_sat_kvb(&depths, &rates, target);
+            if let Some(rate) = rate {
+                if let Some(prev) = prev {
+                    assert!(rate <= prev, "target {target} rose above {prev} to {rate}");
+                }
+                prev = Some(rate);
+            }
+        }
+        assert!(prev.is_some());
     }
 
     #[test]

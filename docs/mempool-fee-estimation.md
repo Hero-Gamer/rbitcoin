@@ -63,11 +63,18 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
 restarted pool can be thin or missing what peers relayed while the node was
 down, so each target is `R_hist`, raised to the frontier when the pool reaches
 that deep, and never lowered by the pool. A target whose history is not ready
-has no rate. If **no** depth has a rate, APIs return insufficient (RPC /
-Electrum `-1`; Esplora leaves the target out and answers **503** when no
-target has a rate). If a nearer depth is defined and a later one is not,
-**hold the last defined rate** so far targets do not drop out. The node logs
-when flow warms and how many targets' history is ready.
+has no rate. The refresh evaluates eleven depths (1, 2, 3, 4, 5, 6, 10, 20,
+144, 504, 1008) and no others. If **no** depth has a rate, APIs return
+insufficient (RPC / Electrum `-1`; Esplora leaves the target out and answers
+**503** when no target has a rate). If a nearer depth is defined and a later
+one is not, **hold the last defined rate** through the later computed depths
+so those depths do not drop out. A confirm target between two computed depths
+that both have rates is the straight line between those rates in block count,
+in whole sat/kvB (nearest, halves away from zero, kept between the two rates).
+A target past the last defined depth holds that rate. A target before every
+defined depth stays insufficient. Esplora `/fee-estimates` answers each integer
+from 1 through 25, plus 144, 504, and 1008, when that target has a rate. The
+node logs when flow warms and how many targets' history is ready.
 
 ### Parameters (code constants, not env)
 

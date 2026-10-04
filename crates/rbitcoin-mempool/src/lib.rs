@@ -51,8 +51,9 @@ pub use error::MempoolError;
 pub use fee_analog::AnalogHistory;
 pub use fee_est::{
     block_individual_p10_sat_kvb, default_candidate_rates, depth_rate_sat_kvb,
-    enforce_monotone_desc, fine_candidate_rates, flow_for_depth, hold_defined_then_monotone,
-    min_rate_for_capacity, percentile_sat, BLOCK_WEIGHT_WU, CONFIDENCE_FAR, CONFIDENCE_NEAR,
+    enforce_monotone_desc, fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth,
+    hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, BLOCK_WEIGHT_WU,
+    CONFIDENCE_FAR, CONFIDENCE_NEAR,
 };
 pub use fee_flow::FeeFlowMeter;
 pub use graph::{

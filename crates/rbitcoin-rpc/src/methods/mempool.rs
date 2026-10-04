@@ -1045,6 +1045,13 @@ mod smart_fee_tests {
         let none = smart_fee_json(6, -1.0, 5_000);
         assert!(none.get("feerate").is_none(), "{none}");
         assert_eq!(none["blocks"], 6, "{none}");
+        let off = smart_fee_json(12, 0.000_010_50, 100);
+        assert_eq!(off["blocks"], 12, "{off}");
+        assert!(off.get("feerate").is_some(), "{off}");
+        assert!(off.get("errors").is_none(), "{off}");
+        let far = smart_fee_json(100, 0.000_008_00, 100);
+        assert_eq!(far["blocks"], 100, "{far}");
+        assert!(far.get("feerate").is_some(), "{far}");
     }
 }
 
