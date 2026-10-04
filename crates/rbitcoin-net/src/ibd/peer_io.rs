@@ -212,6 +212,55 @@ fn misbehavior_disconnect(rate: &mut PeerRateLimiter, ban_score: &mut u32, n: us
     *ban_score >= BAN_SCORE_THRESHOLD
 }
 
+fn relay_headers(id: usize, sinks: &PeerEventSinks, headers: Vec<Header>) {
+    sinks.send_ctrl(PeerEvent::Headers { peer: id, headers });
+}
+
+fn relay_notfound(id: usize, sinks: &PeerEventSinks, inv: &[Inventory]) {
+    let hashes = block_inventory_hashes(inv);
+    if !hashes.is_empty() {
+        sinks.send_body(PeerEvent::NotFound { peer: id, hashes });
+    }
+}
+
+fn relay_addr(id: usize, sinks: &PeerEventSinks, list: &[(u32, bitcoin::p2p::address::Address)]) {
+    let addrs = net_addrs_from_addr(list);
+    if !addrs.is_empty() {
+        sinks.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
+    }
+}
+
+fn relay_addrv2(id: usize, sinks: &PeerEventSinks, list: &[bitcoin::p2p::address::AddrV2Message]) {
+    let addrs = net_addrs_from_addrv2(list);
+    if !addrs.is_empty() {
+        sinks.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
+    }
+}
+
+fn relay_blocks_inv(id: usize, sinks: &PeerEventSinks, inv: &[Inventory]) {
+    let hashes = block_inventory_hashes(inv);
+    if !hashes.is_empty() {
+        sinks.send_ctrl(PeerEvent::BlocksInv { peer: id, hashes });
+    }
+}
+
+fn apply_decoded_message(
+    id: usize,
+    sinks: &PeerEventSinks,
+    msg: bitcoin::p2p::message::RawNetworkMessage,
+) {
+    match msg.into_payload() {
+        NetworkMessage::Headers(h) => relay_headers(id, sinks, h),
+        NetworkMessage::NotFound(inv) => relay_notfound(id, sinks, &inv),
+        NetworkMessage::Addr(list) => relay_addr(id, sinks, &list),
+        NetworkMessage::AddrV2(list) => relay_addrv2(id, sinks, &list),
+        NetworkMessage::SendAddrV2 => {}
+        NetworkMessage::Block(_) => {}
+        NetworkMessage::Inv(inv) => relay_blocks_inv(id, sinks, &inv),
+        _other => {}
+    }
+}
+
 impl Drop for PeerSlot {
     fn drop(&mut self) {
         let _ = self.cmd_tx.send(PeerCmd::Shutdown);
@@ -263,6 +312,26 @@ pub(crate) fn note_block_rx(slots: &mut [PeerSlot], peer: usize, wire_bytes: usi
     }
 }
 
+/// Light-decode tasks die with the reader. A dropped `JoinHandle` would detach.
+struct LightDecodes {
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for LightDecodes {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl LightDecodes {
+    fn push(&mut self, task: JoinHandle<()>) {
+        self.tasks.retain(|t| !t.is_finished());
+        self.tasks.push(task);
+    }
+}
+
 fn note_read_progress(bytes_io: &AtomicU64, prog_mark: &mut usize, buffered: usize) {
     let delta = buffered.saturating_sub(*prog_mark);
     note_stream_bytes(bytes_io, delta as u64);
@@ -277,60 +346,27 @@ fn decoy_hook(rate: &mut PeerRateLimiter, ban_score: &mut u32, n: usize) -> Resu
     }
 }
 
-fn relay_headers(id: usize, sinks: &PeerEventSinks, headers: Vec<Header>) {
-    sinks.send_ctrl(PeerEvent::Headers { peer: id, headers });
-}
-
-fn relay_notfound(id: usize, sinks: &PeerEventSinks, inv: &[Inventory]) {
-    let hashes = block_inventory_hashes(inv);
-    if !hashes.is_empty() {
-        sinks.send_body(PeerEvent::NotFound { peer: id, hashes });
-    }
-}
-
-fn relay_addr(id: usize, sinks: &PeerEventSinks, list: &[(u32, bitcoin::p2p::address::Address)]) {
-    let addrs = net_addrs_from_addr(list);
-    if !addrs.is_empty() {
-        sinks.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
-    }
-}
-
-fn relay_addrv2(id: usize, sinks: &PeerEventSinks, list: &[bitcoin::p2p::address::AddrV2Message]) {
-    let addrs = net_addrs_from_addrv2(list);
-    if !addrs.is_empty() {
-        sinks.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
-    }
-}
-
-fn relay_blocks_inv(id: usize, sinks: &PeerEventSinks, inv: &[Inventory]) {
-    let hashes = block_inventory_hashes(inv);
-    if !hashes.is_empty() {
-        sinks.send_ctrl(PeerEvent::BlocksInv { peer: id, hashes });
-    }
-}
-
-fn apply_decoded_message(
+/// Reader state for one IBD peer. The socket loop only pulls frames.
+struct IbdReadCtx {
     id: usize,
-    sinks: &PeerEventSinks,
-    msg: bitcoin::p2p::message::RawNetworkMessage,
-) {
-    match msg.into_payload() {
-        NetworkMessage::Headers(h) => relay_headers(id, sinks, h),
-        NetworkMessage::NotFound(inv) => relay_notfound(id, sinks, &inv),
-        NetworkMessage::Addr(list) => relay_addr(id, sinks, &list),
-        NetworkMessage::AddrV2(list) => relay_addrv2(id, sinks, &list),
-        NetworkMessage::SendAddrV2 => {}
-        // Blocks must not reach decode (handled before the off-thread decode).
-        NetworkMessage::Block(_) => {}
-        NetworkMessage::Inv(inv) => relay_blocks_inv(id, sinks, &inv),
-        _other => {}
-    }
+    out_tx: mpsc::UnboundedSender<NetworkMessage>,
+    sinks: PeerEventSinks,
+    requested: Arc<Mutex<HashSet<BlockHash>>>,
+    solicited_bytes: Arc<AtomicU64>,
+    solicited_ms: Arc<AtomicU64>,
+    light_decode: Arc<Semaphore>,
+    light: LightDecodes,
+    /// Decoys and unknown types only. Requested block bodies stay off
+    /// this window so a fast peer is not clipped at the tip-follow cap.
+    rate: PeerRateLimiter,
+    logged_invalid_v2: bool,
+    ban_score: u32,
 }
 
-fn on_heavy_err(id: usize, sinks: &PeerEventSinks, err: NetError) {
+fn send_threshold_dead(sinks: &PeerEventSinks, id: usize) {
     sinks.send_body(PeerEvent::Dead {
         peer: id,
-        reason: err.to_string(),
+        reason: "peer misbehavior threshold".to_string(),
     });
 }
 
@@ -357,47 +393,18 @@ async fn decode_light_frame(
     }
 }
 
-/// Light-decode tasks die with the reader. A dropped `JoinHandle` would detach.
-struct LightDecodes {
-    tasks: Vec<JoinHandle<()>>,
-}
-
-impl Drop for LightDecodes {
-    fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
-        }
-    }
-}
-
-impl LightDecodes {
-    fn push(&mut self, task: JoinHandle<()>) {
-        self.tasks.retain(|t| !t.is_finished());
-        self.tasks.push(task);
-    }
-}
-
-/// Reader state for one IBD peer. The socket loop only pulls frames.
-struct IbdReadCtx {
+fn on_heavy_decoded(
     id: usize,
-    out_tx: mpsc::UnboundedSender<NetworkMessage>,
-    sinks: PeerEventSinks,
-    requested: Arc<Mutex<HashSet<BlockHash>>>,
-    solicited_bytes: Arc<AtomicU64>,
-    solicited_ms: Arc<AtomicU64>,
-    light_decode: Arc<Semaphore>,
-    light: LightDecodes,
-    /// Decoys and unknown types only. Requested block bodies stay off
-    /// this window so a fast peer is not clipped at the tip-follow cap.
-    rate: PeerRateLimiter,
-    logged_invalid_v2: bool,
-    ban_score: u32,
+    sinks: &PeerEventSinks,
+    msg: bitcoin::p2p::message::RawNetworkMessage,
+) {
+    apply_decoded_message(id, sinks, msg);
 }
 
-fn send_threshold_dead(sinks: &PeerEventSinks, id: usize) {
+fn on_heavy_err(id: usize, sinks: &PeerEventSinks, err: NetError) {
     sinks.send_body(PeerEvent::Dead {
         peer: id,
-        reason: "peer misbehavior threshold".to_string(),
+        reason: err.to_string(),
     });
 }
 
@@ -497,7 +504,7 @@ impl IbdReadCtx {
         let sinks_err = self.sinks.clone();
         spawn_decode_then_with_err(
             frame,
-            move |msg| apply_decoded_message(id, &sinks_ok, msg),
+            move |msg| on_heavy_decoded(id, &sinks_ok, msg),
             move |err| on_heavy_err(id, &sinks_err, err),
         );
     }
@@ -872,283 +879,6 @@ mod tests {
         }
     }
 
-    fn framed(command: [u8; 12], payload: Vec<u8>) -> FramedMessage {
-        FramedMessage {
-            magic: Magic::from(bitcoin::Network::Regtest),
-            command,
-            payload,
-        }
-    }
-
-    fn test_ctx() -> (
-        IbdReadCtx,
-        mpsc::UnboundedReceiver<NetworkMessage>,
-        mpsc::UnboundedReceiver<PeerEvent>,
-        mpsc::UnboundedReceiver<PeerEvent>,
-    ) {
-        let (out_tx, out_rx) = mpsc::unbounded_channel();
-        let (body_tx, body_rx) = mpsc::unbounded_channel();
-        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let ctx = IbdReadCtx {
-            id: 3,
-            out_tx,
-            sinks: PeerEventSinks {
-                body: body_tx,
-                ctrl: ctrl_tx,
-            },
-            requested: Arc::new(Mutex::new(HashSet::new())),
-            solicited_bytes: Arc::new(AtomicU64::new(0)),
-            solicited_ms: Arc::new(AtomicU64::new(0)),
-            light_decode: Arc::new(Semaphore::new(4)),
-            light: LightDecodes { tasks: Vec::new() },
-            rate: PeerRateLimiter::default_limits(),
-            logged_invalid_v2: false,
-            ban_score: 0,
-        };
-        (ctx, out_rx, body_rx, ctrl_rx)
-    }
-
-    fn one_header() -> Header {
-        use bitcoin::block::Version;
-        use bitcoin::CompactTarget;
-        Header {
-            version: Version::from_consensus(4),
-            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
-            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
-            time: 1,
-            bits: CompactTarget::from_consensus(0x207f_ffff),
-            nonce: 1,
-        }
-    }
-
-    #[test]
-    fn read_progress_counts_the_delta_from_the_mark() {
-        let bytes = AtomicU64::new(0);
-        let mut mark = 0usize;
-        note_read_progress(&bytes, &mut mark, 10);
-        note_read_progress(&bytes, &mut mark, 25);
-        assert_eq!(bytes.load(Ordering::Relaxed), 25);
-        assert_eq!(mark, 25);
-        note_read_progress(&bytes, &mut mark, 4);
-        assert_eq!(bytes.load(Ordering::Relaxed), 25);
-        assert_eq!(mark, 4);
-    }
-
-    #[test]
-    fn second_decoy_past_the_window_is_the_threshold() {
-        let mut rate = PeerRateLimiter::default_limits();
-        let mut score = 0u32;
-        let n = (crate::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;
-        assert!(decoy_hook(&mut rate, &mut score, n).is_ok());
-        assert_eq!(score, RATE_LIMIT_BAN_SCORE);
-        let err = decoy_hook(&mut rate, &mut score, n).unwrap_err();
-        assert!(matches!(
-            err,
-            NetError::Protocol("peer misbehavior threshold")
-        ));
-    }
-
-    #[test]
-    fn ping_and_block_frames_stay_on_their_channels() {
-        let (mut ctx, mut out_rx, mut body_rx, mut ctrl_rx) = test_ctx();
-        let nonce = 0x0102_0304_0506_0708u64;
-        assert!(!ctx.handle(Ok(framed(
-            *b"ping\0\0\0\0\0\0\0\0",
-            nonce.to_le_bytes().to_vec(),
-        ))));
-        assert!(matches!(out_rx.try_recv(), Ok(NetworkMessage::Pong(n)) if n == nonce));
-        assert!(!ctx.handle(Ok(framed(*b"ping\0\0\0\0\0\0\0\0", vec![1, 2, 3]))));
-        assert!(out_rx.try_recv().is_err());
-
-        let block = framed(*b"block\0\0\0\0\0\0\0", vec![7u8; 80]);
-        let hash = block.block_hash_from_header().expect("80-byte header");
-        ctx.requested.lock().unwrap().insert(hash);
-        assert!(!ctx.handle(Ok(block)));
-        match body_rx.try_recv() {
-            Ok(PeerEvent::BlockFramed {
-                peer,
-                hash: got,
-                payload,
-            }) => {
-                assert_eq!(peer, 3);
-                assert_eq!(got, hash);
-                assert_eq!(payload.len(), 80);
-            }
-            _ => panic!("a block frame must be forwarded"),
-        }
-        assert!(ctrl_rx.try_recv().is_err());
-        assert!(!ctx.handle(Ok(framed(*b"block\0\0\0\0\0\0\0", vec![8u8; 80]))));
-        assert!(
-            body_rx.try_recv().is_err(),
-            "an unsolicited block stays off the channel"
-        );
-        assert!(!ctx.handle(Ok(framed(*b"block\0\0\0\0\0\0\0", vec![1, 2, 3]))));
-        assert!(body_rx.try_recv().is_err(), "a short block has no hash");
-    }
-
-    #[test]
-    fn invalid_v2_and_io_errors_stop_on_the_shipped_reasons() {
-        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx();
-        let n = (crate::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;
-        assert!(!ctx.handle(Err(NetError::InvalidV2Type { contents_len: n })));
-        assert!(ctx.handle(Err(NetError::InvalidV2Type { contents_len: n })));
-        match body_rx.try_recv() {
-            Ok(PeerEvent::Dead { reason, .. }) => assert_eq!(reason, "peer misbehavior threshold"),
-            _ => panic!("second invalid type must stop"),
-        }
-
-        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx();
-        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed");
-        assert!(ctx.handle(Err(NetError::Io(eof))));
-        match body_rx.try_recv() {
-            Ok(PeerEvent::Dead { reason, .. }) => assert!(reason.starts_with("eof:"), "{reason}"),
-            _ => panic!("eof must be a dead peer"),
-        }
-
-        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx();
-        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
-        assert!(ctx.handle(Err(NetError::Io(reset))));
-        match body_rx.try_recv() {
-            Ok(PeerEvent::Dead { reason, .. }) => assert!(reason.starts_with("eof:"), "{reason}"),
-            _ => panic!("reset must be a dead peer"),
-        }
-
-        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx();
-        assert!(ctx.handle(Err(NetError::Protocol("bye"))));
-        match body_rx.try_recv() {
-            Ok(PeerEvent::Dead { reason, .. }) => assert!(reason.contains("bye"), "{reason}"),
-            _ => panic!("protocol error must be a dead peer"),
-        }
-    }
-
-    #[test]
-    fn heavy_frames_deliver_or_die_without_stopping_the_read() {
-        use bitcoin::consensus::encode::Encodable;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let (mut ctx, _out, mut body_rx, mut ctrl_rx) = test_ctx();
-            let hash = BlockHash::from_byte_array([4u8; 32]);
-            let inv = bitcoin::consensus::encode::serialize(&vec![Inventory::Block(hash)]);
-            assert!(!ctx.handle(Ok(framed(*b"inv\0\0\0\0\0\0\0\0\0", inv))));
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl_rx.recv())
-                .await
-                .expect("inv")
-                .expect("ctrl open");
-            match ev {
-                PeerEvent::BlocksInv { peer, hashes } => {
-                    assert_eq!(peer, 3);
-                    assert_eq!(hashes, vec![hash]);
-                }
-                _ => panic!("block inv must reach ctrl"),
-            }
-
-            let mut headers = Vec::new();
-            bitcoin::consensus::encode::VarInt(1)
-                .consensus_encode(&mut headers)
-                .unwrap();
-            one_header().consensus_encode(&mut headers).unwrap();
-            headers.push(0);
-            assert!(!ctx.handle(Ok(framed(*b"headers\0\0\0\0\0", headers))));
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl_rx.recv())
-                .await
-                .expect("headers")
-                .expect("ctrl open");
-            match ev {
-                PeerEvent::Headers { headers, .. } => assert_eq!(headers.len(), 1),
-                _ => panic!("headers must reach ctrl"),
-            }
-
-            let mut too_many = Vec::new();
-            bitcoin::consensus::encode::VarInt((crate::codec::MAX_HEADERS_RESULTS as u64) + 1)
-                .consensus_encode(&mut too_many)
-                .unwrap();
-            assert!(!ctx.handle(Ok(framed(*b"headers\0\0\0\0\0", too_many))));
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), body_rx.recv())
-                .await
-                .expect("oversize headers")
-                .expect("body open");
-            match ev {
-                PeerEvent::Dead { reason, .. } => {
-                    assert!(reason.contains("message too large"), "{reason}")
-                }
-                _ => panic!("oversize headers must die in the decoder"),
-            }
-        });
-    }
-
-    fn event_sinks() -> (
-        PeerEventSinks,
-        mpsc::UnboundedReceiver<PeerEvent>,
-        mpsc::UnboundedReceiver<PeerEvent>,
-    ) {
-        let (body_tx, body_rx) = mpsc::unbounded_channel();
-        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        (
-            PeerEventSinks {
-                body: body_tx,
-                ctrl: ctrl_tx,
-            },
-            body_rx,
-            ctrl_rx,
-        )
-    }
-
-    #[test]
-    fn decoded_messages_fan_out_blocks_and_addrs_only() {
-        use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
-        let (sinks, mut body_rx, mut ctrl_rx) = event_sinks();
-        let magic = Magic::from(bitcoin::Network::Regtest);
-        let apply = |msg| {
-            apply_decoded_message(
-                3,
-                &sinks,
-                bitcoin::p2p::message::RawNetworkMessage::new(magic, msg),
-            );
-        };
-        apply(NetworkMessage::Headers(vec![one_header()]));
-        assert!(matches!(
-            ctrl_rx.try_recv(),
-            Ok(PeerEvent::Headers { headers, .. }) if headers.len() == 1
-        ));
-        apply(NetworkMessage::NotFound(vec![]));
-        assert!(body_rx.try_recv().is_err());
-        let block = BlockHash::from_byte_array([1u8; 32]);
-        apply(NetworkMessage::NotFound(vec![Inventory::Block(block)]));
-        assert!(matches!(
-            body_rx.try_recv(),
-            Ok(PeerEvent::NotFound { hashes, .. }) if hashes == vec![block]
-        ));
-        apply(NetworkMessage::Inv(vec![Inventory::Block(block)]));
-        assert!(matches!(
-            ctrl_rx.try_recv(),
-            Ok(PeerEvent::BlocksInv { hashes, .. }) if hashes == vec![block]
-        ));
-        let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
-        let flags = ServiceFlags::NETWORK | ServiceFlags::P2P_V2;
-        apply(NetworkMessage::Addr(vec![(1, Address::new(&good, flags))]));
-        assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { .. })));
-        apply(NetworkMessage::AddrV2(vec![AddrV2Message {
-            time: 1,
-            services: flags,
-            addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
-            port: 8333,
-        }]));
-        assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { .. })));
-        apply(NetworkMessage::SendAddrV2);
-        apply(NetworkMessage::Block(bitcoin::Block {
-            header: one_header(),
-            txdata: vec![],
-        }));
-        apply(NetworkMessage::Verack);
-        apply(NetworkMessage::Addr(vec![]));
-        apply(NetworkMessage::Inv(vec![]));
-        assert!(body_rx.try_recv().is_err());
-        assert!(ctrl_rx.try_recv().is_err());
-    }
-
     #[test]
     fn usable_dial_and_services_filters() {
         assert!(!services_useful_for_ibd(ServiceFlags::NETWORK));
@@ -1288,6 +1018,384 @@ mod tests {
         );
         assert_eq!(bytes.load(Ordering::Relaxed), 100);
         assert_eq!(ms.load(Ordering::Relaxed), stamped);
+    }
+
+    fn framed(command: [u8; 12], payload: Vec<u8>) -> FramedMessage {
+        FramedMessage {
+            magic: Magic::from(bitcoin::Network::Regtest),
+            command,
+            payload,
+        }
+    }
+
+    fn test_ctx(
+        permits: usize,
+    ) -> (
+        IbdReadCtx,
+        mpsc::UnboundedReceiver<NetworkMessage>,
+        mpsc::UnboundedReceiver<PeerEvent>,
+        mpsc::UnboundedReceiver<PeerEvent>,
+    ) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        let (body_tx, body_rx) = mpsc::unbounded_channel();
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        let ctx = IbdReadCtx {
+            id: 3,
+            out_tx,
+            sinks: PeerEventSinks {
+                body: body_tx,
+                ctrl: ctrl_tx,
+            },
+            requested: Arc::new(Mutex::new(HashSet::new())),
+            solicited_bytes: Arc::new(AtomicU64::new(0)),
+            solicited_ms: Arc::new(AtomicU64::new(0)),
+            light_decode: Arc::new(Semaphore::new(permits)),
+            light: LightDecodes { tasks: Vec::new() },
+            rate: PeerRateLimiter::default_limits(),
+            logged_invalid_v2: false,
+            ban_score: 0,
+        };
+        (ctx, out_rx, body_rx, ctrl_rx)
+    }
+
+    fn oversized_block() -> FramedMessage {
+        let n = (crate::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;
+        framed(*b"block\0\0\0\0\0\0\0", vec![0u8; n])
+    }
+
+    fn one_header() -> Header {
+        use bitcoin::block::Version;
+        use bitcoin::CompactTarget;
+        Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: BlockHash::from_byte_array([0u8; 32]),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0u8; 32]),
+            time: 1,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 1,
+        }
+    }
+
+    fn recv_body(rx: &mut mpsc::UnboundedReceiver<PeerEvent>) -> PeerEvent {
+        rx.try_recv().expect("body event")
+    }
+
+    #[test]
+    fn read_progress_counts_the_delta_from_the_mark() {
+        let bytes = AtomicU64::new(0);
+        let mut mark = 0usize;
+        note_read_progress(&bytes, &mut mark, 10);
+        note_read_progress(&bytes, &mut mark, 25);
+        assert_eq!(bytes.load(Ordering::Relaxed), 25);
+        assert_eq!(mark, 25);
+        // The reader stores the latest buffered size, even when it shrinks.
+        note_read_progress(&bytes, &mut mark, 4);
+        assert_eq!(bytes.load(Ordering::Relaxed), 25);
+        assert_eq!(mark, 4);
+    }
+
+    #[test]
+    fn second_decoy_past_the_window_is_the_threshold() {
+        let mut rate = PeerRateLimiter::default_limits();
+        let mut score = 0u32;
+        let n = (crate::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;
+        assert!(decoy_hook(&mut rate, &mut score, n).is_ok());
+        assert_eq!(score, RATE_LIMIT_BAN_SCORE);
+        let err = decoy_hook(&mut rate, &mut score, n).unwrap_err();
+        assert!(matches!(
+            err,
+            NetError::Protocol("peer misbehavior threshold")
+        ));
+    }
+
+    #[test]
+    fn ping_and_solicited_block_stay_on_their_channels() {
+        let (mut ctx, mut out_rx, mut body_rx, mut ctrl_rx) = test_ctx(1);
+        let nonce = 0x0102_0304_0506_0708u64;
+        assert!(!ctx.handle(Ok(framed(
+            *b"ping\0\0\0\0\0\0\0\0",
+            nonce.to_le_bytes().to_vec()
+        ))));
+        assert!(matches!(out_rx.try_recv(), Ok(NetworkMessage::Pong(n)) if n == nonce));
+        assert!(!ctx.handle(Ok(framed(*b"ping\0\0\0\0\0\0\0\0", vec![1, 2, 3]))));
+        assert!(out_rx.try_recv().is_err());
+
+        let block = framed(*b"block\0\0\0\0\0\0\0", vec![7u8; 80]);
+        let hash = block.block_hash_from_header().expect("80-byte header");
+        ctx.requested.lock().unwrap().insert(hash);
+        assert!(!ctx.handle(Ok(block)));
+        match recv_body(&mut body_rx) {
+            PeerEvent::BlockFramed {
+                peer,
+                hash: got,
+                payload,
+            } => {
+                assert_eq!(peer, 3);
+                assert_eq!(got, hash);
+                assert_eq!(payload.len(), 80);
+            }
+            _ => panic!("solicited block must be framed"),
+        }
+        assert_eq!(ctx.solicited_bytes.load(Ordering::Relaxed), 80);
+        assert!(ctrl_rx.try_recv().is_err());
+
+        let again = framed(*b"block\0\0\0\0\0\0\0", vec![7u8; 80]);
+        assert!(!ctx.handle(Ok(again)), "one resend still fits the window");
+        assert!(body_rx.try_recv().is_err(), "a resend is not a second body");
+        assert_eq!(ctx.solicited_bytes.load(Ordering::Relaxed), 80);
+
+        assert!(!ctx.handle(Ok(framed(*b"block\0\0\0\0\0\0\0", vec![1, 2, 3]))));
+        assert!(body_rx.try_recv().is_err(), "a short block has no hash");
+    }
+
+    #[test]
+    fn second_unsolicited_block_past_the_window_stops_the_reader() {
+        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+        assert!(!ctx.handle(Ok(oversized_block())));
+        assert!(body_rx.try_recv().is_err(), "the first overflow stays");
+        assert!(ctx.handle(Ok(oversized_block())));
+        match recv_body(&mut body_rx) {
+            PeerEvent::Dead { peer, reason } => {
+                assert_eq!(peer, 3);
+                assert_eq!(reason, "peer misbehavior threshold");
+            }
+            _ => panic!("second overflow must stop"),
+        }
+    }
+
+    #[test]
+    fn light_permit_exhaustion_scores_like_other_frames() {
+        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(0);
+        let n = (crate::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;
+        let frame = framed(*b"inv\0\0\0\0\0\0\0\0\0", vec![0u8; n]);
+        assert!(!ctx.handle(Ok(frame)));
+        assert!(body_rx.try_recv().is_err());
+        let frame = framed(*b"inv\0\0\0\0\0\0\0\0\0", vec![0u8; n]);
+        assert!(ctx.handle(Ok(frame)));
+        match recv_body(&mut body_rx) {
+            PeerEvent::Dead { reason, .. } => assert_eq!(reason, "peer misbehavior threshold"),
+            _ => panic!("a second permit miss past the window must stop"),
+        }
+    }
+
+    #[test]
+    fn invalid_v2_and_io_errors_stop_on_the_shipped_reasons() {
+        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+        let n = (crate::peer_dos::DEFAULT_MAX_BYTES_PER_SEC as usize) + 1;
+        assert!(!ctx.handle(Err(NetError::InvalidV2Type { contents_len: n })));
+        assert!(ctx.handle(Err(NetError::InvalidV2Type { contents_len: n })));
+        match recv_body(&mut body_rx) {
+            PeerEvent::Dead { reason, .. } => assert_eq!(reason, "peer misbehavior threshold"),
+            _ => panic!("second invalid type must stop"),
+        }
+
+        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "closed");
+        assert!(ctx.handle(Err(NetError::Io(eof))));
+        match recv_body(&mut body_rx) {
+            PeerEvent::Dead { reason, .. } => assert!(reason.starts_with("eof:"), "{reason}"),
+            _ => panic!("eof must be a dead peer"),
+        }
+
+        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset");
+        assert!(ctx.handle(Err(NetError::Io(reset))));
+        match recv_body(&mut body_rx) {
+            PeerEvent::Dead { reason, .. } => assert!(reason.starts_with("eof:"), "{reason}"),
+            _ => panic!("reset must be a dead peer"),
+        }
+
+        let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+        assert!(ctx.handle(Err(NetError::Protocol("bye"))));
+        match recv_body(&mut body_rx) {
+            PeerEvent::Dead { reason, .. } => assert!(reason.contains("bye"), "{reason}"),
+            _ => panic!("protocol error must be a dead peer"),
+        }
+    }
+
+    #[test]
+    fn light_and_heavy_frames_deliver_or_die_without_stopping_the_read() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use bitcoin::consensus::encode::Encodable;
+            let (mut ctx, _out, mut body_rx, mut ctrl_rx) = test_ctx(2);
+            let hash = BlockHash::from_byte_array([4u8; 32]);
+            let inv = bitcoin::consensus::encode::serialize(&vec![Inventory::Block(hash)]);
+            assert!(!ctx.handle(Ok(framed(*b"inv\0\0\0\0\0\0\0\0\0", inv))));
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl_rx.recv())
+                .await
+                .expect("light inv")
+                .expect("ctrl open");
+            match ev {
+                PeerEvent::BlocksInv { peer, hashes } => {
+                    assert_eq!(peer, 3);
+                    assert_eq!(hashes, vec![hash]);
+                }
+                _ => panic!("block inv must reach ctrl"),
+            }
+
+            let mut over = Vec::new();
+            bitcoin::consensus::encode::VarInt((crate::codec::MAX_INV_SIZE as u64) + 1)
+                .consensus_encode(&mut over)
+                .unwrap();
+            assert!(!ctx.handle(Ok(framed(*b"inv\0\0\0\0\0\0\0\0\0", over))));
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), body_rx.recv())
+                .await
+                .expect("oversize inv")
+                .expect("body open");
+            match ev {
+                PeerEvent::Dead { reason, .. } => {
+                    assert!(reason.contains("message too large"), "{reason}")
+                }
+                _ => panic!("oversize inv must die in the decoder"),
+            }
+
+            // Core's headers payload is count, then each 80-byte header and a 0 tx count.
+            let mut headers = Vec::new();
+            bitcoin::consensus::encode::VarInt(1)
+                .consensus_encode(&mut headers)
+                .unwrap();
+            one_header().consensus_encode(&mut headers).unwrap();
+            headers.push(0);
+            let headers_frame = framed(*b"headers\0\0\0\0\0", headers);
+            match headers_frame.clone().try_decode() {
+                Ok(msg) => {
+                    assert!(matches!(msg.payload(), NetworkMessage::Headers(h) if h.len() == 1))
+                }
+                Err(e) => panic!("headers fixture must decode, got {e}"),
+            }
+            assert!(!ctx.handle(Ok(headers_frame)));
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), ctrl_rx.recv())
+                .await
+                .expect("headers")
+                .expect("ctrl open");
+            match ev {
+                PeerEvent::Headers { headers, .. } => assert_eq!(headers.len(), 1),
+                _ => panic!("headers must reach ctrl"),
+            }
+
+            let mut too_many = Vec::new();
+            bitcoin::consensus::encode::VarInt((crate::codec::MAX_HEADERS_RESULTS as u64) + 1)
+                .consensus_encode(&mut too_many)
+                .unwrap();
+            assert!(!ctx.handle(Ok(framed(*b"headers\0\0\0\0\0", too_many))));
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(2), body_rx.recv())
+                .await
+                .expect("oversize headers")
+                .expect("body open");
+            match ev {
+                PeerEvent::Dead { reason, .. } => {
+                    assert!(reason.contains("message too large"), "{reason}")
+                }
+                _ => panic!("oversize headers must die in the decoder"),
+            }
+        });
+    }
+
+    fn sinks() -> (
+        PeerEventSinks,
+        mpsc::UnboundedReceiver<PeerEvent>,
+        mpsc::UnboundedReceiver<PeerEvent>,
+    ) {
+        let (body_tx, body_rx) = mpsc::unbounded_channel();
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        (
+            PeerEventSinks {
+                body: body_tx,
+                ctrl: ctrl_tx,
+            },
+            body_rx,
+            ctrl_rx,
+        )
+    }
+
+    fn apply(msg: NetworkMessage, sinks: &PeerEventSinks) {
+        apply_decoded_message(
+            3,
+            sinks,
+            bitcoin::p2p::message::RawNetworkMessage::new(
+                Magic::from(bitcoin::Network::Regtest),
+                msg,
+            ),
+        );
+    }
+
+    #[test]
+    fn decoded_messages_fan_out_blocks_and_addrs_only() {
+        use bitcoin::p2p::address::{AddrV2, AddrV2Message, Address};
+
+        let (sinks, mut body_rx, mut ctrl_rx) = sinks();
+        apply(NetworkMessage::Headers(vec![one_header()]), &sinks);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(PeerEvent::Headers { headers, .. }) if headers.len() == 1
+        ));
+        apply(NetworkMessage::Headers(vec![]), &sinks);
+        assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Headers { .. })));
+
+        apply(NetworkMessage::NotFound(vec![]), &sinks);
+        apply(
+            NetworkMessage::NotFound(vec![Inventory::Transaction(
+                bitcoin::Txid::from_byte_array([3u8; 32]),
+            )]),
+            &sinks,
+        );
+        assert!(body_rx.try_recv().is_err());
+        let block = BlockHash::from_byte_array([1u8; 32]);
+        apply(
+            NetworkMessage::NotFound(vec![Inventory::Block(block)]),
+            &sinks,
+        );
+        assert!(matches!(
+            body_rx.try_recv(),
+            Ok(PeerEvent::NotFound { hashes, .. }) if hashes == vec![block]
+        ));
+
+        apply(NetworkMessage::Inv(vec![]), &sinks);
+        assert!(ctrl_rx.try_recv().is_err());
+        apply(NetworkMessage::Inv(vec![Inventory::Block(block)]), &sinks);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(PeerEvent::BlocksInv { hashes, .. }) if hashes == vec![block]
+        ));
+
+        let good = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+        let flags = ServiceFlags::NETWORK | ServiceFlags::P2P_V2;
+        apply(NetworkMessage::Addr(vec![]), &sinks);
+        assert!(ctrl_rx.try_recv().is_err());
+        apply(
+            NetworkMessage::Addr(vec![(1, Address::new(&good, flags))]),
+            &sinks,
+        );
+        assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { .. })));
+
+        apply(NetworkMessage::AddrV2(vec![]), &sinks);
+        assert!(ctrl_rx.try_recv().is_err());
+        apply(
+            NetworkMessage::AddrV2(vec![AddrV2Message {
+                time: 1,
+                services: flags,
+                addr: AddrV2::Ipv4(Ipv4Addr::new(9, 9, 9, 9)),
+                port: 8333,
+            }]),
+            &sinks,
+        );
+        assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { .. })));
+
+        apply(NetworkMessage::SendAddrV2, &sinks);
+        apply(
+            NetworkMessage::Block(bitcoin::Block {
+                header: one_header(),
+                txdata: vec![],
+            }),
+            &sinks,
+        );
+        apply(NetworkMessage::Verack, &sinks);
+        assert!(body_rx.try_recv().is_err());
+        assert!(ctrl_rx.try_recv().is_err());
     }
 
     #[test]
