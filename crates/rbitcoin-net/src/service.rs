@@ -597,6 +597,16 @@ struct PreparedOutbound {
     id: u64,
 }
 
+/// Bound on the TCP / SOCKS / SAM connect of an outbound dial, the same 8 s
+/// as the IBD and tip-follow dials ([`crate::connect_timeout_for`] gives I2P
+/// longer). Without it a proxy that accepts and never answers holds the
+/// dial, and its [`crate::peers::DialInFlight`] mark, for good, so the
+/// redial pass would never try that target again.
+#[cfg(not(test))]
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(test)]
+const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn prepare_outbound_session(
     peer: DialTarget,
@@ -610,8 +620,15 @@ async fn prepare_outbound_session(
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
+    // Until this returns, the redial pass treats `peer` as already dialling.
+    let _dialing = peers.dial_in_flight(&peer);
     let peer_net = peer.net_addr();
-    let stream = dialer.connect_net(peer_net).await?;
+    let stream = tokio::time::timeout(
+        crate::connect_timeout_for(peer_net, OUTBOUND_CONNECT_TIMEOUT),
+        dialer.connect_net(peer_net),
+    )
+    .await
+    .map_err(|_| NetError::Timeout)??;
     let peer_hint = peer.version_socket();
     let bind = stream.local_addr().unwrap_or(local);
     let height = hub.tip_height().map(|h| h as i32).unwrap_or(0);
@@ -1019,5 +1036,75 @@ mod tests {
             inbound,
             "loopback client must show as inbound in getpeerinfo"
         );
+    }
+
+    /// The 2 s redial pass must not stack a dial that is still connecting,
+    /// and must not lose the target to one that never finishes. A SOCKS
+    /// proxy that accepts and never answers holds the first dial in
+    /// `connect_net`: later passes skip it until the connect times out, then
+    /// dial again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redial_skips_a_connect_target_still_dialling() {
+        let _live = live_p2p_lock().await;
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&accepts);
+        let stall = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = proxy.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-redial-in-flight-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = P2PNode::start_outbound_only(
+            Query::open_or_create_tiny(&dir).unwrap(),
+            ChainParams::regtest(),
+            Milestone::NONE,
+            "/rbitcoin:0.1.0(redial)/".into(),
+            0,
+            crate::socks::Dialer::socks(proxy_addr, false),
+        )
+        .await
+        .unwrap();
+        node.peers
+            .set_connect_addrs(vec![crate::NetAddr::Ip("127.0.0.1:18444".parse().unwrap())]);
+        node.peers.redial_remembered();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while accepts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first dial never reached the proxy"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..3 {
+            node.peers.redial_remembered();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "a dial still connecting must not be dialled again"
+        );
+        // The stalled connect times out and frees the target for the next pass.
+        let deadline = std::time::Instant::now() + OUTBOUND_CONNECT_TIMEOUT * 3;
+        while accepts.load(Ordering::SeqCst) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a connect that never finishes must time out and be redialled"
+            );
+            node.peers.redial_remembered();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        stall.abort();
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

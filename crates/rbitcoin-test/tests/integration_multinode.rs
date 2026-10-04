@@ -2774,6 +2774,16 @@ async fn pin_blocksonly_seeder_tx_disconnects(
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
+    // The node redials its `--connect` peer, so wait for these sessions to
+    // end rather than for getpeerinfo to be empty.
+    let before = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+    let ids: Vec<u64> = before["result"]
+        .as_array()
+        .expect("getpeerinfo array")
+        .iter()
+        .filter_map(|p| p["id"].as_u64())
+        .collect();
+    assert!(!ids.is_empty(), "{before}");
     wait_ms_until(
         3_000,
         || {
@@ -2794,7 +2804,10 @@ async fn pin_blocksonly_seeder_tx_disconnects(
     let gone_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
-        if peers["result"].as_array().is_some_and(|a| a.is_empty()) {
+        if peers["result"].as_array().is_some_and(|a| {
+            a.iter()
+                .all(|p| p["id"].as_u64().is_none_or(|id| !ids.contains(&id)))
+        }) {
             break;
         }
         if Instant::now() >= gone_deadline {
@@ -2940,6 +2953,7 @@ async fn node_run_p2p_short() {
             );
 
             let id = rows[0]["id"].as_u64().expect("id");
+            let bind = rows[0]["addrbind"].as_str().expect("addrbind").to_string();
             let disc = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
             assert!(disc["error"].is_null(), "{disc}");
             let after = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
@@ -2949,55 +2963,48 @@ async fn node_run_p2p_short() {
                     .is_some_and(|a| a.iter().all(|p| p["id"].as_u64() != Some(id))),
                 "disconnectnode must clear the row before the session task exits: {after}"
             );
-            let again = jsonrpc(rpc_addr, "disconnectnode", json!([addr.clone()])).await;
+            // That session id is gone for good; the redial gets a new one.
+            let again = jsonrpc(rpc_addr, "disconnectnode", json!({"nodeid": id})).await;
             assert_eq!(again["error"]["code"], -29, "node not connected: {again}");
-            let gone_deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
-                if peers["result"].as_array().is_some_and(|a| a.is_empty()) {
-                    break;
-                }
-                if Instant::now() >= gone_deadline {
-                    panic!("getpeerinfo still occupied after disconnectnode: {peers}");
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+            let stranger = jsonrpc(rpc_addr, "disconnectnode", json!(["127.0.0.1:1"])).await;
+            assert_eq!(
+                stranger["error"]["code"], -29,
+                "address not connected: {stranger}"
+            );
             wait_ms_until(
                 3_000,
                 || {
                     !seed_peers
                         .snapshot()
                         .into_iter()
-                        .any(|p| p.inbound && p.handshake_complete)
+                        .any(|p| p.inbound && p.addr.to_string() == bind)
                 },
                 || {
                     format!(
-                        "the seeder must see the disconnect: {:?}",
+                        "the seeder must see the disconnect of {bind}: {:?}",
                         seed_peers.snapshot()
                     )
                 },
             )
             .await;
 
-            let added = jsonrpc(
-                rpc_addr,
-                "addnode",
-                json!([seed_addr.to_string(), "onetry"]),
-            )
-            .await;
-            assert!(added["error"].is_null(), "{added}");
+            // Core keeps reconnecting a `-connect` address that drops.
             let re_deadline = Instant::now() + Duration::from_secs(8);
             loop {
                 let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
-                let ok = peers["result"].as_array().is_some_and(|rows| {
-                    rows.iter()
-                        .any(|p| p["inbound"] == false && p["connection_type"] == "manual")
+                let back = peers["result"].as_array().is_some_and(|rows| {
+                    rows.iter().any(|p| {
+                        p["addr"] == addr.as_str()
+                            && p["inbound"] == false
+                            && p["connection_type"] == "manual"
+                            && p["id"].as_u64() != Some(id)
+                    })
                 });
-                if ok {
+                if back {
                     break;
                 }
                 if Instant::now() >= re_deadline {
-                    panic!("addnode onetry did not produce a manual peer: {peers}");
+                    panic!("--connect peer was not redialled after disconnectnode: {peers}");
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
@@ -3011,7 +3018,7 @@ async fn node_run_p2p_short() {
                 },
                 || {
                     format!(
-                        "the seeder must see the addnode peer inbound: {:?}",
+                        "the seeder must see the redialled peer inbound: {:?}",
                         seed_peers.snapshot()
                     )
                 },

@@ -788,6 +788,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 warn!("node: no follow peers connected — tip announce may stall");
             }
         }
+        // From here the 2 s redial pass reconnects any `--connect` address
+        // without a live session, including ones past `follow_n`. Hostnames
+        // were registered before catch-up (`set_connect_hosts`).
+        node.peers.set_connect_addrs(config.listen.connect.clone());
     }
 
     let (mut electrum_handles, mut electrum_bridge, electrum_onion) = start_electrum_if_ready(
