@@ -1,9 +1,11 @@
 //! Live Core JSON-RPC + bitcoind spawn for differential and v2 session fuzz.
 
 mod block_diff;
+mod chain_review;
 mod cmpct_fuzz;
 mod p2p_seq;
 mod script_kernel;
+mod script_review;
 
 pub use block_diff::{
     basic_auth_b64, build_jsonrpc_http_request, check_diff_env, compare_cmpct_reorg_one,
@@ -15,6 +17,7 @@ pub use block_diff::{
     BlockOracle, CompareOne, DiffPad, DiffTip, OracleReply, StoreReorgOp, DIFF_MATURE_PAD_HEIGHT,
     DIFF_REORG_N, DIFF_TEST_PAD_HEIGHT,
 };
+pub use chain_review::{compare_chain_plan, plan_chain_shape, ChainReview, PlannedSubmit};
 pub use cmpct_fuzz::{
     cmpct_getblocktxn_agrees, cmpct_missing_for_case, encode_cmpctblock_v2,
     encode_getheaders_empty_v2, encode_ping_v2, encode_pong_v2, encode_sendcmpct_hb_v2,
@@ -22,6 +25,9 @@ pub use cmpct_fuzz::{
 };
 pub use p2p_seq::{p2p_sequence_ping_comparisons, parse_p2p_sequence, P2pSeqKind, P2pSeqStep};
 pub use script_kernel::{compare_script_kernel, kernel_forks, parse_kernel_input, KernelCmp};
+pub use script_review::{
+    compare_kernel_bytes, compare_signet_empty, compare_spend, core_block_script_flags,
+};
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -364,12 +370,23 @@ pub fn bitcoind_rpc_args(datadir: &Path, rpcport: u16, p2pport: u16, cookie: &Pa
 }
 
 pub fn spawn_bitcoind(bin: &Path, datadir: &Path) -> Result<CoreChild, String> {
+    spawn_bitcoind_extra(bin, datadir, &[])
+}
+
+/// `spawn_bitcoind` plus extra regtest args (chain-review BIP34 overlay).
+pub fn spawn_bitcoind_extra(
+    bin: &Path,
+    datadir: &Path,
+    extra: &[&str],
+) -> Result<CoreChild, String> {
     std::fs::create_dir_all(datadir).map_err(|e| e.to_string())?;
     let rpcport = free_port()?;
     let p2pport = rpcport.saturating_add(1);
     let cookie = datadir.join(".cookie");
+    let mut args = bitcoind_rpc_args(datadir, rpcport, p2pport, &cookie);
+    args.extend(extra.iter().map(|s| (*s).to_string()));
     let child = Command::new(bin)
-        .args(bitcoind_rpc_args(datadir, rpcport, p2pport, &cookie))
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

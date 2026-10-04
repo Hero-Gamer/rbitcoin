@@ -15,6 +15,8 @@ mod block_reorg_n_differential;
 mod block_spend_differential;
 #[path = "../../../fuzz/fuzz_targets/block_wire.rs"]
 mod block_wire;
+#[path = "../../../fuzz/fuzz_targets/chain_review_differential.rs"]
+mod chain_review_differential;
 #[path = "../../../fuzz/fuzz_targets/cmpct_differential.rs"]
 mod cmpct_differential;
 #[path = "../../../fuzz/fuzz_targets/cmpct_reorg_differential.rs"]

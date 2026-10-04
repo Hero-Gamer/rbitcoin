@@ -75,6 +75,7 @@ fn make_p2wpkh_spend() -> (ScriptCheckJob, bool) {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -155,6 +156,7 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -209,6 +211,7 @@ fn pretaproot_v1_witness_program_anyone_can_spend() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -256,6 +259,7 @@ fn empty_script_pubkey_rejects() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -321,6 +325,7 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -368,6 +373,7 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -419,6 +425,7 @@ fn mainnet_block_110300_sighash_type_zero_p2pkh() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -478,6 +485,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -643,6 +651,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -707,6 +716,7 @@ fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -763,6 +773,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -861,6 +872,7 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -910,6 +922,7 @@ fn cltv_in_scriptsig_with_op_true_spk_enforced() {
             witness_active: false,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -964,6 +977,7 @@ fn unknown_witness_v16_accepts_without_discourage() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -1012,6 +1026,7 @@ fn unknown_witness_v16_malleated_scriptsig() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -1065,6 +1080,7 @@ fn unknown_witness_v16_discourage_rejects() {
             witness_active: true,
             discourage_upgradable_witness: true,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -1120,6 +1136,7 @@ fn p2wsh_oversized_witness_element_rejected() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };
@@ -1189,6 +1206,7 @@ fn p2wsh_witness_script_larger_than_520_is_valid() {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         },
         pre: std::sync::OnceLock::new(),
     };

@@ -276,7 +276,11 @@ fn verify_bare(
         interpreter::SigVersion::Base,
     );
     if interpreter::eval_script(spk, &mut stack, &ctx)? {
-        interpreter::require_true_top(&stack)?;
+        if job.cleanstack {
+            interpreter::require_clean_true(&stack)?;
+        } else {
+            interpreter::require_true_top(&stack)?;
+        }
     }
     Ok(())
 }
@@ -886,6 +890,7 @@ mod verify_routing_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         }
@@ -971,6 +976,7 @@ mod verify_routing_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1004,6 +1010,7 @@ mod verify_routing_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1182,6 +1189,7 @@ mod verify_routing_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1419,6 +1427,7 @@ mod verify_routing_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
