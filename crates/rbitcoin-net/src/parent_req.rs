@@ -360,21 +360,19 @@ impl ParentTracker {
     }
 
     fn fail_inflight(&mut self, hash: &[u8; 32], peer: u64, exp: u64) {
-        let unindex_it = match self.by_hash.get_mut(hash) {
-            None => true,
-            Some(slot) => match slot.anns.iter_mut().find(|a| a.peer == peer) {
-                None => true,
-                Some(ann) if ann.requested_until == Some(exp) => {
-                    ann.requested_until = None;
-                    ann.failed = true;
-                    true
-                }
-                Some(_) => false,
-            },
-        };
-        if unindex_it {
-            unindex(&mut self.inflight_by_peer, peer, exp, hash);
+        // Expire the ann whose window is `exp`. A same-peer txid parent is a
+        // different row and must stay eligible once this window ends.
+        if let Some(slot) = self.by_hash.get_mut(hash) {
+            if let Some(ann) = slot
+                .anns
+                .iter_mut()
+                .find(|a| a.peer == peer && a.requested_until == Some(exp))
+            {
+                ann.requested_until = None;
+                ann.failed = true;
+            }
         }
+        unindex(&mut self.inflight_by_peer, peer, exp, hash);
     }
 
     fn slot_all_failed(&self, hash: &[u8; 32]) -> bool {

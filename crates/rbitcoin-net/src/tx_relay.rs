@@ -5094,6 +5094,42 @@ mod tests {
     }
 
     #[test]
+    fn same_peer_wtxid_inflight_expires_back_to_txid_parent() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let hash = [0xbc; 32];
+        let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
+        let t0 = 1_000u64;
+        hub.schedule_orphan_parents(&missing, 2, false, t0);
+        assert_eq!(
+            hub.note_inv_tx_requested(2, hash, false, t0, true),
+            ParentNote::Accepted,
+            "the same peer's wtxid inv is a second announcement"
+        );
+        let due = t0 + TXID_RELAY_DELAY_SECS;
+        assert!(
+            hub.take_due_parent_getdata(2, due).is_empty(),
+            "the txid parent waits while this peer's wtxid request is in flight"
+        );
+        let expired = t0 + GETDATA_TX_INTERVAL_SECS;
+        let parent = hub.take_due_parent_getdata(2, expired);
+        assert_eq!(
+            parent.len(),
+            1,
+            "the txid parent is requested once the wtxid window ends"
+        );
+        assert_eq!(parent[0].hash, hash);
+        assert!(
+            !parent[0].wtxid,
+            "after the window the parent is requested as a txid"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
     fn take_due_parent_getdata_waits_inbound_txid_delay() {
         let dir = tmp();
         let store_dir = tmp();
