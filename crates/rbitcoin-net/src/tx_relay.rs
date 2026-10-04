@@ -5078,7 +5078,11 @@ mod tests {
         assert_eq!(follow.len(), 1);
         assert_eq!(follow[0].hash, hash);
         assert!(follow[0].wtxid, "wtxid follow-up must stay WTx");
-        let parent = hub.take_due_parent_getdata(2, expired);
+        assert!(
+            hub.take_due_parent_getdata(2, expired).is_empty(),
+            "a txid parent waits while those bytes are in flight"
+        );
+        let parent = hub.take_due_parent_getdata(2, expired + GETDATA_TX_INTERVAL_SECS);
         assert_eq!(parent.len(), 1);
         assert_eq!(parent[0].hash, hash);
         assert!(
