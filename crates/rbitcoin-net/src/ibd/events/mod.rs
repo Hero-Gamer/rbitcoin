@@ -618,10 +618,13 @@ fn apply_block_framed(
     if hub.query.block_queue_has_hash(&raw) {
         return;
     }
-    match hub
-        .query
-        .block_queue_offer(height, raw, header_fk.0, &payload)
-    {
+    match hub.query.block_queue_offer_from(
+        height,
+        raw,
+        header_fk.0,
+        &payload,
+        u64::try_from(peer).ok(),
+    ) {
         Ok(_offer) => {
             let _ = try_complete_awaiting_reorg(st, hub);
         }
@@ -766,6 +769,7 @@ pub(crate) fn apply_confirm_events(
                 class,
                 err,
                 batch_len,
+                sender,
             } => {
                 apply_confirm_reject(
                     st,
@@ -777,6 +781,7 @@ pub(crate) fn apply_confirm_events(
                     Some(hub),
                     batch_len,
                     feed,
+                    sender,
                 );
             }
         }
@@ -800,6 +805,7 @@ pub(crate) fn apply_confirm_reject(
     hub: Option<&crate::chain::ChainHub>,
     batch_len: usize,
     feed: Option<&super::confirm::ConfirmFeed>,
+    sender: Option<usize>,
 ) {
     // Never blacklist the all-zero sentinel (write used to emit this on
     // mis-attributed rejects).
@@ -829,15 +835,8 @@ pub(crate) fn apply_confirm_reject(
             f.request_single_block(until);
         }
     }
-    if class != ConfirmRejectClass::Cancelled && class != ConfirmRejectClass::EngineFault {
-        if let Some(q) = query {
-            let tip = hub.and_then(|h| h.tip_height());
-            q.set_lookup_taken_hi(tip);
-            q.set_lookup_started_hi(tip);
-        }
-    }
     if class.is_soft() {
-        apply_soft_wire_reject(st, height, hash, err, query, hub);
+        apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
         return;
     }
     match class {
@@ -864,6 +863,7 @@ fn apply_soft_wire_reject(
     err: &str,
     query: Option<&rbitcoin_query::Query>,
     hub: Option<&crate::chain::ChainHub>,
+    sender: Option<usize>,
 ) {
     let bad_prev = super::reorg::is_bad_prev_err(err);
     if bad_prev {
@@ -889,23 +889,69 @@ fn apply_soft_wire_reject(
         let _ = q.block_queue_dequeue_height(height);
         if crate::chain::reject_is_mutated(err) {
             match q.clear_archived_body(hash.as_byte_array()) {
-                Ok(true) => warn!(
-                    "ibd: cleared corrupt Class A body for {hash} @{height} (merkle mismatch)"
-                ),
+                Ok(true) => {
+                    warn!("ibd: cleared corrupt Class A body for {hash} @{height} (mutated body)")
+                }
                 Ok(false) => {}
                 Err(e) => warn!("ibd: clear Class A body {hash} @{height}: {e}"),
             }
         }
     }
     if !bad_prev {
+        // `isolate_if_batched` leaves SoftWire only for a one-block wave, so
+        // `hash` is the block that failed and `sender` sent that copy. The
+        // live pending sender may be a replacement's.
+        if crate::chain::reject_is_mutated(err) {
+            if let Some(peer) = sender {
+                punish_mutated_sender(st, peer, hash);
+            }
+        }
+        // A batched soft reject was isolated as a cascade. It landed here on
+        // its own block, so it does not count toward the cascade halt. This
+        // also clears a count for another hash: the tip+1 retry got a
+        // verdict, so the pipeline is not stuck repeating that cascade.
+        st.cascade_at = None;
         st.body.mark_missing(hash);
         st.body.demote_known(hash);
+        st.reopen_for_densify(&[hash]);
         warn!("ibd: confirm reject soft @{height} {hash}: {err} (re-getdata, not blacklisted)");
     } else {
         warn!(
             "ibd: confirm reject BadPrev @{height} {hash}: {err} (slot evicted, not re-get same hash)"
         );
     }
+}
+
+/// Core `MaybePunishNodeForBlock` (`BLOCK_MUTATED`): drop the sender and
+/// cool down its address so the re-get goes to another peer. Redial falls
+/// back to a cooling address when no other is dialable. A noban peer stays.
+fn punish_mutated_sender(st: &mut IbdWorkState, peer: usize, hash: BlockHash) {
+    let Some(addr) = st
+        .slots
+        .iter()
+        .find(|s| s.id == peer && s.alive)
+        .map(|s| s.addr)
+    else {
+        return;
+    };
+    // IBD dials outbound only. A bind address only matters for inbound
+    // (`-whitebind`), so the peer address fills that slot.
+    let noban = st.perms.as_ref().is_some_and(|p| {
+        p.is_noban()
+            || p.permission_flags(addr, false, addr)
+                .has(crate::net_permissions::NetPermissionFlags::NOBAN)
+    });
+    if noban {
+        warn!("ibd: peer[{peer}] sent mutated block {hash}; not punishing noban peer");
+        return;
+    }
+    warn!("ibd: peer[{peer}] sent mutated block {hash}; dropping peer");
+    disconnect_peer(
+        &mut st.slots,
+        &mut st.addr_cooldown,
+        &mut st.addr_strikes,
+        peer,
+    );
 }
 
 fn apply_cascade_reject(
@@ -915,7 +961,8 @@ fn apply_cascade_reject(
     err: &str,
     hub: Option<&crate::chain::ChainHub>,
 ) {
-    // Leave the body queue: the plan was stale, the wire is still good.
+    // Leave the body queue: the plan was stale, and the confirm thread that
+    // rejected offered any body it held back.
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
     const CASCADE_HALT_AFTER: u8 = 3;
     let tip = hub

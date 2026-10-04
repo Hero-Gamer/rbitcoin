@@ -350,7 +350,10 @@ fn assign_reorg_need(
         if hub.query.block_queue_has_hash(&h.to_byte_array()) {
             continue;
         }
-        demote_zombie_pending_for_fetch(&mut st.body, hub, h, st.hash_height.get(&h).copied());
+        let ht = st.hash_height.get(&h).copied();
+        let held =
+            st.body.is_pending(&h) && ht.is_some_and(|ht| confirm_pipeline_holds(st, hub, h, ht));
+        demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht, held);
         if st.body.skip_download(hub, &h) {
             continue;
         }
@@ -616,7 +619,8 @@ fn need_hash_at(st: &mut IbdWorkState, hub: &ChainHub, ht: u32, room: usize) -> 
     if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
         return None;
     }
-    demote_zombie_pending_for_fetch(&mut st.body, hub, h, Some(ht));
+    let held = st.body.is_pending(&h) && confirm_pipeline_holds(st, hub, h, ht);
+    demote_zombie_pending_for_fetch(&mut st.body, hub, h, Some(ht), held);
     if st.body.skip_download(hub, &h) {
         return None;
     }
@@ -905,16 +909,19 @@ fn cover_first_pre_hole(
 /// Confirm intake and reorg gather need real wire (BQ / held). `mark_pending`
 /// alone is not enough — without BQ it is a zombie that would `skip_download`
 /// forever. Tip-hole cover and reorg densify (1b) share this; only walks the
-/// small hole/need lists (not the full pending map).
+/// small hole/need lists (not the full pending map). `held` is
+/// [`confirm_pipeline_holds`]: a body the confirm engine holds has no queue
+/// row but is not a zombie, and its verdict is still to come.
 #[inline]
 fn demote_zombie_pending_for_fetch(
     body: &mut super::body::BodyPresence,
     hub: &ChainHub,
     hash: BlockHash,
     height: Option<u32>,
+    held: bool,
 ) {
     use bitcoin::hashes::Hash as _;
-    if !body.is_pending(&hash) {
+    if held || !body.is_pending(&hash) {
         return;
     }
     if hub.has_block(&hash) {
@@ -932,6 +939,15 @@ fn demote_zombie_pending_for_fetch(
         }
     }
     body.mark_missing(hash);
+}
+
+/// `hash` is the path block at `height` and the confirm engine holds a body
+/// for that height: lookup has taken it (the take mark covers it), or load
+/// claimed it and write has not finished.
+fn confirm_pipeline_holds(st: &IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u32) -> bool {
+    st.height_to_hash.get(&height) == Some(&hash)
+        && (hub.query.lookup_already_taken(height)
+            || st.confirm_feed.as_ref().is_some_and(|f| f.holds(height)))
 }
 
 /// Stream rx older than this is not “recent” for tip-hole owner eviction.
@@ -1335,7 +1351,10 @@ pub(crate) fn cover_tip_holes(
         } else if hub.has_block(&h) {
             continue;
         }
-        demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht);
+        if st.body.is_pending(&h) && ht.is_some_and(|ht| confirm_pipeline_holds(st, hub, h, ht)) {
+            continue;
+        }
+        demote_zombie_pending_for_fetch(&mut st.body, hub, h, ht, false);
         let mut avoid: HashSet<usize> = HashSet::new();
         if let Some(req) = st.inflight.get(&h) {
             if let Some(pid) =
@@ -2002,6 +2021,24 @@ pub(in crate::ibd) mod tests {
         assert!(race(&mut st, &three, want, TIP_HOLE_MAX_PEERS) >= 1);
         assert!(st.inflight.contains_key(&want));
         assert!(!st.body.is_pending(&want), "cover demotes zombie pending");
+
+        // Load claimed tip+1 and write has not finished: its body is in the
+        // pipeline with no queue row. It is not a zombie and is not raced.
+        restart_on(&mut st, &hub, &mut wire, &three);
+        plant_tip_hole(&mut st, want, tip1);
+        st.body.mark_pending(want);
+        let feed = std::sync::Arc::new(crate::ibd::confirm::ConfirmFeed::new());
+        feed.inner.lock().unwrap().inflight.insert(tip1);
+        st.confirm_feed = Some(std::sync::Arc::clone(&feed));
+        assert_eq!(race(&mut st, &three, want, TIP_HOLE_MAX_PEERS), 0);
+        assert!(
+            st.body.is_pending(&want),
+            "a held body keeps its pending flag"
+        );
+        feed.finish([tip1]);
+        assert!(race(&mut st, &three, want, TIP_HOLE_MAX_PEERS) >= 1);
+        assert!(!st.body.is_pending(&want), "a released zombie is demoted");
+        st.confirm_feed = None;
 
         // A tight pack of streaming racers keeps its owners however old the
         // request is.

@@ -491,6 +491,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A re-arm (a reject offering bodies back at the tip) between lookup's
+    /// selection and its take wins: the take does not move the mark back
+    /// over the offered-back heights.
+    #[test]
+    fn lookup_take_after_a_rearm_keeps_the_rearm() {
+        let (dir, q) = temp_query();
+        q.set_lookup_taken_hi(Some(300));
+        let gen = q.lookup_taken_gen();
+        q.set_lookup_taken_hi(Some(100));
+        assert!(!q.advance_lookup_taken_hi(gen, 400), "stale take");
+        assert_eq!(q.lookup_taken_hi(), Some(100));
+        assert!(!q.lookup_already_taken(101));
+
+        let gen = q.lookup_taken_gen();
+        assert!(q.advance_lookup_taken_hi(gen, 101));
+        assert_eq!(q.lookup_taken_hi(), Some(101));
+        assert_eq!(q.lookup_taken_gen(), gen, "a take is not a re-arm");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn lookup_take_removes_bq_row_via_query() {
         let (dir, q) = temp_query();
@@ -582,7 +602,7 @@ mod tests {
         let intake2 = q.block_queue_wave_intake(&[7, 8]);
         assert_eq!(intake2.resolved.len(), 1);
         assert_eq!(intake2.raw.len(), 1);
-        assert_eq!(intake2.raw[0], (8, 0, 2));
+        assert_eq!(intake2.raw[0], (8, 0, 2, None));
         q.block_queue_drop_resolved_from(7);
         assert!(q.block_queue_resolved(7).is_none());
         assert_eq!(q.block_queue_dequeue_height(8).unwrap(), 1);

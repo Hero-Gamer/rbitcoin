@@ -300,8 +300,10 @@ pub struct Query {
     block_queue_pressure: AtomicBool,
     /// Last 1-min confirm window (`bq soft=n/win` `win`). 0 = rate unknown.
     soft_confirm_window: AtomicU32,
-    /// Last contiguous height lookup dequeued into loadq (`u32::MAX` = none).
-    lookup_taken_hi: AtomicU32,
+    /// Re-arm generation (high 32 bits) and the last contiguous height lookup
+    /// dequeued into loadq (low 32 bits, `u32::MAX` = none). One word, so a
+    /// take selected before a re-arm cannot overwrite it.
+    lookup_taken: AtomicU64,
     /// Highest height whose TipOnly **started** (`u32::MAX` = none).
     lookup_started_hi: AtomicU32,
     /// Max height whose Class A append committed (`u32::MAX` = none).
@@ -463,7 +465,7 @@ impl Query {
             }),
             block_queue_pressure: AtomicBool::new(false),
             soft_confirm_window: AtomicU32::new(0),
-            lookup_taken_hi: AtomicU32::new(u32::MAX),
+            lookup_taken: AtomicU64::new(u32::MAX as u64),
             lookup_started_hi: AtomicU32::new(u32::MAX),
             class_a_hi: AtomicU32::new(u32::MAX),
             sh_run: sh_builder::ShRunBuilder::new(&store_path),
@@ -1392,7 +1394,7 @@ impl Query {
 
     /// Last contiguous height lookup took off the BQ (`None` if none yet).
     pub fn lookup_taken_hi(&self) -> Option<u32> {
-        let h = self.lookup_taken_hi.load(AtomicOrdering::Acquire);
+        let h = self.lookup_taken.load(AtomicOrdering::Acquire) as u32;
         if h == u32::MAX {
             None
         } else {
@@ -1400,10 +1402,35 @@ impl Query {
         }
     }
 
-    /// Publish lookup consume high-water. `None` resets (disconnect / reject).
+    /// Re-arm generation lookup reads before it selects a wave.
+    pub fn lookup_taken_gen(&self) -> u32 {
+        (self.lookup_taken.load(AtomicOrdering::Acquire) >> 32) as u32
+    }
+
+    /// Re-arm the lookup consume high-water (disconnect, reject, rewind).
+    /// `None` resets. Bumps the generation so a take selected earlier does
+    /// not advance past it.
     pub fn set_lookup_taken_hi(&self, hi: Option<u32>) {
-        self.lookup_taken_hi
-            .store(hi.unwrap_or(u32::MAX), AtomicOrdering::Release);
+        let lo = u64::from(hi.unwrap_or(u32::MAX));
+        let _ = self.lookup_taken.fetch_update(
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |cur| {
+                let gen = ((cur >> 32) as u32).wrapping_add(1);
+                Some((u64::from(gen) << 32) | lo)
+            },
+        );
+    }
+
+    /// Lookup took `hi` off the BQ in a wave selected at generation `gen`.
+    /// Returns false, leaving the mark, when a re-arm came in between.
+    pub fn advance_lookup_taken_hi(&self, gen: u32, hi: u32) -> bool {
+        let next = (u64::from(gen) << 32) | u64::from(hi);
+        self.lookup_taken
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |cur| {
+                ((cur >> 32) as u32 == gen).then_some(next)
+            })
+            .is_ok()
     }
 
     pub fn lookup_started_hi(&self) -> Option<u32> {
@@ -1507,19 +1534,44 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<BlockQueueOffer, QueryError> {
+        self.block_queue_offer_from(height, hash, header_fk, payload, None)
+    }
+
+    /// [`Self::block_queue_offer`] that records the caller's id for the peer
+    /// the wire came from. Lookup carries it on [`ResolvedWire::sender`].
+    pub fn block_queue_offer_from(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        payload: &[u8],
+        sender: Option<u64>,
+    ) -> Result<BlockQueueOffer, QueryError> {
         {
             let g = self.block_queue.lock().unwrap();
             if let Some(id) = g.id_for_height(height) {
                 return Ok(BlockQueueOffer { queue_id: id });
             }
         }
-        let n_inputs = rbitcoin_store::block_wire_input_count(payload);
-        let owned = payload.to_vec();
+        self.block_queue_offer_vec(height, hash, header_fk, payload.to_vec(), sender)
+    }
+
+    /// [`Self::block_queue_offer_from`] for a payload the caller already
+    /// owns (moved in, not copied).
+    pub fn block_queue_offer_vec(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        owned: Vec<u8>,
+        sender: Option<u64>,
+    ) -> Result<BlockQueueOffer, QueryError> {
+        let n_inputs = rbitcoin_store::block_wire_input_count(&owned);
         let mut g = self.block_queue.lock().unwrap();
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
         }
-        let id = g.enqueue_vec(height, hash, header_fk, owned, n_inputs)?;
+        let id = g.enqueue_vec(height, hash, header_fk, owned, n_inputs, sender)?;
         Ok(BlockQueueOffer { queue_id: id })
     }
 
@@ -1534,7 +1586,7 @@ impl Query {
         let n_inputs = rbitcoin_store::block_wire_input_count(payload);
         let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
-        g.enqueue_vec(height, hash, header_fk, owned, n_inputs)
+        g.enqueue_vec(height, hash, header_fk, owned, n_inputs, None)
     }
 
     /// Remove RAM queue entry after combined confirm-write (or permanent drop).
@@ -1680,6 +1732,7 @@ impl Query {
                     h,
                     g.input_count_at(h).unwrap_or(0),
                     g.header_fk_at(h).unwrap_or(0),
+                    g.sender_at(h),
                 ));
             }
         }

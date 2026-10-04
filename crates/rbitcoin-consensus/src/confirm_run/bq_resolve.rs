@@ -184,12 +184,16 @@ pub fn confirm_bq_resolve_wave_capped(
     let intake = query.block_queue_wave_intake(heights);
     let mut n_inputs_at: U32Map<u32> = U32Map::default();
     let mut header_fk_at: U32Map<u64> = U32Map::default();
+    let mut sender_at: U32Map<u64> = U32Map::default();
     let raw_h: HashSet<u32> = intake
         .raw
         .into_iter()
-        .map(|(h, n, fk)| {
+        .map(|(h, n, fk, sender)| {
             n_inputs_at.insert(h, n);
             header_fk_at.insert(h, fk);
+            if let Some(s) = sender {
+                sender_at.insert(h, s);
+            }
             h
         })
         .collect();
@@ -282,6 +286,7 @@ pub fn confirm_bq_resolve_wave_capped(
                     n_inputs: n_inputs_at.get(&h).copied().unwrap_or(0),
                     header_fk: header_fk_at.get(&h).copied().unwrap_or(0),
                     spend_keys: Arc::from([]),
+                    sender: sender_at.get(&h).copied(),
                 },
             ));
             (block, pres)
@@ -376,18 +381,28 @@ pub fn confirm_bq_resolve_wave_capped(
     })
 }
 
-/// Dequeue BQ rows and bump `lookup_taken_hi` after a successful loadq send.
+/// Take one load batch: move `lookup_taken_hi` to its last height, then
+/// dequeue its BQ rows. `gen` is [`Query::lookup_taken_gen`] when the wave
+/// was selected. After a re-arm the mark stays at the re-arm and this
+/// returns `false` with the rows still queued, so the caller must not send
+/// the batch: lookup selects those rows again.
 pub fn take_wave_items_for_load(
     query: &Query,
     items: &[(u32, [u8; 32], ResolvedWire)],
-) -> Result<(), ConsensusError> {
+    gen: u32,
+) -> Result<bool, ConsensusError> {
+    let Some(&(last, _, _)) = items.last() else {
+        return Ok(true);
+    };
+    if !query.advance_lookup_taken_hi(gen, last) {
+        return Ok(false);
+    }
     for (h, _, _) in items {
         query
             .block_queue_dequeue_height(*h)
             .map_err(ConsensusError::from)?;
-        query.set_lookup_taken_hi(Some(*h));
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -409,7 +424,7 @@ mod tests {
     }
 
     fn take_emitted(q: &Query, wave: &BqResolveWave) {
-        take_wave_items_for_load(q, &wave.items).unwrap();
+        assert!(take_wave_items_for_load(q, &wave.items, q.lookup_taken_gen()).unwrap());
     }
 
     fn resolve_wave(
@@ -1226,6 +1241,38 @@ mod tests {
         );
         assert!(!q.block_queue_has_height(1));
         assert!(q.block_queue_has_height(4));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// A re-arm between selection and take wins: the take reports it lost,
+    /// leaves its rows on the queue for lookup to select again, and does not
+    /// move the mark. A take at the live generation consumes the rows.
+    #[test]
+    fn take_after_a_rearm_leaves_its_rows_queued() {
+        let (path, q) = tmp_query();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let mut prev = genesis.block_hash();
+        let mut time = genesis.header.time;
+        for h in 1..=2u32 {
+            time += 600;
+            let b = mine_empty_regtest(prev, time, h);
+            prev = b.block_hash();
+            q.block_queue_enqueue(h, prev.to_byte_array(), 1, &serialize(&b))
+                .unwrap();
+        }
+        let wave = resolve_wave(&q, &params, Milestone::NONE, &[1, 2]);
+        assert_eq!(wave.items.len(), 2);
+        let gen = q.lookup_taken_gen();
+        q.set_lookup_taken_hi(Some(0));
+        assert!(!take_wave_items_for_load(&q, &wave.items, gen).unwrap());
+        assert_eq!(q.lookup_taken_hi(), Some(0));
+        assert!(q.block_queue_has_height(1) && q.block_queue_has_height(2));
+
+        assert!(take_wave_items_for_load(&q, &wave.items, q.lookup_taken_gen()).unwrap());
+        assert_eq!(q.lookup_taken_hi(), Some(2));
+        assert!(!q.block_queue_has_height(1) && !q.block_queue_has_height(2));
         let _ = std::fs::remove_dir_all(&path);
     }
 }

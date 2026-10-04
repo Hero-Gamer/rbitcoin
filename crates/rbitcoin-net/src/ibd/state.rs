@@ -184,6 +184,10 @@ pub(crate) struct IbdWorkState {
     pub(crate) block_lens: VecDeque<u32>,
     /// Checkpoints for headers past the download queue.
     pub header_walk: super::header_walk::HeaderWalk,
+    /// `-whitelist` / operator noban grants. `None`: no peer is noban.
+    pub(crate) perms: Option<std::sync::Arc<crate::peers::PeerHub>>,
+    /// Confirm engine feed: assign does not demote a body load still holds.
+    pub(crate) confirm_feed: Option<std::sync::Arc<super::confirm::ConfirmFeed>>,
 }
 
 impl IbdWorkState {
@@ -244,6 +248,8 @@ impl IbdWorkState {
             intake_queued: 0,
             block_lens: VecDeque::new(),
             header_walk: super::header_walk::HeaderWalk::default(),
+            perms: None,
+            confirm_feed: None,
         }
     }
 

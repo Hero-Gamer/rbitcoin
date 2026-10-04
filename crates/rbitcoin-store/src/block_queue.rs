@@ -101,6 +101,8 @@ struct IndexEntry {
     body: QueuedBody,
     n_inputs: u32,
     resolve_complete: bool,
+    /// Caller's id for the peer that sent this wire (opaque here; RAM only).
+    sender: Option<u64>,
 }
 
 impl BlockQueue {
@@ -145,13 +147,14 @@ impl BlockQueue {
         payload: &[u8],
     ) -> Result<u64, StoreError> {
         let n_inputs = crate::block_wire_input_count(payload);
-        self.enqueue_vec(height, hash, header_fk, payload.to_vec(), n_inputs)
+        self.enqueue_vec(height, hash, header_fk, payload.to_vec(), n_inputs, None)
     }
 
     /// Enqueue an already-owned payload (copy happened outside the BQ lock).
     ///
     /// `n_inputs` is [`crate::block_wire_input_count`] from the caller so the
-    /// walk can run off the BQ mutex (peer offer).
+    /// walk can run off the BQ mutex (peer offer). `sender` is the caller's id
+    /// for the peer the wire came from, if any.
     pub fn enqueue_vec(
         &mut self,
         height: u32,
@@ -159,6 +162,7 @@ impl BlockQueue {
         header_fk: u64,
         payload: Vec<u8>,
         n_inputs: u32,
+        sender: Option<u64>,
     ) -> Result<u64, StoreError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
@@ -171,6 +175,7 @@ impl BlockQueue {
                 body: QueuedBody::Raw(payload),
                 n_inputs,
                 resolve_complete: false,
+                sender,
             },
         );
         self.height_to_id.entry(height).or_insert(id);
@@ -362,6 +367,11 @@ impl BlockQueue {
     /// Class A header fk stamped at enqueue (`None` if height missing).
     pub fn header_fk_at(&self, height: u32) -> Option<u64> {
         self.entry_for_height(height).map(|e| e.header_fk)
+    }
+
+    /// Sender id given at enqueue (`None` if height missing or none given).
+    pub fn sender_at(&self, height: u32) -> Option<u64> {
+        self.entry_for_height(height).and_then(|e| e.sender)
     }
 
     /// One-pass height list for a load pack: stored hash + resolve-complete.
