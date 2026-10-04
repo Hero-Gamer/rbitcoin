@@ -281,6 +281,9 @@ pub struct Store {
     mtp_ring: std::sync::RwLock<MtpRing>,
     /// Latest confirm height plus one. Zero means no snapshot yet.
     spend_snapshot: std::sync::atomic::AtomicU64,
+    /// First height of a confirm write whose spend annotate has not finished,
+    /// plus one. Zero means none.
+    spend_annotate_from: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
@@ -369,6 +372,7 @@ impl Store {
             height_fence: std::sync::RwLock::new(HeightFence::empty()),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
+            spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -431,6 +435,7 @@ impl Store {
             height_fence: std::sync::RwLock::new(height_fence),
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
+            spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -1584,10 +1589,32 @@ impl Store {
     ///
     /// This is not a durability claim. The checkpoint thread reads it before
     /// `sync_data` and publishes that height only.
+    ///
+    /// Stores `min(tip, confirmed tip)`. The caller may have read `tip` before
+    /// a disconnect lowered the chain. A clamp that does not change the
+    /// snapshot word does not retry a CAS, so after a successful store this
+    /// reads the tip again and lowers the word when the chain moved.
     pub fn note_spend_snapshot(&self, tip: u32) {
         use std::sync::atomic::Ordering;
-        self.spend_snapshot
-            .store(u64::from(tip).saturating_add(1), Ordering::Release);
+        let want_at = |live: Option<u32>| match live {
+            Some(h) => u64::from(tip.min(h)) + 1,
+            None => 0,
+        };
+        loop {
+            let want = want_at(self.confirmed.tip_height().map(|h| h.0));
+            let prev = self.spend_snapshot.load(Ordering::Acquire);
+            if prev != want
+                && self
+                    .spend_snapshot
+                    .compare_exchange(prev, want, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                continue;
+            }
+            if want_at(self.confirmed.tip_height().map(|h| h.0)) == want {
+                return;
+            }
+        }
     }
 
     pub fn spend_snapshot_height(&self) -> Option<u32> {
@@ -1598,8 +1625,80 @@ impl Store {
         }
     }
 
+    /// A confirm write from `height` may connect blocks before their spends
+    /// are annotated. Keeps the lowest pending height.
+    ///
+    /// The returned token is the word this note stored. A later note bumps
+    /// the generation in the high 32 bits, so a clear of this token does not
+    /// drop the later one. The low 32 bits are `height + 1`.
+    pub fn note_spend_annotate_pending(&self, height: u32) -> u64 {
+        use std::sync::atomic::Ordering;
+        let v = u64::from(height).saturating_add(1);
+        self.spend_annotate_from
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let cur_h = cur & 0xffff_ffff;
+                let new_h = if cur_h == 0 { v } else { cur_h.min(v) };
+                let mut gen = (cur >> 32).wrapping_add(1);
+                if gen == 0 {
+                    gen = 1;
+                }
+                let next = (gen << 32) | new_h;
+                (next != cur).then_some(next)
+            })
+            .map_or(0, |prev| {
+                let cur_h = prev & 0xffff_ffff;
+                let new_h = if cur_h == 0 { v } else { cur_h.min(v) };
+                let mut gen = (prev >> 32).wrapping_add(1);
+                if gen == 0 {
+                    gen = 1;
+                }
+                let next = (gen << 32) | new_h;
+                if next == prev {
+                    prev
+                } else {
+                    next
+                }
+            })
+    }
+
+    /// Lowest height whose spend annotate did not finish in this process.
+    pub fn spend_annotate_pending(&self) -> Option<u32> {
+        let v = self.spend_annotate_token() & 0xffff_ffff;
+        match v {
+            0 => None,
+            h => Some(h.saturating_sub(1) as u32),
+        }
+    }
+
+    /// Full in-process pending word, including the generation.
+    pub fn spend_annotate_token(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.spend_annotate_from.load(Ordering::Acquire)
+    }
+
+    /// Drop the pending word only when it is still `token`.
+    ///
+    /// A confirm write that finished its own annotate must not clear a
+    /// replacement that noted a later failure. Call only after this write's
+    /// annotate or replay returned `Ok`.
+    pub fn clear_spend_annotate_pending(&self, token: u64) {
+        use std::sync::atomic::Ordering;
+        if token == 0 {
+            return;
+        }
+        let _ = self
+            .spend_annotate_from
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                (cur == token).then_some(0)
+            });
+    }
+
     /// `sync_data` the replay stems, then publish `A = D = height` when the
     /// confirmed tip is still at least `height`. A lower tip leaves the marker.
+    ///
+    /// A pending spend annotate caps the published height below its first
+    /// height, so open still replays it. With pending from genesis, nothing is
+    /// published.
     pub fn checkpoint_spend_through(&self, height: u32) -> Result<(), StoreError> {
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
@@ -1609,11 +1708,32 @@ impl Store {
         if tip < height {
             return Ok(());
         }
+        let height = match self.spend_annotate_pending() {
+            Some(p) if p <= height => match p.checked_sub(1) {
+                Some(h) => h,
+                None => return Ok(()),
+            },
+            _ => height,
+        };
         crate::spend_durable::SpendDurable::new(height, height).store(self.path())
     }
 
     /// A disconnect below the marker lowers both heights to the new tip.
+    ///
+    /// The spend snapshot drops to the new tip too. A reconnect above it is not
+    /// annotated until its write finishes, so the checkpoint must not publish
+    /// the old snapshot over it.
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        let _ = self
+            .spend_snapshot
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let low = self
+                    .confirmed
+                    .tip_height()
+                    .map_or(0, |h| cur.min(u64::from(h.0) + 1));
+                (low != cur).then_some(low)
+            });
         let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {
             return Ok(());
         };

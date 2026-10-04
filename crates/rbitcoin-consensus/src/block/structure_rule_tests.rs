@@ -370,6 +370,7 @@ fn rejects_unspent_overwrite(q: &rbitcoin_query::Query, first: &Transaction) {
             &BatchParents::new(),
             &mut U32Map::default(),
             &heights,
+            &crate::block::ClassAWave::default(),
             &mut crate::block::StructuralScratch::default(),
             None,
         )
@@ -481,6 +482,7 @@ fn bip30_message_at_mainnet_above_bip34(
         &BatchParents::new(),
         &mut U32Map::default(),
         &heights,
+        &crate::block::ClassAWave::default(),
         &mut crate::block::StructuralScratch::default(),
         None,
     )
@@ -1848,6 +1850,7 @@ fn bip30_ignores_unspendable_outputs() {
             &BatchParents::new(),
             &mut mtp_cache,
             &RunCreateHeight::Spans(Vec::new()),
+            &crate::block::ClassAWave::default(),
             &mut crate::block::StructuralScratch::default(),
             None,
         )
@@ -2321,6 +2324,7 @@ fn already_archived_schema13_pin_identity_tip_follow() {
             &parents,
             &mut mtp,
             &heights,
+            &crate::block::ClassAWave::default(),
             &mut crate::block::StructuralScratch::default(),
             None,
         )
