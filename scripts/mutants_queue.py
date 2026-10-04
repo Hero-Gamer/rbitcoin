@@ -96,6 +96,54 @@ def rust_re_exact(line: str) -> str:
     return f"^{body}$"
 
 
+def file_batch(lines: list[str], offset: int, cap: int) -> list[str]:
+    """Queue lines from ``offset`` that share one path, at most ``cap``.
+
+    cargo-mutants 27.1.0 emits ``..`` struct field deletes without applying
+    ``--re``. One source file per invocation keeps that repeat inside the
+    file under test.
+    """
+    if offset < 0 or cap < 1:
+        raise ValueError("file batch")
+    queued = [line.strip() for line in lines if parse_mutant(line.strip())]
+    if offset >= len(queued):
+        return []
+    path = parse_mutant(queued[offset])[0]
+    out: list[str] = []
+    for line in queued[offset:]:
+        if parse_mutant(line)[0] != path or len(out) >= cap:
+            break
+        out.append(line)
+    return out
+
+
+_OUTCOME_NAME = re.compile(
+    r"^(?:caught|MISSED|TIMEOUT|unviable)\s+(.*?)\s+in \d"
+)
+
+
+def prefix_progress(log: str, requested: list[str]) -> int:
+    """How far into ``requested`` the log got, in order.
+
+    Outcome lines for other mutants (the unfiltered struct-field deletes)
+    do not count, and a later hit does not skip a hole.
+    """
+    done: set[str] = set()
+    for raw in log.splitlines():
+        match = _OUTCOME_NAME.match(raw.strip())
+        if match:
+            done.add(match.group(1))
+    count = 0
+    for line in requested:
+        name = line.strip()
+        if not name:
+            continue
+        if name not in done:
+            break
+        count += 1
+    return count
+
+
 def finished_mutants(log: str) -> int:
     """How many mutants a cargo-mutants batch actually finished.
 
@@ -151,12 +199,30 @@ def main(argv: list[str]) -> int:
     fin = sub.add_parser("finished")
     fin.add_argument("--log", type=Path, required=True)
 
+    batch_p = sub.add_parser("file-batch")
+    batch_p.add_argument("--queue", type=Path, required=True)
+    batch_p.add_argument("--offset", type=int, required=True)
+    batch_p.add_argument("--cap", type=int, required=True)
+
+    prog = sub.add_parser("progress")
+    prog.add_argument("--log", type=Path, required=True)
+    prog.add_argument("--slice", type=Path, required=True)
+
     args = parser.parse_args(argv)
     if args.cmd == "re":
         print(rust_re_exact(args.line))
         return 0
     if args.cmd == "finished":
         print(finished_mutants(args.log.read_text()))
+        return 0
+    if args.cmd == "file-batch":
+        lines = file_batch(args.queue.read_text().splitlines(), args.offset, args.cap)
+        for line in lines:
+            print(line)
+        return 0
+    if args.cmd == "progress":
+        requested = args.slice.read_text().splitlines()
+        print(prefix_progress(args.log.read_text(), requested))
         return 0
 
     if args.cmd == "order":

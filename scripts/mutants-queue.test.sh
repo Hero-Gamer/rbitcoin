@@ -81,6 +81,32 @@ EOF
 partial="$(python3 "$PY" finished --log "$tmp/partial.log")"
 assert_ok "killed batch counts outcome lines" test "$partial" = 2
 
+cat >"$tmp/queue.txt" <<'EOF'
+crates/a/src/lib.rs:1:1: replace a in f
+crates/a/src/lib.rs:2:1: replace b in f
+crates/b/src/lib.rs:3:1: replace c in f
+EOF
+batch="$(python3 "$PY" file-batch --queue "$tmp/queue.txt" --offset 0 --cap 10)"
+assert_ok "file batch stays on the first path" test "$batch" = "$(printf '%s\n' \
+  'crates/a/src/lib.rs:1:1: replace a in f' \
+  'crates/a/src/lib.rs:2:1: replace b in f')"
+capped="$(python3 "$PY" file-batch --queue "$tmp/queue.txt" --offset 0 --cap 1)"
+assert_ok "file batch honors the cap" test "$capped" = "crates/a/src/lib.rs:1:1: replace a in f"
+next_file="$(python3 "$PY" file-batch --queue "$tmp/queue.txt" --offset 2 --cap 10)"
+assert_ok "file batch offset reaches the next path" test "$next_file" = "crates/b/src/lib.rs:3:1: replace c in f"
+
+cat >"$tmp/slice.txt" <<'EOF'
+crates/a/src/lib.rs:2:1: replace b in f
+crates/a/src/lib.rs:4:1: replace d in f
+EOF
+cat >"$tmp/killed.log" <<'EOF'
+unviable crates/a/src/lib.rs:1:1: delete field x from struct S expression in f in 1s build
+caught   crates/a/src/lib.rs:2:1: replace b in f in 10s build + 4s test
+caught   crates/a/src/lib.rs:9:1: replace z in f in 10s build + 4s test
+EOF
+prog="$(python3 "$PY" progress --log "$tmp/killed.log" --slice "$tmp/slice.txt")"
+assert_ok "progress ignores unfiltered deletes and stops at a hole" test "$prog" = 1
+
 NIGHTLY="$ROOT/scripts/mutants-nightly.sh"
 TOML="$ROOT/.cargo/mutants.toml"
 assert_ok "nightly list excludes rbitcoin-bench" \
@@ -94,8 +120,12 @@ assert_ok "nightly cron is 03:47 UTC" \
   grep -q 'cron: "47 3 \* \* \*"' "$WF"
 assert_ok "nightly uses the queue regex helper" \
   grep -q 'mutants_queue.py" re' "$NIGHTLY"
-assert_ok "nightly counts the mutants summary" \
-  grep -q 'mutants_queue.py" finished' "$NIGHTLY"
+assert_ok "nightly examines one file" \
+  grep -q -- '--file' "$NIGHTLY"
+assert_ok "nightly batches by file" \
+  grep -q 'mutants_queue.py" file-batch' "$NIGHTLY"
+assert_ok "nightly progress ignores extra outcomes" \
+  grep -q 'mutants_queue.py" progress' "$NIGHTLY"
 assert_ok "same-file cursor copy is skipped" \
   grep -q -- '-ef' "$NIGHTLY"
 assert_ok "job timeout is 330 minutes" \
