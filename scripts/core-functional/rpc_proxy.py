@@ -9,12 +9,15 @@ Wallet/utility methods are handled locally in later steps.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
 import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+
+from rpcauth import password_to_hmac
 
 
 # GBT longpoll can sit ~80s; stay under Core's client-side patience.
@@ -73,6 +76,143 @@ def authorization_ok(authorization: str, cookie_line: str | None) -> bool:
         return False
     _user, password = parsed
     return password == token_from_cookie_line(cookie_line)
+
+
+def parse_rpcauth_line(line: str) -> tuple[str, str, str] | None:
+    """Core `rpcauth=user:salt$hash` (HMAC-SHA256, salt is the key)."""
+    raw = line.strip()
+    if ":" not in raw or "$" not in raw:
+        return None
+    user, rest = raw.split(":", 1)
+    salt, mac = rest.split("$", 1)
+    if not user or not salt or not mac:
+        return None
+    return user, salt, mac
+
+
+def parse_whitelist_line(line: str) -> tuple[str, set[str]] | None:
+    """Core `rpcwhitelist=user:method,method`."""
+    raw = line.strip()
+    if ":" not in raw:
+        return None
+    user, methods = raw.split(":", 1)
+    user = user.strip()
+    if not user:
+        return None
+    return user, {m.strip() for m in methods.split(",") if m.strip()}
+
+
+def whitelist_map(lines: list[str]) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for line in lines:
+        parsed = parse_whitelist_line(line)
+        if parsed is None:
+            continue
+        user, methods = parsed
+        out.setdefault(user, set()).update(methods)
+    return out
+
+
+def _hmac_ok(salt: str, password: str, expected: str) -> bool:
+    got = password_to_hmac(salt, password)
+    if len(got) != len(expected):
+        return False
+    return hmac.compare_digest(got, expected)
+
+
+def _others_restricted(whitelist_default: str | None, has_entries: bool) -> bool:
+    """Core: default 0 limits only users who have a whitelist entry.
+
+    Unset, or any other value, subjects every other user to an empty list
+    once a whitelist exists. Explicit non-zero with no entries denies all.
+    """
+    if whitelist_default is None:
+        return has_entries
+    if whitelist_default.strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return True
+
+
+def method_permitted(
+    user: str,
+    method: str | None,
+    entries: dict[str, set[str]],
+    whitelist_default: str | None,
+) -> bool:
+    if user in entries:
+        return method is not None and method in entries[user]
+    if _others_restricted(whitelist_default, bool(entries)):
+        return False
+    return True
+
+
+def authenticated_user(
+    authorization: str,
+    cookie_line: str | None,
+    rpcauth_lines: list[str],
+) -> str | None:
+    """Username that passed cookie, tank-token, or `rpcauth` HMAC.
+
+    No cookie and no `rpcauth` lines stays open (the functional harness
+    before `.cookie` exists). A cookie line refuses a password that matches
+    neither the token nor an `rpcauth` row.
+    """
+    parsed = parse_basic_userpass(authorization)
+    if not cookie_line and not rpcauth_lines:
+        return parsed[0] if parsed else ""
+    if cookie_line:
+        want = "Basic " + base64.b64encode(cookie_line.encode()).decode()
+        if authorization == want:
+            return "__cookie__"
+        if parsed is not None and parsed[1] == token_from_cookie_line(cookie_line):
+            return parsed[0]
+    if parsed is None:
+        return "" if not cookie_line else None
+    user, password = parsed
+    for line in rpcauth_lines:
+        rec = parse_rpcauth_line(line)
+        if rec is None or rec[0] != user:
+            continue
+        if _hmac_ok(rec[1], password, rec[2]):
+            return user
+        return None
+    if not cookie_line:
+        return user
+    return None
+
+
+def rpc_methods(payload: Any) -> list[str | None]:
+    if isinstance(payload, dict):
+        method = payload.get("method")
+        return [method if isinstance(method, str) else None]
+    if isinstance(payload, list):
+        out: list[str | None] = []
+        for item in payload:
+            if isinstance(item, dict) and isinstance(item.get("method"), str):
+                out.append(item["method"])
+            else:
+                out.append(None)
+        return out or [None]
+    return [None]
+
+
+def request_authorized(
+    authorization: str,
+    cookie_line: str | None,
+    rpcauth_lines: list[str],
+    whitelist_lines: list[str],
+    whitelist_default: str | None,
+    payload: Any,
+) -> str:
+    """`ok`, `unauthorized`, or `forbidden` for one HTTP RPC body."""
+    user = authenticated_user(authorization, cookie_line, rpcauth_lines)
+    if user is None:
+        return "unauthorized"
+    entries = whitelist_map(whitelist_lines)
+    for method in rpc_methods(payload):
+        if not method_permitted(user, method, entries, whitelist_default):
+            return "forbidden"
+    return "ok"
 
 
 def core_btc_kvb_to_sat_vb(value: Any) -> int:
@@ -219,9 +359,15 @@ class RpcProxy:
         listen: tuple[str, int],
         node_url: str,
         cookie_line: Callable[[], str | None],
+        rpcauth_lines: list[str] | None = None,
+        whitelist_lines: list[str] | None = None,
+        whitelist_default: str | None = None,
     ) -> None:
         self.node_url = node_url.rstrip("/") + "/"
         self.cookie_line = cookie_line
+        self.rpcauth_lines = list(rpcauth_lines or [])
+        self.whitelist_lines = list(whitelist_lines or [])
+        self.whitelist_default = whitelist_default
         self._handlers: dict[str, Callable[[Any], dict[str, Any]]] = {}
         proxy = self
 
@@ -257,11 +403,25 @@ class RpcProxy:
 
     def handle_http(self, raw: bytes, authorization: str) -> tuple[int, bytes]:
         cookie = self.cookie_line()
-        if not authorization_ok(authorization, cookie):
-            return 401, b'{"error":"unauthorized"}\n'
         try:
             payload = json.loads(raw.decode() or "null")
+            parsed = True
         except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = None
+            parsed = False
+        decision = request_authorized(
+            authorization,
+            cookie,
+            self.rpcauth_lines,
+            self.whitelist_lines,
+            self.whitelist_default,
+            payload,
+        )
+        if decision == "unauthorized":
+            return 401, b'{"error":"unauthorized"}\n'
+        if decision == "forbidden":
+            return 403, b'{"error":"forbidden"}\n'
+        if not parsed:
             return self.forward_raw(raw)
         try:
             if isinstance(payload, list):

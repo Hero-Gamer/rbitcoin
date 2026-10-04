@@ -275,4 +275,133 @@ assert body["result"][1] == {"txid": "bb", "wtxid": "wb"}, body
 node.shutdown()
 proxy.shutdown()
 print("ok - rpc_proxy forward + local handler")
+
+# Warnet fork-observer: published rpcauth, whitelist, tank password, cookie.
+# Drove through RpcProxy.handle_http (the shim's listen path).
+FORK_AUTH = (
+    "forkobserver:1418183465eecbd407010cf60811c6a0$"
+    "d4e5f0647a63429c218da1302d7f19fe627302aeb0a71a74de55346a25d8057c"
+)
+FORK_PASSWORD = "tabconf2024"
+FORK_WHITELIST = (
+    "forkobserver:getchaintips,getblockheader,getblockhash,getblock,getnetworkinfo"
+)
+TANK_PASSWORD = "secret0"
+TANK_COOKIE = f"__cookie__:{TANK_PASSWORD}"
+
+
+class TankNode(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        return
+
+    def do_POST(self):
+        auth = self.headers.get("Authorization", "")
+        n = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(n)
+        item = json.loads(raw.decode())
+        if auth != "Bearer " + TANK_PASSWORD:
+            body = json.dumps(
+                {
+                    "result": None,
+                    "error": {"code": -32600, "message": "auth"},
+                    "id": item.get("id"),
+                }
+            ).encode()
+            self.send_response(401)
+        else:
+            body = json.dumps(
+                {
+                    "result": item.get("method"),
+                    "error": None,
+                    "id": item.get("id"),
+                }
+            ).encode()
+            self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+node2 = HTTPServer(("127.0.0.1", 0), TankNode)
+threading.Thread(target=node2.serve_forever, daemon=True).start()
+proxy2 = RpcProxy(
+    ("127.0.0.1", 0),
+    f"http://127.0.0.1:{node2.server_address[1]}",
+    lambda: TANK_COOKIE,
+    rpcauth_lines=[FORK_AUTH],
+    whitelist_lines=[FORK_WHITELIST],
+    whitelist_default="0",
+)
+proxy2.start()
+port2 = proxy2._httpd.server_address[1]
+
+
+def call2(method, user, password):
+    token = base64.b64encode(f"{user}:{password}".encode()).decode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port2}/",
+        data=json.dumps(
+            {"jsonrpc": "1.0", "id": 1, "method": method, "params": []}
+        ).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Basic " + token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode()
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            body = {"raw": raw}
+        return e.code, body
+
+
+def call2_cookie(method):
+    token = base64.b64encode(TANK_COOKIE.encode()).decode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port2}/",
+        data=json.dumps(
+            {"jsonrpc": "1.0", "id": 1, "method": method, "params": []}
+        ).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Basic " + token,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return resp.status, json.loads(resp.read().decode())
+
+
+for method in (
+    "getchaintips",
+    "getblockheader",
+    "getblockhash",
+    "getblock",
+    "getnetworkinfo",
+):
+    st, body = call2(method, "forkobserver", FORK_PASSWORD)
+    assert st == 200, (method, st, body)
+    assert body["result"] == method, (method, body)
+
+st, body = call2("generatetoaddress", "forkobserver", FORK_PASSWORD)
+assert st == 403, (st, body)
+st, body = call2("generatetoaddress", "user", TANK_PASSWORD)
+assert st == 200, (st, body)
+assert body["result"] == "generatetoaddress", body
+st, body = call2("getblock", "forkobserver", "not-the-password")
+assert st == 401, (st, body)
+st, body = call2_cookie("generatetoaddress")
+assert st == 200, (st, body)
+assert body["result"] == "generatetoaddress", body
+
+node2.shutdown()
+proxy2.shutdown()
+print("ok - fork-observer rpcauth whitelist and tank password")
 PY

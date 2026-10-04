@@ -345,6 +345,74 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# Lab image: no head_scale in conf, entrypoint default selects tiny.
+# Explicit head_scale=mainnet still wins. Unset lab env leaves the node default.
+HS_DD="$WORKDIR/warnet-no-scale"
+mkdir -p "$HS_DD"
+printf 'regtest=1\nrpcpassword=secret0\nrpcbind=0.0.0.0\naddnode=tank-0001\nport=18444\nrpcport=18443\n' >"$HS_DD/bitcoin.conf"
+OUT_HS="$(RBITCOIN_LAB_HEAD_SCALE=tiny "$SHIM" --print-cmd -datadir="$HS_DD" -regtest 2>/dev/null)" || OUT_HS=""
+if printf '%s' "$OUT_HS" | grep -q -- "--head-scale tiny" \
+  && printf '%s' "$OUT_HS" | grep -q -- "--connect tank-0001:18444" \
+  && [[ "$(cat "$HS_DD/regtest/rpc.token")" == "secret0" ]]; then
+  echo "ok - lab default head scale is tiny when conf omits it"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - lab default head scale is tiny (got: $OUT_HS)"
+  FAIL=$((FAIL + 1))
+fi
+printf 'regtest=1\nhead_scale=mainnet\nport=18444\nrpcport=18443\n' >"$HS_DD/bitcoin.conf"
+OUT_HM="$(RBITCOIN_LAB_HEAD_SCALE=tiny "$SHIM" --print-cmd -datadir="$HS_DD" -regtest 2>/dev/null)" || OUT_HM=""
+if printf '%s' "$OUT_HM" | grep -q -- "--head-scale mainnet" \
+  && ! printf '%s' "$OUT_HM" | grep -q -- "--head-scale tiny"; then
+  echo "ok - conf head_scale=mainnet overrides the lab default"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - conf head_scale=mainnet overrides the lab default (got: $OUT_HM)"
+  FAIL=$((FAIL + 1))
+fi
+# Conf still says mainnet; drop it and leave the lab env unset.
+printf 'regtest=1\nport=18444\nrpcport=18443\n' >"$HS_DD/bitcoin.conf"
+OUT_HU="$(env -u RBITCOIN_LAB_HEAD_SCALE "$SHIM" --print-cmd -datadir="$HS_DD" -regtest 2>/dev/null)" || OUT_HU=""
+if ! printf '%s' "$OUT_HU" | grep -q -- "--head-scale"; then
+  echo "ok - omitted head_scale without the lab env stays the node default"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - omitted head_scale without the lab env (got: $OUT_HU)"
+  FAIL=$((FAIL + 1))
+fi
+
+# Lab log switch: node stdout is tee'd. Off, the shim stays quiet.
+MARK="warnet-log-marker-$RANDOM-$$"
+LOG_FAKE="$WORKDIR/rbitcoin-node-logmark"
+printf '%s\n' '#!/bin/sh' "printf '%s\n' '$MARK'" 'exit 0' >"$LOG_FAKE"
+chmod +x "$LOG_FAKE"
+LOG_DD="$WORKDIR/log-on"
+mkdir -p "$LOG_DD"
+printf 'regtest=1\nport=18444\nrpcport=18443\n' >"$LOG_DD/bitcoin.conf"
+LOG_OUT="$(RBITCOIN_NODE="$LOG_FAKE" RBITCOIN_LOG_STDOUT=1 "$SHIM" -datadir="$LOG_DD" -regtest 2>"$WORKDIR/log-on.err")" || true
+if printf '%s\n' "$LOG_OUT" | grep -qx -- "$MARK" \
+  && ! grep -q -- "$MARK" "$WORKDIR/log-on.err" \
+  && grep -qx -- "$MARK" "$LOG_DD/regtest/debug.log"; then
+  echo "ok - RBITCOIN_LOG_STDOUT=1 tees the node line to stdout and debug.log"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - log stdout on (out=$(printf %q "$LOG_OUT") err=$(cat "$WORKDIR/log-on.err") log=$(cat "$LOG_DD/regtest/debug.log" 2>/dev/null))"
+  FAIL=$((FAIL + 1))
+fi
+LOG_DD2="$WORKDIR/log-off"
+mkdir -p "$LOG_DD2"
+printf 'regtest=1\nport=18444\nrpcport=18443\n' >"$LOG_DD2/bitcoin.conf"
+LOG_OUT2="$(RBITCOIN_NODE="$LOG_FAKE" env -u RBITCOIN_LOG_STDOUT "$SHIM" -datadir="$LOG_DD2" -regtest 2>"$WORKDIR/log-off.err")" || true
+if ! printf '%s\n' "$LOG_OUT2" | grep -q -- "$MARK" \
+  && ! grep -q -- "$MARK" "$WORKDIR/log-off.err" \
+  && grep -qx -- "$MARK" "$LOG_DD2/regtest/debug.log"; then
+  echo "ok - log switch off keeps the node line in debug.log only"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - log stdout off (out=$(printf %q "$LOG_OUT2") err=$(cat "$WORKDIR/log-off.err") log=$(cat "$LOG_DD2/regtest/debug.log" 2>/dev/null))"
+  FAIL=$((FAIL + 1))
+fi
+
 assert_fail_msg "port 65536 invalid" "Error: Invalid port specified in -port: '65536'" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -listen -port=65536
 assert_fail_msg "port 0 invalid" "Error: Invalid port specified in -port: '0'" \
