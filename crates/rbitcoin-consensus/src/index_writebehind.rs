@@ -18,6 +18,7 @@
 use crate::index_rows::{self, IndexHeightOut, IndexRows};
 use crate::silent_payments::tweak_records_from_window;
 use crate::ConsensusError;
+use rbitcoin_log::progress;
 #[cfg(test)]
 use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
@@ -42,6 +43,77 @@ fn next_needed(query: &Query) -> Option<u32> {
     match (query.filter_index_next(), query.tweak_index_next()) {
         (Some(f), Some(t)) => Some(f.min(t)),
         (f, t) => f.or(t),
+    }
+}
+
+/// `blockfilter build` and `sp_tweaks build` for the health listener's
+/// `/progress`, one stage per index since the two watermarks move apart (an
+/// index turned on later, or a tweak origin above 0). Counts heights from
+/// where the index starts (0 for filters, the tweak origin for tweaks) through
+/// the target, read from the committed watermarks. A stage begins only when
+/// its index is a full window behind, so tip following does not register one
+/// per block, and ends when the watermark passes the target or the index is
+/// turned off.
+#[derive(Default)]
+struct IndexStages {
+    filters: Option<progress::Stage>,
+    tweaks: Option<progress::Stage>,
+}
+
+impl IndexStages {
+    /// Refresh from the watermarks. `filters` / `tweaks` false leave that
+    /// index untracked (a startup repair that skips it).
+    fn observe(&mut self, query: &Query, target: Option<u32>, filters: bool, tweaks: bool) {
+        if filters {
+            track_index(
+                &mut self.filters,
+                "blockfilter build",
+                query.filter_index_next(),
+                0,
+                target,
+            );
+        }
+        if tweaks {
+            track_index(
+                &mut self.tweaks,
+                "sp_tweaks build",
+                query.tweak_index_next(),
+                query.sptweaks_origin().0,
+                target,
+            );
+        }
+    }
+}
+
+fn track_index(
+    slot: &mut Option<progress::Stage>,
+    stage: &'static str,
+    next: Option<u32>,
+    from: u32,
+    target: Option<u32>,
+) {
+    let (Some(next), Some(target)) = (next, target) else {
+        *slot = None;
+        return;
+    };
+    let done = u64::from(next.saturating_sub(from));
+    let total = u64::from(target.saturating_add(1).saturating_sub(from));
+    if next > target {
+        if let Some(s) = slot.take() {
+            s.set_total(total);
+            s.set_done(done);
+        }
+        return;
+    }
+    match slot {
+        Some(s) => {
+            s.set_total(total);
+            s.set_done(done);
+        }
+        None if target - next >= WINDOW_HEIGHTS => {
+            *slot = Some(progress::begin_at(stage, total, done));
+        }
+        None => {}
     }
 }
 
@@ -128,6 +200,16 @@ fn seal_through(
         (None, Some(t)) => t,
         (None, None) => return Ok(()),
     };
+    let mut live = IndexStages::default();
+    let observe = |live: &mut IndexStages| {
+        live.observe(
+            query,
+            Some(tip),
+            filter_from.is_some(),
+            tweak_from.is_some(),
+        );
+    };
+    observe(&mut live);
     while start <= tip {
         let end = plan_window(query, start, tip)?;
         let window = Arc::new(read_window_from(query, start, end, tweak_from)?);
@@ -137,6 +219,7 @@ fn seal_through(
                 "invariant: startup index repair",
             )));
         }
+        observe(&mut live);
         if end >= tip {
             break;
         }
@@ -365,6 +448,8 @@ fn commit_window(
 
 /// Seal every released height on this thread (regtest `generate`, tests).
 pub fn build_indexes_released(query: &Query) -> Result<(), ConsensusError> {
+    let mut live = IndexStages::default();
+    live.observe(query, query.index_target(), true, true);
     while let (Some(start), Some(target)) = (next_needed(query), query.index_target()) {
         if start > target {
             break;
@@ -372,7 +457,9 @@ pub fn build_indexes_released(query: &Query) -> Result<(), ConsensusError> {
         let end = plan_window(query, start, target)?;
         let stages = IndexStageMs::default();
         let window = Arc::new(read_window(query, start, end)?);
-        if !commit_window(query, &window, &stages)?.ok {
+        let ok = commit_window(query, &window, &stages)?.ok;
+        live.observe(query, query.index_target(), true, true);
+        if !ok {
             break;
         }
     }
@@ -483,11 +570,13 @@ fn io_loop(
     let mut on_filters_caught_up = Some(on_filters_caught_up);
     let mut cursor: Option<u32> = None;
     let mut pass: Option<Pass> = None;
+    let mut live = IndexStages::default();
     while !stop.load(Ordering::Relaxed) {
         if resync.swap(false, Ordering::AcqRel) {
             cursor = None;
         }
         let target = query.index_target();
+        live.observe(query, target, true, true);
         if let (Some(t), Some(f)) = (target, query.filter_index_next()) {
             if f > t {
                 if let Some(cb) = on_filters_caught_up.take() {
@@ -1065,6 +1154,147 @@ mod tests {
             "{lines:?}"
         );
 
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// Heights `0..=through`, one coinbase each.
+    fn coinbase_chain(q: &Query, through: u32) {
+        let (mut prev_fk, mut prev_hash) = (Fk::NULL, None);
+        connect_coinbases(q, 0, through, &mut prev_fk, &mut prev_hash);
+    }
+
+    /// `(stage, base, done, total)` of the index stages that ended on this
+    /// thread since [`progress::capture_finished`].
+    fn finished_index_stages() -> Vec<(&'static str, u64, u64, u64)> {
+        progress::take_finished()
+            .into_iter()
+            .filter(|s| s.stage == "blockfilter build" || s.stage == "sp_tweaks build")
+            .map(|s| (s.stage, s.base, s.done, s.total))
+            .collect()
+    }
+
+    #[test]
+    fn index_stage_begins_a_window_behind_and_ends_past_the_target() {
+        progress::capture_finished(true);
+        let mut slot = None;
+        track_index(
+            &mut slot,
+            "blockfilter build",
+            Some(0),
+            0,
+            Some(WINDOW_HEIGHTS - 1),
+        );
+        assert!(slot.is_none(), "less than a window behind");
+        track_index(
+            &mut slot,
+            "blockfilter build",
+            Some(0),
+            0,
+            Some(WINDOW_HEIGHTS),
+        );
+        assert!(slot.is_some(), "a full window behind");
+        track_index(&mut slot, "blockfilter build", Some(40), 0, Some(100));
+        track_index(&mut slot, "blockfilter build", Some(90), 0, Some(100));
+        assert!(slot.is_some(), "short of the target");
+        track_index(&mut slot, "blockfilter build", Some(102), 0, Some(101));
+        assert!(slot.is_none(), "past a target that moved");
+        assert_eq!(
+            finished_index_stages(),
+            [("blockfilter build", 0, 102, 102)]
+        );
+
+        track_index(&mut slot, "sp_tweaks build", Some(1_000), 900, Some(1_100));
+        track_index(&mut slot, "sp_tweaks build", Some(1_050), 900, Some(1_100));
+        track_index(&mut slot, "sp_tweaks build", None, 900, Some(1_100));
+        assert!(slot.is_none(), "index turned off");
+        assert_eq!(
+            finished_index_stages(),
+            [("sp_tweaks build", 100, 150, 201)],
+            "counted from the origin, stopped where it was"
+        );
+        track_index(&mut slot, "sp_tweaks build", Some(5), 0, None);
+        assert!(slot.is_none(), "no target, nothing to build");
+        progress::capture_finished(false);
+    }
+
+    /// Filters already sealed at height 0, tweaks from origin 1: each stage
+    /// counts from its own start and ends at its own total.
+    #[test]
+    fn released_builder_reports_each_index_from_its_start() {
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("idx-progress-released");
+        q.set_block_filter_index(true).unwrap();
+        let tip = WINDOW_HEIGHTS + 1;
+        coinbase_chain(&q, tip);
+        let first = Arc::new(read_window(&q, 0, 0).unwrap());
+        let filter = q.basic_filter_from_window(&first, 0).unwrap();
+        q.commit_window_filters(0, &[(filter, first.blocks[0].header_fk)])
+            .unwrap();
+        q.set_sptweaks_enabled(true, Height(1)).unwrap();
+        q.release_index_writebehind(Height(tip));
+
+        progress::capture_finished(true);
+        build_indexes_released(&q).unwrap();
+        let fin = finished_index_stages();
+        progress::capture_finished(false);
+        assert_eq!(q.filter_index_next(), Some(tip + 1));
+        assert_eq!(q.tweak_index_next(), Some(tip + 1));
+        let total = u64::from(tip) + 1;
+        assert_eq!(
+            fin,
+            [
+                ("blockfilter build", 1, total, total),
+                ("sp_tweaks build", 0, total - 1, total - 1),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    #[test]
+    fn startup_repair_reports_only_the_indexes_it_seals() {
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("idx-progress-repair");
+        q.set_block_filter_index(true).unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let tip = WINDOW_HEIGHTS + 1;
+        coinbase_chain(&q, tip);
+        let first = Arc::new(read_window(&q, 0, 0).unwrap());
+        let filter = q.basic_filter_from_window(&first, 0).unwrap();
+        q.commit_window_filters(0, &[(filter, first.blocks[0].header_fk)])
+            .unwrap();
+
+        // Tweaks are one height further behind than the cap: only filters
+        // are repaired here.
+        progress::capture_finished(true);
+        prepare_live_indexes_limited(&q, tip).unwrap();
+        let fin = finished_index_stages();
+        progress::capture_finished(false);
+        assert_eq!(q.filter_index_next(), Some(tip + 1));
+        assert_eq!(q.tweak_index_next(), Some(0));
+        let total = u64::from(tip) + 1;
+        assert_eq!(fin, [("blockfilter build", 1, total, total)]);
+        let _ = std::fs::remove_dir_all(dir.path());
+    }
+
+    /// The write-behind IO thread registers the stage from the watermark
+    /// before it reads; with no CPU worker nothing commits, so it ends where
+    /// it began.
+    #[test]
+    fn writebehind_registers_a_stage_for_a_wide_gap() {
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("idx-progress-wb");
+        q.set_block_filter_index(true).unwrap();
+        let tip = WINDOW_HEIGHTS + 1;
+        coinbase_chain(&q, tip);
+        q.release_index_writebehind(Height(tip));
+
+        progress::capture_finished(true);
+        let stop = AtomicBool::new(false);
+        let resync = AtomicBool::new(false);
+        let stages = IndexStageMs::default();
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        io_loop(&q, &stop, &resync, &stages, &tx, || {}).unwrap();
+        let fin = finished_index_stages();
+        progress::capture_finished(false);
+        assert_eq!(fin, [("blockfilter build", 0, 0, u64::from(tip) + 1)]);
         let _ = std::fs::remove_dir_all(dir.path());
     }
 
