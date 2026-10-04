@@ -52,7 +52,24 @@ start = doc.find("### Operator kind")
 if start < 0:
     sys.exit("missing operator kind section")
 section = doc[start:]
-semver = re.compile(r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+def release_ge_017(tag: str) -> bool:
+    """Warnet emits [regtest] only when the tag is a release >= 0.17.0.
+
+    A prerelease is stripped on current Warnet main before semverCompare,
+    and 0.7.99 is below 0.17.0, so the section is omitted. helm template
+    still exits 0 in that case. Warnet 1.1.20's raw compare is also false
+    for that prerelease; the hyphen only happens to keep the section.
+    """
+    if re.fullmatch(r"\d+\.\d+\.\d+", tag) is None:
+        return False
+    parts = tuple(int(x) for x in tag.split("."))
+    return parts >= (0, 17, 0)
+
+if not release_ge_017("28.0.0") or not release_ge_017("0.17.0"):
+    sys.exit("release gate accepts a known good tag")
+for bad in ("0.7.99", "0.7.99-warnet0", "0.16.9", "local", "28.0.0-warnet0"):
+    if release_ge_017(bad):
+        sys.exit(f"release gate accepted {bad}")
 found = False
 for line in section.splitlines():
     if "docker build -t" not in line and "kind load docker-image" not in line:
@@ -61,15 +78,15 @@ for line in section.splitlines():
     if ":local" in line or "rbitcoin-warnet:local" in line:
         sys.exit(f"kind instructions still use local: {line}")
     match = re.search(r"rbitcoin-warnet:([^\s\\]+)", line)
-    if match is None or semver.fullmatch(match.group(1)) is None:
-        sys.exit(f"kind tag is not semver: {line}")
+    if match is None or not release_ge_017(match.group(1)):
+        sys.exit(f"kind tag is below 0.17.0 or not a release: {line}")
 if not found:
     sys.exit("kind section has no docker build -t or kind load docker-image")
 PY
 )"; then
-  ok "kind instructions use a semver image tag"
+  ok "kind instructions use a release tag >= 0.17.0"
 else
-  bad "kind instructions use a semver image tag (${KIND_OUT})"
+  bad "kind instructions use a release tag >= 0.17.0 (${KIND_OUT})"
 fi
 
 echo

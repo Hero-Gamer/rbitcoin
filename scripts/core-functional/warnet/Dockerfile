@@ -5,9 +5,11 @@
 #   docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target/docker \
 #     rust:1.95.0-bookworm cargo build -p rbitcoin-node
 #   ./scripts/core-functional/init-submodule.sh
-# Kind/Helm tag (semver; `local` does not render). Compose uses
-# rbitcoin-warnet:local via example.sh.
-#   docker build -t rbitcoin-warnet:0.7.99-warnet0 \
+# Kind/Helm tag is a release >= 0.17.0 with no prerelease. That is the
+# chart's semverCompare gate for writing [regtest], not the rbitcoin
+# version. `local` does not render. Compose uses rbitcoin-warnet:local
+# via example.sh.
+#   docker build -t rbitcoin-warnet:28.0.0 \
 #     --build-arg NODE_BIN=target/docker/debug/rbitcoin-node \
 #     -f scripts/core-functional/warnet/Dockerfile .
 

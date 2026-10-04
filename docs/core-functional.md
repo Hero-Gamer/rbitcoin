@@ -294,10 +294,16 @@ python3 scripts/core-functional/create_cache.py --ensure
 ## Warnet lab (all-rbitcoin tanks)
 
 Not an operator musl Release. The compose example keeps image tag
-`rbitcoin-warnet:local`. Kind and Helm use `rbitcoin-warnet:0.7.99-warnet0`:
-Warnet's chart passes the tag to `semverCompare ">=0.17.0"`, and `local`
-is not a semantic version (Warnet 1.1.20 compares the raw tag; current
-Warnet main normalizes a few Core shapes and still rejects that fallback).
+`rbitcoin-warnet:local`. Kind and Helm use `rbitcoin-warnet:28.0.0`.
+That tag is the chart's Core-version gate, not the rbitcoin version.
+Warnet passes it to `semverCompare ">=0.17.0"` and, when the compare
+succeeds, writes `[regtest]` before `rpcport`, `rpcpassword`, `rpcauth`,
+and `addnode`. A prerelease does not count: Warnet main strips `-…` and
+then compares, and `0.7.99` is below `0.17.0`, so the section is omitted
+while `helm template` still exits 0. `local` is not a semantic version
+(Warnet 1.1.20 compares the raw tag; current Warnet main normalizes a few
+Core shapes and still rejects that fallback). A release tag `>= 0.17.0`
+with no prerelease, such as `28.0.0`, emits the section on both.
 Warnet stays Core Helm (`bitcoin.conf`, `rpcuser`/`rpcpassword`,
 `addnode=tank-N`, `pidof bitcoind`). The node is not taught Core conf; the
 Python shim translates `addnode=` to `--connect host:18444`, seeds
@@ -352,10 +358,10 @@ Needs Docker + kind on an operator host. Do not open mainnet. Wallet keys
 are RAM-only.
 
 ```bash
-docker build -t rbitcoin-warnet:0.7.99-warnet0 \
+docker build -t rbitcoin-warnet:28.0.0 \
   --build-arg NODE_BIN=target/dev/debug/rbitcoin-node \
   -f scripts/core-functional/warnet/Dockerfile .
-kind load docker-image rbitcoin-warnet:0.7.99-warnet0
+kind load docker-image rbitcoin-warnet:28.0.0
 python3 -m venv .venv && source .venv/bin/activate
 pip install warnet
 warnet setup
@@ -363,7 +369,7 @@ warnet new /tmp/rbtc-warnet
 ```
 
 Three tanks, ring `addnode`, unique `rpcpassword`. Set
-`image.repository` to `rbitcoin-warnet`, `image.tag` to `0.7.99-warnet0`,
+`image.repository` to `rbitcoin-warnet`, `image.tag` to `28.0.0`,
 and `pullPolicy: Never`.
 Pass when `miner_std.py --interval=10 --mature` leaves all three
 `getblockcount` values equal and greater than 0. Fail classes: CrashLoop
