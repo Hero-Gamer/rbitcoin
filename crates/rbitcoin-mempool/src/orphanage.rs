@@ -457,7 +457,7 @@ mod tests {
         Txid::from_byte_array([n; 32])
     }
 
-    fn make_orphan(parent: Txid, salt: u8) -> Transaction {
+    fn make_orphan(parent: Txid, mark: u8) -> Transaction {
         Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -471,9 +471,9 @@ mod tests {
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(1000 + salt as u64),
+                value: Amount::from_sat(1000 + mark as u64),
                 script_pubkey: ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
-                    [salt; 20],
+                    [mark; 20],
                 )),
             }],
         }
