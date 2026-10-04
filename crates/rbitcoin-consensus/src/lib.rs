@@ -78,9 +78,9 @@ pub fn verify_tx_scripts_with_flags(
 pub use block::{
     bip34_height_script, bip68_active_for_tx, block_has_witness, block_mutated_without_coinbase,
     block_subsidy, check_block_wire, is_final_tx, sequence_locks_satisfied, tx_sigop_cost,
-    validate_block_structure, witness_commitment_script, ScriptVerifyFlags, ValidationContext,
-    BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
-    TAPROOT_EXCEPTION_MAINNET,
+    validate_block_structure, witness_commitment_script, witness_commitment_vout_index,
+    ScriptVerifyFlags, ValidationContext, BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT,
+    MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT, TAPROOT_EXCEPTION_MAINNET,
 };
 pub(crate) use block::{validate_block_structure_hashed, TxPrecompute};
 pub use clock::{with_now, NodeClock};
