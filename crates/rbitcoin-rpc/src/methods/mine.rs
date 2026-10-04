@@ -1035,28 +1035,19 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
     if !known {
         return SubmitBlockOutcome::Rejected("prev-blk-not-found".into());
     }
-    let mut prevout_fault = None;
-    let cheap = cheap_submit_tx_reject(&block, |op| {
-        read_confirmed_prevout(hub.query.as_ref(), op).unwrap_or_else(|e| {
-            prevout_fault.get_or_insert(e);
-            None
-        })
-    });
-    if let Some(e) = prevout_fault {
-        return SubmitBlockOutcome::Error(format!("store: {e}"));
-    }
-    if let Some(reason) = cheap {
-        // `bad-txns-duplicate` is the mutated-block needle. A coinbase-less
-        // 64-byte body is too: it can be the header's inner nodes, so
-        // `bad-cb-missing` must not stick to the hash. Cache every other
-        // cheap consensus reason so a second submit is `duplicate-invalid`.
-        if reason != "bad-txns-duplicate"
-            && !rbitcoin_consensus::block_mutated_without_coinbase(&block)
-        {
-            hub.note_invalid_block(hash);
-            let _ = hub.ensure_header(&block.header);
+    match cheap_submit_tx_reject(hub.query.as_ref(), &block, hub.params.coinbase_maturity()) {
+        Err(e) => return SubmitBlockOutcome::Error(format!("store: {e}")),
+        Ok(Some(reason)) => {
+            // `bad-txns-duplicate` and `bad-txnmrklroot` are mutated-block needles.
+            // Cache every other cheap consensus reason so a second submit is
+            // `duplicate-invalid`.
+            if reason != "bad-txns-duplicate" && reason != "bad-txnmrklroot" {
+                hub.note_invalid_block(hash);
+                let _ = hub.ensure_header(&block.header);
+            }
+            return SubmitBlockOutcome::Rejected(reason);
         }
-        return SubmitBlockOutcome::Rejected(reason);
+        Ok(None) => {}
     }
     match hub.accept_received_block(block.clone()) {
         Ok(AcceptOutcome::Accepted { .. }) => SubmitBlockOutcome::Accepted,
@@ -1080,32 +1071,79 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
     }
 }
 
-/// Confirmed unspent output at `op`. `Ok(None)` is a real miss or spend;
-/// `Err` is a store read fault, not a verdict on the spending block.
+/// Spend height of `block` when its parent is confirmed. The tip parent is a
+/// header-fk compare. Any other parent uses the best-chain hash index.
+fn cheap_spend_height(
+    query: &rbitcoin_query::Query,
+    block: &Block,
+) -> Result<Option<u32>, rbitcoin_store::StoreError> {
+    use rbitcoin_store::StoreError;
+    let prev = block.header.prev_blockhash.to_byte_array();
+    let parent_fk = match query.get_header_by_hash(&prev) {
+        Ok(Some((fk, _))) => fk,
+        Ok(None) | Err(StoreError::NotFound) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if query.tip_header_fk()? == Some(parent_fk) {
+        return Ok(query.tip_height().map(|h| h.0.saturating_add(1)));
+    }
+    Ok(query
+        .height_of_hash(&prev)?
+        .map(|h| h.0.saturating_add(1)))
+}
+
+/// Core `CheckTxInputs`: a coinbase spend inside the maturity window is
+/// `bad-txns-premature-spend-of-coinbase` before the value check.
+fn cheap_immature_coinbase(
+    query: &rbitcoin_query::Query,
+    create_fk: rbitcoin_primitives::Fk,
+    spend_height: u32,
+    maturity: u32,
+) -> Result<bool, rbitcoin_store::StoreError> {
+    use rbitcoin_store::StoreError;
+    let created_h = match query.store().tx_height_get(create_fk) {
+        Ok(Some(h)) => h,
+        Ok(None) | Err(StoreError::NotFound) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if spend_height >= created_h.saturating_add(maturity) {
+        return Ok(false);
+    }
+    let coinbases = query.store().coinbase_fk_at_heights(&[created_h])?;
+    Ok(coinbases.get(&created_h).copied() == Some(create_fk))
+}
+
+/// Confirmed unspent output at `op`, with the creating tx's fk. `Ok(None)` is
+/// a real miss or spend. `Err` is a store read fault, not a verdict on the
+/// spending block.
 ///
 /// `vout` is peer-chosen. It is checked against the parent's output count
 /// before the spender read, which treats a slot past that count as corrupt.
 fn read_confirmed_prevout(
     query: &rbitcoin_query::Query,
     op: bitcoin::OutPoint,
-) -> Result<Option<bitcoin::TxOut>, rbitcoin_store::StoreError> {
+) -> Result<Option<(rbitcoin_primitives::Fk, bitcoin::TxOut)>, rbitcoin_store::StoreError> {
     use rbitcoin_store::StoreError;
-    let read = || {
-        let tid = op.txid.to_byte_array();
-        let Some((fk, rec)) = query.get_tx_by_txid(&tid)? else {
-            return Ok(None);
-        };
-        if op.vout >= rec.output_count || query.is_outpoint_spent(&tid, op.vout)? {
-            return Ok(None);
-        }
-        query
-            .tx_output_at_fk(fk, op.vout)
-            .or_else(|_| query.tx_output(&rec, op.vout))
-            .map(Some)
+    let tid = op.txid.to_byte_array();
+    let Some((fk, rec)) = match query.get_tx_by_txid(&tid) {
+        Ok(v) => v,
+        Err(StoreError::NotFound) => None,
+        Err(e) => return Err(e),
+    } else {
+        return Ok(None);
     };
-    let out = match read() {
-        Ok(Some(out)) => out,
-        Ok(None) | Err(StoreError::NotFound) => return Ok(None),
+    if op.vout >= rec.output_count {
+        return Ok(None);
+    }
+    if query.is_outpoint_spent(&tid, op.vout)? {
+        return Ok(None);
+    }
+    let out = match query
+        .tx_output_at_fk(fk, op.vout)
+        .or_else(|_| query.tx_output(&rec, op.vout))
+    {
+        Ok(out) => out,
+        Err(StoreError::NotFound) => return Ok(None),
         Err(e) => return Err(e),
     };
     let value = if out.value < 0 {
@@ -1113,17 +1151,22 @@ fn read_confirmed_prevout(
     } else {
         bitcoin::Amount::from_sat(out.value as u64)
     };
-    Ok(Some(bitcoin::TxOut {
-        value,
-        script_pubkey: bitcoin::ScriptBuf::from_bytes(out.script),
-    }))
+    Ok(Some((
+        fk,
+        bitcoin::TxOut {
+            value,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(out.script),
+        },
+    )))
 }
 
 fn cheap_submit_tx_reject(
+    query: &rbitcoin_query::Query,
     block: &Block,
-    mut confirmed_prevout: impl FnMut(bitcoin::OutPoint) -> Option<bitcoin::TxOut>,
-) -> Option<String> {
+    maturity: u32,
+) -> Result<Option<String>, rbitcoin_store::StoreError> {
     use bitcoin::{OutPoint, TxOut};
+    let spend_height = cheap_spend_height(query, block)?;
     // Core CheckMerkleRoot runs before every body rule. A repeat that keeps
     // the root (CVE-2012-2459) is the only bad-txns-duplicate. Any other
     // repeat spends a coin its first copy spent.
@@ -1131,19 +1174,19 @@ fn cheap_submit_tx_reject(
     let leaves: Vec<[u8; 32]> = txids.iter().map(|t| t.to_byte_array()).collect();
     let (root, mutated) = rbitcoin_store::merkle_root_mutated(&leaves);
     if root != block.header.merkle_root.to_byte_array() {
-        return Some("bad-txnmrklroot".into());
+        return Ok(Some("bad-txnmrklroot".into()));
     }
     if mutated {
-        return Some("bad-txns-duplicate".into());
+        return Ok(Some("bad-txns-duplicate".into()));
     }
     let Some((first, rest)) = block.txdata.split_first() else {
-        return Some("bad-blk-length".into());
+        return Ok(Some("bad-blk-length".into()));
     };
     if !first.is_coinbase() {
-        return Some("bad-cb-missing".into());
+        return Ok(Some("bad-cb-missing".into()));
     }
     if rest.iter().any(Transaction::is_coinbase) {
-        return Some("bad-cb-multiple".into());
+        return Ok(Some("bad-cb-multiple".into()));
     }
     let mut spent = std::collections::HashSet::new();
     let mut created: std::collections::HashMap<OutPoint, TxOut> = std::collections::HashMap::new();
@@ -1160,25 +1203,43 @@ fn cheap_submit_tx_reject(
             }
             continue;
         }
+        // CheckTransaction rejects an empty vin or vout before ConnectBlock
+        // compares values or coinbase maturity.
+        if tx.input.is_empty() {
+            return Ok(Some("bad-txns-vin-empty".into()));
+        }
+        if tx.output.is_empty() {
+            return Ok(Some("bad-txns-vout-empty".into()));
+        }
         let mut in_val = 0u64;
         for inp in &tx.input {
             let op = inp.previous_output;
             if !spent.insert(op) {
-                return Some("bad-txns-inputs-missingorspent".into());
+                return Ok(Some("bad-txns-inputs-missingorspent".into()));
+            }
+            // Same-block coinbase is immature. Core reports that before
+            // `bad-txns-in-belowout`.
+            if op.txid == txids[0] && created.contains_key(&op) {
+                return Ok(Some("bad-txns-premature-spend-of-coinbase".into()));
             }
             let txout = if let Some(o) = created.get(&op) {
                 o.clone()
             } else {
-                let Some(out) = confirmed_prevout(op) else {
-                    return Some("bad-txns-inputs-missingorspent".into());
+                let Some((fk, out)) = read_confirmed_prevout(query, op)? else {
+                    return Ok(Some("bad-txns-inputs-missingorspent".into()));
                 };
+                if let Some(h) = spend_height {
+                    if cheap_immature_coinbase(query, fk, h, maturity)? {
+                        return Ok(Some("bad-txns-premature-spend-of-coinbase".into()));
+                    }
+                }
                 out
             };
             in_val = in_val.saturating_add(txout.value.to_sat());
         }
         let out_val: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
         if out_val > in_val {
-            return Some("bad-txns-in-belowout".into());
+            return Ok(Some("bad-txns-in-belowout".into()));
         }
         for (v, o) in tx.output.iter().enumerate() {
             created.insert(
@@ -1190,7 +1251,7 @@ fn cheap_submit_tx_reject(
             );
         }
     }
-    None
+    Ok(None)
 }
 
 fn submit_reject_reason(e: &rbitcoin_net::NetError) -> String {

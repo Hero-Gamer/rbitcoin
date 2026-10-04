@@ -17,8 +17,13 @@ Fixed
   `bad-txns-inputs-missingorspent`.
 - **A transaction with no outputs or no inputs gets Bitcoin Core's reason.**
   `submitblock` and the block reject log said `no outputs` and `no inputs`.
-  They now say `bad-txns-vout-empty` and `bad-txns-vin-empty`.
+  They now say `bad-txns-vout-empty` and `bad-txns-vin-empty`. The pre-check
+  applies that before comparing input and output values, so an empty input
+  list with an output is not `bad-txns-in-belowout`.
 - **A block that spends an immature coinbase reports
   `bad-txns-premature-spend-of-coinbase`.** It said `coinbase immature`.
+  The pre-check reports the same reason before `bad-txns-in-belowout`, for
+  a same-block coinbase and for a confirmed coinbase inside the maturity
+  window.
 - **A block over the weight limit reports `bad-blk-weight`.** It said
   `block weight too large`.

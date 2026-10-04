@@ -528,9 +528,11 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
         )
     };
     let before = tip_count(ctx);
-    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&mine(0)))]).unwrap();
+    let good = mine(0);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&good))]).unwrap();
     assert!(r.is_null(), "good submitblock: {r}");
     assert_eq!(tip_count(ctx), before + 1);
+    let prev_cb = good.txdata[0].compute_txid();
 
     let mut bad = mine(0);
     bad.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0xab; 32]);
@@ -587,14 +589,33 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     let mut young = mine(7);
     let cb = young.txdata[0].compute_txid();
     young.txdata.push(spend(OutPoint { txid: cb, vout: 0 }, 1));
+    // CheckTransaction rejects an empty vin before CheckTxInputs compares values.
+    let mut no_vin = mine(8);
+    no_vin.txdata.push(Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::new(),
+        }],
+    });
+    // A confirmed coinbase is still immature here. CheckTxInputs reports that
+    // before the value check, including when the outputs exceed the inputs.
+    let mut young_prev = mine(9);
+    young_prev
+        .txdata
+        .push(spend(OutPoint { txid: prev_cb, vout: 0 }, u64::MAX));
     for (block, want) in [
         (commit(empty), "bad-blk-length"),
         (commit(no_cb), "bad-cb-missing"),
         (uncommitted, "bad-txnmrklroot"),
-        (commit(below), "bad-txns-in-belowout"),
+        (commit(below), "bad-txns-premature-spend-of-coinbase"),
         (commit(miss), "bad-txns-inputs-missingorspent"),
         (commit(no_vout), "bad-txns-vout-empty"),
         (commit(young), "bad-txns-premature-spend-of-coinbase"),
+        (commit(no_vin), "bad-txns-vin-empty"),
+        (commit(young_prev), "bad-txns-premature-spend-of-coinbase"),
     ] {
         let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
         assert_eq!(r, want);
@@ -1187,8 +1208,15 @@ fn chain_ops_proposal_spends(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     let mut fat = spend.clone();
     fat.output[0].value = Amount::from_sat(cb_f + 1);
     assert_eq!(
-        propose(ctx, &proposal_on_tip(ctx, vec![fat])),
+        propose(ctx, &proposal_on_tip(ctx, vec![fat.clone()])),
         "bad-txns-in-belowout"
+    );
+    let mut fat_block = proposal_on_tip(ctx, vec![fat]);
+    regrind(&mut fat_block);
+    assert_eq!(
+        dispatch(ctx, "submitblock", vec![json!(block_hex(&fat_block))]).unwrap(),
+        "bad-txns-in-belowout",
+        "a mature coin with outputs above its inputs"
     );
     let mut locked = spend.clone();
     locked.lock_time = LockTime::from_height(tip_count(ctx) as u32 + 50).unwrap();
