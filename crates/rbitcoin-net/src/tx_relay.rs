@@ -628,8 +628,11 @@ pub struct MempoolHub {
     accept_gen: Mutex<HashMap<Wtxid, u64>>,
     /// Mempool expiry in seconds (default 336h).
     expiry_secs: AtomicU64,
-    /// Next index into `wtxid_by_txid` for a bounded expiry scan.
-    expiry_cursor: AtomicU64,
+    /// Accept-time order for expiry: `(accept_at, wtxid) → txid`, one row per
+    /// live tx. Extra RAM beside `accept_at` (key + txid, plus tree nodes;
+    /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
+    /// and does not walk `wtxid_by_txid`.
+    expiry_order: Mutex<BTreeMap<(u64, Wtxid), Txid>>,
     /// Min-relay overlay (sat/kvB). Session FeeFilter reads this
     /// without taking `inner`.
     min_relay_sat_kvb: AtomicU64,
@@ -641,6 +644,24 @@ pub struct MempoolHub {
     tip_ctx: Mutex<Option<(Fk, ChainTipCtx)>>,
     /// TxRequestTracker-shaped missing-parent GETDATA.
     parent_req: Mutex<parent_req::ParentTracker>,
+}
+
+const EXPIRE_SCAN: usize = 256;
+
+/// Oldest expired accepts, at most [`EXPIRE_SCAN`]. The map is ordered by
+/// accept time, so the first still-young key ends the scan.
+fn expired_roots_in(order: &BTreeMap<(u64, Wtxid), Txid>, now: u64, lim: u64) -> Vec<Txid> {
+    let mut roots = Vec::new();
+    for (&(at, _), txid) in order.iter() {
+        if now.saturating_sub(at) < lim {
+            break;
+        }
+        roots.push(*txid);
+        if roots.len() == EXPIRE_SCAN {
+            break;
+        }
+    }
+    roots
 }
 
 impl MempoolHub {
@@ -763,7 +784,7 @@ impl MempoolHub {
             next_accept_gen: AtomicU64::new(1),
             accept_gen: Mutex::new(HashMap::new()),
             expiry_secs: AtomicU64::new(DEFAULT_MEMPOOL_EXPIRY_SECS),
-            expiry_cursor: AtomicU64::new(0),
+            expiry_order: Mutex::new(BTreeMap::new()),
             min_relay_sat_kvb: AtomicU64::new(
                 rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
             ),
@@ -941,11 +962,17 @@ impl MempoolHub {
         let mut ats = self.accept_at.lock().unwrap();
         let mut gens = self.accept_gen.lock().unwrap();
         let mut age = self.age_inv.lock().unwrap();
-        by_tx.insert(txid, wtxid);
+        let mut order = self.expiry_order.lock().unwrap();
+        if let Some(prev_w) = by_tx.insert(txid, wtxid) {
+            if let Some(prev_at) = ats.get(&prev_w).copied() {
+                order.remove(&(prev_at, prev_w));
+            }
+        }
         seqs.insert(wtxid, seq);
         ats.insert(wtxid, at);
         gens.insert(wtxid, gen);
         age.insert((due, gen), (txid, wtxid));
+        order.insert((at, wtxid), txid);
         self.min_live_accept_at.fetch_min(at, Ordering::Relaxed);
     }
 
@@ -955,12 +982,16 @@ impl MempoolHub {
         let mut ats = self.accept_at.lock().unwrap();
         let mut gens = self.accept_gen.lock().unwrap();
         let mut age = self.age_inv.lock().unwrap();
+        let mut order = self.expiry_order.lock().unwrap();
         if let Some(w) = by_tx.remove(txid) {
             seqs.remove(&w);
             let at = ats.remove(&w);
             let gen = gens.remove(&w);
             if let (Some(at), Some(gen)) = (at, gen) {
                 age.remove(&(at.saturating_add(30), gen));
+            }
+            if let Some(at) = at {
+                order.remove(&(at, w));
             }
             let min = ats.values().copied().min().unwrap_or(u64::MAX);
             self.min_live_accept_at.store(min, Ordering::Relaxed);
@@ -1143,6 +1174,16 @@ impl MempoolHub {
     /// Drop live txs (and in-mempool descendants) older than `-mempoolexpiry`.
     /// Called when a new tx is admitted so expiry is checked on the accept path.
     pub fn expire_stale(&self) -> usize {
+        self.expire_stale_inner(true)
+    }
+
+    /// Same scan as [`Self::expire_stale`]. A busy accept-time index skips
+    /// this tick instead of waiting.
+    pub(crate) fn try_expire_stale(&self) -> usize {
+        self.expire_stale_inner(false)
+    }
+
+    fn expire_stale_inner(&self, block: bool) -> usize {
         let now = self.relay_now_secs();
         let lim = self.expiry_secs.load(Ordering::Relaxed);
         if lim == 0 || now == 0 {
@@ -1152,46 +1193,29 @@ impl MempoolHub {
         if min_at == u64::MAX || now.saturating_sub(min_at) < lim {
             return 0;
         }
-        self.meter_expire_full_scans.fetch_add(1, Ordering::Relaxed);
-        const EXPIRE_SCAN: usize = 256;
-        let start = self.expiry_cursor.load(Ordering::Relaxed) as usize;
-        let expired_roots: Vec<Txid> = {
-            let ats = self.accept_at.lock().unwrap();
-            let by_tx = self.wtxid_by_txid.lock().unwrap();
-            let mut skipped = 0usize;
-            let mut scanned = 0usize;
-            let mut roots = Vec::new();
-            for (txid, wtxid) in by_tx.iter() {
-                if skipped < start {
-                    skipped += 1;
-                    continue;
-                }
-                scanned += 1;
-                if ats
-                    .get(wtxid)
-                    .is_some_and(|at| now.saturating_sub(*at) >= lim)
-                {
-                    roots.push(*txid);
-                }
-                if scanned >= EXPIRE_SCAN {
-                    break;
-                }
-            }
-            let next = if by_tx.is_empty() || skipped.saturating_add(scanned) >= by_tx.len() {
-                0
+        let expired_roots = {
+            let order = if block {
+                self.expiry_order.lock().unwrap()
             } else {
-                skipped.saturating_add(scanned)
+                let Ok(order) = self.expiry_order.try_lock() else {
+                    return 0;
+                };
+                order
             };
-            self.expiry_cursor.store(next as u64, Ordering::Relaxed);
-            roots
+            self.meter_expire_full_scans.fetch_add(1, Ordering::Relaxed);
+            expired_roots_in(&order, now, lim)
         };
-        if expired_roots.is_empty() {
+        self.remove_expired_roots(&expired_roots)
+    }
+
+    fn remove_expired_roots(&self, roots: &[Txid]) -> usize {
+        if roots.is_empty() {
             return 0;
         }
-        let mut kill = std::collections::BTreeSet::new();
+        let mut kill = BTreeSet::new();
         {
             let g = self.lock_read();
-            for t in &expired_roots {
+            for t in roots {
                 if let Some(set) = g.graph.descendant_set(t) {
                     kill.extend(set);
                 } else {
@@ -1215,11 +1239,12 @@ impl MempoolHub {
 
     /// Headers poll runs on `tokio-rt-worker`. Expiry takes mempool locks, so
     /// it has to enter a [`crate::reactor::BlockingRegion`] on the blocking pool.
+    /// A busy index skips the tick.
     pub fn expire_stale_from_session(self: &Arc<Self>) {
         let hub = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
             let _g = crate::reactor::BlockingRegion::enter();
-            hub.expire_stale()
+            hub.try_expire_stale()
         });
     }
 
@@ -3769,6 +3794,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// One scan visits 256 live txs. With more than that expired, the survivors
+    /// are the newest accepts, and the next call continues from there.
+    #[test]
+    fn expire_stale_drops_oldest_accepts_within_one_scan() {
+        const N: u32 = 257;
+        let (store_dir, q, cbs) = pad_cbs(N);
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        let mut ids = Vec::with_capacity(N as usize);
+        for (i, cb) in cbs.iter().enumerate() {
+            hub.note_mock_now((i as u64) + 1);
+            // Regtest halves every 150 blocks, so later coinbases are under 50 BTC.
+            let mut tx = spend_true(*cb, 0, ScriptBuf::from_bytes(vec![0x51]));
+            tx.output[0].value = Amount::from_sat(1_000_000);
+            hub.accept_tx(&tx).expect("admit");
+            ids.push(tx.compute_txid());
+        }
+        assert_eq!(hub.live_count(), N as usize);
+        hub.set_expiry_hours(0);
+        hub.note_mock_now(N as u64 + 1);
+        let newest = *ids.last().unwrap();
+        assert_eq!(hub.expire_stale(), 256);
+        assert_eq!(hub.live_count(), 1);
+        assert!(hub.contains(&newest), "newest accept must survive the cap");
+        for id in &ids[..ids.len() - 1] {
+            assert!(
+                !hub.contains(id),
+                "older accept must leave in the first scan"
+            );
+        }
+        assert_eq!(hub.expire_stale(), 1);
+        assert_eq!(hub.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
+    fn try_expire_stale_skips_when_the_order_lock_is_held() {
+        let (store_dir, q, cbs) = pad_one_cb();
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(1);
+        let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        let tid = tx.compute_txid();
+        hub.accept_tx(&tx).expect("admit");
+        hub.set_expiry_hours(0);
+        hub.note_mock_now(hub.relay_now_secs() + 5);
+        let held = hub.expiry_order.lock().unwrap();
+        assert_eq!(hub.try_expire_stale(), 0);
+        assert!(hub.contains(&tid));
+        drop(held);
+        assert_eq!(hub.expire_stale(), 1);
+        assert!(!hub.contains(&tid));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
     fn record_fee_sample(hub: &MempoolHub, height: u32, rate_sat_kvb: u64) {
         let block = HistoricalFeeBlock {
             p10_sat_kvb: Some(rate_sat_kvb),
@@ -4674,8 +4758,12 @@ mod tests {
         );
         {
             let mut ats = hub.accept_at.lock().unwrap();
+            let mut order = hub.expiry_order.lock().unwrap();
             let at = ats.get_mut(&w).expect("accept_at");
+            let old = *at;
             *at = at.saturating_sub(30);
+            let tid = order.remove(&(old, w)).expect("expiry order");
+            order.insert((*at, w), tid);
             hub.min_live_accept_at.store(*at, Ordering::Relaxed);
         }
         assert!(
@@ -5320,6 +5408,11 @@ mod tests {
     }
 
     fn pad_one_cb() -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
+        pad_cbs(1)
+    }
+
+    /// Coinbases at heights `1..=n`, each with 100 confirmations.
+    fn pad_cbs(n: u32) -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
         use rbitcoin_primitives::Height;
         let store_dir = tmp();
@@ -5327,15 +5420,17 @@ mod tests {
         let params = ChainParams::regtest();
         let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
         accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let last = n + params.coinbase_maturity();
         let (_tip, _t, cbs) = rbitcoin_consensus::pad_empty_from(
             &q,
             &params,
             genesis.block_hash(),
             genesis.header.time,
             1,
-            101,
-            1,
+            last,
+            n,
         );
+        assert_eq!(cbs.len(), n as usize);
         (store_dir, Arc::new(q), cbs)
     }
 
