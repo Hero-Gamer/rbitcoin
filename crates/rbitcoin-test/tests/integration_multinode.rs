@@ -1454,21 +1454,41 @@ fn pin_select_node_to_evict_ranking() {
             noban: false,
         }
     }
+    let mut covered = Vec::new();
+    for i in 0..4 {
+        covered.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
+    }
+    for i in 4..9 {
+        covered.push(cand(i, 200 + i, Some(0.5), 0, 0));
+    }
+    for i in 9..13 {
+        covered.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
+    }
+    for i in 13..21 {
+        covered.push(cand(i, 400 + i, Some(0.01), 0, 0));
+    }
+    assert!(
+        select_inbound_eviction(covered).is_none(),
+        "longest-connected protection covers the remaining slow peers"
+    );
+
+    // Ten slow peers: netgroup and the fourth block slot take one, the eight
+    // longest-connected stay, and the newest slow peer is the victim.
     let mut cands = Vec::new();
     for i in 0..4 {
         cands.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
     }
-    for i in 4..9 {
+    for i in 4..14 {
         cands.push(cand(i, 200 + i, Some(0.5), 0, 0));
     }
-    for i in 9..13 {
+    for i in 14..18 {
         cands.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
     }
-    for i in 13..21 {
+    for i in 18..26 {
         cands.push(cand(i, 400 + i, Some(0.01), 0, 0));
     }
     let victim = select_inbound_eviction(cands).expect("one unprotected slow");
-    assert!((4..9).contains(&victim), "victim={victim}");
+    assert_eq!(victim, 13, "evict the newest slow peer, victim={victim}");
 }
 
 #[tokio::test]
