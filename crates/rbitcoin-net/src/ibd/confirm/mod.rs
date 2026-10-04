@@ -1508,6 +1508,7 @@ pub(crate) fn write_batch_is_stale_plan(hub: &ChainHub, feed: &ConfirmFeed, firs
 /// from in-flight + skeleton + pin + assemble) → scriptq →
 /// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
+#[allow(clippy::cognitive_complexity)] // lookup also drops undecodable wire before the load batch
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
