@@ -12,7 +12,11 @@ cd "$ROOT"
 # is 30 minutes longer so the script can stop itself and upload artifacts.
 # GitHub-hosted jobs cannot run longer than 6 hours.
 BUDGET_SEC="${MUTANTS_BUDGET_SEC:-18000}"
-BATCH="${MUTANTS_BATCH:-4}"
+# One cargo-mutants process per source file. 27.1.0 emits `..` struct
+# field deletes without applying --re, so a workspace-wide --re batch
+# retests every such delete. --file keeps that repeat inside this file.
+# The cap is how many queued names from that file one process may take.
+BATCH="${MUTANTS_BATCH:-200}"
 # A mutant that has not finished in 20 minutes is a hang, not a miss.
 MUTANT_TIMEOUT="${MUTANTS_TIMEOUT:-1200}"
 CURSOR="${MUTANTS_CURSOR:-mutants-nightly/cursor.json}"
@@ -74,20 +78,6 @@ deadline=$((SECONDS + BUDGET_SEC))
 : >"$OUT/ran.txt"
 completed_total=0
 
-re_args_for_batch() {
-  local start="$1" count="$2" i line
-  RE_ARGS=()
-  i=0
-  while IFS= read -r line; do
-    if ((i >= start && i < start + count)); then
-      local escaped
-      escaped="$(python3 "$ROOT/scripts/mutants_queue.py" re "$line")"
-      RE_ARGS+=(--re "$escaped")
-    fi
-    i=$((i + 1))
-  done <"$OUT/queue.txt"
-}
-
 queue_len="$(grep -c . "$OUT/queue.txt" || true)"
 offset=0
 while ((offset < queue_len && SECONDS < deadline)); do
@@ -95,12 +85,21 @@ while ((offset < queue_len && SECONDS < deadline)); do
   if ((remain < 60)); then
     break
   fi
-  re_args_for_batch "$offset" "$BATCH"
-  if ((${#RE_ARGS[@]} == 0)); then
+  slice="$OUT/batch-$offset.names"
+  python3 "$ROOT/scripts/mutants_queue.py" file-batch \
+    --queue "$OUT/queue.txt" --offset "$offset" --cap "$BATCH" >"$slice"
+  requested="$(grep -c . "$slice" || true)"
+  if ((requested == 0)); then
     break
   fi
-  requested=$((${#RE_ARGS[@]} / 2))
-  echo "mutants-nightly: batch at $offset ($requested mutants, ${remain}s left)"
+  file="$(head -n 1 "$slice" | cut -d: -f1)"
+  RE_ARGS=(--file "$file")
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    escaped="$(python3 "$ROOT/scripts/mutants_queue.py" re "$line")"
+    RE_ARGS+=(--re "$escaped")
+  done <"$slice"
+  echo "mutants-nightly: batch at $offset ($requested mutants in $file, ${remain}s left)"
   set +e
   timeout --signal=TERM --kill-after=60s "$remain" \
     cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' \
@@ -110,24 +109,20 @@ while ((offset < queue_len && SECONDS < deadline)); do
       >"$OUT/batch-$offset.log" 2>&1
   ec=$?
   set -e
-  # The summary counts caught and unviable. A killed batch has no summary;
-  # outcome lines still advance the cursor through what finished.
-  done_n="$(python3 "$ROOT/scripts/mutants_queue.py" finished --log "$OUT/batch-$offset.log")"
   grep -E '^MISSED' "$OUT/batch-$offset.log" >>"$OUT/missed.txt" || true
-  if ((done_n == 0)); then
-    echo "mutants-nightly: batch made no progress (exit $ec); same queue next night"
-    break
-  fi
-  # A finished batch consumed the queue slice it was given. A killed batch
-  # only consumed the mutants that printed an outcome. cargo-mutants can
-  # test more names than the slice when a regex is broad; do not skip the
-  # queue past the names this batch asked for.
+  # A clean exit consumed the slice. A killed process counts only the
+  # requested names that printed an outcome, in order. Unfiltered
+  # struct-field deletes in this file do not advance the cursor.
   if ((ec == 0)); then
     step=$requested
   else
-    step=$done_n
+    step="$(python3 "$ROOT/scripts/mutants_queue.py" progress --log "$OUT/batch-$offset.log" --slice "$slice")"
     if ((step > requested)); then
       step=$requested
+    fi
+    if ((step == 0)); then
+      echo "mutants-nightly: batch made no progress (exit $ec); same queue next night"
+      break
     fi
   fi
   python3 "$ROOT/scripts/mutants_queue.py" advance \
