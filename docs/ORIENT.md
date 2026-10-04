@@ -48,7 +48,6 @@ Ask before any of these, including when the change looks locally justified:
 - Widen who is trusted beyond [`../SECURITY.md`](../SECURITY.md).
 - Merge, force-push `master`, or `cargo clean` the shared cargo silo.
 - Start an item in [`quality.md`](./quality.md), [`peer-clients.md`](./peer-clients.md),
-  [`personal-node-plans/`](./personal-node-plans/), or [`road-to-1.0.md`](./road-to-1.0.md)
-  that the user did not name.
+  or [`road-to-1.0.md`](./road-to-1.0.md) that the user did not name.
 - Open a mainnet datadir, or treat an agent-VM run as a perf result.
 - Label an ordinary net or RPC pull request `core-functional`.

@@ -19,7 +19,7 @@ update that file — do not paste a parallel spec.
 
 Planning a multi-step change: [`how-we-plan.md`](./how-we-plan.md).
 Workspace crate roles and dependency orientation: [`CRATES.md`](./CRATES.md).
-Home-node (no clearnet listen ports): [`personal-node-plans/`](./personal-node-plans/).
+Home-node overlays and seqsigwit-window prune: [`operator/operations.md`](./operator/operations.md).
 Releases (tag / `vX.Y.x` / `.99`): [`releases.md`](./releases.md).
 1.0 product gates: [`road-to-1.0.md`](./road-to-1.0.md) (not the living
 quality backlog).
@@ -51,7 +51,6 @@ into `AGENTS.md`.
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
 | [`overlay-functional.md`](./overlay-functional.md) | Private Tor / i2pd / cjdns mesh harness (labeled / nightly). |
 | [`how-we-plan.md`](./how-we-plan.md) | Agent contract (cycle, Agent RAM, keep-compiling), then human rationale. |
-| [`personal-node-plans/`](./personal-node-plans/) | Home-node implementation plan group (SOCKS, overlays, wallet onions, ephemeral broadcast, seqsigwit prune / `NETWORK_LIMITED`). Live flags stay OPERATOR/COMPAT when a slice ships. Do not copy step lists into quality.md until scheduled. |
 | [`sv2-template-provider.md`](./sv2-template-provider.md) | SV2 Template Distribution Protocol server roadmap (**Q-64**): Step 0 finding and plans A–C. Live flags/COMPAT rows land in OPERATOR/COMPAT with the plan that ships them. |
 | [`releases.md`](./releases.md) | Tag `vX.Y.Z`, `vX.Y.x` patch line, `.99` bump, Highlights / GitHub notes. |
 | [`code-shape.md`](./code-shape.md) | Control flow, types, naming, composition (CONTRIBUTING principle 10). Named extracts: quality.md **Q-61** (Completed). Clippy: no workspace `allow` list; leftover lints are site-local with a reason. |

@@ -229,7 +229,13 @@ read seqsigwit; reconstruct / `getrawtransaction` / block serve do.
 ```
 
 A hot-store sidecar `seqsigwit.reloc` records the split. Opening without
-`--datadir-cold` then refuses. Do not leave `seqsigwit.*` in both places. Moving an
+`--datadir-cold` then refuses. Do not leave `seqsigwit.*` in both places.
+`--prune-seqsigwit` writes `{store}/seqsigwit.prune` (the pruneheight) and
+keeps the 288-height window at `{store}/seqsigwit.window/{height}.bin` on the
+hot store, including when `seqsigwit.body` is on `--datadir-cold`. A datadir
+that already has that sidecar refuses to start unless the flag is set again
+(`datadir is pruned-seqsigwit; restart with --prune-seqsigwit enabled`).
+Disconnect at or below that pruneheight fails closed. Moving an
 existing datadir is operator `mv` (or copy+remove cross-device):
 
 ```
