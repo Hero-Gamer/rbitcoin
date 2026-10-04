@@ -105,7 +105,7 @@ assert_ok "chain_review listed in fuzz Cargo.toml" \
 assert_ok "chain_review listed in fuzz.yml matrix" \
   grep -q '{ bin: chain_review_differential, core: true }' "$ROOT/.github/workflows/fuzz.yml"
 assert_ok "chain_review milestone seed" \
-  test -s "$ROOT/fuzz/fixtures/chain_review_milestone.bin"
+  test "$(od -An -tu1 "$ROOT/fuzz/fixtures/chain_review_milestone.bin" | tr -d ' ')" = 0
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" p2p_sequence_differential)"
 assert_ok "p2p_sequence dry-run bin" \

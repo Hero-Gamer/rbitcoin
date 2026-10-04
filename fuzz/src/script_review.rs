@@ -15,8 +15,8 @@ use bitcoin::{
     TxMerkleNode, TxOut, Witness,
 };
 use bitcoinconsensus::{
-    verify_with_flags, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY, VERIFY_DERSIG,
-    VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
+    verify_with_flags, Error, Utxo, VERIFY_CHECKLOCKTIMEVERIFY, VERIFY_CHECKSEQUENCEVERIFY,
+    VERIFY_DERSIG, VERIFY_NULLDUMMY, VERIFY_P2SH, VERIFY_TAPROOT, VERIFY_WITNESS,
 };
 use rbitcoin_consensus::{
     signet_challenge_transactions, validate_signet_block_solution, verify_tx_scripts_with_flags,
@@ -31,18 +31,16 @@ pub const STRUCTURED: u8 = 0xFE;
 const STRICTENC: u32 = 1 << 1;
 const LOW_S: u32 = 1 << 3;
 const MINIMALDATA: u32 = 1 << 6;
-/// Core checks these. This interpreter has no field for them, so a verdict
-/// change is a disagreement rather than a skipped flag.
-const UNMAPPED_POLICY: u32 = (1 << 5) | (1 << 7);
+/// Core checks these. This interpreter has no field for them, so they stay
+/// on the Core word only. A verdict change is a disagreement, not a skip.
+/// Bits 18–20 are not `discourage_upgradable_witness` (bit 12).
+const UNMAPPED_POLICY: u32 = (1 << 5) | (1 << 7) | (1 << 18) | (1 << 19) | (1 << 20);
 const CLEANSTACK: u32 = 1 << 8;
 const DISCOURAGE_UPGRADABLE_WITNESS: u32 = 1 << 12;
 const MINIMALIF: u32 = 1 << 13;
 const NULLFAIL: u32 = 1 << 14;
 const WITNESS_PUBKEYTYPE: u32 = 1 << 15;
 const CONST_SCRIPTCODE: u32 = 1 << 16;
-const DISCOURAGE_UPGRADABLE_TAPROOT: u32 = 1 << 18;
-const DISCOURAGE_OP_SUCCESS: u32 = 1 << 19;
-const DISCOURAGE_UPGRADABLE_PUBKEY: u32 = 1 << 20;
 
 const SHAPE_RAW: u8 = 0;
 const SHAPE_CMS: u8 = 1;
@@ -91,12 +89,6 @@ pub fn flags_abort_libconsensus(flags: u32) -> bool {
 pub fn flags_to_ours(flags: u32) -> ScriptVerifyFlags {
     let low_s = flags & LOW_S != 0;
     let strictenc = flags & STRICTENC != 0;
-    let discourage = flags
-        & (DISCOURAGE_UPGRADABLE_WITNESS
-            | DISCOURAGE_UPGRADABLE_TAPROOT
-            | DISCOURAGE_OP_SUCCESS
-            | DISCOURAGE_UPGRADABLE_PUBKEY)
-        != 0;
     ScriptVerifyFlags {
         bip65_active: flags & VERIFY_CHECKLOCKTIMEVERIFY != 0,
         bip112_active: flags & VERIFY_CHECKSEQUENCEVERIFY != 0,
@@ -111,13 +103,19 @@ pub fn flags_to_ours(flags: u32) -> ScriptVerifyFlags {
         minimal_data: flags & MINIMALDATA != 0,
         witness_pubkeytype: flags & WITNESS_PUBKEYTYPE != 0,
         witness_active: flags & VERIFY_WITNESS != 0,
-        discourage_upgradable_witness: discourage,
+        discourage_upgradable_witness: flags & DISCOURAGE_UPGRADABLE_WITNESS != 0,
         const_scriptcode: flags & CONST_SCRIPTCODE != 0,
         cleanstack: flags & CLEANSTACK != 0,
     }
 }
 
 pub fn core_accept(prevouts: &[TxOut], tx: &Transaction, flags: u32) -> bool {
+    core_script_verdict(prevouts, tx, flags).unwrap_or(false)
+}
+
+/// `Ok` is a script verdict. `Err(ERR_INVALID_FLAGS)` means the C library
+/// refused the flag word, which is not a script failure.
+fn core_script_verdict(prevouts: &[TxOut], tx: &Transaction, flags: u32) -> Result<bool, Error> {
     let raw = serialize(tx);
     let spk = prevouts[0].script_pubkey.as_bytes();
     let amount = prevouts[0].value.to_sat();
@@ -134,7 +132,11 @@ pub fn core_accept(prevouts: &[TxOut], tx: &Transaction, flags: u32) -> bool {
     } else {
         None
     };
-    verify_with_flags(spk, amount, &raw, spent, 0, flags).is_ok()
+    match verify_with_flags(spk, amount, &raw, spent, 0, flags) {
+        Ok(()) => Ok(true),
+        Err(Error::ERR_INVALID_FLAGS) => Err(Error::ERR_INVALID_FLAGS),
+        Err(_) => Ok(false),
+    }
 }
 
 fn classify(ours: bool, core: bool) -> KernelCmp {
@@ -153,8 +155,11 @@ pub fn compare_spend(prevouts: Vec<TxOut>, tx: Transaction, flags: u32) -> Kerne
     debug_assert_eq!(UNMAPPED_POLICY & (VERIFY_P2SH | VERIFY_WITNESS), 0);
     let ours =
         verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), flags_to_ours(flags)).is_ok();
-    let core = core_accept(&prevouts, &tx, flags);
-    classify(ours, core)
+    match core_script_verdict(&prevouts, &tx, flags) {
+        Ok(core) => classify(ours, core),
+        Err(Error::ERR_INVALID_FLAGS) => KernelCmp::Skip,
+        Err(_) => classify(ours, false),
+    }
 }
 
 fn spend(
@@ -381,10 +386,7 @@ fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
         SHAPE_DER => compare_spend_pair(witness_der_spend(), flags),
         SHAPE_P2PKH => compare_spend_pair(typed_p2pkh_spend(), flags),
         SHAPE_P2WPKH => compare_spend_pair(typed_p2wpkh_spend(), flags),
-        SHAPE_V0 => {
-            let height = payload_height(payload);
-            compare_at_height(height, &[0x11; 32], v0_program_spend())
-        }
+        SHAPE_V0 => compare_v0_at_payload_height(payload),
         SHAPE_DERSIG => {
             let height = payload_height(payload);
             compare_at_height(height, &[0x11; 32], nullfail_spend())
@@ -405,6 +407,22 @@ fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
 fn compare_spend_pair(pair: (Vec<TxOut>, Transaction), flags: u32) -> KernelCmp {
     let (prev, tx) = pair;
     compare_spend(prev, tx, flags)
+}
+
+/// v0 program vs `for_block` only once segwit is active.
+///
+/// Below that height `for_block` leaves WITNESS off, so this program is a
+/// true bare script, while `GetBlockScriptFlags` has had WITNESS on since
+/// genesis. A missing height is not treated as 1000.
+fn compare_v0_at_payload_height(payload: &[u8]) -> KernelCmp {
+    if payload.len() < 4 {
+        return KernelCmp::Skip;
+    }
+    let height = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if !ChainParams::mainnet().segwit_active_at(height) {
+        return KernelCmp::Skip;
+    }
+    compare_at_height(height, &[0x11; 32], v0_program_spend())
 }
 
 fn payload_height(payload: &[u8]) -> u32 {
@@ -445,10 +463,20 @@ mod tests {
 
     #[test]
     fn cms_empty_sig_matches_core_bool() {
-        let flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_NULLDUMMY | CONST_SCRIPTCODE;
         let (prev, tx) = cms_empty_sig_spend();
-        // Core FindAndDeletes OP_0 and CONST_SCRIPTCODE hard-fails. Known reject.
-        assert_classifies(prev, tx, flags, false);
+        // Legal consensus word: empty sig is a soft fail, OP_NOT accepts.
+        let legal = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_NULLDUMMY;
+        assert_classifies(prev.clone(), tx.clone(), legal, true);
+        // CONST_SCRIPTCODE is outside libbitcoinconsensus VERIFY_ALL.
+        let flags = legal | CONST_SCRIPTCODE;
+        assert!(matches!(
+            compare_spend(prev.clone(), tx.clone(), flags),
+            KernelCmp::Skip
+        ));
+        assert!(
+            verify_tx_scripts_with_flags(prev, tx, flags_to_ours(flags)).is_ok(),
+            "empty-sig deletion is not a hard fail without a Core verdict to match"
+        );
     }
 
     #[test]
@@ -461,9 +489,20 @@ mod tests {
 
     #[test]
     fn nullfail_policy_matches_core_bool() {
-        let flags = VERIFY_P2SH | VERIFY_WITNESS | NULLFAIL;
         let (prev, tx) = nullfail_spend();
-        assert_classifies(prev, tx, flags, false);
+        // DERSIG and NULLFAIL off: soft false, OP_NOT accepts.
+        let legal = VERIFY_P2SH | VERIFY_WITNESS;
+        assert_classifies(prev.clone(), tx.clone(), legal, true);
+        // NULLFAIL is outside libbitcoinconsensus VERIFY_ALL.
+        let flags = legal | NULLFAIL;
+        assert!(matches!(
+            compare_spend(prev.clone(), tx.clone(), flags),
+            KernelCmp::Skip
+        ));
+        assert!(
+            verify_tx_scripts_with_flags(prev, tx, flags_to_ours(flags)).is_err(),
+            "our NULLFAIL rejects the non-canonical DER"
+        );
     }
 
     #[test]
@@ -484,23 +523,32 @@ mod tests {
 
     #[test]
     fn v0_program_and_signet_empty_match_core_bool() {
+        let short = vec![STRUCTURED, 0, 0, 0, 0, SHAPE_V0];
+        assert!(
+            matches!(compare_kernel_bytes(&short), Some(KernelCmp::Skip)),
+            "a v0 input with no height is not height 1000"
+        );
+        let mut below = short.clone();
+        below.extend_from_slice(&1000u32.to_le_bytes());
+        assert!(
+            matches!(compare_kernel_bytes(&below), Some(KernelCmp::Skip)),
+            "pre-segwit v0 is not compared"
+        );
+
         let (prev, tx) = v0_program_spend();
         let params = ChainParams::mainnet();
         let hash = [0x11u8; 32];
-        let core_flags = core_block_script_flags(&params, 1000, &hash);
+        let height = 481_824;
+        let core_flags = core_block_script_flags(&params, height, &hash);
         let core = core_accept(&prev, &tx, core_flags);
-        // Core has had WITNESS on since genesis. Empty P2WPKH witness rejects.
-        assert!(
-            !core,
-            "pre-segwit height still has WITNESS in GetBlockScriptFlags"
-        );
-        let ours_flags = ScriptVerifyFlags::for_block(&params, 1000, &hash, 0);
+        let ours_flags = ScriptVerifyFlags::for_block(&params, height, &hash, 0);
         let ours = verify_tx_scripts_with_flags(prev.clone(), tx.clone(), ours_flags).is_ok();
-        match compare_at_height(1000, &hash, (prev, tx)) {
-            KernelCmp::Agree { accept } if accept == ours && ours == core => {}
-            KernelCmp::Disagree { ours: o, core: c } if o == ours && c == core && ours != core => {}
-            other => panic!("v0 ours={ours} core={core}: {other:?}"),
-        }
+        assert_eq!(ours, core, "for_block and GetBlockScriptFlags diverge");
+        assert!(!core, "empty v0 witness rejects once WITNESS is on");
+        assert!(matches!(
+            compare_at_height(height, &hash, (prev, tx)),
+            KernelCmp::Agree { accept: false }
+        ));
 
         let challenge = [0x52u8];
         assert_ne!(challenge, [0x51]);
@@ -518,6 +566,32 @@ mod tests {
             KernelCmp::Agree { accept } if accept == ours && ours == core => {}
             KernelCmp::Disagree { ours: o, core: c } if o == ours && c == core && ours != core => {}
             other => panic!("signet ours={ours} core={core}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn op_success_bit_is_not_witness_program_policy() {
+        // Witness v2, non-zero program. Anyone-can-spend unless bit 12 is set.
+        // This libbitcoinconsensus refuses bit 19, so the compare skips.
+        // The bit must not be applied as DISCOURAGE_UPGRADABLE_WITNESS.
+        let (prev, tx) = spend(Vec::new(), vec![0x52, 0x02, 0x01, 0x01], Witness::new());
+        let flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT | (1 << 19);
+        assert!(!flags_to_ours(flags).discourage_upgradable_witness);
+        assert!(
+            verify_tx_scripts_with_flags(prev.clone(), tx.clone(), flags_to_ours(flags)).is_ok()
+        );
+        assert!(matches!(compare_spend(prev, tx, flags), KernelCmp::Skip));
+
+        let (prev, tx) = spend(Vec::new(), vec![0x52, 0x02, 0x01, 0x01], Witness::new());
+        let flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT | DISCOURAGE_UPGRADABLE_WITNESS;
+        assert!(flags_to_ours(flags).discourage_upgradable_witness);
+        assert!(
+            verify_tx_scripts_with_flags(prev.clone(), tx.clone(), flags_to_ours(flags)).is_err()
+        );
+        assert!(matches!(compare_spend(prev, tx, flags), KernelCmp::Skip));
+        for bit in [18u32, 20] {
+            let word = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_TAPROOT | (1 << bit);
+            assert!(!flags_to_ours(word).discourage_upgradable_witness);
         }
     }
 

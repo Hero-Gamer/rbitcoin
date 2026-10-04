@@ -198,12 +198,14 @@ fn plan_milestone() -> Result<Vec<PlannedSubmit>, String> {
     let params = params_bip34_off();
     // Height-only milestone (no anchor). The spend is under that height and
     // after coinbase maturity, so immaturity is not what decides the block.
+    // The script is OP_TRUE: Core submitblock has no milestone skip, and an
+    // OP_0 scriptPubKey would be accepted here and rejected there.
     let maturity = params.coinbase_maturity();
     let spend_h = maturity + 1;
     let session = HubSession::open("chain-ms", params.clone(), Milestone::height(spend_h + 50))?;
     let (mut tip, mut time) = genesis_tip(&params);
     time += REGTEST_BLOCK_SPACING;
-    let coin = mine_regtest_paying(tip, time, 1, ScriptBuf::from_bytes(vec![0x00]), Vec::new());
+    let coin = mine_regtest_paying(tip, time, 1, op_true(), Vec::new());
     let fate_coin = hub_fate(&session.hub, coin.clone())?;
     if fate_coin != Fate::Accept {
         return Err(format!("milestone coinbase rejected: {fate_coin:?}"));
@@ -237,6 +239,11 @@ fn plan_milestone() -> Result<Vec<PlannedSubmit>, String> {
         vec![spend_tx(prev, value, Sequence::MAX)],
     );
     let fate = hub_fate(&session.hub, spend.clone())?;
+    if fate != Fate::Accept {
+        return Err(format!(
+            "milestone OP_TRUE spend was not accepted: {fate:?}"
+        ));
+    }
     push_check(&mut out, &spend, fate);
     drop(session);
     Ok(out)
@@ -739,6 +746,14 @@ mod tests {
                 plan.iter().any(|s| s.fate.is_some()),
                 "shape {shape} skipped the comparison"
             );
+            if shape == SHAPE_MILESTONE {
+                let checked: Vec<Fate> = plan.iter().filter_map(|s| s.fate).collect();
+                assert_eq!(
+                    checked,
+                    vec![Fate::Accept],
+                    "milestone comparison is the OP_TRUE spend, which Core accepts"
+                );
+            }
             let matched = compare_chain_plan(&plan, &QueueOracle::new(scripted(&plan, false)))
                 .unwrap_or_else(|e| panic!("shape {shape}: {e}"));
             assert!(
