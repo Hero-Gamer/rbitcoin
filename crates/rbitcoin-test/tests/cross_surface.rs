@@ -1291,6 +1291,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.electrum = Some(electrum_addr);
     cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
     cfg.rpc.listen = Some(rpc_addr);
+    cfg.rpc.rest = true;
     cfg.listen.health = Some(health_addr);
     cfg.metrics = true;
     // mempool's CORE_RPC.SOCKET_PATH reaches the node from another user.
