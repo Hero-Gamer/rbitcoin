@@ -49,7 +49,7 @@ def main() -> None:
     p.add_argument("--lf", type=int, required=True)
     p.add_argument("--gate", type=int, default=92)
     p.add_argument("--sha", default="")
-    p.add_argument("--scope", default="production+journeys")
+    p.add_argument("--scope", default="production")
     p.add_argument("--date", default="")
     p.add_argument("--base-lh", type=int, default=None)
     p.add_argument("--base-lf", type=int, default=None)

@@ -37,6 +37,7 @@ excluded = [
     "/repo/crates/rbitcoin-net/src/ibd/confirm/tests.rs",
     "/repo/crates/rbitcoin-net/src/peer_tests.rs",
     "/repo/crates/rbitcoin-net/tests/ibd_smoke.rs",
+    "/repo/crates/rbitcoin-test/src/lib.rs",
     "/repo/crates/rbitcoin-test/tests/integration_multinode.rs",
     "/repo/crates/rbitcoin-bench/src/suite.rs",
     "/repo/crates/rbitcoin-store/src/testutil.rs",
@@ -52,7 +53,6 @@ kept = [
     "/repo/crates/rbitcoin-consensus/src/regtest_pad.rs",
     "/repo/crates/rbitcoin-node/src/run.rs",
     "/repo/crates/rbitcoin-rpc/src/methods/chain.rs",
-    "/repo/crates/rbitcoin-test/src/lib.rs",
 ]
 fail = 0
 for p in excluded:
@@ -100,7 +100,7 @@ need = {
     "lh": 906,
     "lf": 1000,
     "gate": 90,
-    "scope": "production+journeys",
+    "scope": "production",
     "sha": "abcdef123456",
     "date": "2026-09-13",
 }
