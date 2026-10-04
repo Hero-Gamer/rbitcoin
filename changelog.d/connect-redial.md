@@ -11,4 +11,6 @@ Fixed
   redial of `--connect` and `addnode add` targets skips a target whose
   previous dial has not finished connecting. Before, a target behind a slow
   SOCKS circuit or a host that drops SYNs got a new dial every pass, and
-  each one that connected became its own session.
+  each one that connected became its own session. An outbound connect now
+  gives up after 8 s (90 s for I2P), as IBD and tip-follow dials already
+  did, so a proxy that never answers cannot hold a target forever.
