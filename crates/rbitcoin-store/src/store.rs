@@ -407,7 +407,6 @@ impl Store {
         } else {
             ScriptHashTable::create_with_scale(&path, layout.head_scale)?
         };
-        open_layout_rewrite_pre15(&path, meta_ver, &scripthash)?;
         let header_txs = if path.join("header_txs_first.body").exists() {
             HeaderTxsTable::open(&path)?
         } else {
@@ -1806,50 +1805,6 @@ impl Store {
     }
 }
 
-/// True when `txout.body` has creates whose first meta byte lacks LAYOUT17.
-fn txout_meta_lacks_layout17(dir: &Path) -> bool {
-    let path = dir.join("txout.body");
-    let Ok(mut f) = std::fs::File::open(&path) else {
-        return false;
-    };
-    let mut hdr = [0u8; 16];
-    if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
-        return false;
-    }
-    let published = u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]));
-    if published <= 16 {
-        return false;
-    }
-    let mut first = [0u8; 1];
-    if std::io::Read::read_exact(&mut f, &mut first).is_err() {
-        return false;
-    }
-    first[0] & 0x80 == 0
-}
-
-fn class_a_has_creates(dir: &Path) -> bool {
-    fn published_len(path: &Path) -> u64 {
-        let Ok(mut f) = std::fs::File::open(path) else {
-            return 0;
-        };
-        let mut hdr = [0u8; 16];
-        if std::io::Read::read_exact(&mut f, &mut hdr).is_err() {
-            return 0;
-        }
-        u64::from_le_bytes(hdr[8..16].try_into().unwrap_or([0; 8]))
-    }
-    if published_len(&dir.join("txout.body")) > 16 {
-        return true;
-    }
-    if published_len(&dir.join("txid.body")) > 32 {
-        return true;
-    }
-    if published_len(&dir.join("tx.body")) > 16 {
-        return true;
-    }
-    false
-}
-
 fn write_meta(dir: &Path) -> Result<(), StoreError> {
     let path = dir.join("meta");
     let mut f = OpenOptions::new()
@@ -1865,7 +1820,7 @@ fn write_meta(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Overwrite store `meta` with current [`SCHEMA_VERSION`] (silent 13→14 upgrade).
+/// Overwrite store `meta` with current [`SCHEMA_VERSION`].
 fn rewrite_meta_current(dir: &Path) -> Result<(), StoreError> {
     let path = dir.join("meta");
     let tmp = path.with_extension("meta.tmp");
@@ -1905,22 +1860,6 @@ fn open_layout_refuse_old(path: &Path, meta_ver: u16) -> Result<(), StoreError> 
         HeaderTable::rewrite_v24_body_to_88(path)?;
     }
     unlink_leftover_spent_off(path)?;
-    if class_a_has_creates(path) && txout_meta_lacks_layout17(path) {
-        return Err(StoreError::Corrupt(
-            "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD",
-        ));
-    }
-    if (15..22).contains(&meta_ver) && class_a_has_creates(path) {
-        return Err(StoreError::Corrupt(SCHEMA22_CLASS_A_REFUSE));
-    }
-    if (meta_ver == 18 || meta_ver == 19) && SCHEMA_VERSION >= 20 {
-        if crate::segmented_head::SegmentedTxHead::disk_occupied(path)
-            || scripthash_index_data_present(path)
-        {
-            return Err(StoreError::Corrupt(SCHEMA20_INDEX_REFUSE));
-        }
-        rewrite_meta_current(path)?;
-    }
     Ok(())
 }
 
@@ -1946,27 +1885,6 @@ fn drop_unread_store_leftovers(path: &Path) {
     }
 }
 
-fn open_layout_rewrite_pre15(
-    path: &Path,
-    meta_ver: u16,
-    scripthash: &ScriptHashTable,
-) -> Result<(), StoreError> {
-    if (meta_ver == 13 || meta_ver == 14) && SCHEMA_VERSION >= 15 {
-        if scripthash.has_index_occupancy() {
-            return Err(StoreError::Corrupt(
-                "schema 14 store has a materialized scripthash index; wipe store/scripthash* (head, body, ovf, runs, include_hwm, cold_progress) and rematerialize for schema 15",
-            ));
-        }
-        if class_a_has_creates(path) {
-            return Err(StoreError::Corrupt(
-                "schema 16 refuses packed Class A with creates; wipe datadir and redo IBD",
-            ));
-        }
-        rewrite_meta_current(path)?;
-    }
-    Ok(())
-}
-
 fn drop_leftover_tx_height(path: &Path) {
     let leftover_h = path.join("tx_height.body");
     if leftover_h.exists() {
@@ -1978,81 +1896,10 @@ fn drop_leftover_tx_height(path: &Path) {
 }
 
 fn open_layout_rewrite_current(path: &Path, meta_ver: u16) -> Result<(), StoreError> {
-    if meta_ver == 15 && SCHEMA_VERSION >= 16 {
-        rewrite_meta_current(path)?;
-    }
-    if meta_ver == 16 && SCHEMA_VERSION >= 17 {
-        rewrite_meta_current(path)?;
-    }
-    if meta_ver == 17 {
-        if schema17_index_data_present(path) {
-            return Err(StoreError::Corrupt(SCHEMA18_INDEX_REFUSE));
-        }
-        rewrite_meta_current(path)?;
-    }
     if meta_ver < SCHEMA_VERSION {
         rewrite_meta_current(path)?;
     }
     Ok(())
-}
-
-/// One-line 17→18 index refuse (`Store::open` + tests).
-const SCHEMA18_INDEX_REFUSE: &str = "schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)";
-
-/// One-line 18/19→20 index refuse (`Store::open` + tests).
-const SCHEMA20_INDEX_REFUSE: &str = "schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)";
-
-/// Occupied schema ≤21 Class A (spent slot layout / no vin pack).
-const SCHEMA22_CLASS_A_REFUSE: &str =
-    "schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD";
-
-fn schema17_index_data_present(dir: &Path) -> bool {
-    crate::segmented_head::SegmentedTxHead::disk_occupied(dir) || scripthash_index_data_present(dir)
-}
-
-fn scripthash_index_data_present(dir: &Path) -> bool {
-    let runs = dir.join("scripthash.runs");
-    if runs.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(&runs) {
-            if rd.filter_map(|e| e.ok()).any(|e| e.path().is_file()) {
-                return true;
-            }
-        }
-    }
-    let head = dir.join("scripthash.head");
-    if head.is_file() {
-        return true;
-    }
-    if head.is_dir() {
-        if let Ok(rd) = std::fs::read_dir(&head) {
-            if rd.filter_map(|e| e.ok()).any(|e| e.path().is_file()) {
-                return true;
-            }
-        }
-    }
-    let hwm = dir.join("scripthash.include_hwm");
-    if let Ok(buf) = std::fs::read(&hwm) {
-        if buf.len() >= 8 {
-            let n = u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]));
-            if n > 0 {
-                return true;
-            }
-        }
-    }
-    let ingest_occ = {
-        let mut p = dir.join("scripthash.ovf").join("ingest").into_os_string();
-        p.push(".occ");
-        PathBuf::from(p)
-    };
-    if let Ok(buf) = std::fs::read(&ingest_occ) {
-        if buf.len() >= 16 && &buf[0..8] == b"SHOCC001" {
-            let n = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
-            if n > 0 {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Validate store magic + schema. Returns on-disk version when openable.
@@ -2066,11 +1913,17 @@ fn check_meta(dir: &Path) -> Result<u16, StoreError> {
         return Err(StoreError::BadMagic);
     }
     let ver = u16::from_le_bytes([bytes[4], bytes[5]]);
+    if ver < 22 {
+        return Err(StoreError::Corrupt(PRE22_WIPE));
+    }
     if !schema_file_openable(ver) {
         return Err(StoreError::BadSchema(ver));
     }
     Ok(ver)
 }
+
+/// One wipe-and-IBD line for every store `meta` older than schema 22.
+const PRE22_WIPE: &str = "schema before 22 refuses this datadir; wipe datadir and redo IBD";
 
 #[cfg(test)]
 mod tests {
@@ -2632,16 +2485,18 @@ mod tests {
             assert!(matches!(check_meta(&bad), Err(StoreError::BadMagic)));
             let mut good_magic = STORE_MAGIC.to_vec();
             good_magic.extend_from_slice(&0u16.to_le_bytes());
-            // wrong schema if 0 != SCHEMA_VERSION
-            if SCHEMA_VERSION != 0 {
-                std::fs::write(bad.join("meta"), &good_magic).unwrap();
-                assert!(matches!(check_meta(&bad), Err(StoreError::BadSchema(_))));
+            std::fs::write(bad.join("meta"), &good_magic).unwrap();
+            match check_meta(&bad) {
+                Err(StoreError::Corrupt(m)) => assert_eq!(m, PRE22_WIPE),
+                other => panic!("meta 0: {other:?}"),
             }
-            // schema 13 meta alone is openable at the check_meta gate
             let mut v13 = STORE_MAGIC.to_vec();
             v13.extend_from_slice(&13u16.to_le_bytes());
             std::fs::write(bad.join("meta"), &v13).unwrap();
-            assert_eq!(check_meta(&bad).unwrap(), 13);
+            match check_meta(&bad) {
+                Err(StoreError::Corrupt(m)) => assert_eq!(m, PRE22_WIPE),
+                other => panic!("meta 13: {other:?}"),
+            }
             let _ = std::fs::remove_dir_all(&bad);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -2694,59 +2549,29 @@ mod tests {
     }
 
     #[test]
-    fn open_schema20_empty_rewrites_meta() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            s.flush().unwrap();
-        }
-        assert!(dir.join("create.loc").is_file());
-        write_store_meta_ver(&dir, 20);
-        assert_eq!(read_store_meta_ver(&dir), 20);
-
-        let s = Store::open_tiny(&dir).unwrap();
-        drop(s);
-        assert!(
-            dir.join("create.loc").is_file(),
-            "schema 22 open must keep create.loc"
-        );
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 26);
-        let s = Store::open_tiny(&dir).unwrap();
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema21_occupied_refuses_wipe_ibd() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let tx = TxRecord {
-                txid: [0x21u8; 32],
-                version: 1,
-                locktime: 0,
-                input_start_fk: Fk::NULL,
-                input_count: 1,
-                output_start_fk: Fk::NULL,
-                output_count: 1,
-            };
-            let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x51], vec![])];
-            let outs = vec![OutputRecord::unspent(1, vec![0x51])];
-            s.put_tx_full_batch_indexed(&[(tx, ins, outs)], false)
-                .unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 21);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for occupied schema-21 Class A"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
+    fn open_schema_before_22_refuses_wipe_and_ibd() {
+        for ver in [21u16, 13u16] {
+            let dir = tmp();
+            {
+                let s = Store::create_tiny(&dir).unwrap();
+                s.flush().unwrap();
             }
-            Err(other) => panic!("expected Corrupt, got {other}"),
+            write_store_meta_ver(&dir, ver);
+            match Store::open_tiny(&dir) {
+                Err(StoreError::Corrupt(m)) => {
+                    assert_eq!(m, PRE22_WIPE, "meta {ver}");
+                    eprintln!("meta {ver} StoreError::Corrupt: {m}");
+                }
+                Ok(_) => panic!("meta {ver} opened"),
+                Err(other) => panic!("meta {ver}: {other}"),
+            }
+            assert_eq!(
+                read_store_meta_ver(&dir),
+                ver,
+                "meta {ver} must not rewrite"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn ovf_data_len(dir: &Path) -> u64 {
@@ -2842,78 +2667,6 @@ mod tests {
     }
 
     #[test]
-    fn open_schema21_empty_rewrites_meta_and_unlinks_spent_off() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 21);
-        std::fs::write(dir.join("spent.off"), b"leftover").unwrap();
-        std::fs::create_dir_all(dir.join("txout.idx")).unwrap();
-        std::fs::create_dir_all(dir.join("spent.idx")).unwrap();
-        std::fs::create_dir_all(dir.join("seqsigwit.idx")).unwrap();
-        let s = Store::open_tiny(&dir).unwrap();
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 26);
-        assert!(
-            !dir.join("spent.off").exists(),
-            "empty 21 open must unlink leftover spent.off"
-        );
-        assert!(!dir.join("txout.idx").exists());
-        assert!(!dir.join("spent.idx").exists());
-        assert!(!dir.join("seqsigwit.idx").exists());
-        assert!(dir.join("create.loc").is_file());
-        assert!(dir.join("seqsigwit.loc").is_file());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema 13 with empty SH is layout-compatible: open succeeds and meta
-    /// is rewritten to 14. Also stamps empty SHAL alloc v1 → v2 (real 13 body).
-    #[test]
-    fn open_schema13_empty_scripthash_upgrades_meta_to_14() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            assert!(!s.scripthash.has_durable_index());
-            s.flush().unwrap();
-        }
-        // Real schema-13 stores have SHAL alloc v1 on scripthash.body.
-        {
-            use crate::file::{TableFile, FILE_HEADER_LEN};
-            use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
-            use rbitcoin_primitives::TableKind;
-            let body_path = dir.join("scripthash.body").join("00");
-            let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
-            let mut hdr = [0u8; 24];
-            body.read_at(FILE_HEADER_LEN as u64, &mut hdr).unwrap();
-            hdr[4..6].copy_from_slice(&1u16.to_le_bytes());
-            let mut page = vec![0u8; SH_ALLOC_HEADER_LEN];
-            page[..24].copy_from_slice(&hdr);
-            // Preserve freelist zeros already in file for rest of page.
-            body.read_at(FILE_HEADER_LEN as u64, &mut page).unwrap();
-            page[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
-            page[4..6].copy_from_slice(&1u16.to_le_bytes());
-            body.write_at(FILE_HEADER_LEN as u64, &page).unwrap();
-            body.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 13);
-        assert_eq!(read_store_meta_ver(&dir), 13);
-
-        let s = Store::open_tiny(&dir).unwrap();
-        assert!(!s.scripthash.has_durable_index());
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-
-        // Re-open stays 14.
-        let s = Store::open_tiny(&dir).unwrap();
-        assert_eq!(s.header_count(), 0);
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn put_full_and_seqsigwit_prevouts_at() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
@@ -2935,153 +2688,6 @@ mod tests {
         assert_eq!(m.input_count, 1);
         assert_eq!(prevs.len(), 1);
         assert!(s.tx_seqsigwit_range(fk).unwrap().1 > 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema14_packed_tx_body_with_creates_refused() {
-        use crate::file::{TableFile, FILE_HEADER_LEN};
-        use rbitcoin_primitives::TableKind;
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            s.flush().unwrap();
-        }
-        let path = dir.join("tx.body");
-        let f = TableFile::create(&path, TableKind::TxOut).unwrap();
-        f.write_at(FILE_HEADER_LEN as u64, &[0xABu8; 16]).unwrap();
-        f.flush().unwrap();
-        write_store_meta_ver(&dir, 14);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for packed tx.body"),
-            Err(StoreError::Corrupt(m)) => {
-                assert!(m.contains("packed Class A") || m.contains("tx.body"), "{m}");
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema 14 with empty SH is Class-A compatible: open succeeds and meta
-    /// is rewritten to 15. Page-era SHAL stays empty (no dual-read of pages).
-    #[test]
-    fn open_schema14_empty_scripthash_upgrades_meta_to_15() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            assert!(!s.scripthash.has_durable_index());
-            s.flush().unwrap();
-        }
-        // Real schema-14 stores have SHAL alloc v2 on scripthash.body.
-        {
-            use crate::file::{TableFile, FILE_HEADER_LEN};
-            use crate::scripthash_layout::{SH_ALLOC_HEADER_LEN, SH_ALLOC_MAGIC};
-            use rbitcoin_primitives::TableKind;
-            let body_path = dir.join("scripthash.body").join("00");
-            let body = TableFile::open(&body_path, TableKind::ScriptHash).unwrap();
-            let mut page = vec![0u8; SH_ALLOC_HEADER_LEN];
-            body.read_at(FILE_HEADER_LEN as u64, &mut page).unwrap();
-            page[0..4].copy_from_slice(&SH_ALLOC_MAGIC);
-            page[4..6].copy_from_slice(&2u16.to_le_bytes());
-            body.write_at(FILE_HEADER_LEN as u64, &page).unwrap();
-            body.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 14);
-        assert_eq!(read_store_meta_ver(&dir), 14);
-
-        let s = Store::open_tiny(&dir).unwrap();
-        assert!(!s.scripthash.has_durable_index());
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-
-        let s = Store::open_tiny(&dir).unwrap();
-        assert_eq!(s.header_count(), 0);
-        drop(s);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema 14 with a durable page-era SH index cannot open.
-    #[test]
-    fn open_schema14_with_materialized_scripthash_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let sh = [0xcdu8; 32];
-            sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)));
-            assert!(s.scripthash.has_index_occupancy());
-            assert!(!s.scripthash.has_durable_index());
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 14);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema 14 with durable SH"),
-            Err(StoreError::Corrupt(m)) => {
-                assert!(
-                    m.contains("wipe store/scripthash") || m.contains("schema 14"),
-                    "{m}"
-                );
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        // Meta left at 14 (no silent bump on refuse).
-        assert_eq!(read_store_meta_ver(&dir), 14);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema 13 with a durable SH head cannot open (slab layout incompatible).
-    #[test]
-    fn open_schema13_with_materialized_scripthash_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let sh = [0xabu8; 32];
-            sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)));
-            assert!(s.scripthash.has_index_occupancy());
-            assert!(!s.scripthash.has_durable_index());
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 13);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema 13 with durable SH"),
-            Err(StoreError::Corrupt(m)) => {
-                assert!(
-                    m.contains("materialized scripthash") || m.contains("schema 13"),
-                    "{m}"
-                );
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        // Meta left at 13 (no silent bump on refuse).
-        assert_eq!(read_store_meta_ver(&dir), 13);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema 16 leftover SH runs (`key_len=32`) cannot open under 17.
-    #[test]
-    fn open_schema16_legacy_sh_runs_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 16);
-        let runs = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs).unwrap();
-        let mut rec = [0u8; 40];
-        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
-        crate::sorted_run::write_sorted_run(&runs.join("000001.run"), 32, 40, &rec).unwrap();
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for key_len=32 scripthash.runs"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(
-                    m,
-                    "schema 17 refuses key_len=32 scripthash.runs; wipe store/scripthash.runs and rematerialize"
-                );
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 16);
-        assert!(dir.join("scripthash.body").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3110,228 +2716,6 @@ mod tests {
         crate::scripthash::sh_run_catalog_key_len_ok(&dir).unwrap();
         Store::open_tiny(&dir).unwrap();
         assert!(orphan.exists(), "open-time catalog check must not GC");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema18_occupied_scripthash_refused() {
-        let dir = tmp();
-        let sh = [0xabu8; 32];
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)));
-            s.flush().unwrap();
-            assert_eq!(s.scripthash.entries(&sh).unwrap().len(), 1);
-        }
-        write_store_meta_ver(&dir, 18);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema-18 scripthash data"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 18);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema17_empty_indexes_upgrades_meta_to_18() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 17);
-        assert_eq!(read_store_meta_ver(&dir), 17);
-        let s = Store::open_tiny(&dir).unwrap();
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema17_with_scripthash_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            sh_put_create(
-                &s,
-                crate::scripthash::ScriptHashRecord::from_fk([0xabu8; 32], Fk(1)),
-            );
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 17);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema-17 scripthash data"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA18_INDEX_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 17);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema17_with_tx_head_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-            s.put_tx_full_batch_indexed(&[item], true).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 17);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for occupied schema-17 Class A"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 17);
-        assert!(dir.join("txout.body").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Occupied 17 Class A cannot rebuild after wiping indexes (vin pack).
-    #[test]
-    fn open_schema17_wiped_indexes_occupied_class_a_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-            s.put_tx_full_batch_indexed(&[item], true).unwrap();
-            s.flush().unwrap();
-        }
-        crate::segmented_head::wipe_segmented_head_files(&dir);
-        write_store_meta_ver(&dir, 17);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for occupied schema-17 Class A"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema19_with_tx_head_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-            s.put_tx_full_batch_indexed(&[item], true).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 19);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for occupied schema-19 Class A"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 19);
-        assert!(dir.join("txout.body").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema18_with_tx_head_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let item = coinbase_item([0x33u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-            s.put_tx_full_batch_indexed(&[item], true).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 18);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for occupied schema-18 Class A"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 18);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema19_wiped_head_occupied_class_a_refused() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let item = coinbase_item([0x22u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-            s.put_tx_full_batch_indexed(&[item], true).unwrap();
-            s.flush().unwrap();
-        }
-        crate::segmented_head::wipe_segmented_head_files(&dir);
-        write_store_meta_ver(&dir, 19);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for occupied schema-19 Class A"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA22_CLASS_A_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_schema19_scripthash_only_refused() {
-        let dir = tmp();
-        let sh = [0xcdu8; 32];
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            sh_put_create(&s, crate::scripthash::ScriptHashRecord::from_fk(sh, Fk(1)));
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 19);
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for schema-19 scripthash data"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(m, SCHEMA20_INDEX_REFUSE);
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
-        assert_eq!(read_store_meta_ver(&dir), 19);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema-15 16-byte Class A meta with creates cannot open under 17.
-    #[test]
-    fn open_legacy_class_a_with_creates_refused() {
-        use crate::file::{TableFile, FILE_HEADER_LEN};
-        use rbitcoin_primitives::TableKind;
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            let item = coinbase_item([0x11u8; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
-            s.put_tx_full_batch_indexed(&[item], true).unwrap();
-            s.flush().unwrap();
-        }
-        {
-            let f = TableFile::open(dir.join("txout.body"), TableKind::TxOut).unwrap();
-            let mut b = [0u8; 1];
-            f.read_at(FILE_HEADER_LEN as u64, &mut b).unwrap();
-            b[0] &= !0x80;
-            f.write_at(FILE_HEADER_LEN as u64, &b).unwrap();
-            f.flush().unwrap();
-        }
-        match Store::open_tiny(&dir) {
-            Ok(_) => panic!("expected refuse for 16-layout Class A with creates"),
-            Err(StoreError::Corrupt(m)) => {
-                assert_eq!(
-                    m,
-                    "schema 17 refuses 16-layout Class A; wipe datadir and redo IBD"
-                );
-            }
-            Err(other) => panic!("expected Corrupt, got {other}"),
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3467,21 +2851,6 @@ mod tests {
         let s2 = Store::open_tiny(&dir).unwrap();
         let (_, outs) = s2.get_tx_meta_and_outputs(fks[1]).unwrap();
         assert_eq!(outs[0].script, p2tr);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Schema 16 with no SH run catalog soft-opens to current meta.
-    #[test]
-    fn open_schema16_no_sh_runs_soft_opens() {
-        let dir = tmp();
-        {
-            let s = Store::create_tiny(&dir).unwrap();
-            s.flush().unwrap();
-        }
-        write_store_meta_ver(&dir, 16);
-        let s = Store::open_tiny(&dir).unwrap();
-        drop(s);
-        assert_eq!(read_store_meta_ver(&dir), SCHEMA_VERSION);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4293,7 +3662,7 @@ mod tests {
     }
 
     #[test]
-    fn schema17_create_does_not_write_archive_epoch() {
+    fn create_does_not_write_archive_epoch() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
         assert!(
@@ -4321,12 +3690,12 @@ mod tests {
     }
 
     #[test]
-    fn schema16_create_does_not_write_tx_height_and_fence_has_reorg_holes() {
+    fn create_does_not_write_tx_height_and_fence_has_reorg_holes() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();
         assert!(
             !dir.join("tx_height.body").exists(),
-            "schema 16 must not create tx_height.body"
+            "live create must not write tx_height.body"
         );
         s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
         s.confirmed.set(Height(0), Fk(1)).unwrap();
@@ -4483,56 +3852,5 @@ mod tests {
         assert!(range.1 > 0);
         assert!(!hot.join("seqsigwit.body").exists());
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn scripthash_index_data_present_runs_and_head_file() {
-        let dir = tmp();
-        assert!(!scripthash_index_data_present(&dir));
-        let runs = dir.join("scripthash.runs");
-        std::fs::create_dir_all(&runs).unwrap();
-        assert!(!scripthash_index_data_present(&dir));
-        std::fs::write(runs.join("seg"), b"x").unwrap();
-        assert!(scripthash_index_data_present(&dir));
-        std::fs::remove_dir_all(&runs).unwrap();
-        std::fs::write(dir.join("scripthash.head"), b"x").unwrap();
-        assert!(scripthash_index_data_present(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn scripthash_index_data_present_head_dir_hwm_and_ingest_occ() {
-        let dir = tmp();
-        let head = dir.join("scripthash.head");
-        std::fs::create_dir_all(&head).unwrap();
-        std::fs::write(head.join("seg"), b"x").unwrap();
-        assert!(scripthash_index_data_present(&dir));
-        std::fs::remove_dir_all(&head).unwrap();
-
-        std::fs::write(dir.join("scripthash.include_hwm"), [0u8; 4]).unwrap();
-        assert!(!scripthash_index_data_present(&dir));
-        std::fs::write(dir.join("scripthash.include_hwm"), 0u64.to_le_bytes()).unwrap();
-        assert!(!scripthash_index_data_present(&dir));
-        std::fs::write(dir.join("scripthash.include_hwm"), 3u64.to_le_bytes()).unwrap();
-        assert!(scripthash_index_data_present(&dir));
-        std::fs::remove_file(dir.join("scripthash.include_hwm")).unwrap();
-
-        let ingest = dir.join("scripthash.ovf").join("ingest");
-        std::fs::create_dir_all(ingest.parent().unwrap()).unwrap();
-        let mut occ = ingest.into_os_string();
-        occ.push(".occ");
-        let occ = std::path::PathBuf::from(occ);
-        let mut buf = b"SHOCC001".to_vec();
-        buf.extend_from_slice(&0u64.to_le_bytes());
-        std::fs::write(&occ, &buf).unwrap();
-        assert!(!scripthash_index_data_present(&dir));
-        buf.clear();
-        buf.extend_from_slice(b"SHOCC001");
-        buf.extend_from_slice(&2u64.to_le_bytes());
-        std::fs::write(&occ, &buf).unwrap();
-        assert!(scripthash_index_data_present(&dir));
-        std::fs::write(&occ, b"NOMAGIC0").unwrap();
-        assert!(!scripthash_index_data_present(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

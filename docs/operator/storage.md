@@ -87,33 +87,17 @@ names the dirs. Corrupt files are **not** repaired in-process.
 | **23** | Rewrite `meta` to 25 first, then rewrite `header.body` 88 B rows to 96 B (size/weight 0) on open. Class A tx stems kept. A torn `header.body` rewrite is retried. Zero-extend `txstat.body`. |
 | **22**, occupied Class A | Rewrite `meta` to 25 first, then `create.loc.ovf` 12 B→16 B on `TxTable::open`, then `header.body` 88→96. Crash window is 25 `meta` + old ovf/header; this binary retries those file rewrites. Zero-extend `txstat.body`. |
 | **22**, empty Class A | Rewrite `meta` to 25, then open. |
-| **21**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 25, then open. |
-| **21**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **20**, empty Class A | Unlink leftover `spent.off`, rewrite `meta` to 25, then open. |
-| **20**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **19** or **18**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 25, then open. |
-| **19** or **18**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **19** or **18**, empty Class A, occupied `tx.head` or any `scripthash*` | **Refuse.** Wipe `store/tx.head` and `store/scripthash*`, keep Class A, restart. |
-| **17**, empty Class A and empty `tx.head` / no `scripthash*` data | Rewrite `meta` to 25, then open. |
-| **17**, occupied Class A | **Refuse.** Wipe datadir and redo IBD. |
-| **17**, empty Class A, populated `tx.head` or any `scripthash*` | **Refuse.** Wipe those index dirs, keep Class A, restart. |
-| Older than 17 with creates / leftover catalogs | **Refuse.** The error names files; often a full datadir wipe + IBD. Details: SCHEMA.md **13/14→17**, **15→17**, **16→17**. |
+| **Below 22**, empty or occupied | **Refuse.** One line: `schema before 22 refuses this datadir; wipe datadir and redo IBD`. Wipe the datadir and redo IBD. No per-version rewrite. |
 
 A `txstat.body` cell written as four ULEBs starting with `n_in` (an unreleased 25 experiment) is not detected and is not rewritten. Resync that datadir. A **24 binary** refuses 25 `meta` (do not downgrade in place). A **23 binary** refuses 24+ `meta`. A **22 binary** refuses 23+ `meta`. A **21 binary** refuses 22+ `meta`. A **19 binary** refuses 20+ `meta`.
 
-When the schema-22 Class A refuse fires, the log line is:
+When meta is below 22, the log line is:
 
 ```text
-schema 22 refuses schema-21 Class A with creates; wipe datadir and redo IBD
+schema before 22 refuses this datadir; wipe datadir and redo IBD
 ```
 
-When the 20 index refuse fires, the log line is:
-
-```text
-schema 20 refuses schema-18/19 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; tx.head rebuilds, SH rematerializes with --sh-index)
-```
-
-A **schema-20** datadir can still refuse leftover **index** layouts (fuse8 v1,
+A meta **22 or newer** datadir can still refuse leftover **index** layouts (fuse8 v1,
 flat `*.idx.meta`, Shared file `scripthash.body`, pack8 Paged mode 10). The
 line is one of:
 
@@ -138,23 +122,6 @@ rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
 Keep Class A (`txout` / `seqsigwit` / `spent` + `create.loc` / `seqsigwit.loc`, `txid.body`, headers) and
 Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
 `--sh-index`, SH rematerializes. Do **not** `rm -rf store/`.
-
-When the 17-index refuse fires, the log line is:
-
-```text
-schema 18 refuses schema-17 tx.head/scripthash; wipe store/tx.head and store/scripthash* then restart (Class A kept; indexes rebuild)
-```
-
-Copy-paste (node stopped with SIGTERM):
-
-```bash
-DATADIR=/path/to/datadir
-rm -rf "$DATADIR/store/tx.head" "$DATADIR/store/scripthash"*
-```
-
-Keep Class A (`txout` / `seqsigwit` / `spent` + idx, `txid.body`, headers) and
-Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
-`--sh-index`, SH rematerializes from runs / Class A. Do **not** `rm -rf store/`.
 
 **Kill-9 / crash is not a schema upgrade.** Open follows
 [`docs/crash-recovery.md`](docs/crash-recovery.md) (tip-as-commit, Class C

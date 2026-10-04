@@ -33,8 +33,9 @@ if [[ -z "${LLVM_PROFDATA:-}" ]] && command -v llvm-profdata >/dev/null 2>&1; th
 fi
 
 # main.rs trampolines are one-liners; logic is covered via cli_main in libs.
-# Test files / rbitcoin-test / rbitcoin-bench / testutil are not production. Do not match the
-# substring "test" (regtest_rpc.rs / regtest_pad.rs stay in the denominator).
+# Test files / rbitcoin-test / rbitcoin-bench / testutil are not in the ratio.
+# The journey tests still run, so production lines they hit still count.
+# Do not match the substring "test" (regtest_rpc.rs / regtest_pad.rs stay).
 IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/tests/|_tests\.rs$|/tests\.rs$|/testutil\.rs$|/tests_verify\.rs$|/crates/rbitcoin-test/|/crates/rbitcoin-bench/)'
 
 if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/null 2>&1; then

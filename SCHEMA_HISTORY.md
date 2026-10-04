@@ -17,16 +17,16 @@ Versions below are listed **newest → oldest** after the summary table.
 | **25** | `txstat.body` three ULEBs (`fee_sat`/`base`/`wit_extra`); `n_in` and parent edges on `input.*`. `seqsigwit` is the old `inwit` stem. Occupied 24 zero-extends `txstat`; no `txout` rewrite. | Prior |
 | **24** | `header.body` 96 B (`size`/`weight` u32). Occupied 23 rewrites 88 B rows. Extent last-page reserved = create count. | Prior |
 | **23** | `create.loc.ovf` 16 B (u32 strides / `n_out`). Occupied 22 rewrites 12 B ovf. Occupied 15–21 Class A refused. | Prior |
-| **22** | `create.loc` + `seqsigwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Occupied 15–21 Class A refused. Empty 15–21 rewrite `meta` and unlink leftover `spent.off` + leftover `*.idx`. | Prior |
-| **21** | Drop `spent.idx`. Spent ranges are `8 × max(n_out,1)` from txout meta; sparse `spent.off`. Unlink leftover idx; rewrite `meta` 20→21. Table headers 13–20 remain openable. | Prior |
-| **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`); sealed SH compact `BDZ3` (2-bit `g` + rank). Refuse occupied 18/19 `tx.head` / `scripthash*`. Leftover fuse8 v1, flat `*.idx.meta`, Shared SH body, pack8 Paged (mode 10) refuse. | Prior |
-| **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). Soft-open 18 with occupied indexes. | Prior |
-| **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. Refuse 17 with `tx.head`/`scripthash*` data (wipe indexes, keep Class A). | Prior |
-| **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Prior |
-| **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. Soft-open 15 | Prior |
-| **15** | Class A `txout`/`seqsigwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Prior |
-| **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Prior |
-| **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Prior |
+| **22** | `create.loc` + `seqsigwit.loc`; no Class A `*.idx`. LAYOUT17 drops `output_count`. Spent slot flags + u40 fk + u16 vin. `txout` amount is exp nibble + ULEB mantissa. Oldest meta this binary opens. | Prior |
+| **21** | Drop `spent.idx`. Spent ranges are `8 × max(n_out,1)` from txout meta; sparse `spent.off`. | Gone (meta &lt; 22 refuses) |
+| **20** | Sealed `tx.head` value-assigned packed BDZ (`BDZ2`, no `.rel`); sealed SH compact `BDZ3` (2-bit `g` + rank). | Gone (meta &lt; 22 refuses) |
+| **19** | Megakey SH extent: pack8 mode 11 + `ver=2` last page (`extent_base`, `extent_n`). | Gone (meta &lt; 22 refuses) |
+| **18** | MPHF SH main (8 B values) + sealed `tx.head` MPHF; no IBD SH runs. | Gone (meta &lt; 22 refuses) |
+| **17** | SH runs `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent; megakey pages delta-stream; `spent.ovf`; no `archive_epoch`; segmented tip-only `sp_tweaks.*` dirs. | Gone (meta &lt; 22 refuses) |
+| **16** | Drop `tx_height.body`; RAM fence from `confirmed[]` + `header_txs_*`. | Gone (meta &lt; 22 refuses) |
+| **15** | Class A `txout`/`seqsigwit`/`spent` split; SH slabs + sorted heads; refuse packed Class A with txs and page-era SH | Gone (meta &lt; 22 refuses) |
+| **14** | SH head Empty/Inline/**Paged** (4 KiB page chains); seal @0.8 + overflow OA; refuse slab values | Gone (meta &lt; 22 refuses) |
+| **13** | Dense `txid.body` sidefile; packed body **without** leading txid; RWF_DONTCACHE policy | Gone (meta &lt; 22 refuses) |
 | **12** | Datadir `store.secret`; script/witness XOR at rest; keyed `tx.head` mix; head overflow; durable `block_queue/` | Prior |
 | **11** | Txid-first packed body; 8-byte align + page rule; segmented u32 stride `tx.idx.*` | Prior |
 | **10** | Packed inputs: `create_fk:u64` + vout (not `prev_txid[32]`); online `tx.head` resize; default BITS=28 | Prior packed layout |

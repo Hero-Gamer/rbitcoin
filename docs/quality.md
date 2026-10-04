@@ -86,7 +86,6 @@ just not the current product. COMPAT/OPERATOR stay the shipped contract.
 | ID | Item | Why parked | Reopen when |
 |----|------|------------|-------------|
 | **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx (`OPERATOR.md`). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
-| **Q-65** | BIP157/158 compact block filters | Shipped as optional `--block-filter-index` (basic / type 0). `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip. Serving follows the filter watermark, not the scripthash watermark. | — |
 
 ---
 
@@ -117,7 +116,9 @@ checklist.
   (`live_p2p_lock`). Do not “fix” flakes with `RUST_TEST_THREADS=1`.
   [`TESTING.md`](../TESTING.md).
 - **Default CI is the pin.** Unlabeled PRs: `cargo test`, not Core
-  functional. Coverage: production LCOV **≥ 92%** floor; CRAP `--fail-above 30`
+  functional. Coverage: production LCOV **≥ 92%** floor. Journey tests run
+  and already count the production lines they hit; their own lines stay out
+  of the ratio. CRAP `--fail-above 30`
   with `.cargo-crap.toml` allowlist. Tests assert shipped behavior, not repo
   text.
 - **Operator honesty:** experimental 0.x; milestone skip is loud; CLI/conf

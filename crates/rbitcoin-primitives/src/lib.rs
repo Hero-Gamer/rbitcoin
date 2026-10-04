@@ -93,47 +93,25 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         confirm stamps. SH extent last-page reserved is create count.
 /// **23:** `create.loc.ovf` rows are 16 B (`fk:u64` + strides/`n_out` u32) so a
 ///         ~1 MiB consensus-valid txout (and `n_out > 65535`) stores. Occupied
-///         22 Class A rewrites 12 B ovf rows and `meta`. Occupied 15–21 Class A
-///         still refused. Empty 13–22 rewrite `meta`.
+///         22 Class A rewrites 12 B ovf rows and `meta`.
 /// **22:** `create.loc` + `seqsigwit.loc`; LAYOUT17 omits `output_count`. Spent
-///         slot is flags + u40 spend fk + u16 vin. Occupied 21 Class A
-///         refused (wipe + IBD). Empty 21 rewrites `meta` and unlinks
-///         leftover `spent.off` and `{txout,spent,seqsigwit}.idx`.
-/// **21:** Drop `spent.idx`; leftover unlinked; rewrite `meta` 20→21. Spent
-///         ranges are `n_out` prefix of `txout` (sparse `spent.off`).
-/// **20:** Sealed `tx.head` value-assigned packed BDZ (no `.rel`). Occupied
-///         schema **18/19** `tx.head` is refused (wipe `store/tx.head`, keep
-///         Class A + SH). Empty `tx.head` rewrites `meta` and rebuilds.
-/// **19:** Megakey SH extent pack8 mode 11 (`ver=2` last page). Soft-open **18**
-///         with occupied indexes (rewrite `meta`). 18 binary refuses 19 `meta`.
-/// **18:** MPHF SH main + sealed `tx.head`; no IBD SH runs. Soft-open **17**
-///         only when `tx.head` occupancy and `scripthash*` data are absent
-///         (rewrite `meta`); otherwise refuse (wipe those indexes, keep Class A).
-/// **17:** SH `key_len=40`; Class A thin meta + kinds 0–9 + 8 B spent;
-///         megakey pages are uleb deltas.
-/// **16:** Drop `tx_height.body`; create height is a RAM fence from `confirmed[]` +
-///         `header_txs_*`. Soft-open schema 15 (unlink leftover file). Class A unchanged.
-/// **15:** Class A split (`txout` / `seqsigwit` / `spent`) + Class B SH slabs / sorted heads.
-///         Refuse packed schema-13/14 Class A with txs; refuse materialized page-era SH.
-/// **14:** Class B SH head = Empty/Inline/Paged (4 KiB page chains); refuse schema-13 slabs.
-/// **13:** dense `txid.body` sidefile; Class A packed body meta **without** leading txid.
+///         slot is flags + u40 spend fk + u16 vin. This is the oldest meta
+///         this binary opens.
+/// **21 and older:** not opened. Meta below 22 is one wipe-and-IBD refuse.
+///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
 pub const SCHEMA_VERSION: u16 = 26;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **26** is current (`header.body` 88 B). Occupied **24/25** strips
-/// the trailing size/weight from 96 B rows. Occupied **25** still rewrites
-/// `meta` and zero-extends `txstat.body`. Occupied **23** header rows are
-/// already 88 B. Occupied **22** Class A
-/// rewrites 12 B ovf rows. Occupied 21 Class A is refused. Schema **21** empty
-/// Class A rewrites `meta`. Schema **20** table headers still open when Class A
-/// is empty. Schema **18/19** with occupied `tx.head` or `scripthash*` are
-/// refused; empty 18/19 indexes rewrite `meta`. Schema **17** still refuses
-/// populated `tx.head` / `scripthash*` or rewrites empty indexes. Schema **13**–**16**
-/// still soft-open empty Class A / empty SH (meta rewrite).
+/// Schema **26** is current. Meta **22** through **26** opens. Occupied **22**
+/// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
+/// trailing size/weight from 96 B `header.body` rows. Occupied **25** rewrites
+/// `meta` and zero-extends `txstat.body`. Meta older than **22** is not
+/// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /
+/// `seqsigwit.body`) were wiped, not rewritten.
 #[inline]
 pub fn schema_file_openable(ver: u16) -> bool {
-    (13..=SCHEMA_VERSION).contains(&ver)
+    (22..=SCHEMA_VERSION).contains(&ver)
 }
 
 /// 1-based foreign key into a store table body. Zero means null / absent.
@@ -413,6 +391,23 @@ mod tests {
     }
 
     #[test]
+    fn schema_file_openable_is_22_through_current() {
+        assert!(!schema_file_openable(21));
+        assert!(!schema_file_openable(13));
+        assert!(schema_file_openable(22));
+        assert!(schema_file_openable(SCHEMA_VERSION));
+        assert!(!schema_file_openable(SCHEMA_VERSION + 1));
+        eprintln!(
+            "schema_file_openable false below 22 (21={} 13={}) true from 22 through current {} (22={} current={})",
+            schema_file_openable(21),
+            schema_file_openable(13),
+            SCHEMA_VERSION,
+            schema_file_openable(22),
+            schema_file_openable(SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
     fn constants_stable() {
         assert_eq!(STORE_MAGIC, *b"RBT1");
         assert_eq!(SCHEMA_VERSION, 26);
@@ -422,15 +417,10 @@ mod tests {
         assert!(schema_file_openable(24));
         assert!(schema_file_openable(23));
         assert!(schema_file_openable(22));
-        assert!(schema_file_openable(21));
-        assert!(schema_file_openable(20));
-        assert!(schema_file_openable(19));
-        assert!(schema_file_openable(18));
-        assert!(schema_file_openable(17));
-        assert!(schema_file_openable(16));
-        assert!(schema_file_openable(15));
-        assert!(schema_file_openable(14));
-        assert!(schema_file_openable(13));
+        assert!(!schema_file_openable(21));
+        assert!(!schema_file_openable(20));
+        assert!(!schema_file_openable(16));
+        assert!(!schema_file_openable(13));
         assert!(!schema_file_openable(12));
         assert!(!schema_file_openable(27));
         assert!(!schema_file_openable(0));
@@ -440,7 +430,7 @@ mod tests {
     fn open_schema26_meta_refused_by_v25_gate() {
         const SCHEMA25_MAX: u16 = 25;
         fn schema25_binary_openable(ver: u16) -> bool {
-            (13..=SCHEMA25_MAX).contains(&ver)
+            (22..=SCHEMA25_MAX).contains(&ver)
         }
         assert!(!schema25_binary_openable(26));
         assert!(schema25_binary_openable(25));
@@ -452,7 +442,7 @@ mod tests {
     fn open_schema25_meta_refused_by_v24_gate() {
         const SCHEMA24_MAX: u16 = 24;
         fn schema24_binary_openable(ver: u16) -> bool {
-            (13..=SCHEMA24_MAX).contains(&ver)
+            (22..=SCHEMA24_MAX).contains(&ver)
         }
         assert!(!schema24_binary_openable(25));
         assert!(schema24_binary_openable(24));

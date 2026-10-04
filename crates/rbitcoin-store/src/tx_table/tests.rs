@@ -8,7 +8,7 @@ use crate::compact::{
     SCRIPT_KIND_V17_P2WPKH, SCRIPT_KIND_V17_P2WSH, SCRIPT_KIND_V17_RAW,
 };
 use crate::hashhead::{HeadOpenOpts, HeadScale};
-use rbitcoin_primitives::{read_uleb128, write_compact_size, write_uleb128, Fk, TableKind};
+use rbitcoin_primitives::{read_uleb128, write_compact_size, write_uleb128, Fk};
 use std::path::Path;
 
 fn tempfile_dir(name: &str) -> std::path::PathBuf {
@@ -110,25 +110,6 @@ fn decode_input_run(buf: &[u8], count: u32) -> Result<Vec<InputRecord>, StoreErr
         return Err(StoreError::Corrupt("input run trailing bytes"));
     }
     Ok(out)
-}
-
-#[test]
-fn open_refuses_packed_tx_body_with_creates() {
-    let dir = tempfile_dir("legacy-tx-body");
-    {
-        let t = crate::var_table::VarTable::create(&dir, "tx", TableKind::TxOut).unwrap();
-        let prep = t
-            .prepare_batch_encode(1, 32, |_, buf| buf.extend_from_slice(&[1u8; 16]))
-            .unwrap()
-            .expect("prep");
-        t.write_body_blob_bulk(prep.start, &prep.body_blob).unwrap();
-        t.finish_prepared(prep).unwrap();
-    }
-    match TxTable::open_tiny(&dir) {
-        Ok(_) => panic!("packed tx.body must refuse"),
-        Err(err) => assert!(format!("{err}").contains("packed tx.body"), "{err}"),
-    }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
