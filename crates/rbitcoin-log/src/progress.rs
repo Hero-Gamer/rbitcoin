@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 struct Entry {
     stage: &'static str,
-    total: u64,
+    total: AtomicU64,
     base: u64,
     started: Instant,
     started_at: SystemTime,
@@ -29,7 +29,7 @@ impl Entry {
         Snapshot {
             stage: self.stage,
             done: self.done.load(Ordering::Relaxed),
-            total: self.total,
+            total: self.total.load(Ordering::Relaxed),
             base: self.base,
             elapsed: self.started.elapsed(),
             started_at: self.started_at,
@@ -124,6 +124,12 @@ impl Stage {
     pub fn add_done(&self, n: u64) {
         self.0.done.fetch_add(n, Ordering::Relaxed);
     }
+
+    /// Replace the total, for a stage whose target moves while it runs (an
+    /// index build chasing a tip that keeps advancing).
+    pub fn set_total(&self, total: u64) {
+        self.0.total.store(total, Ordering::Relaxed);
+    }
 }
 
 impl Drop for Stage {
@@ -148,7 +154,7 @@ pub fn begin(stage: &'static str, total: u64) -> Stage {
 pub fn begin_at(stage: &'static str, total: u64, base: u64) -> Stage {
     let entry = Arc::new(Entry {
         stage,
-        total,
+        total: AtomicU64::new(total),
         base,
         started: Instant::now(),
         started_at: SystemTime::now(),
@@ -204,6 +210,27 @@ mod tests {
             .collect();
         capture_finished(false);
         assert_eq!(fin, [("progress unit a", 100, 200)]);
+    }
+
+    #[test]
+    fn total_follows_a_moving_target() {
+        capture_finished(true);
+        {
+            let s = begin_at("progress unit moving", 100, 40);
+            s.set_done(90);
+            s.set_total(120);
+            let snap = running("progress unit moving").unwrap();
+            assert_eq!((snap.done, snap.total, snap.base), (90, 120, 40));
+            assert_eq!(snap.percent(), Some(75.0));
+            s.set_done(130);
+            s.set_total(130);
+        }
+        let fin: Vec<_> = take_finished()
+            .into_iter()
+            .map(|s| (s.stage, s.done, s.total))
+            .collect();
+        capture_finished(false);
+        assert_eq!(fin, [("progress unit moving", 130, 130)]);
     }
 
     #[test]

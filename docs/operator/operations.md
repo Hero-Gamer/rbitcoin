@@ -437,11 +437,19 @@ check the log for an ERROR. With no stage running, the body is the phase,
 | `scripthash keys merge` | `indexing` | Head shards sealed (a merge finishing key files an older build left starts at the shards that need no merge) | `scripthash keys merge shard=` (one line per shard) |
 | `scripthash postings collect` | `indexing` | Class A creates scanned (pass 2) | `scripthash postings collect scanned=` |
 | `scripthash pack` | `indexing` | Head shards packed and published | `scripthash unsorted pack shard= shards=` |
+| `blockfilter build` | `starting`, `indexing`, `following` | Heights with a BIP158 filter, from 0; `total` follows the tip while it builds | `index: build next= tip=` (both indexes on one line) |
+| `sp_tweaks build` | `starting`, `indexing`, `following` | Heights with BIP-352 tweaks, from the tweak origin (the taproot height by default); `total` follows the tip | `index: build next= tip=` |
 
 Other work in these phases (for example spend replay at open, or the
 scripthash catch-up after the build) has no stage yet and shows
-`"stage":null` while it runs. The counters are per process, which matters
-only when several nodes share one (tests).
+`"stage":null` while it runs. The two index stages appear only while that
+index is at least 64 heights behind the tip: the startup repair of a short
+restart gap (`starting`), or the `rbtc-idx-wb` build after
+`--block-filter-index` or `--sp-tweaks` is turned on later, which keeps
+running into `following`. They count committed heights, so each ends once
+its index passes the tip; following the tip one block at a time registers
+no stage. The counters are per process, which matters only when several
+nodes share one (tests).
 
 `/readyz` still answers with the phase alone (`not ready: indexing`); poll
 `/progress` for how far along it is. With `--metrics`, every running stage is
