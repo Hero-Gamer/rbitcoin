@@ -33,9 +33,10 @@ if [[ -z "${LLVM_PROFDATA:-}" ]] && command -v llvm-profdata >/dev/null 2>&1; th
 fi
 
 # main.rs trampolines are one-liners; logic is covered via cli_main in libs.
-# Test files / rbitcoin-test / rbitcoin-bench / testutil are not production. Do not match the
-# substring "test" (regtest_rpc.rs / regtest_pad.rs stay in the denominator).
-IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/tests/|_tests\.rs$|/tests\.rs$|/testutil\.rs$|/tests_verify\.rs$|/crates/rbitcoin-test/|/crates/rbitcoin-bench/)'
+# Unit files, testutil, and rbitcoin-bench stay out of the ratio. The journey
+# crate (crates/rbitcoin-test/) stays in. Do not match the substring "test"
+# (regtest_rpc.rs / regtest_pad.rs stay in the denominator).
+IGNORE='(/\.cargo/|/rustc-|/nix/store/|library/std/|/src/main\.rs$|/tests/|_tests\.rs$|/tests\.rs$|/testutil\.rs$|/tests_verify\.rs$|/crates/rbitcoin-bench/)'
 
 if command -v cargo-llvm-cov >/dev/null 2>&1 || cargo llvm-cov --version >/dev/null 2>&1; then
   ./scripts/coverage.test.sh
@@ -113,7 +114,7 @@ PY
   # Display and gate both use 2-decimal percent (llvm-cov LH jitters).
   LCOV_PCT="$(python3 -c "print(f'{100.0*$LCOV_HIT/$LCOV_TOT:.2f}')")"
   MISS=$((LCOV_TOT > LCOV_HIT ? LCOV_TOT - LCOV_HIT : 0))
-  echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS} (production files)"
+  echo "LCOV lines: ${LCOV_HIT}/${LCOV_TOT} (${LCOV_PCT}%) miss=${MISS} (production files + journey crate)"
   echo "Line coverage gate: ${LCOV_PCT}% now; pass iff unrounded LH*100 >= LF*92"
   echo "Gate math: 92% floor (llvm-cov LH jitters; no never-falls ratchet)"
 
@@ -146,8 +147,8 @@ PY
   SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
   python3 "$ROOT/scripts/coverage-badge.py" \
     --lh "$LCOV_HIT" --lf "$LCOV_TOT" --gate 92 \
-    --sha "$SHA" --scope production --out "$ROOT/coverage/badge.json"
-  echo "Wrote coverage/badge.json (${LCOV_PCT}% production)"
+    --sha "$SHA" --scope production+journeys --out "$ROOT/coverage/badge.json"
+  echo "Wrote coverage/badge.json (${LCOV_PCT}% production+journeys)"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
   echo "Tooling: use llvmPackages matching rustc (rustc 1.95 → LLVM 21; see shell.nix)."

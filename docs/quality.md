@@ -116,7 +116,9 @@ checklist.
   (`live_p2p_lock`). Do not “fix” flakes with `RUST_TEST_THREADS=1`.
   [`TESTING.md`](../TESTING.md).
 - **Default CI is the pin.** Unlabeled PRs: `cargo test`, not Core
-  functional. Coverage: production LCOV **≥ 92%** floor; CRAP `--fail-above 30`
+  functional. Coverage: production files plus the `rbitcoin-test` journey
+  crate, LCOV **≥ 92%** floor (`LH*100 >= LF*92`). A journey that executes
+  a production line already counts that line. CRAP `--fail-above 30`
   with `.cargo-crap.toml` allowlist. Tests assert shipped behavior, not repo
   text.
 - **Operator honesty:** experimental 0.x; milestone skip is loud; CLI/conf

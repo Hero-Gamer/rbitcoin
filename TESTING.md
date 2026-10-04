@@ -189,13 +189,18 @@ test bytes are RAM.
 
 | Metric | Required |
 |--------|----------|
-| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **≥ 92%** (unrounded `LH*100 >= LF*92`). No never-falls ratchet — llvm-cov hit counts jitter tens of lines on the same tree. |
+| Line coverage | LCOV `LH`/`LF` from `./scripts/coverage.sh` **≥ 92%** (unrounded `LH*100 >= LF*92`) over production files plus the `rbitcoin-test` journey crate. No never-falls ratchet — llvm-cov hit counts jitter tens of lines on the same tree. |
 | Branch coverage | **≥ 90%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close large gaps via scenarios |
 
-Test modules (`*_tests.rs`, `/tests/`, `testutil.rs`, crate `rbitcoin-test`)
-are omitted from `LH`/`LF`. `#[cfg(test)]` arms inside production files
-still count. llvm-cov hit counts jitter tens of lines on the same tree;
-the floor is the gate, not a never-falls ratchet vs master.
+Unit modules (`*_tests.rs`, `tests.rs`, `/tests/`, `testutil.rs`,
+`tests_verify.rs`) and `rbitcoin-bench` are omitted from `LH`/`LF`.
+`crates/rbitcoin-test/` source is in the ratio; a file under that crate
+still drops out when it matches those unit-file ignores (`/tests/`,
+`testutil.rs`). A journey that executes a production line already counts
+that line, so a second in-crate `#[test]` is not required to make LCOV see
+it. `#[cfg(test)]` arms inside production files still count. llvm-cov hit
+counts jitter tens of lines on the same tree; the floor is the gate, not a
+never-falls ratchet vs master.
 
 The README badge and rbitcoin.org figure are the last **green `master`**
 `coverage` job (`badges` branch `coverage.json`, Shields endpoint). A red
@@ -232,18 +237,20 @@ cold instrumented rebuild with `COVERAGE_CLEAN=1 ./scripts/coverage.sh`.
 
 ### What is measured
 
-All workspace members that contain production code:
+Production files plus the journey crate:
 
 - `rbitcoin-primitives`, `rbitcoin-store`, `rbitcoin-query`
 - `rbitcoin-consensus`, `rbitcoin-mempool`, `rbitcoin-net`
 - `rbitcoin-electrum`, `rbitcoin-esplora`, `rbitcoin-log`
 - `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
+- `rbitcoin-test` source that is not under a unit-file ignore
 
 **Excluded by default:** third-party crates, `src/main.rs` trampolines, test
 modules (`*_tests.rs`, `tests.rs`, crate `/tests/`, `testutil.rs`,
-`tests_verify.rs`), crate `rbitcoin-test`, and `rbitcoin-bench` (optional
-host client tool; not a coverage gate). Dependencies are not attributed
-to us. `regtest_rpc.rs` / `regtest_pad.rs` stay in the denominator.
+`tests_verify.rs`), and `rbitcoin-bench` (optional host client tool; not a
+coverage gate). Dependencies are not attributed to us. `regtest_rpc.rs` /
+`regtest_pad.rs` stay in the denominator. A journey which executes a
+production line already counts that line.
 
 ### Philosophy
 
