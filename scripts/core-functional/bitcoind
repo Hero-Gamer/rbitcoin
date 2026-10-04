@@ -678,15 +678,24 @@ def translate(
     if log_level:
         cmd += ["--log-level", log_level]
     cmd += extra_node_args
-    for scale in read_conf_keys(datadir / "bitcoin.conf", "head_scale"):
-        if scale == "tiny" or scale == "mainnet":
-            cmd += ["--head-scale", scale]
     for host in read_conf_keys(datadir / "bitcoin.conf", "addnode") + addnodes:
         if not host:
             continue
         if ":" not in host:
             host = f"{host}:{p2pport}"
         cmd += ["--connect", host]
+    scales = [
+        s for s in read_conf_keys(datadir / "bitcoin.conf", "head_scale") if s
+    ]
+    # Lab entrypoint sets RBITCOIN_LAB_HEAD_SCALE=tiny. An explicit conf
+    # value wins, including mainnet. Unset env leaves the node default.
+    if not scales:
+        lab_scale = os.environ.get("RBITCOIN_LAB_HEAD_SCALE", "").strip()
+        if lab_scale == "tiny":
+            scales = ["tiny"]
+    for scale in scales:
+        if scale == "tiny" or scale == "mainnet":
+            cmd += ["--head-scale", scale]
 
     pw = (conf.get("rpcpassword") or "").strip()
     if pw:
@@ -751,6 +760,14 @@ def main(argv: list[str] | None = None) -> int:
     # TestNode tails this process's stderr and requires it empty on a clean
     # stop. Core writes logs to debug.log (printtoconsole=0). Keep that shape:
     # node stdio → {datadir}/debug.log; only `Error:` lines on shim stderr.
+    # The lab image sets RBITCOIN_LOG_STDOUT=1 so kubectl / warnet logs see
+    # the same bytes. Functional tests leave the switch off.
+    log_stdout = os.environ.get("RBITCOIN_LOG_STDOUT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     log_path = node_dir / "debug.log"
     prior = log_path.stat().st_size if log_path.is_file() else 0
     log_f = open(log_path, "ab", buffering=0)
@@ -782,6 +799,12 @@ def main(argv: list[str] | None = None) -> int:
             for mapped in apply_line(text, rules):
                 log_f.write((mapped + "\n").encode())
             log_f.flush()
+            if log_stdout and raw:
+                try:
+                    sys.stdout.buffer.write(raw)
+                    sys.stdout.buffer.flush()
+                except OSError:
+                    pass
 
     pump = threading.Thread(target=_pump, daemon=True)
     pump.start()
@@ -856,8 +879,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         core_datadir = node_dir.parent
-        rpcbind = read_conf(core_datadir / "bitcoin.conf").get("rpcbind") or ""
-        proxy = RpcProxy((proxy_bind_host(rpcbind), public_rpc), node_url, _cookie)
+        conf_path = core_datadir / "bitcoin.conf"
+        conf = read_conf(conf_path)
+        rpcbind = conf.get("rpcbind") or ""
+        proxy = RpcProxy(
+            (proxy_bind_host(rpcbind), public_rpc),
+            node_url,
+            _cookie,
+            rpcauth_lines=read_conf_keys(conf_path, "rpcauth"),
+            whitelist_lines=read_conf_keys(conf_path, "rpcwhitelist"),
+            whitelist_default=conf.get("rpcwhitelistdefault"),
+        )
     except OSError:
         if child.poll() is None:
             child.terminate()

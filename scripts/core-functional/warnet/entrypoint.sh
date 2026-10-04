@@ -4,6 +4,8 @@ DATADIR="${BITCOIN_DATA:-/root/.bitcoin}"
 export BITCOIN_DATA="$DATADIR"
 export RBITCOIN_NODE="${RBITCOIN_NODE:-/usr/local/bin/rbitcoin-node}"
 export RBITCOIN_LOG_STDOUT="${RBITCOIN_LOG_STDOUT:-1}"
+# Regtest tanks. Conf head_scale= wins, including mainnet.
+export RBITCOIN_LAB_HEAD_SCALE="${RBITCOIN_LAB_HEAD_SCALE:-tiny}"
 export PYTHONPATH="${PYTHONPATH:-/opt/rbitcoin/shim:/opt/rbitcoin/functional}"
 mkdir -p "$DATADIR"
 if [ "$#" -eq 0 ]; then

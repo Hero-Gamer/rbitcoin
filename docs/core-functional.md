@@ -293,12 +293,30 @@ python3 scripts/core-functional/create_cache.py --ensure
 
 ## Warnet lab (all-rbitcoin tanks)
 
-Not an operator musl Release. Image tag `rbitcoin-warnet:local`. Warnet
-stays Core Helm (`bitcoin.conf`, `rpcuser`/`rpcpassword`, `addnode=tank-N`,
-`pidof bitcoind`). The node is not taught Core conf; the Python shim
-translates `addnode=` to `--connect host:18444`, seeds `{datadir}/rpc.token`
-from `rpcpassword`, and binds the test proxy on `rpcbind=0.0.0.0`. Basic
-auth accepts any username whose password matches that token.
+Not an operator musl Release. The compose example keeps image tag
+`rbitcoin-warnet:local`. Kind and Helm use `rbitcoin-warnet:28.0.0`.
+That tag is the chart's Core-version gate, not the rbitcoin version.
+Warnet passes it to `semverCompare ">=0.17.0"` and, when the compare
+succeeds, writes `[regtest]` before `rpcport`, `rpcpassword`, `rpcauth`,
+and `addnode`. A prerelease does not count: Warnet main strips `-…` and
+then compares, and `0.7.99` is below `0.17.0`, so the section is omitted
+while `helm template` still exits 0. `local` is not a semantic version
+(Warnet 1.1.20 compares the raw tag; current Warnet main normalizes a few
+Core shapes and still rejects that fallback). A release tag `>= 0.17.0`
+with no prerelease, such as `28.0.0`, emits the section on both.
+Warnet stays Core Helm (`bitcoin.conf`, `rpcuser`/`rpcpassword`,
+`addnode=tank-N`, `pidof bitcoind`). The node is not taught Core conf; the
+Python shim translates `addnode=` to `--connect host:18444`, seeds
+`{datadir}/rpc.token` from `rpcpassword`, and binds the test proxy on
+`rpcbind=0.0.0.0`. Basic auth accepts the cookie, any username whose
+password matches that token, and Core `rpcauth=` (HMAC-SHA256, salt as
+the key). `rpcwhitelistdefault=0` limits only users named in
+`rpcwhitelist=`, so fork-observer's published login can call
+`getchaintips`, `getblockheader`, `getblockhash`, `getblock`, and
+`getnetworkinfo`, and the tank `rpcuser` is not locked out. The image
+sets `RBITCOIN_LOG_STDOUT=1` (node lines on container stdout and in
+`debug.log`) and `RBITCOIN_LAB_HEAD_SCALE=tiny` when conf omits
+`head_scale`. Conf `head_scale=mainnet` still selects mainnet heads.
 
 Hostname `--connect` / `addnode add` resolve at each dial on a blocking
 thread and retry every 2 seconds until a live session exists. `--connect`
@@ -322,8 +340,9 @@ cargo build -p rbitcoin-node
 ./scripts/core-functional/warnet/example.sh
 ```
 
-The example conf sets `head_scale=tiny` so a tank does not fallocate mainnet
-heads. `example.sh` copies a **bookworm-linked** `rbitcoin-node` into the image
+The example conf sets `head_scale=tiny`. The lab image does the same when
+conf omits it, so a Helm tank does not fallocate mainnet heads. `example.sh`
+copies a **bookworm-linked** `rbitcoin-node` into the image
 (a nix devshell binary will not exec: its dynamic loader is not in Debian).
 It starts `tank1` first (`addnode=tank0`), waits until that RPC is up at
 height 0 with no peer, then starts `tank0`, mines one regtest block, and
@@ -339,17 +358,19 @@ Needs Docker + kind on an operator host. Do not open mainnet. Wallet keys
 are RAM-only.
 
 ```bash
-docker build -t rbitcoin-warnet:local \
+docker build -t rbitcoin-warnet:28.0.0 \
   --build-arg NODE_BIN=target/dev/debug/rbitcoin-node \
   -f scripts/core-functional/warnet/Dockerfile .
-kind load docker-image rbitcoin-warnet:local
+kind load docker-image rbitcoin-warnet:28.0.0
 python3 -m venv .venv && source .venv/bin/activate
 pip install warnet
 warnet setup
 warnet new /tmp/rbtc-warnet
 ```
 
-Three tanks, ring `addnode`, unique `rpcpassword`, `pullPolicy: Never`.
+Three tanks, ring `addnode`, unique `rpcpassword`. Set
+`image.repository` to `rbitcoin-warnet`, `image.tag` to `28.0.0`,
+and `pullPolicy: Never`.
 Pass when `miner_std.py --interval=10 --mature` leaves all three
 `getblockcount` values equal and greater than 0. Fail classes: CrashLoop
 `pidof`; 401 on RPC; height only on the miner (DNS or bind); ImagePullBackOff
