@@ -1508,6 +1508,7 @@ pub(crate) fn write_batch_is_stale_plan(hub: &ChainHub, feed: &ConfirmFeed, firs
 /// from in-flight + skeleton + pin + assemble) → scriptq →
 /// scripts → writeq → write.
 /// Returns the lookup-thread join handle and shared queue-depth counters.
+#[allow(clippy::cognitive_complexity)] // lookup also drops undecodable wire before the load batch
 pub(crate) fn spawn_confirm_engine(
     hub: Arc<ChainHub>,
     feed: Arc<ConfirmFeed>,
@@ -2414,9 +2415,26 @@ pub(crate) fn spawn_confirm_engine(
                         max_blocks,
                         max_inputs,
                     ) {
-                        Ok(wave) if !wave.items.is_empty() => {
+                        Ok(wave) if !wave.items.is_empty() || wave.undecodable.is_some() => {
                             lookup_faults.on_success();
                             did = true;
+                            if let Some((h, hash)) = wave.undecodable {
+                                warn!("ibd: body queue wire @{h} does not decode; dropped");
+                                if emit_confirm_reject(
+                                    &event_tx_lookup,
+                                    &feed,
+                                    h,
+                                    BlockHash::from_byte_array(hash),
+                                    ConfirmRejectClass::SoftWire,
+                                    "body queue wire does not decode".into(),
+                                    1,
+                                    None,
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
+                            }
                             let counts: Vec<u32> = wave
                                 .items
                                 .iter()

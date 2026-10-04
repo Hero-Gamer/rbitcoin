@@ -1244,6 +1244,10 @@ impl Query {
     pub const MAX_SH_CREATES_MSG: &'static str =
         "scripthash join exceeds --max-sh-creates (default 10000)";
 
+    /// [`StoreError::Rejected`] payload from [`Self::block_queue_offer`] for
+    /// wire that does not decode. Only this refusal is the sender's fault.
+    pub const UNDECODABLE_WIRE_MSG: &'static str = "block wire does not decode";
+
     pub fn set_max_sh_creates(&self, n: u32) {
         self.max_sh_creates.store(n, AtomicOrdering::Relaxed);
     }
@@ -1524,9 +1528,15 @@ impl Query {
 
     /// Enqueue a raw block payload in the process-local RAM queue.
     ///
-    /// **Always accepts** peer wire. Soft densify / assign-stop only limit
-    /// **new getdata assign**; never refuse in-flight bodies here. Restart
-    /// drops the queue (redownload); sole durable write is Class A on confirm.
+    /// **Always accepts** decodable peer wire. Soft densify / assign-stop only
+    /// limit **new getdata assign**; never refuse in-flight bodies here.
+    /// Restart drops the queue (redownload); sole durable write is Class A on
+    /// confirm.
+    ///
+    /// A payload lookup would not decode is refused with
+    /// [`StoreError::Rejected`] carrying [`Self::UNDECODABLE_WIRE_MSG`], and
+    /// nothing is queued: a queued hash counts as in hand, so an undecodable
+    /// row would block the honest copy.
     pub fn block_queue_offer(
         &self,
         height: u32,
@@ -1553,11 +1563,15 @@ impl Query {
                 return Ok(BlockQueueOffer { queue_id: id });
             }
         }
-        self.block_queue_offer_vec(height, hash, header_fk, payload.to_vec(), sender)
+        let Some(n_inputs) = rbitcoin_store::block_wire_input_count(payload) else {
+            return Err(StoreError::Rejected(Self::UNDECODABLE_WIRE_MSG));
+        };
+        self.block_queue_offer_counted(height, hash, header_fk, payload.to_vec(), n_inputs, sender)
     }
 
     /// [`Self::block_queue_offer_from`] for a payload the caller already
-    /// owns (moved in, not copied).
+    /// owns (moved in, not copied). An undecodable payload is refused and
+    /// not queued.
     pub fn block_queue_offer_vec(
         &self,
         height: u32,
@@ -1566,7 +1580,21 @@ impl Query {
         owned: Vec<u8>,
         sender: Option<u64>,
     ) -> Result<BlockQueueOffer, QueryError> {
-        let n_inputs = rbitcoin_store::block_wire_input_count(&owned);
+        let Some(n_inputs) = rbitcoin_store::block_wire_input_count(&owned) else {
+            return Err(StoreError::Rejected(Self::UNDECODABLE_WIRE_MSG));
+        };
+        self.block_queue_offer_counted(height, hash, header_fk, owned, n_inputs, sender)
+    }
+
+    fn block_queue_offer_counted(
+        &self,
+        height: u32,
+        hash: [u8; 32],
+        header_fk: u64,
+        owned: Vec<u8>,
+        n_inputs: u32,
+        sender: Option<u64>,
+    ) -> Result<BlockQueueOffer, QueryError> {
         let mut g = self.block_queue.lock().unwrap();
         if let Some(id) = g.id_for_height(height) {
             return Ok(BlockQueueOffer { queue_id: id });
@@ -1583,7 +1611,7 @@ impl Query {
         header_fk: u64,
         payload: &[u8],
     ) -> Result<u64, QueryError> {
-        let n_inputs = rbitcoin_store::block_wire_input_count(payload);
+        let n_inputs = rbitcoin_store::block_wire_input_count(payload).unwrap_or(0);
         let owned = payload.to_vec();
         let mut g = self.block_queue.lock().unwrap();
         g.enqueue_vec(height, hash, header_fk, owned, n_inputs, None)
