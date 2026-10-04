@@ -3003,6 +3003,86 @@ async fn inv_getdata_charges_send_budget() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A full process-wide parent table skips a new announcement. The peer stays
+/// connected, and getdata / getheaders already collected in that inv still go out.
+#[tokio::test]
+async fn full_parent_table_keeps_headers_and_collected_getdata() {
+    use bitcoin::hashes::Hash;
+    use bitcoin::Txid;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("parent-global");
+    hub.ensure_genesis().unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    assert!(!hub.in_ibd(), "parent-cap inv pin is not IBD");
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+        .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let mp = hub.mempool().unwrap();
+    let peers = crate::peers::PeerHub::new();
+    let peer = inbound_peer(&peers);
+    let keep = [0x42; 32];
+    assert_eq!(
+        mp.note_inv_tx_requested(peer.id, keep, true, 1_000, false),
+        crate::tx_relay::ParentNote::Accepted
+    );
+    let mut n = 0u32;
+    let mut filler = peer.id.saturating_add(1);
+    let mut per_peer = 0u32;
+    loop {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&n.to_le_bytes());
+        match mp.note_inv_tx_requested(filler, hash, false, 1_000, false) {
+            crate::tx_relay::ParentNote::Accepted => {
+                n += 1;
+                per_peer += 1;
+                if per_peer == 5_000 {
+                    filler += 1;
+                    per_peer = 0;
+                }
+            }
+            crate::tx_relay::ParentNote::GlobalFull => break,
+            crate::tx_relay::ParentNote::PeerCapped => {
+                panic!("filler peer {filler} hit its own cap before the table filled")
+            }
+        }
+    }
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let block = Inventory::Block(BlockHash::from_byte_array([0x91; 32]));
+    let kept = Inventory::WitnessTransaction(Txid::from_byte_array(keep));
+    let fresh = Inventory::WitnessTransaction(Txid::from_byte_array([0x77; 32]));
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[block, kept, fresh],
+    )
+    .unwrap();
+    assert_eq!(
+        follow.ban_score, 0,
+        "a full process-wide table is not this peer's misbehavior"
+    );
+    let mut saw_headers = false;
+    let mut getdata = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        match msg.expect_msg() {
+            NetworkMessage::GetHeaders(_) => saw_headers = true,
+            NetworkMessage::GetData(v) => getdata = v,
+            other => panic!("unexpected inv follow-up: {other:?}"),
+        }
+    }
+    assert!(saw_headers, "block inv still requests headers");
+    assert_eq!(
+        getdata,
+        vec![kept],
+        "getdata already collected is sent, and the refused announcement is not"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[tokio::test]
 async fn getdata_stops_when_send_budget_is_already_over() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("gd-budget");

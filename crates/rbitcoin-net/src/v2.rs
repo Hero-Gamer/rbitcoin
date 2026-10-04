@@ -1122,6 +1122,78 @@ mod tests {
         assert!(is_ping, "the genuine packet after the decoy is the ping");
     }
 
+    /// Tip-follow and the IBD reader both call [`crate::peer_dos::decoy_stays`].
+    /// One decoy that does not fit scores and the following frame is still read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn decoy_over_the_window_scores_like_other_frames() {
+        use crate::peer::BAN_SCORE_THRESHOLD;
+        use crate::peer_dos::{decoy_stays, PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
+        use bip324::OutboundCipher;
+        use tokio::io::AsyncWriteExt;
+
+        let magic = signet_magic();
+        let magic_b = magic.to_bytes();
+        let (client, server) = duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let (rh, wh) = tokio::io::split(server);
+            let reader = BufReader::new(rh);
+            let protocol = Protocol::new(magic_b, Role::Responder, None, None, reader, wh)
+                .await
+                .expect("server handshake");
+            let (r, _w) = protocol.into_split();
+            let mut reader = V2SessionReader::from_protocol_reader(r);
+            let mut rate = PeerRateLimiter::new(1, 10_000);
+            let mut score = 0u32;
+            assert!(rate.note(1), "the window is already full");
+            let frame = read_v2_frame_with_progress(
+                &mut reader,
+                magic,
+                |_| {},
+                |n| {
+                    if decoy_stays(&mut rate, &mut score, n, BAN_SCORE_THRESHOLD) {
+                        Ok(())
+                    } else {
+                        Err(NetError::Protocol("peer misbehavior threshold"))
+                    }
+                },
+            )
+            .await
+            .expect("one decoy over the window must not abort the read");
+            (score, frame.is_ping())
+        });
+
+        let (rh, wh) = tokio::io::split(client);
+        let reader = BufReader::new(rh);
+        let protocol = Protocol::new(magic_b, Role::Initiator, None, None, reader, wh)
+            .await
+            .expect("client handshake");
+        let (_r, w) = protocol.into_split();
+        let (mut cipher, mut raw_w) = w.into_inner();
+        let decoy_plain = vec![0u8; 32];
+        let mut packet = vec![0u8; OutboundCipher::encryption_buffer_len(decoy_plain.len())];
+        cipher
+            .encrypt(&decoy_plain, &mut packet, PacketType::Decoy, None)
+            .expect("encrypt decoy");
+        raw_w.write_all(&packet).await.unwrap();
+        let ping = encode_v2_contents(NetworkMessage::Ping(7)).unwrap();
+        let mut packet = vec![0u8; OutboundCipher::encryption_buffer_len(ping.len())];
+        cipher
+            .encrypt(&ping, &mut packet, PacketType::Genuine, None)
+            .expect("encrypt ping");
+        raw_w.write_all(&packet).await.unwrap();
+        raw_w.flush().await.unwrap();
+
+        let (score, is_ping) = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("decoy overflow read timed out")
+            .expect("server task join");
+        assert_eq!(score, RATE_LIMIT_BAN_SCORE);
+        assert!(
+            is_ping,
+            "the genuine packet after the over-window decoy is the ping"
+        );
+    }
+
     #[test]
     fn truncated_v2_long_command_is_protocol() {
         assert!(matches!(

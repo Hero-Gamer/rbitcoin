@@ -30,7 +30,7 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -1568,6 +1568,7 @@ pub async fn peer_session_with(
     }
     let mut requested_since: Option<std::time::Instant> = None;
     let mut rate = PeerRateLimiter::default_limits();
+    let decoy_score = AtomicU32::new(0);
     let mut logged_invalid_v2 = false;
     let mut tx_announce_rx = hub.mempool().map(|m| m.subscribe_announces());
     let mut inv_flush_rx = hub.mempool().map(|m| m.subscribe_inv_flush());
@@ -1590,6 +1591,7 @@ pub async fn peer_session_with(
                 }
             }
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
+            decoy_score.store(follow.ban_score, Ordering::Relaxed);
             tokio::select! {
                 biased;
                 // Peer half-close / write failure: tear down so getpeerinfo
@@ -1601,12 +1603,21 @@ pub async fn peer_session_with(
                 // Inbound before local tip announce so GetData during a
                 // generate burst is not queued behind hundreds of cmpctblocks.
                 frame = read_v2_frame_with_progress(&mut reader, magic, |_| {}, |n| {
-                    if rate.note(n) {
+                    let mut score = decoy_score.load(Ordering::Relaxed);
+                    let keep = crate::peer_dos::decoy_stays(
+                        &mut rate,
+                        &mut score,
+                        n,
+                        BAN_SCORE_THRESHOLD,
+                    );
+                    decoy_score.store(score, Ordering::Relaxed);
+                    if keep {
                         Ok(())
                     } else {
                         Err(NetError::Protocol("peer misbehavior threshold"))
                     }
                 }) => {
+                    follow.ban_score = decoy_score.load(Ordering::Relaxed);
                     let frame = match frame {
                         Ok(f) => f,
                         // Any socket Io means the peer is gone — exit cleanly so
@@ -3287,9 +3298,14 @@ fn on_inv_txid(
         return None;
     }
     if let Some(s) = session {
-        if !mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false) {
-            *parent_capped = true;
-            return None;
+        match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
+        {
+            crate::tx_relay::ParentNote::Accepted => {}
+            crate::tx_relay::ParentNote::PeerCapped => {
+                *parent_capped = true;
+                return None;
+            }
+            crate::tx_relay::ParentNote::GlobalFull => return None,
         }
     }
     Some(Inventory::WitnessTransaction(*txid))
@@ -3308,15 +3324,19 @@ fn on_inv_wtxid(
     let mp = hub.mempool()?;
     if !mp.try_contains_wtxid(wtxid) {
         if let Some(s) = session {
-            if !mp.note_inv_tx_requested(
+            match mp.note_inv_tx_requested(
                 s.id,
                 wtxid.to_byte_array(),
                 s.inbound,
                 s.clock_now(),
                 true,
             ) {
-                *parent_capped = true;
-                return None;
+                crate::tx_relay::ParentNote::Accepted => {}
+                crate::tx_relay::ParentNote::PeerCapped => {
+                    *parent_capped = true;
+                    return None;
+                }
+                crate::tx_relay::ParentNote::GlobalFull => return None,
             }
         }
         return Some(Inventory::WTx(*wtxid));

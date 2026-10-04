@@ -112,6 +112,24 @@ impl PeerRateLimiter {
     }
 }
 
+/// Count one decoy (or other unsolicited frame) in `rate`.
+///
+/// A frame that does not fit adds [`RATE_LIMIT_BAN_SCORE`] and stays
+/// connected until `disconnect_at`. Callers use the same threshold as an
+/// unknown message type.
+pub fn decoy_stays(
+    rate: &mut PeerRateLimiter,
+    ban_score: &mut u32,
+    payload_len: usize,
+    disconnect_at: u32,
+) -> bool {
+    if rate.note(payload_len) {
+        return true;
+    }
+    *ban_score = ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
+    *ban_score < disconnect_at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +187,24 @@ mod tests {
         }
         assert_eq!(RATE_LIMIT_BAN_SCORE, 50);
         assert_eq!(OVERSIZE_BAN_SCORE, 100);
+    }
+
+    #[test]
+    fn one_overflow_scores_and_the_second_disconnects() {
+        let mut rate = PeerRateLimiter::new(1, 10_000);
+        let mut score = 0u32;
+        let disconnect_at = RATE_LIMIT_BAN_SCORE.saturating_mul(2);
+        assert!(decoy_stays(&mut rate, &mut score, 1, disconnect_at));
+        assert_eq!(score, 0, "a frame that fits does not score");
+        assert!(
+            decoy_stays(&mut rate, &mut score, 1, disconnect_at),
+            "one frame over the window stays connected"
+        );
+        assert_eq!(score, RATE_LIMIT_BAN_SCORE);
+        assert!(
+            !decoy_stays(&mut rate, &mut score, 1, disconnect_at),
+            "the next overflow reaches the disconnect threshold"
+        );
+        assert_eq!(score, disconnect_at);
     }
 }

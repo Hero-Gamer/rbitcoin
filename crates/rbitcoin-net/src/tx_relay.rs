@@ -31,7 +31,7 @@ use crate::fee_history_file;
 
 #[path = "parent_req.rs"]
 mod parent_req;
-pub(crate) use parent_req::DueParent;
+pub(crate) use parent_req::{DueParent, ParentNote};
 
 /// Max age of a published fee snapshot before refresh (request path is still Arc-load only
 /// after a concurrent refresh has finished; see [`MempoolHub::maybe_refresh_fee_snapshot`]).
@@ -2530,8 +2530,9 @@ impl MempoolHub {
         }
     }
 
-    /// `wtxid` records that `hash` arrived as a wtxid inv.
-    /// Returns false when a cap refuses a new announcement (peer misbehavior).
+    /// `wtxid` records that this announcement is a wtxid inv.
+    /// [`ParentNote::PeerCapped`] is this peer's own cap. [`ParentNote::GlobalFull`]
+    /// skips the row and is not misbehavior.
     pub(crate) fn note_inv_tx_requested(
         &self,
         peer: u64,
@@ -2539,7 +2540,7 @@ impl MempoolHub {
         inbound: bool,
         now: u64,
         wtxid: bool,
-    ) -> bool {
+    ) -> ParentNote {
         self.parent_req
             .lock()
             .unwrap()
@@ -4982,9 +4983,17 @@ mod tests {
         for i in 0..(cap as u32 + 10) {
             let accepted = hub.note_inv_tx_requested(7, parent_hash(i), false, 1_000, false);
             if i < cap as u32 {
-                assert!(accepted, "announcement {i} under the cap");
+                assert_eq!(
+                    accepted,
+                    ParentNote::Accepted,
+                    "announcement {i} under the cap"
+                );
             } else {
-                assert!(!accepted, "announcement {i} past the cap is misbehavior");
+                assert_eq!(
+                    accepted,
+                    ParentNote::PeerCapped,
+                    "announcement {i} past this peer's cap"
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -5002,13 +5011,20 @@ mod tests {
         let mut n = 0u32;
         let mut peer = 1u64;
         while n < global {
-            assert!(hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false));
+            assert_eq!(
+                hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
+                ParentNote::Accepted
+            );
             n += 1;
             if n.is_multiple_of(per_peer) {
                 peer += 1;
             }
         }
-        assert!(!hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false));
+        assert_eq!(
+            hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
+            ParentNote::GlobalFull,
+            "a peer under its own cap is not misbehavior when the table is full"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }
@@ -5022,7 +5038,10 @@ mod tests {
         let hash = [0x91; 32];
         let txid = Txid::from_byte_array(hash);
         let wtxid = Wtxid::from_byte_array(hash);
-        assert!(hub.note_inv_tx_requested(1, hash, false, 1_000, false));
+        assert_eq!(
+            hub.note_inv_tx_requested(1, hash, false, 1_000, false),
+            ParentNote::Accepted
+        );
         hub.note_recent_reject(wtxid);
         assert_eq!(hub.announcer_peers_for(&txid, &wtxid), vec![1]);
         assert!(hub.take_due_parent_getdata(2, 2_000).is_empty());
@@ -5042,15 +5061,30 @@ mod tests {
         let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
         let hash = [0xab; 32];
-        assert!(hub.note_inv_tx_requested(1, hash, false, 1_000, true));
+        assert_eq!(
+            hub.note_inv_tx_requested(1, hash, false, 1_000, true),
+            ParentNote::Accepted
+        );
+        assert_eq!(
+            hub.note_inv_tx_requested(3, hash, false, 1_000, true),
+            ParentNote::Accepted,
+            "the wtxid follow-up is its own row"
+        );
         let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
         hub.schedule_orphan_parents(&missing, 2, false, 1_000);
         let expired = 1_000 + GETDATA_TX_INTERVAL_SECS;
         assert!(hub.take_due_parent_getdata(1, expired).is_empty());
-        let got = hub.take_due_parent_getdata(2, expired);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].hash, hash);
-        assert!(got[0].wtxid, "wtxid follow-up must stay WTx");
+        let follow = hub.take_due_parent_getdata(3, expired);
+        assert_eq!(follow.len(), 1);
+        assert_eq!(follow[0].hash, hash);
+        assert!(follow[0].wtxid, "wtxid follow-up must stay WTx");
+        let parent = hub.take_due_parent_getdata(2, expired);
+        assert_eq!(parent.len(), 1);
+        assert_eq!(parent[0].hash, hash);
+        assert!(
+            !parent[0].wtxid,
+            "a txid parent is not fetched as a wtxid because another peer announced these bytes"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
     }

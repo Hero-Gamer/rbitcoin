@@ -12,7 +12,7 @@ use crate::peer::{
     connect_and_handshake_timed, HandshakePolicy, BAN_SCORE_THRESHOLD, HANDSHAKE_TIMEOUT,
 };
 use crate::peer_dos::{PeerRateLimiter, RATE_LIMIT_BAN_SCORE};
-use crate::v2::{read_v2_frame_with_progress, write_v2_msg_offload};
+use crate::v2::{read_v2_frame_with_progress, write_v2_msg_offload, V2Reader, V2Writer};
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message::NetworkMessage;
@@ -170,6 +170,242 @@ pub(crate) fn note_block_rx(slots: &mut [PeerSlot], peer: usize, wire_bytes: usi
     }
 }
 
+async fn read_ibd_peer(
+    id: usize,
+    magic: Magic,
+    mut reader: V2Reader,
+    out_tx: mpsc::UnboundedSender<NetworkMessage>,
+    sinks_r: PeerEventSinks,
+    bytes_io: Arc<AtomicU64>,
+) {
+    let mut prog_mark = 0usize;
+    // Decoys and unknown types only. Requested block bodies stay off
+    // this window so a fast peer is not clipped at the tip-follow cap.
+    let mut rate = PeerRateLimiter::default_limits();
+    let mut logged_invalid_v2 = false;
+    let mut ban_score = 0u32;
+    loop {
+        let frame = read_v2_frame_with_progress(
+            &mut reader,
+            magic,
+            |buffered| {
+                let delta = buffered.saturating_sub(prog_mark);
+                note_stream_bytes(&bytes_io, delta as u64);
+                prog_mark = buffered;
+            },
+            |n| {
+                if crate::peer_dos::decoy_stays(&mut rate, &mut ban_score, n, BAN_SCORE_THRESHOLD) {
+                    Ok(())
+                } else {
+                    Err(NetError::Protocol("peer misbehavior threshold"))
+                }
+            },
+        )
+        .await;
+        prog_mark = 0;
+        match frame {
+            Ok(frame) => {
+                if frame.is_ping() {
+                    if let Some(n) = frame.ping_nonce() {
+                        let _ = out_tx.send(NetworkMessage::Pong(n));
+                    }
+                    continue;
+                }
+
+                if frame.is_block() {
+                    match frame.block_hash_from_header() {
+                        Some(hash) if frame.payload.len() >= 80 => {
+                            sinks_r.send_body(PeerEvent::BlockFramed {
+                                peer: id,
+                                hash,
+                                payload: frame.payload,
+                            });
+                        }
+                        Some(hash) => {
+                            sinks_r.send_body(PeerEvent::BlockDecodeFailed { peer: id, hash });
+                        }
+                        None => {
+                            rbitcoin_log::debug!(
+                                "ibd: peer[{id}] block frame without usable header hash"
+                            );
+                        }
+                    }
+                    continue;
+                }
+
+                let sinks_d = sinks_r.clone();
+                // Non-block: decode off-thread. Never await a decode permit
+                // on the reader (stalls TCP). Soft budgets gate *requests* only.
+                spawn_decode_then_with_err(
+                    frame,
+                    move |msg| {
+                        match msg.into_payload() {
+                            NetworkMessage::Headers(h) => {
+                                sinks_d.send_ctrl(PeerEvent::Headers {
+                                    peer: id,
+                                    headers: h,
+                                });
+                            }
+                            NetworkMessage::NotFound(inv) => {
+                                let hashes = block_inventory_hashes(&inv);
+                                if !hashes.is_empty() {
+                                    sinks_d.send_body(PeerEvent::NotFound { peer: id, hashes });
+                                }
+                            }
+                            NetworkMessage::Addr(list) => {
+                                let addrs = net_addrs_from_addr(&list);
+                                if !addrs.is_empty() {
+                                    sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
+                                }
+                            }
+                            NetworkMessage::AddrV2(list) => {
+                                let addrs = net_addrs_from_addrv2(&list);
+                                if !addrs.is_empty() {
+                                    sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
+                                }
+                            }
+                            NetworkMessage::SendAddrV2 => {}
+                            // Blocks must not reach decode (handled above).
+                            NetworkMessage::Block(_) => {}
+                            NetworkMessage::Inv(inv) => {
+                                let hashes = block_inventory_hashes(&inv);
+                                if !hashes.is_empty() {
+                                    sinks_d.send_ctrl(PeerEvent::BlocksInv { peer: id, hashes });
+                                }
+                            }
+                            _other => {}
+                        }
+                    },
+                    {
+                        let sinks_e = sinks_r.clone();
+                        move |e| {
+                            sinks_e.send_body(PeerEvent::Dead {
+                                peer: id,
+                                reason: e.to_string(),
+                            });
+                        }
+                    },
+                );
+            }
+            Err(NetError::InvalidV2Type { contents_len }) => {
+                if !logged_invalid_v2 {
+                    logged_invalid_v2 = true;
+                    rbitcoin_log::debug!("{}", crate::v2::v2_invalid_message_type_log());
+                }
+                if !rate.note(contents_len) {
+                    ban_score = ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
+                    if ban_score >= BAN_SCORE_THRESHOLD {
+                        sinks_r.send_body(PeerEvent::Dead {
+                            peer: id,
+                            reason: "peer misbehavior threshold".to_string(),
+                        });
+                        break;
+                    }
+                }
+                continue;
+            }
+            Err(NetError::Io(e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                sinks_r.send_body(PeerEvent::Dead {
+                    peer: id,
+                    reason: format!("eof: {e}"),
+                });
+                break;
+            }
+            Err(e) => {
+                sinks_r.send_body(PeerEvent::Dead {
+                    peer: id,
+                    reason: e.to_string(),
+                });
+                break;
+            }
+        }
+    }
+}
+
+async fn write_ibd_peer(
+    id: usize,
+    mut cmd_rx: mpsc::UnboundedReceiver<PeerCmd>,
+    mut out_rx: mpsc::UnboundedReceiver<NetworkMessage>,
+    mut writer: V2Writer,
+    sinks_w: PeerEventSinks,
+) {
+    loop {
+        tokio::select! {
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(PeerCmd::GetHeaders { locator }) => {
+                        let locator = if locator.len() > crate::codec::MAX_LOCATOR_SZ {
+                            locator[..crate::codec::MAX_LOCATOR_SZ].to_vec()
+                        } else {
+                            locator
+                        };
+                        let gh = GetHeadersMessage::new(
+                            locator,
+                            BlockHash::from_byte_array([0u8; 32]),
+                        );
+                        if write_v2_msg_offload(
+                            &mut writer,
+                            NetworkMessage::GetHeaders(gh),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            sinks_w.send_body(PeerEvent::Dead {
+                                peer: id,
+                                reason: "write getheaders failed".into(),
+                            });
+                            break;
+                        }
+                    }
+                    Some(PeerCmd::GetData { hashes }) => {
+                        for chunk in hashes.chunks(MAX_INV_SIZE) {
+                            let inv: Vec<_> = chunk
+                                .iter()
+                                .copied()
+                                .map(Inventory::WitnessBlock)
+                                .collect();
+                            if inv.is_empty() {
+                                continue;
+                            }
+                            if write_v2_msg_offload(
+                                &mut writer,
+                                NetworkMessage::GetData(inv),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                sinks_w.send_body(PeerEvent::Dead {
+                                    peer: id,
+                                    reason: "write getdata failed".into(),
+                                });
+                                return;
+                            }
+                        }
+                    }
+                    Some(PeerCmd::Shutdown) | None => break,
+                }
+            }
+            msg = out_rx.recv() => {
+                match msg {
+                    Some(payload) => {
+                        if write_v2_msg_offload(&mut writer, payload).await.is_err() {
+                            sinks_w.send_body(PeerEvent::Dead {
+                                peer: id,
+                                reason: "write outbound failed".into(),
+                            });
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn spawn_peer(
     id: usize,
     addr: crate::NetAddr,
@@ -199,10 +435,10 @@ pub(crate) async fn spawn_peer(
     .await?;
     let peer_height = u32::try_from(ver.start_height).unwrap_or(0);
 
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<PeerCmd>();
     // Reader → writer for pongs (must not write on the read task — that would
     // stall the receive half and look like a peer stall).
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<NetworkMessage>();
     let bytes_rx_total = Arc::new(AtomicU64::new(0));
     let bytes_io = Arc::clone(&bytes_rx_total);
 
@@ -226,242 +462,14 @@ pub(crate) async fn spawn_peer(
         // July 18 cold-start worked with **no** post-handshake getaddr/sendaddrv2
         // before getheaders; those writes raced Core's pipeline and peers closed
         // (ordered=0 / inflight=0 / never archive).
-        let mut reader = reader;
         let sinks_r = sinks.clone();
-        let reader_task = tokio::spawn(async move {
-            let mut prog_mark = 0usize;
-            // Decoys and unknown types only. Requested block bodies stay off
-            // this window so a fast peer is not clipped at the tip-follow cap.
-            let mut rate = PeerRateLimiter::default_limits();
-            let mut logged_invalid_v2 = false;
-            let mut ban_score = 0u32;
-            loop {
-                let frame = read_v2_frame_with_progress(
-                    &mut reader,
-                    magic,
-                    |buffered| {
-                        let delta = buffered.saturating_sub(prog_mark);
-                        note_stream_bytes(&bytes_io, delta as u64);
-                        prog_mark = buffered;
-                    },
-                    |n| {
-                        if rate.note(n) {
-                            Ok(())
-                        } else {
-                            Err(NetError::Protocol("peer misbehavior threshold"))
-                        }
-                    },
-                )
-                .await;
-                prog_mark = 0;
-                match frame {
-                    Ok(frame) => {
-                        if frame.is_ping() {
-                            if let Some(n) = frame.ping_nonce() {
-                                let _ = out_tx.send(NetworkMessage::Pong(n));
-                            }
-                            continue;
-                        }
-
-                        if frame.is_block() {
-                            match frame.block_hash_from_header() {
-                                Some(hash) if frame.payload.len() >= 80 => {
-                                    sinks_r.send_body(PeerEvent::BlockFramed {
-                                        peer: id,
-                                        hash,
-                                        payload: frame.payload,
-                                    });
-                                }
-                                Some(hash) => {
-                                    sinks_r
-                                        .send_body(PeerEvent::BlockDecodeFailed { peer: id, hash });
-                                }
-                                None => {
-                                    rbitcoin_log::debug!(
-                                        "ibd: peer[{id}] block frame without usable header hash"
-                                    );
-                                }
-                            }
-                            continue;
-                        }
-
-                        let sinks_d = sinks_r.clone();
-                        // Non-block: decode off-thread. Never await a decode permit
-                        // on the reader (stalls TCP). Soft budgets gate *requests* only.
-                        spawn_decode_then_with_err(
-                            frame,
-                            move |msg| {
-                                match msg.into_payload() {
-                                    NetworkMessage::Headers(h) => {
-                                        sinks_d.send_ctrl(PeerEvent::Headers {
-                                            peer: id,
-                                            headers: h,
-                                        });
-                                    }
-                                    NetworkMessage::NotFound(inv) => {
-                                        let hashes = block_inventory_hashes(&inv);
-                                        if !hashes.is_empty() {
-                                            sinks_d.send_body(PeerEvent::NotFound {
-                                                peer: id,
-                                                hashes,
-                                            });
-                                        }
-                                    }
-                                    NetworkMessage::Addr(list) => {
-                                        let addrs = net_addrs_from_addr(&list);
-                                        if !addrs.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
-                                        }
-                                    }
-                                    NetworkMessage::AddrV2(list) => {
-                                        let addrs = net_addrs_from_addrv2(&list);
-                                        if !addrs.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
-                                        }
-                                    }
-                                    NetworkMessage::SendAddrV2 => {}
-                                    // Blocks must not reach decode (handled above).
-                                    NetworkMessage::Block(_) => {}
-                                    NetworkMessage::Inv(inv) => {
-                                        let hashes = block_inventory_hashes(&inv);
-                                        if !hashes.is_empty() {
-                                            sinks_d.send_ctrl(PeerEvent::BlocksInv {
-                                                peer: id,
-                                                hashes,
-                                            });
-                                        }
-                                    }
-                                    _other => {}
-                                }
-                            },
-                            {
-                                let sinks_e = sinks_r.clone();
-                                move |e| {
-                                    sinks_e.send_body(PeerEvent::Dead {
-                                        peer: id,
-                                        reason: e.to_string(),
-                                    });
-                                }
-                            },
-                        );
-                    }
-                    Err(NetError::InvalidV2Type { contents_len }) => {
-                        if !logged_invalid_v2 {
-                            logged_invalid_v2 = true;
-                            rbitcoin_log::debug!("{}", crate::v2::v2_invalid_message_type_log());
-                        }
-                        if !rate.note(contents_len) {
-                            ban_score = ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
-                            if ban_score >= BAN_SCORE_THRESHOLD {
-                                sinks_r.send_body(PeerEvent::Dead {
-                                    peer: id,
-                                    reason: "peer misbehavior threshold".to_string(),
-                                });
-                                break;
-                            }
-                        }
-                        continue;
-                    }
-                    Err(NetError::Io(e))
-                        if e.kind() == std::io::ErrorKind::UnexpectedEof
-                            || e.kind() == std::io::ErrorKind::ConnectionReset =>
-                    {
-                        sinks_r.send_body(PeerEvent::Dead {
-                            peer: id,
-                            reason: format!("eof: {e}"),
-                        });
-                        break;
-                    }
-                    Err(e) => {
-                        sinks_r.send_body(PeerEvent::Dead {
-                            peer: id,
-                            reason: e.to_string(),
-                        });
-                        break;
-                    }
-                }
-            }
-        });
+        let reader_task = tokio::spawn(read_ibd_peer(id, magic, reader, out_tx, sinks_r, bytes_io));
 
         // Let the reader poll once before we accept write work (getheaders).
         tokio::task::yield_now().await;
 
-        let mut writer = writer;
         let sinks_w = sinks;
-        let writer_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    cmd = cmd_rx.recv() => {
-                        match cmd {
-                            Some(PeerCmd::GetHeaders { locator }) => {
-                                let locator = if locator.len() > crate::codec::MAX_LOCATOR_SZ {
-                                    locator[..crate::codec::MAX_LOCATOR_SZ].to_vec()
-                                } else {
-                                    locator
-                                };
-                                let gh = GetHeadersMessage::new(
-                                    locator,
-                                    BlockHash::from_byte_array([0u8; 32]),
-                                );
-                                if write_v2_msg_offload(
-                                    &mut writer,
-                                    NetworkMessage::GetHeaders(gh),
-                                )
-                                .await
-                                .is_err()
-                                {
-                                    sinks_w.send_body(PeerEvent::Dead {
-                                        peer: id,
-                                        reason: "write getheaders failed".into(),
-                                    });
-                                    break;
-                                }
-                            }
-                            Some(PeerCmd::GetData { hashes }) => {
-                                for chunk in hashes.chunks(MAX_INV_SIZE) {
-                                    let inv: Vec<_> = chunk
-                                        .iter()
-                                        .copied()
-                                        .map(Inventory::WitnessBlock)
-                                        .collect();
-                                    if inv.is_empty() {
-                                        continue;
-                                    }
-                                    if write_v2_msg_offload(
-                                        &mut writer,
-                                        NetworkMessage::GetData(inv),
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        sinks_w.send_body(PeerEvent::Dead {
-                                            peer: id,
-                                            reason: "write getdata failed".into(),
-                                        });
-                                        return;
-                                    }
-                                }
-                            }
-                            Some(PeerCmd::Shutdown) | None => break,
-                        }
-                    }
-                    msg = out_rx.recv() => {
-                        match msg {
-                            Some(payload) => {
-                                if write_v2_msg_offload(&mut writer, payload).await.is_err() {
-                                    sinks_w.send_body(PeerEvent::Dead {
-                                        peer: id,
-                                        reason: "write outbound failed".into(),
-                                    });
-                                    break;
-                                }
-                            }
-                            None => break,
-                        }
-                    }
-                }
-            }
-        });
+        let writer_task = tokio::spawn(write_ibd_peer(id, cmd_rx, out_rx, writer, sinks_w));
 
         let mut guard = PeerIoTasks {
             reader: reader_task,
