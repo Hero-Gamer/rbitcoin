@@ -1269,6 +1269,8 @@ pub struct PeerHub {
     manual_hosts: Mutex<HashSet<String>>,
     /// `--connect` hostnames that are not a [`crate::NetAddr`] (clearnet DNS).
     connect_hosts: Mutex<Vec<String>>,
+    /// `--connect` targets given as a [`crate::NetAddr`] (IP, onion, I2P, CJDNS).
+    connect_addrs: Mutex<Vec<crate::NetAddr>>,
     /// Network P2P port used when a remembered host omits `:port`. `0` = unset.
     connect_default_port: AtomicU16,
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
@@ -1384,6 +1386,7 @@ impl PeerHub {
             added: Mutex::new(HashSet::new()),
             manual_hosts: Mutex::new(HashSet::new()),
             connect_hosts: Mutex::new(Vec::new()),
+            connect_addrs: Mutex::new(Vec::new()),
             connect_default_port: AtomicU16::new(0),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
@@ -2392,6 +2395,13 @@ impl PeerHub {
         *self.connect_hosts.lock().unwrap_or_else(|e| e.into_inner()) = hosts;
     }
 
+    /// `--connect` targets that parse as a [`crate::NetAddr`]. The redial pass
+    /// dials each one that has no live session, as Core keeps reconnecting
+    /// every `-connect` address.
+    pub fn set_connect_addrs(&self, addrs: Vec<crate::NetAddr>) {
+        *self.connect_addrs.lock().unwrap_or_else(|e| e.into_inner()) = addrs;
+    }
+
     fn note_default_port(&self, default_port: u16) {
         if default_port != 0 && self.connect_default_port.load(Ordering::Relaxed) == 0 {
             self.connect_default_port
@@ -2490,15 +2500,23 @@ impl PeerHub {
 
     /// One `manual` dial per resolved endpoint in this pass, as Core dials
     /// `-addnode` and `-connect`. `addnode add` and `--connect` of the same
-    /// host share that dial. A later pass dials again when the session is
+    /// host share that dial, as do a `--connect` hostname and address that
+    /// meet at one endpoint. A later pass dials again when the session is
     /// still not live. DNS lookup is synchronous; callers on a Tokio worker
     /// use [`Self::redial_remembered_off_runtime`].
     pub fn redial_remembered_with(&self, resolve: impl Fn(&str) -> Result<DialTarget, String>) {
         let mut seen = HashSet::<String>::new();
-        for host in self.remembered_redials() {
-            let Ok(target) = resolve(&host) else {
-                continue;
-            };
+        let addrs = self
+            .connect_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let targets = self
+            .remembered_redials()
+            .into_iter()
+            .filter_map(|host| resolve(&host).ok())
+            .chain(addrs.into_iter().map(DialTarget::from_net));
+        for target in targets {
             if !seen.insert(target.to_string()) {
                 continue;
             }
@@ -3456,6 +3474,33 @@ mod tests {
         let got = take_dials(&mut rx);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(matches!(got[0].typ, PeerConnType::Manual), "{got:?}");
+
+        // A --connect address (IP or overlay) redials in the same pass. One
+        // that meets a hostname at an endpoint shares its dial, and a live
+        // session is not dialled again.
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        hub.set_connect_addrs(vec![crate::NetAddr::Ip(ip), onion]);
+        hub.redial_remembered();
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert!(got.iter().all(|d| d.typ == PeerConnType::Manual), "{got:?}");
+        assert_eq!(got[0].target, DialTarget::Socket(ip), "{got:?}");
+        assert_eq!(got[1].target, DialTarget::from_net(onion), "{got:?}");
+        let _live = hub.register(
+            ip,
+            ip,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::Manual,
+        );
+        hub.redial_remembered();
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 1, "only the onion has no live session: {got:?}");
+        assert_eq!(got[0].target, DialTarget::from_net(onion), "{got:?}");
     }
 
     #[tokio::test]
