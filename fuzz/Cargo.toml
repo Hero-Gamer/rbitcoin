@@ -165,3 +165,10 @@ path = "fuzz_targets/p2p_sequence_differential.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "chain_review_differential"
+path = "fuzz_targets/chain_review_differential.rs"
+test = false
+doc = false
+bench = false

@@ -95,8 +95,12 @@ pub(crate) fn verify_p2sh_legacy(
     let redeem_script = Script::from_bytes(&redeem);
     let ctx = EvalContext::from_job(job, tx, input_index, redeem_script, SigVersion::Base);
     if interpreter::eval_script(redeem_script, &mut stack, &ctx)? {
-        // BIP16: true top only. Witness nested paths use cleanstack separately.
-        interpreter::require_true_top(&stack)?;
+        // BIP16: true top unless CLEANSTACK. Witness nested paths clean separately.
+        if job.cleanstack {
+            interpreter::require_clean_true(&stack)?;
+        } else {
+            interpreter::require_true_top(&stack)?;
+        }
     }
     Ok(())
 }
@@ -217,6 +221,7 @@ mod tests {
                 witness_active,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         }
@@ -508,6 +513,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -539,6 +545,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -581,6 +588,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -613,6 +621,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -648,6 +657,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -681,6 +691,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -711,6 +722,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -752,6 +764,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -794,6 +807,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -833,6 +847,7 @@ mod tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };

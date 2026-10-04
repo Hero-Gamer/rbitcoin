@@ -58,11 +58,28 @@ pub fn verify_tx_scripts_detached_forks(
     .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
 }
 
+/// Same worker as [`verify_tx_scripts_detached`], with the caller's flag word.
+///
+/// Block confirm and mempool admission keep [`ScriptVerifyFlags::consensus_at`]
+/// and [`ScriptVerifyFlags::buried`]. This entry exists so an in-process oracle
+/// can apply policy bits and pre-activation witness without those paths changing.
+pub fn verify_tx_scripts_with_flags(
+    prevouts: Vec<bitcoin::TxOut>,
+    tx: bitcoin::Transaction,
+    flags: crate::block::ScriptVerifyFlags,
+) -> Result<(), ConsensusError> {
+    script_pool::run_detached_join(move || {
+        let job = ScriptCheckJob::new(prevouts, tx, flags);
+        crate::script::verify_job_all_inputs(&job)
+    })
+    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
+}
+
 pub use block::{
     bip34_height_script, bip68_active_for_tx, block_has_witness, block_subsidy, check_block_wire,
     is_final_tx, sequence_locks_satisfied, tx_sigop_cost, validate_block_structure,
-    witness_commitment_script, ValidationContext, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT,
-    MIN_TX_WEIGHT,
+    witness_commitment_script, ScriptVerifyFlags, ValidationContext, BIP16_EXCEPTION_MAINNET,
+    MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT, TAPROOT_EXCEPTION_MAINNET,
 };
 pub(crate) use block::{validate_block_structure_hashed, TxPrecompute};
 pub use clock::{with_now, NodeClock};
@@ -85,9 +102,9 @@ pub use params::{
 pub use policy::PolicyResult;
 pub use regtest_pad::{
     grind_regtest_pow, mine_empty_regtest, mine_regtest_paying, pad_empty_from,
-    prepare_regtest_candidate, REGTEST_BLOCK_SPACING,
+    prepare_regtest_candidate, REGTEST_BLOCK_SPACING, REGTEST_POW_BITS,
 };
-pub use signet::signet_magic;
+pub use signet::{signet_challenge_transactions, signet_magic, validate_signet_block_solution};
 pub use silent_payments::{
     taproot_matches_scan, tweak_from_tx, tweaks_for_height, TaprootOut, TxTweak,
 };

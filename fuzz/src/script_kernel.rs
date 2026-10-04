@@ -12,8 +12,15 @@ use bitcoinconsensus::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelCmp {
-    Agree { accept: bool },
-    Disagree { ours: bool, core: bool },
+    Agree {
+        accept: bool,
+    },
+    Disagree {
+        ours: bool,
+        core: bool,
+    },
+    /// libbitcoinconsensus would abort (WITNESS or CLEANSTACK without the flags it asserts).
+    Skip,
 }
 
 pub fn kernel_forks(flags: u8) -> (bool, bool, bool, bool, bool, u32) {

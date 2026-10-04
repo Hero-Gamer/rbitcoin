@@ -625,10 +625,20 @@ pub fn bip34_height_script(height: u32) -> Vec<u8> {
 ///
 /// Mainnet BIP16 exception block (never enforce P2SH redeem), Core `BIP16Exception`.
 /// Height 170060 — pre-activation spends of HASH160/EQUAL as bare scripts.
-pub(crate) const BIP16_EXCEPTION_MAINNET: [u8; 32] = [
+pub const BIP16_EXCEPTION_MAINNET: [u8; 32] = [
     // little-endian display hash 00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22
     0x22, 0x9c, 0x4f, 0xac, 0x88, 0xba, 0xb1, 0x94, 0xeb, 0x08, 0xf1, 0xa5, 0x28, 0xcc, 0x30, 0x8d,
     0xed, 0x23, 0x97, 0xf4, 0xf4, 0xeb, 0x6e, 0x75, 0xdc, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Mainnet taproot exception, Core `TAPROOT_EXCEPTION` (height 692261).
+///
+/// `GetBlockScriptFlags` starts from `P2SH|WITNESS` for this hash.
+/// Little-endian display hash
+/// `0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad`.
+pub const TAPROOT_EXCEPTION_MAINNET: [u8; 32] = [
+    0xad, 0x95, 0xe3, 0xa1, 0x5e, 0xe5, 0xff, 0xd5, 0x85, 0xc5, 0xe8, 0x1d, 0x44, 0xb5, 0x6a, 0x98,
+    0x1e, 0x84, 0x2d, 0x5b, 0xc3, 0x14, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
 /// BIP16 P2SH from **precomputed** prev MTP + block hash (no header re-walk, no rehash).
@@ -756,6 +766,9 @@ pub struct ScriptVerifyFlags {
     pub witness_active: bool,
     pub discourage_upgradable_witness: bool,
     pub const_scriptcode: bool,
+    /// SCRIPT_VERIFY_CLEANSTACK for legacy bare and P2SH. Witness v0 already
+    /// requires a clean stack. Production confirm leaves this off.
+    pub cleanstack: bool,
 }
 
 impl ScriptVerifyFlags {
@@ -783,6 +796,7 @@ impl ScriptVerifyFlags {
             witness_active: true,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         }
     }
 
@@ -807,7 +821,22 @@ impl ScriptVerifyFlags {
             witness_active: segwit,
             discourage_upgradable_witness: false,
             const_scriptcode: false,
+            cleanstack: false,
         }
+    }
+
+    /// Flags a confirm of this block would use: BIP16 from the exception hash,
+    /// then [`Self::consensus_at`]. Policy flags stay off.
+    #[inline]
+    pub fn for_block(
+        params: &ChainParams,
+        height: u32,
+        block_hash: &[u8; 32],
+        prev_mtp: u32,
+    ) -> Self {
+        let bip16 = bip16_active_from_prev_mtp(params, height, block_hash, prev_mtp);
+        let ctx = ValidationContext::at(params, Height(height), Milestone::NONE);
+        Self::consensus_at(&ctx, bip16)
     }
 }
 

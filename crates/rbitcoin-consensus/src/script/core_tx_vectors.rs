@@ -241,6 +241,7 @@ fn flags_to_job(tx: Transaction, prevouts: Vec<TxOut>, flags: &TxFlags) -> Scrip
             witness_active: flags.witness,
             discourage_upgradable_witness: flags.discourage_upgradable_witness,
             const_scriptcode: flags.const_scriptcode,
+            cleanstack: flags.cleanstack,
         },
         pre: std::sync::OnceLock::new(),
     }

@@ -394,7 +394,7 @@ New features: add a high-level scenario; remove obsolete lower-level tests in th
 
 ## Core differential
 
-Nightly (not a required PR check) `fuzz.yml` runs **20** cargo-fuzz jobs.
+Nightly (not a required PR check) `fuzz.yml` runs **21** cargo-fuzz jobs.
 `fuzz/` is not a default workspace member.
 Treat crate-root `pub` that exists only so a fuzz target can call it as
 the same smell as a test-only export: prefer `pub(crate)` plus an in-crate
@@ -423,8 +423,9 @@ API.
 | `mempool_differential` | `MempoolHub::test_accept` vs Core `testmempoolaccept`. **Consensus-class only** — Core standardness / fee / RBF / dust is skip (COMPAT) | same tarball, `-acceptnonstdtxn=1` |
 | `script_verify_differential` | `verify_tx_scripts_detached` vs Core `testmempoolaccept` of the parent+spend package. Same policy skip | same tarball, `-acceptnonstdtxn=1` |
 | `store_reorg` | Tiny-hub `{extend, sibling, rewind}` connect churn (ASan, no Core). Equal-work siblings park in `held_bodies`; sibling ops no-op once `held_body_count` hits 16 so `try_apply_held` stays inside `-timeout=30` on one persistent hub (reopening the store leaked ASan RSS to 2 GiB). Store `Corrupt` / probe-exhausted **panics** | none |
-| `script_kernel_differential` | In-process `verify_tx_scripts_detached_forks` vs `bitcoinconsensus::verify_with_flags` (ASan, **fuzz workspace only**) | Core interpreter via `bitcoinconsensus` crate |
+| `script_kernel_differential` | In-process script verify vs `bitcoinconsensus` (ASan, **fuzz workspace only**). Legacy half-split still forces P2SH\|WITNESS. `0xFE` inputs carry an independent flag word, witness bytes, and fixed discriminators (empty-sig CHECKMULTISIG, non-canonical DER, typed P2PKH/P2WPKH, flag schedule, BIP16 exception, empty signet solution). Aborting flag combinations are skips. Disagreement panics | Core interpreter via `bitcoinconsensus` crate |
 | `p2p_sequence_differential` | Up to 8 `{ping, headers, block}` steps vs live Core v2 + `compare_one` for block | same tarball, `-listen=1` |
+| `chain_review_differential` | Fresh `ChainHub` per shape: height-only milestone spend, genesis coinbase spend, unspendable BIP30 replay, same-batch immature coinbase, height-0 BIP68 lock, mutated-then-honest body, reorg respend. Injected or live `submitblock` reply. No skip. Harness failure exits 2 | same tarball, `--sanitizer none`, `-testactivationheight=bip34@100000000` |
 
 ```bash
 ./scripts/fuzz-run.sh                           # block_wire (ASan)
@@ -447,6 +448,7 @@ API.
 ./scripts/fuzz-run.sh store_reorg                # tiny hub connect/disconnect, ASan, no Core
 ./scripts/fuzz-run.sh script_kernel_differential # ours vs libbitcoinconsensus, ASan, no Core
 ./scripts/fuzz-run.sh p2p_sequence_differential  # ping/headers/block vs Core, --sanitizer none
+./scripts/fuzz-run.sh chain_review_differential  # hub review shapes vs submitblock, --sanitizer none
 ```
 
 `block_differential` prepares every candidate on **regtest genesis** (`prev`

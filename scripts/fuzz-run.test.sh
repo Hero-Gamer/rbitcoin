@@ -84,6 +84,28 @@ assert_ok "script_kernel dry-run dict" \
   grep -qx "FUZZ_DICT=fuzz/dict/script.dict" <<<"$out"
 assert_ok "script_kernel dry-run max_len 2000" \
   grep -qx "FUZZ_MAX_LEN=2000" <<<"$out"
+assert_ok "script_kernel listed in fuzz Cargo.toml" \
+  grep -q 'name = "script_kernel_differential"' "$ROOT/fuzz/Cargo.toml"
+assert_ok "script_kernel listed in fuzz.yml matrix" \
+  grep -q '{ bin: script_kernel_differential, core: false }' "$ROOT/.github/workflows/fuzz.yml"
+
+out="$(FUZZ_DRY_RUN=1 "$RUN" chain_review_differential)"
+assert_ok "chain_review dry-run bin" \
+  grep -qx "FUZZ_BIN=chain_review_differential" <<<"$out"
+assert_ok "chain_review dry-run sanitizer none" \
+  grep -qx "FUZZ_SANITIZER=none" <<<"$out"
+assert_ok "chain_review dry-run prints CORE_BITCOIND" \
+  grep -q "^RBITCOIN_CORE_BITCOIND=" <<<"$out"
+assert_ok "chain_review dry-run does not set FUZZ_NO_CORE" \
+  test "$(grep -c 'FUZZ_NO_CORE' <<<"$out" || true)" = "0"
+assert_ok "chain_review dry-run timeout 180" \
+  grep -qx "FUZZ_TIMEOUT=180" <<<"$out"
+assert_ok "chain_review listed in fuzz Cargo.toml" \
+  grep -q 'name = "chain_review_differential"' "$ROOT/fuzz/Cargo.toml"
+assert_ok "chain_review listed in fuzz.yml matrix" \
+  grep -q '{ bin: chain_review_differential, core: true }' "$ROOT/.github/workflows/fuzz.yml"
+assert_ok "chain_review milestone seed" \
+  test -s "$ROOT/fuzz/fixtures/chain_review_milestone.bin"
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" p2p_sequence_differential)"
 assert_ok "p2p_sequence dry-run bin" \
@@ -309,6 +331,9 @@ assert_ok "missing comparisons fail" \
 echo "block-differential: comparisons=0" >"$WORKDIR/zero.log"
 assert_ok "zero comparisons fail" \
   bash -c '! '"$RUN"' --check-log '"$WORKDIR/zero.log"
+echo "chain-review: comparisons=0" >"$WORKDIR/chain-zero.log"
+assert_ok "chain-review zero comparisons fail" \
+  bash -c '! '"$RUN"' --check-log '"$WORKDIR/chain-zero.log"
 echo "block-differential: comparisons=1" >"$WORKDIR/one.log"
 assert_ok "comparisons=1 pass" "$RUN" --check-log "$WORKDIR/one.log"
 echo "block-spend-differential: comparisons=1" >"$WORKDIR/spend.log"

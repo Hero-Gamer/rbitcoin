@@ -146,7 +146,7 @@ elif [[ "$BIN" == "store_reorg" ]]; then
 elif [[ "$BIN" == "script_kernel_differential" ]]; then
   sanitizer="address"
   timeout=10
-elif [[ "$BIN" == "p2p_sequence_differential" ]]; then
+elif [[ "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" ]]; then
   sanitizer="none"
   timeout=180
 fi
@@ -175,7 +175,7 @@ if [[ "${FUZZ_DRY_RUN:-}" == "1" ]]; then
   if [[ "$BIN" == "script_differential" || "$BIN" == "script_verify_differential" ]]; then
     echo "FUZZ_MAX_LEN=2000"
   fi
-  if [[ "$BIN" == "block_differential" || "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" || "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" || "$BIN" == "p2p_sequence_differential" ]]; then
+  if [[ "$BIN" == "block_differential" || "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" || "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" || "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" ]]; then
     echo "RBITCOIN_CORE_BITCOIND=${RBITCOIN_CORE_BITCOIND:-}"
   fi
   if [[ "$BIN" == "store_reorg" || "$BIN" == "asmap" ]]; then
@@ -369,6 +369,29 @@ if [[ "$BIN" == "script_kernel_differential" ]]; then
     -timeout="$timeout" \
     -max_len=2000 \
     -dict=fuzz/dict/script.dict \
+    -seed="$SEED" \
+    2>&1 | tee "$log"
+  st=${PIPESTATUS[0]}
+  set -e
+  if [[ "$st" -ne 0 ]]; then
+    copy_crashers fuzz/artifacts "$CRASHERS"
+    exit "$st"
+  fi
+  fail_if_no_comparisons "$log" 0.01
+  exit 0
+fi
+
+if [[ "$BIN" == "chain_review_differential" ]]; then
+  export RBITCOIN_IO="${RBITCOIN_IO:-fd}"
+  export RBITCOIN_CORE_BITCOIND="$(./scripts/core-functional/fetch-bitcoind.sh)"
+  merge_seed fuzz/corpus/chain_review_differential \
+    fuzz/fixtures/chain_review_milestone.bin
+  log="${TMPDIR:-/tmp}/rbtc-fuzz-chain-review.$$.log"
+  set +e
+  env -u CARGO_TARGET_DIR cargo fuzz run --target "$target" --sanitizer none chain_review_differential -- \
+    -max_total_time="$(fuzz_max_total_time)" \
+    -timeout="$timeout" \
+    -max_len=64 \
     -seed="$SEED" \
     2>&1 | tee "$log"
   st=${PIPESTATUS[0]}

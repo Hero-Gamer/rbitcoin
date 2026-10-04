@@ -411,6 +411,7 @@ fn run_script_row(
                 .iter()
                 .any(|e| e == "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"),
             const_scriptcode: flags.extra.iter().any(|e| e == "CONST_SCRIPTCODE"),
+            cleanstack: flags.cleanstack,
         },
         pre: std::sync::OnceLock::new(),
     };

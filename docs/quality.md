@@ -7,7 +7,7 @@ in [`CHANGELOG.md`](../CHANGELOG.md). 1.0 product gates:
 
 **Last reaudit:** 2026-09-17. Live schema: [`SCHEMA.md`](../SCHEMA.md).
 Core functional inventory: [`core-functional.md`](./core-functional.md).
-Findings **001–023** fixed. Nightly fuzz **20** jobs. Nightly mutants,
+Findings **001–023** fixed. Nightly fuzz **21** jobs. Nightly mutants,
 5 hour budget (not required; owner [`TESTING.md`](../TESTING.md)). Previous:
 2026-09-15.
 

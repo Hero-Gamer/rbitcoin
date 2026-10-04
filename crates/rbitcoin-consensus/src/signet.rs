@@ -49,11 +49,12 @@ pub fn validate_signet_block_solution(
         return Ok(());
     }
 
-    let (to_spend, to_sign) = build_signet_txs(block, challenge)?;
+    let (to_spend, to_sign) = signet_challenge_transactions(block, challenge)?;
     verify_challenge_spend(&to_spend, &to_sign, challenge)
 }
 
-fn build_signet_txs(
+/// BIP325 `to_spend` / `to_sign` pair. The challenge script is `to_sign`'s prevout.
+pub fn signet_challenge_transactions(
     block: &Block,
     challenge: &Script,
 ) -> Result<(Transaction, Transaction), ConsensusError> {
@@ -417,7 +418,7 @@ mod tests {
         let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
         let block: Block = deserialize(raw).unwrap();
         let challenge = default_signet_challenge();
-        let (to_spend, _) = build_signet_txs(&block, challenge.as_script()).unwrap();
+        let (to_spend, _) = signet_challenge_transactions(&block, challenge.as_script()).unwrap();
         let ss = to_spend.input[0].script_sig.as_bytes();
         assert_eq!(ss[0], 0x00, "Core CScript(OP_0) then push(block_data)");
     }
@@ -439,7 +440,7 @@ mod tests {
         let mut block: Block = deserialize(raw).unwrap();
         block.txdata.clear();
         assert!(matches!(
-            build_signet_txs(&block, challenge.as_script()),
+            signet_challenge_transactions(&block, challenge.as_script()),
             Err(ConsensusError::BadBlock(_))
         ));
         let mut block: Block = deserialize(raw).unwrap();
@@ -450,7 +451,7 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         });
         assert!(matches!(
-            build_signet_txs(&block, challenge.as_script()),
+            signet_challenge_transactions(&block, challenge.as_script()),
             Err(ConsensusError::BadBlock(_))
         ));
     }
@@ -473,7 +474,8 @@ mod tests {
         };
         for challenge in [vec![0x51], vec![0x52], vec![0x74, 0x00, 0x87]] {
             let challenge = ScriptBuf::from_bytes(challenge);
-            let (to_spend, to_sign) = build_signet_txs(&block, challenge.as_script()).unwrap();
+            let (to_spend, to_sign) =
+                signet_challenge_transactions(&block, challenge.as_script()).unwrap();
             assert!(to_sign.input[0].script_sig.is_empty());
             assert!(to_sign.input[0].witness.is_empty());
             assert_eq!(to_spend.output[0].script_pubkey, challenge);

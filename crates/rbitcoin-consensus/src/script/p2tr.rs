@@ -302,6 +302,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -383,6 +384,7 @@ mod bip341_tests {
                     witness_active: true,
                     discourage_upgradable_witness: false,
                     const_scriptcode: false,
+                    cleanstack: false,
                 },
                 pre: std::sync::OnceLock::new(),
             }
@@ -628,6 +630,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -699,6 +702,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -765,6 +769,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -851,6 +856,7 @@ mod bip341_tests {
                     witness_active: true,
                     discourage_upgradable_witness: false,
                     const_scriptcode: false,
+                    cleanstack: false,
                 },
                 pre: std::sync::OnceLock::new(),
             };
@@ -895,6 +901,7 @@ mod bip341_tests {
                     witness_active: true,
                     discourage_upgradable_witness: false,
                     const_scriptcode: false,
+                    cleanstack: false,
                 },
                 pre: std::sync::OnceLock::new(),
             };
@@ -969,6 +976,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1067,6 +1075,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1358,6 +1367,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1480,6 +1490,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
@@ -1533,6 +1544,7 @@ mod bip341_tests {
                 witness_active: true,
                 discourage_upgradable_witness: false,
                 const_scriptcode: false,
+                cleanstack: false,
             },
             pre: std::sync::OnceLock::new(),
         };
