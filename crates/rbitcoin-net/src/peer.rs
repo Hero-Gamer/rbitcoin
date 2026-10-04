@@ -1408,7 +1408,7 @@ fn on_headers_poll(
         let _ = queue_getheaders(out_tx, hub, session, false, None);
     }
     if let Some(mp) = hub.mempool() {
-        let _ = mp.expire_stale();
+        mp.expire_stale_from_session();
     }
 }
 

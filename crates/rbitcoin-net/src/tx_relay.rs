@@ -1213,6 +1213,16 @@ impl MempoolHub {
         n
     }
 
+    /// Headers poll runs on `tokio-rt-worker`. Expiry takes mempool locks, so
+    /// it has to enter a [`crate::reactor::BlockingRegion`] on the blocking pool.
+    pub fn expire_stale_from_session(self: &Arc<Self>) {
+        let hub = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _g = crate::reactor::BlockingRegion::enter();
+            hub.expire_stale()
+        });
+    }
+
     pub fn subscribe_inv_flush(&self) -> broadcast::Receiver<()> {
         self.inv_flush.subscribe()
     }

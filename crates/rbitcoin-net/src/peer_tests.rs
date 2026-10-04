@@ -3437,6 +3437,79 @@ include!("peer_blocksonly_journey.rs");
 /// Core `PrepareBlockFilterRequest`: start past stop, or a range of 1000+
 /// cfilters / 2000+ cfheaders, disconnects instead of being clamped.
 #[test]
+fn headers_poll_expires_a_stale_tx_off_the_tokio_worker() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("hdr-poll-expire");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_header().unwrap();
+    let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
+        &hub.query,
+        &ChainParams::regtest(),
+        hub.tip_hash().unwrap(),
+        tip.time,
+        1,
+        101,
+        1,
+    );
+    let mp =
+        crate::tx_relay::MempoolHub::open(dir.path().join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    let tx = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cbs[0],
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let tid = tx.compute_txid();
+    mp.accept_tx(&tx).expect("admit");
+    assert_eq!(mp.live_count(), 1);
+    mp.set_expiry_hours(1);
+    mp.note_mock_now(mp.relay_now_secs() + 3600 + 5);
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let mp_wait = Arc::clone(&mp);
+
+    // The worker name is what `assert_not_reactor` checks. Inline expiry panics here.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, _rx) = mpsc::unbounded_channel();
+            on_headers_poll(&hub, &out_tx, None);
+        })
+        .await
+        .expect("headers poll task")
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mp_wait.live_count() != 0 {
+        if Instant::now() > deadline {
+            panic!("headers poll left the expired tx live");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!mp.contains(&tid));
+}
+
+#[test]
 fn compact_filter_ranges_past_core_limits_disconnect() {
     assert!(compact_filter_range(5, 4, MAX_GETCFILTERS).is_err());
     assert!(compact_filter_range(0, 999, MAX_GETCFILTERS).is_ok());
