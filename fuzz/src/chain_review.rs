@@ -102,25 +102,41 @@ fn spend_tx(prev: OutPoint, value: Amount, sequence: Sequence) -> Transaction {
 }
 
 fn hub_fate(hub: &ChainHub, block: Block) -> Result<Fate, String> {
+    Ok(hub_verdict(hub, block)?.0)
+}
+
+/// Fate plus the hub's reject text. Genesis and CSV shapes use the text so an
+/// immature or missing-prevout result is not stored as the compared fate.
+fn hub_verdict(hub: &ChainHub, block: Block) -> Result<(Fate, String), String> {
     let hash = block.block_hash();
     match hub.accept_received_block(block) {
-        Ok(_) => Ok(Fate::Accept),
-        Err(NetError::Mutated(_)) => {
+        Ok(_) => Ok((Fate::Accept, String::new())),
+        Err(NetError::Mutated(s)) => {
             if hub.is_block_invalid(&hash) {
-                Ok(Fate::Reject)
+                Ok((Fate::Reject, s))
             } else {
-                Ok(Fate::Mutated)
+                Ok((Fate::Mutated, s))
             }
         }
-        Err(
-            NetError::Consensus(_)
-            | NetError::ConnectFailed { .. }
-            | NetError::BadPrev
-            | NetError::SideBlock
-            | NetError::UnknownParent,
-        ) => Ok(Fate::Reject),
+        Err(NetError::Consensus(s)) => Ok((Fate::Reject, s)),
+        Err(NetError::ConnectFailed { msg, .. }) => Ok((Fate::Reject, msg)),
+        Err(e @ (NetError::BadPrev | NetError::SideBlock | NetError::UnknownParent)) => {
+            Ok((Fate::Reject, e.to_string()))
+        }
         Err(e) => Err(format!("hub: {e}")),
     }
+}
+
+fn detail_has(detail: &str, needle: &str) -> bool {
+    detail.to_ascii_lowercase().contains(needle)
+}
+
+fn is_immature(detail: &str) -> bool {
+    detail_has(detail, "immature")
+}
+
+fn is_missing_prevout(detail: &str) -> bool {
+    detail_has(detail, "missing prevout") || detail_has(detail, "missingorspent")
 }
 
 fn push_setup(out: &mut Vec<PlannedSubmit>, block: &Block) {
@@ -226,6 +242,28 @@ fn plan_milestone() -> Result<Vec<PlannedSubmit>, String> {
     Ok(out)
 }
 
+fn connect_empty(
+    session: &HubSession,
+    out: &mut Vec<PlannedSubmit>,
+    tip: &mut bitcoin::BlockHash,
+    time: &mut u32,
+    heights: impl Iterator<Item = u32>,
+    label: &str,
+) -> Result<(), String> {
+    for h in heights {
+        *time += REGTEST_BLOCK_SPACING;
+        let b = mine_empty_regtest(*tip, *time, h);
+        let fate = hub_fate(&session.hub, b.clone())?;
+        if fate != Fate::Accept {
+            return Err(format!("{label} pad {h}: {fate:?}"));
+        }
+        push_setup(out, &b);
+        *tip = b.block_hash();
+        *time = b.header.time;
+    }
+    Ok(())
+}
+
 fn plan_genesis_spend() -> Result<Vec<PlannedSubmit>, String> {
     let params = params_bip34_off();
     let session = HubSession::open("chain-gen", params.clone(), Milestone::NONE)?;
@@ -235,16 +273,33 @@ fn plan_genesis_spend() -> Result<Vec<PlannedSubmit>, String> {
         vout: 0,
     };
     let value = g.txdata[0].output[0].value;
-    let (tip, time) = genesis_tip(&params);
+    // Height 1 is inside the maturity window, so a node that treats the
+    // genesis coinbase as a coin still rejects before it can accept. Spend
+    // only after `coinbase_maturity` empty blocks.
+    let maturity = params.coinbase_maturity();
+    let spend_h = maturity + 1;
+    let (mut tip, mut time) = genesis_tip(&params);
+    let mut out = Vec::new();
+    connect_empty(
+        &session,
+        &mut out,
+        &mut tip,
+        &mut time,
+        1..=maturity,
+        "genesis",
+    )?;
+    time += REGTEST_BLOCK_SPACING;
     let b = mine_regtest_paying(
         tip,
-        time + REGTEST_BLOCK_SPACING,
-        1,
+        time,
+        spend_h,
         op_true(),
         vec![spend_tx(prev, value, Sequence::MAX)],
     );
-    let fate = hub_fate(&session.hub, b.clone())?;
-    let mut out = Vec::new();
+    let (fate, detail) = hub_verdict(&session.hub, b.clone())?;
+    if is_immature(&detail) {
+        return Err(format!("genesis spend is an immature reject: {detail}"));
+    }
     push_check(&mut out, &b, fate);
     drop(session);
     Ok(out)
@@ -351,24 +406,55 @@ fn batch_accept(hub: &ChainHub, blocks: &[(Height, Block)]) -> Result<bool, Stri
 fn plan_height0_csv() -> Result<Vec<PlannedSubmit>, String> {
     let params = params_bip34_off();
     let session = HubSession::open("chain-csv", params.clone(), Milestone::NONE)?;
-    let g = genesis_block(&params);
+    // The genesis coinbase is not a coin: spending it returns MissingPrevout
+    // in assemble, before structural_bip68. The first real coin is the
+    // height-1 coinbase. Its BIP68 ancestor is height 0 (`max(h - 1, 0)`).
+    // A panic on that median-time lookup propagates.
+    let maturity = params.coinbase_maturity();
+    let spend_h = maturity + 1;
+    let (mut tip, mut time) = genesis_tip(&params);
+    time += REGTEST_BLOCK_SPACING;
+    let coin = mine_regtest_paying(tip, time, 1, op_true(), Vec::new());
+    let fate_coin = hub_fate(&session.hub, coin.clone())?;
+    if fate_coin != Fate::Accept {
+        return Err(format!("csv coinbase: {fate_coin:?}"));
+    }
+    let value = coin.txdata[0].output[0].value;
     let prev = OutPoint {
-        txid: g.txdata[0].compute_txid(),
+        txid: coin.txdata[0].compute_txid(),
         vout: 0,
     };
-    let value = g.txdata[0].output[0].value;
-    // BIP68 time-based lock. A panic in the height-0 median-time path propagates.
-    let sequence = Sequence::from_consensus(1 << 22);
-    let (tip, time) = genesis_tip(&params);
+    let mut out = Vec::new();
+    push_setup(&mut out, &coin);
+    tip = coin.block_hash();
+    time = coin.header.time;
+    connect_empty(&session, &mut out, &mut tip, &mut time, 2..=maturity, "csv")?;
+    time += REGTEST_BLOCK_SPACING;
+    // Non-zero time lock so the height-0 median is an input to the decision.
+    let sequence = Sequence::from_consensus((1 << 22) | 1);
     let b = mine_regtest_paying(
         tip,
-        time + REGTEST_BLOCK_SPACING,
-        1,
+        time,
+        spend_h,
         op_true(),
         vec![spend_tx(prev, value, sequence)],
     );
-    let fate = hub_fate(&session.hub, b.clone())?;
-    let mut out = Vec::new();
+    let (fate, detail) = hub_verdict(&session.hub, b.clone())?;
+    if is_missing_prevout(&detail) {
+        return Err(format!(
+            "csv shape stopped before BIP68 (missing prevout): {detail}"
+        ));
+    }
+    if is_immature(&detail) {
+        return Err(format!(
+            "csv shape stopped before BIP68 (immature): {detail}"
+        ));
+    }
+    if fate != Fate::Accept && !detail_has(&detail, "nonfinal") {
+        return Err(format!(
+            "csv shape was not decided by the BIP68 time lock: {fate:?} {detail}"
+        ));
+    }
     push_check(&mut out, &b, fate);
     drop(session);
     Ok(out)
