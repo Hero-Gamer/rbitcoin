@@ -609,6 +609,8 @@ async fn prepare_outbound_session(
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
+    // Until this returns, the redial pass treats `peer` as already dialling.
+    let _dialing = peers.dial_in_flight(&peer);
     let peer_net = peer.net_addr();
     let stream = dialer.connect_net(peer_net).await?;
     let peer_hint = peer.version_socket();
@@ -1018,5 +1020,63 @@ mod tests {
             inbound,
             "loopback client must show as inbound in getpeerinfo"
         );
+    }
+
+    /// The 2 s redial pass must not stack a dial that is still connecting.
+    /// A SOCKS proxy that accepts and never answers holds the first dial in
+    /// `connect_net`; later passes must not open a second one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redial_skips_a_connect_target_still_dialling() {
+        let _live = live_p2p_lock().await;
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&accepts);
+        let stall = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = proxy.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-redial-in-flight-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let node = P2PNode::start_outbound_only(
+            Query::open_or_create_tiny(&dir).unwrap(),
+            ChainParams::regtest(),
+            Milestone::NONE,
+            "/rbitcoin:0.1.0(redial)/".into(),
+            0,
+            crate::socks::Dialer::socks(proxy_addr, false),
+        )
+        .await
+        .unwrap();
+        node.peers
+            .set_connect_addrs(vec![crate::NetAddr::Ip("127.0.0.1:18444".parse().unwrap())]);
+        node.peers.redial_remembered();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while accepts.load(Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first dial never reached the proxy"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for _ in 0..3 {
+            node.peers.redial_remembered();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "a dial still connecting must not be dialled again"
+        );
+        stall.abort();
+        drop(node);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

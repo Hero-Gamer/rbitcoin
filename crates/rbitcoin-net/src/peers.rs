@@ -202,6 +202,29 @@ impl std::fmt::Display for DialTarget {
     }
 }
 
+/// An outbound dial counted in [`PeerHub::dial_in_flight`]; dropping it
+/// ends the count.
+pub(crate) struct DialInFlight {
+    peers: Arc<PeerHub>,
+    key: String,
+}
+
+impl Drop for DialInFlight {
+    fn drop(&mut self) {
+        let mut g = self
+            .peers
+            .dials_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = g.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                g.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Request that the node dial `addr` as `typ`.
 #[derive(Clone, Debug)]
 pub struct DialRequest {
@@ -1271,6 +1294,9 @@ pub struct PeerHub {
     connect_hosts: Mutex<Vec<String>>,
     /// `--connect` targets given as a [`crate::NetAddr`] (IP, onion, I2P, CJDNS).
     connect_addrs: Mutex<Vec<crate::NetAddr>>,
+    /// Outbound dials still before session registration, by target. The
+    /// redial pass skips these, so a slow connect is not stacked every 2 s.
+    dials_in_flight: Mutex<HashMap<String, usize>>,
     /// Network P2P port used when a remembered host omits `:port`. `0` = unset.
     connect_default_port: AtomicU16,
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
@@ -1387,6 +1413,7 @@ impl PeerHub {
             manual_hosts: Mutex::new(HashSet::new()),
             connect_hosts: Mutex::new(Vec::new()),
             connect_addrs: Mutex::new(Vec::new()),
+            dials_in_flight: Mutex::new(HashMap::new()),
             connect_default_port: AtomicU16::new(0),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
@@ -2470,6 +2497,30 @@ impl PeerHub {
         }
     }
 
+    /// Count an outbound dial to `target` until the guard drops. Held from
+    /// before the TCP / SOCKS connect until the session is registered or the
+    /// dial fails, whichever path ends it.
+    pub(crate) fn dial_in_flight(self: &Arc<Self>, target: &DialTarget) -> DialInFlight {
+        let key = target.to_string();
+        *self
+            .dials_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.clone())
+            .or_insert(0) += 1;
+        DialInFlight {
+            peers: Arc::clone(self),
+            key,
+        }
+    }
+
+    fn is_target_dialing(&self, target: &DialTarget) -> bool {
+        self.dials_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&target.to_string())
+    }
+
     fn is_target_live(&self, target: &DialTarget) -> bool {
         let peers = self.snapshot();
         match target {
@@ -2520,7 +2571,7 @@ impl PeerHub {
             if !seen.insert(target.to_string()) {
                 continue;
             }
-            if self.is_target_live(&target) {
+            if self.is_target_live(&target) || self.is_target_dialing(&target) {
                 continue;
             }
             let _ = self.dial_target(target, PeerConnType::Manual);
