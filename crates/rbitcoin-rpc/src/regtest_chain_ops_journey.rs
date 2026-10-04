@@ -606,6 +606,7 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     young_prev
         .txdata
         .push(spend(OutPoint { txid: prev_cb, vout: 0 }, u64::MAX));
+    let no_vin = commit(no_vin);
     for (block, want) in [
         (commit(empty), "bad-blk-length"),
         (commit(no_cb), "bad-cb-missing"),
@@ -614,12 +615,17 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
         (commit(miss), "bad-txns-inputs-missingorspent"),
         (commit(no_vout), "bad-txns-vout-empty"),
         (commit(young), "bad-txns-premature-spend-of-coinbase"),
-        (commit(no_vin), "bad-txns-vin-empty"),
+        (no_vin.clone(), "bad-txns-vin-empty"),
         (commit(young_prev), "bad-txns-premature-spend-of-coinbase"),
     ] {
         let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
         assert_eq!(r, want);
     }
+    assert_eq!(
+        dispatch(ctx, "submitblock", vec![json!(block_hex(&no_vin))]).unwrap(),
+        "duplicate-invalid",
+        "a cheap consensus reject is cached"
+    );
     assert_eq!(tip_count(ctx), before + 1);
 
     // A ground block [cb, t1] has txid(cb) || txid(t1) as one 64-byte tx.

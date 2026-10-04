@@ -25,5 +25,8 @@ Fixed
   The pre-check reports the same reason before `bad-txns-in-belowout`, for
   a same-block coinbase and for a confirmed coinbase inside the maturity
   window.
+- **A cheap `submitblock` consensus reject is remembered.** A second submit
+  of that header is `duplicate-invalid`. A merkle mismatch and a mutated
+  duplicate are not remembered.
 - **A block over the weight limit reports `bad-blk-weight`.** It said
   `block weight too large`.
