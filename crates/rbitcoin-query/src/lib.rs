@@ -1566,14 +1566,7 @@ impl Query {
         let Some(n_inputs) = rbitcoin_store::block_wire_input_count(payload) else {
             return Err(StoreError::Rejected(Self::UNDECODABLE_WIRE_MSG));
         };
-        self.block_queue_offer_counted(
-            height,
-            hash,
-            header_fk,
-            payload.to_vec(),
-            n_inputs,
-            sender,
-        )
+        self.block_queue_offer_counted(height, hash, header_fk, payload.to_vec(), n_inputs, sender)
     }
 
     /// [`Self::block_queue_offer_from`] for a payload the caller already
