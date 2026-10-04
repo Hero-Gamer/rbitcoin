@@ -300,12 +300,10 @@ impl ParentTracker {
                 !a.failed && a.reqtime <= now && a.peer == peer && (!has_pref || a.preferred)
             })?;
             let wtxid = slot.anns[pos].wtxid;
-            // Another in-flight request of this kind blocks only this kind.
-            if slot
-                .anns
-                .iter()
-                .any(|a| a.wtxid == wtxid && a.requested_until.is_some())
-            {
+            // Any in-flight request for these bytes blocks a second getdata.
+            // A non-segwit wtxid inv uses the txid, so the orphan parent is
+            // already in flight. The kind we would send stays this ann's own.
+            if slot.anns.iter().any(|a| a.requested_until.is_some()) {
                 return None;
             }
             let ann = &mut slot.anns[pos];
@@ -541,5 +539,26 @@ mod tests {
         });
         assert_eq!(follow.len(), 1);
         assert!(follow[0].wtxid);
+    }
+
+    #[test]
+    fn inflight_wtxid_of_the_same_hash_is_not_requested_again_as_txid() {
+        let mut t = ParentTracker::new();
+        let inflight = [0x11; 32];
+        let missing = [0x22; 32];
+        assert_eq!(
+            t.note_inv(1, inflight, true, 1_000, true),
+            ParentNote::Accepted
+        );
+        t.schedule(inflight, 2, false, 1_000);
+        t.schedule(missing, 2, false, 1_000);
+        let due = t.take_due(2, 1_000, |_, _| false);
+        assert_eq!(
+            due.len(),
+            1,
+            "the in-flight hash must not join this getdata"
+        );
+        assert_eq!(due[0].hash, missing);
+        assert!(!due[0].wtxid, "the other parent stays a txid request");
     }
 }

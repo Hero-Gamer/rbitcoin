@@ -4,7 +4,8 @@ Security
   process-wide table skips the new announcement and does not disconnect
   the peer. Only a peer at its own cap is disconnected. A wtxid
   announcement is re-requested as a wtxid and does not change another
-  peer's txid parent.
+  peer's txid parent. While that request is in flight, the same hash is
+  not asked again as a txid.
 - Charge outbound getdata and tx announcements against the per-peer send
   budget, and stop serving blocks once that budget is already over.
 - The per-peer rate window keeps the previous second so a boundary does
