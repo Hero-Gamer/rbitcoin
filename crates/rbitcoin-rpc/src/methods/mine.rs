@@ -1046,6 +1046,12 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
         return SubmitBlockOutcome::Error(format!("store: {e}"));
     }
     if let Some(reason) = cheap {
+        // `bad-txns-duplicate` is the mutated-block needle. Cache every other
+        // cheap consensus reason so a second submit is `duplicate-invalid`.
+        if reason != "bad-txns-duplicate" {
+            hub.note_invalid_block(hash);
+            let _ = hub.ensure_header(&block.header);
+        }
         return SubmitBlockOutcome::Rejected(reason);
     }
     match hub.accept_received_block(block.clone()) {

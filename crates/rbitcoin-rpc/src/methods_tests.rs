@@ -4394,13 +4394,21 @@ fn submitblock_vout_past_n_out_is_missingorspent() {
             .unwrap_or_else(|e| panic!("vout {vout} is a consensus reject, not an RPC error: {e}"));
         assert_eq!(r, "bad-txns-inputs-missingorspent", "vout {vout}");
         assert_eq!(hub.tip_hash(), Some(b1.block_hash()));
+        assert!(
+            hub.is_block_invalid(&b2.block_hash()),
+            "vout {vout}: submitblock caches the consensus reject"
+        );
+        let again = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b2))]).unwrap();
+        assert_eq!(again, "duplicate-invalid", "vout {vout}");
 
         let err = hub
             .accept_received_block(b2.clone())
             .expect_err("tip connect rejects the same spend");
+        let err_s = err.to_string();
         assert!(
-            err.to_string().contains("bad-txns-inputs-missingorspent"),
-            "vout {vout}: {err}"
+            err_s.contains("bad-txns-inputs-missingorspent")
+                || err_s.contains("block is invalidated"),
+            "vout {vout}: {err_s}"
         );
         assert!(
             hub.is_block_invalid(&b2.block_hash()),
