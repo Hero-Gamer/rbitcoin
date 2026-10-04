@@ -57,7 +57,7 @@ const MAX_BLOCKS_TO_ANNOUNCE: u32 = 8;
 /// These must not tear down the TCP session: re-request or skip and keep the peer.
 pub(crate) fn net_error_is_store_not_found(e: &NetError) -> bool {
     match e {
-        NetError::Consensus(s) => {
+        NetError::Consensus(s) | NetError::Store(s) => {
             let l = s.to_ascii_lowercase();
             l.contains("record not found")
                 || l.contains("not found")
@@ -3519,6 +3519,13 @@ async fn on_block(
     let hash = block.block_hash();
     if !block.check_merkle_root() {
         rbitcoin_log::info!("Block mutated: bad-txnmrklroot, hashMerkleRoot mismatch");
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
+    if rbitcoin_consensus::block_mutated_without_coinbase(block) {
+        rbitcoin_log::info!("Block mutated: 64-byte transaction without a coinbase");
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(());
     }
@@ -3633,6 +3640,10 @@ async fn on_block_accept(
                 session,
             )
             .await
+        }
+        Err(e @ NetError::Store(_)) => {
+            rbitcoin_log::warn!("p2p: accept dropped {hash} (local fault — keep session): {e}");
+            Ok(())
         }
         Err(e) => {
             rbitcoin_log::warn!("p2p: accept dropped {hash} (invalid — keep session): {e}");
