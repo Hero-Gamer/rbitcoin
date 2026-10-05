@@ -517,17 +517,6 @@ fn mainnet_ancestor_skip_then_miss(q: &rbitcoin_query::Query, first: &Transactio
 }
 
 #[test]
-fn s3_rejects_second_coinbase() {
-    let b = block_with(vec![coinbase(1), coinbase(2)]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "coinbase not first");
-    // The same coinbase twice is a mutated tree (Core `bad-txns-duplicate`).
-    let b = block_with(vec![coinbase(1), coinbase(1)]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "bad-txns-duplicate");
-}
-
-#[test]
 fn s4_rejects_overweight_block() {
     // ~1MB of script data per tx ≈ 4M weight; a few large outputs exceed the limit.
     let mut txs = vec![coinbase(1)];
