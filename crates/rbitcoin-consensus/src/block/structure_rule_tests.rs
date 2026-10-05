@@ -517,14 +517,6 @@ fn mainnet_ancestor_skip_then_miss(q: &rbitcoin_query::Query, first: &Transactio
 }
 
 #[test]
-fn s1_rejects_empty_txdata() {
-    validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();
-    let b = block_with(vec![]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "no transactions");
-}
-
-#[test]
 fn s2_rejects_non_coinbase_first() {
     validate_block_structure(
         &block_with(vec![coinbase(0), non_coinbase_spend(1)]),

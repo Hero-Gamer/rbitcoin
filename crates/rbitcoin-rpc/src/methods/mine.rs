@@ -1203,14 +1203,13 @@ fn cheap_submit_tx_reject(
     if mutated {
         return Ok(Some("bad-txns-duplicate".into()));
     }
+    // The spend loop below assumes one leading coinbase. Empty body, a
+    // non-coinbase first tx, and a later coinbase are CheckBlock.
     let Some((first, rest)) = block.txdata.split_first() else {
-        return Ok(Some("bad-blk-length".into()));
+        return Ok(None);
     };
-    if !first.is_coinbase() {
-        return Ok(Some("bad-cb-missing".into()));
-    }
-    if rest.iter().any(Transaction::is_coinbase) {
-        return Ok(Some("bad-cb-multiple".into()));
+    if !first.is_coinbase() || rest.iter().any(Transaction::is_coinbase) {
+        return Ok(None);
     }
     let mut spent = std::collections::HashSet::new();
     let mut created: std::collections::HashMap<OutPoint, TxOut> = std::collections::HashMap::new();
