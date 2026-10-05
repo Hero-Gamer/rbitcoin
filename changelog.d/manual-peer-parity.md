@@ -10,4 +10,6 @@ Fixed
 - **`addnode` opens no second session to a connected address.** `addnode
   onetry` or `add` of an address with a live session, or one still being
   dialled, dialled it again, and each dial that connected became its own
-  session. As in Core, the RPC now succeeds without dialling.
+  session. As in Core, the RPC now succeeds without dialling. A dial now
+  counts from the moment it is queued, so an `addnode` or `--connect`
+  redial right behind another dial to the same address adds nothing.
