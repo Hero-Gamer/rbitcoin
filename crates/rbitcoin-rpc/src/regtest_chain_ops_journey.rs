@@ -67,11 +67,11 @@ fn regrind(block: &mut Block) {
     }
 }
 
-/// One regtest hub an operator drives over RPC from genesis: mine, submit,
-/// headers, templates, mocktime, fee caps, invalidate and precious.
+/// One regtest hub from genesis through the first submits: mine, headers,
+/// mocktime, and the consensus rejects that do not need a mature coinbase.
 #[test]
-fn rpc_regtest_chain_ops() {
-    let (mut ctx, dir, hub) = ctx_regtest_hub();
+fn rpc_regtest_from_genesis() {
+    let (ctx, dir, hub) = ctx_regtest_hub();
     let (addr, p2wpkh) = p2wpkh_regtest();
     let store = dir.join("store");
     chain_ops_at_genesis(&ctx, &hub, &store);
@@ -83,9 +83,19 @@ fn rpc_regtest_chain_ops() {
     chain_ops_empty_template_and_proposals(&ctx);
     chain_ops_header_rejects(&ctx, &hub, &p2wpkh);
     chain_ops_submit_rejects(&ctx, &hub, &p2wpkh);
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
+/// One regtest hub past maturity: templates, sigops, packages, invalidate,
+/// and a mainnet view of that same hub. The genesis rejects are a separate
+/// chain; this one mines its own pad inside 121..144.
+#[test]
+fn rpc_regtest_mature_chain_ops() {
+    let (mut ctx, dir, hub) = ctx_regtest_hub();
+    let (addr, p2wpkh) = p2wpkh_regtest();
+    let store = dir.join("store");
     let mut cbs = TrueCoinbases(tip_count(&ctx) as u32 + 1);
-    dispatch(&ctx, "generate", vec![json!(120)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(130)]).unwrap();
     chain_ops_mature_pad_work(&ctx);
     chain_ops_template_sigops_and_script_reject(&ctx, &mut cbs);
     chain_ops_sigop_adjusted_entry_and_min_fee(&ctx, &mut cbs);
