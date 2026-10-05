@@ -686,6 +686,12 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     over.txdata[0].output[0].value = Amount::from_sat(MAX_MONEY + 1);
     let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(over)))]).unwrap();
     assert_eq!(r, "bad-txns-vout-toolarge");
+
+    // Coinbase with no outputs is CheckTransaction, not the spend-loop reject.
+    let mut no_cb_out = mine(12);
+    no_cb_out.txdata[0].output.clear();
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(no_cb_out)))]).unwrap();
+    assert_eq!(r, "bad-txns-vout-empty");
 }
 
 /// Past 120 blocks and short of the 144 retarget window.

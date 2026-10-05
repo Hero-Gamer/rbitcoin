@@ -1019,20 +1019,6 @@ fn p3_default_milestone_heights() {
 }
 
 #[test]
-fn s13_rejects_coinbase_empty_vout() {
-    validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();
-    let mut cb = coinbase(0);
-    cb.output.clear();
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("no outputs") || msg.contains("vout-empty"),
-        "expected empty vout reject, got {msg}"
-    );
-}
-
-#[test]
 fn s10_rejects_txouttotal_toolarge() {
     // Two outputs each under MAX_MONEY but sum over.
     let half = 11_000_000 * 100_000_000u64; // 11M BTC each
