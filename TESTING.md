@@ -211,8 +211,11 @@ files still count. llvm-cov hit counts jitter tens of lines on the same
 tree; the floor is the gate, not a never-falls ratchet vs master.
 
 The README badge and rbitcoin.org figure are the last **green `master`**
-`coverage` job (`badges` branch `coverage.json`, Shields endpoint). A red
-PR does not publish. `coverage-history.jsonl` remains a log, not a gate.
+`coverage` job (`badges` branch `coverage.json`, Shields endpoint). The
+same file lists each production crate (`crates`: `name`, `lh`, `lf`,
+`pct`). Those rows are the filtered LCOV grouped by `crates/<name>/`, and
+they must sum to the badge `lh`/`lf`. A red PR does not publish.
+`coverage-history.jsonl` remains a log of the workspace total, not a gate.
 
 `cargo llvm-cov`'s text “Missed Lines” column can count *partial regions within
 a line* (for example match or-patterns) even when the line executed. The gate

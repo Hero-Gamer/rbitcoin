@@ -125,6 +125,66 @@ PY
 assert_ok "badge is red below the gate" true
 rm -f "$tmp"
 
+lcov="$(mktemp)"
+tmp="$(mktemp)"
+cat >"$lcov" <<'EOF'
+SF:/build/crates/rbitcoin-store/src/a.rs
+LH:40
+LF:50
+end_of_record
+SF:crates/rbitcoin-store/src/b.rs
+LH:10
+LF:10
+end_of_record
+SF:crates/rbitcoin-net/src/peer.rs
+LH:1
+LF:4
+end_of_record
+EOF
+python3 "$ROOT/scripts/coverage-badge.py" \
+  --lh 51 --lf 64 --gate 92 --sha abcdef1234567890 --date 2026-10-05 \
+  --lcov "$lcov" --out "$tmp"
+python3 - "$tmp" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text())
+assert d["lh"] == 51 and d["lf"] == 64, d
+crates = d["crates"]
+assert [c["name"] for c in crates] == ["rbitcoin-net", "rbitcoin-store"], crates
+net, store = crates
+assert net == {"name": "rbitcoin-net", "lh": 1, "lf": 4, "pct": 25.0}, net
+assert store == {"name": "rbitcoin-store", "lh": 50, "lf": 60, "pct": 83.33}, store
+assert sum(c["lh"] for c in crates) == d["lh"]
+assert sum(c["lf"] for c in crates) == d["lf"]
+PY
+assert_ok "badge crates sum to the workspace lines" true
+rm -f "$tmp" "$lcov"
+
+lcov="$(mktemp)"
+tmp="$(mktemp)"
+cat >"$lcov" <<'EOF'
+SF:crates/rbitcoin-log/src/lib.rs
+LH:1
+LF:2
+end_of_record
+SF:fuzz/src/target.rs
+LH:1
+LF:1
+end_of_record
+EOF
+if python3 "$ROOT/scripts/coverage-badge.py" \
+  --lh 2 --lf 3 --gate 92 --lcov "$lcov" --out "$tmp" >/dev/null 2>"$tmp.err"; then
+  echo "not ok - badge accepts lines outside crates/"
+  FAIL=$((FAIL + 1))
+else
+  echo "ok - badge rejects lines outside crates/"
+  PASS=$((PASS + 1))
+fi
+rm -f "$tmp" "$tmp.err" "$lcov"
+
+assert_ok "coverage.sh passes the filtered LCOV into the badge" \
+  grep -q -- '--lcov' "$COV"
+
 out="$(BADGE_DRY_RUN=1 "$ROOT/scripts/publish-coverage-badge.sh")"
 assert_ok "publish dry-run names badges/coverage.json" \
   grep -q "badges/coverage.json" <<<"$out"
