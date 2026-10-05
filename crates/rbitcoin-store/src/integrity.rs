@@ -491,6 +491,9 @@ impl Store {
         self.flush_confirmed_only()?;
         self.rebuild_height_fence()?;
         self.persist_class_c_repair()?;
+        // Disconnect clamps in `Query`. Open revalidation shrinks here and
+        // then replay treats a marker above the new tip as already annotated.
+        self.clamp_spend_durable()?;
         report.tip_shrunk = true;
         report.tip_after = self.confirmed.tip_height().map(|h| h.0);
         Ok(())
@@ -680,6 +683,35 @@ mod tests {
         assert_eq!(r.first_bad_reason, Some("prev_fk != confirmed parent"));
         assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
         assert_eq!(r.tip_after, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shrink_lowers_a_spend_marker_above_the_new_tip() {
+        let dir = tmp();
+        let s = Store::create_tiny(&dir).unwrap();
+        let g = hdr(Fk::NULL, [0u8; 32], 0);
+        let g_fk = s.put_header(&g).unwrap();
+        s.confirmed.set(Height(0), g_fk).unwrap();
+        let a = hdr(g_fk, g.hash, 1);
+        let a_fk = s.put_header(&a).unwrap();
+        s.confirmed.set(Height(1), a_fk).unwrap();
+        let b = hdr(a_fk, a.hash, 2);
+        let b_fk = s.put_header(&b).unwrap();
+        s.confirmed.set(Height(2), b_fk).unwrap();
+        s.confirmed.set(Height(2), g_fk).unwrap();
+        s.flush_class_c_tip().unwrap();
+        crate::spend_durable::SpendDurable::new(5, 5)
+            .store(s.path())
+            .unwrap();
+
+        let r = s.revalidate_tip_window_n(6).unwrap();
+        assert!(r.tip_shrunk, "{r:?}");
+        let m = crate::spend_durable::SpendDurable::load(s.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.annotated_through(), 1);
+        assert_eq!(m.durable_through(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

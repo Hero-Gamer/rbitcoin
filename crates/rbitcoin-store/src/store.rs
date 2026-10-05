@@ -281,6 +281,8 @@ pub struct Store {
     mtp_ring: std::sync::RwLock<MtpRing>,
     /// Latest confirm height plus one. Zero means no snapshot yet.
     spend_snapshot: std::sync::atomic::AtomicU64,
+    /// Serializes spend-marker publishes so a checkpoint cannot overwrite a clamp.
+    spend_marker: std::sync::Mutex<()>,
     /// First height of a confirm write whose spend annotate has not finished,
     /// plus one. Zero means none.
     spend_annotate_from: std::sync::atomic::AtomicU64,
@@ -373,6 +375,7 @@ impl Store {
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
+            spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -435,6 +438,7 @@ impl Store {
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
+            spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -1580,8 +1584,16 @@ impl Store {
         };
         self.txs.sync_replay_bodies()?;
         self.spenders.flush()?;
-        crate::spend_durable::SpendDurable::new(tip, tip).store(self.path())?;
+        self.store_spend_marker(tip, tip)?;
         Ok(t.elapsed().as_nanos() as u64)
+    }
+
+    /// Publish the marker at `min(requested, confirmed tip)` under [`Self::spend_marker`].
+    fn store_spend_marker(&self, annotated: u32, durable: u32) -> Result<(), StoreError> {
+        let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+        crate::spend_durable::SpendDurable::new(annotated.min(tip), durable.min(tip))
+            .store(self.path())
     }
 
     /// Record the confirmed height whose annotations have been written.
@@ -1714,7 +1726,7 @@ impl Store {
             },
             _ => height,
         };
-        crate::spend_durable::SpendDurable::new(height, height).store(self.path())
+        self.store_spend_marker(height, height)
     }
 
     /// A disconnect below the marker lowers both heights to the new tip.
@@ -1733,6 +1745,7 @@ impl Store {
                     .map_or(0, |h| cur.min(u64::from(h.0) + 1));
                 (low != cur).then_some(low)
             });
+        let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
         let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {
             return Ok(());
         };
