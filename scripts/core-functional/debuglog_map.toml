@@ -200,5 +200,9 @@ match = 'p2p: Not relaying non-mempool transaction ([0-9a-f]+) \(wtxid=([0-9a-f]
 emit = ['Not relaying non-mempool transaction {1} (wtxid={2}) from forcerelay peer={3}']
 
 [[rule]]
+match = 'mempool: rolling minimum fee bumped'
+emit = ['rolling minimum fee bumped']
+
+[[rule]]
 match = 'p2p: using obsolete version (\d+), disconnecting peer=(\d+)'
 emit = ['using obsolete version {1}, disconnecting peer={2}']

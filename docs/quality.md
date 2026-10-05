@@ -61,7 +61,7 @@ at an explicit rank with **Q-63+**.
 | **—** | Darwin notarization | Ad-hoc `codesign -s -` only |
 | **—** | Leftover maps as `txid → Vec<Fk>` | [`errata.md`](./errata.md): only if a mainnet miss is shown |
 | **X-M3** | Esplora unbounded process `sh_join` LRU | Last-1 GET + last-bulk POST (16 MiB/client) shipped. Sticky joins stay Electrum TCP |
-| **—** | Package-level feerate on `submitpackage` | Sequential `accept_tx`; Core parity is not 1.0 |
+| **—** | BIP331 package relay and package RBF | `submitpackage` package-evaluates a child-with-parents remainder (package feerate, dynamic-floor waiver). No P2P package message and no package RBF |
 | **—** | Chained Esplora `scripthash_mempool_stats` | Dialect / page cost. Compact `/txs/summary` is COMPAT dialect |
 | **—** | Retired algo-review micro-opts | Reopen a named Q-id only with a mainnet profile that names the cost |
 | **—** | Headerless SH extent interiors | Uniform 4 KiB page records; ~0.2% density; schema bump |

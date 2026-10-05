@@ -316,6 +316,36 @@ def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None
         result[i] = {"txid": row.get("txid"), "wtxid": row.get("wtxid")}
 
 
+def rewrite_getmempoolinfo_budget(method: Any, parsed: dict[str, Any]) -> None:
+    """Core `maxmempool` is the byte cap. The node field is the weight budget.
+
+    The bitcoind shim maps `-maxmempool=N` to a 4× weight budget so vsize
+    capacity matches Core. `bytes` stays virtual size, so the reported cap
+    is weight/4 (`mempool_limit.py` compares `maxmempool - bytes`).
+    """
+    if method != "getmempoolinfo":
+        return
+    result = parsed.get("result")
+    if not isinstance(result, dict):
+        return
+    cap = result.get("maxmempool")
+    if isinstance(cap, int) and not isinstance(cap, bool):
+        result["maxmempool"] = cap // 4
+
+
+def _rewrite_forwarded_body(method: Any, body: bytes) -> bytes:
+    if method == "getmempoolinfo":
+        try:
+            parsed = json.loads(body.decode())
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return body
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("result"), dict):
+            return body
+        rewrite_getmempoolinfo_budget(method, parsed)
+        return json.dumps(parsed).encode()
+    return _rewrite_forwarded_testmempoolaccept(method, body)
+
+
 def _rewrite_forwarded_testmempoolaccept(method: Any, body: bytes) -> bytes:
     if method != "testmempoolaccept":
         return body
@@ -443,7 +473,7 @@ class RpcProxy:
                 if isinstance(method, str) and method in self._handlers:
                     return 200, json.dumps(self._one(payload)).encode()
                 status, body = self.forward_raw(json.dumps(payload).encode())
-                return status, _rewrite_forwarded_testmempoolaccept(method, body)
+                return status, _rewrite_forwarded_body(method, body)
         except RpcError as e:
             req_id = payload.get("id") if isinstance(payload, dict) else None
             body = json.dumps(

@@ -23,10 +23,19 @@ from rpc_proxy import (
     node_rpc_port,
     peel_authproxy_args,
     rewrite_core_maxfeerate,
+    rewrite_getmempoolinfo_budget,
     rewrite_testmempoolaccept_abort,
     shim_gettxoutsetinfo,
     whitelist_map,
 )
+
+info = {"result": {"maxmempool": 20_000_000, "bytes": 4_999_802}, "error": None, "id": 1}
+rewrite_getmempoolinfo_budget("getmempoolinfo", info)
+assert info["result"]["maxmempool"] == 5_000_000, info
+assert info["result"]["bytes"] == 4_999_802
+untouched = {"result": {"maxmempool": 20_000_000}}
+rewrite_getmempoolinfo_budget("getrawmempool", untouched)
+assert untouched["result"]["maxmempool"] == 20_000_000
 
 seq = {
     "result": [

@@ -113,6 +113,10 @@ run "compact low-work maps to Core [net] needle" \
   "2026-01-01T00:00:00Z INFO p2p: ignore low-work compact block from peer 0" \
   "[net] Ignoring low-work compact block from peer 0"
 
+run "rolling minimum fee bump maps to Core needle" \
+  "2026-01-01T00:00:00Z INFO mempool: rolling minimum fee bumped" \
+  "rolling minimum fee bumped"
+
 run "unmapped is empty" \
   "2026-01-01T00:00:00Z INFO something else" \
   ""

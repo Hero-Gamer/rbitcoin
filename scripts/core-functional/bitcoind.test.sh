@@ -126,6 +126,9 @@ else
 fi
 
 # Unknown flags abort like Core (feature_help.py -fakearg).
+assert_fail_msg "maxmempool below 5 MB" "Error: -maxmempool must be at least 5 MB" \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -maxmempool=4
+
 assert_fail_msg "unknown flag parse error" "Error parsing command line arguments" \
   env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -notarealflag
 assert_fail_msg "fakearg still hard-fails" "Error parsing command line arguments" \
@@ -673,6 +676,49 @@ if [[ -f "$LOG_BOUND2" ]] \
   PASS=$((PASS + 1))
 else
   echo "not ok - -bind port wins Bound to (log: $([[ -f $LOG_BOUND2 ]] && cat "$LOG_BOUND2" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+
+SIGNET_DD="$WORKDIR/signet-magic"
+mkdir -p "$SIGNET_DD"
+printf 'signet=1\n' >"$SIGNET_DD/bitcoin.conf"
+# --print-cmd returns before the shim writes debug.log. Start the fake node
+# so the signet phrase is appended, then print the argv.
+RBITCOIN_NODE="$FAKE" "$SHIM" -datadir="$SIGNET_DD" >/dev/null 2>&1 || true
+OUT_SIGNET="$("$SHIM" --print-cmd -datadir="$SIGNET_DD" 2>/dev/null)"
+LOG_SIGNET="$SIGNET_DD/signet/debug.log"
+if printf '%s' "$OUT_SIGNET" | grep -q -- '--network signet' \
+  && [[ -f "$LOG_SIGNET" ]] \
+  && grep -q 'Signet derived magic (message start)' "$LOG_SIGNET"; then
+  echo "ok - signet conf selects signet and logs derived magic"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - signet conf selects signet and logs derived magic (cmd: $OUT_SIGNET log: $([[ -f $LOG_SIGNET ]] && cat "$LOG_SIGNET" || echo missing))"
+  FAIL=$((FAIL + 1))
+fi
+
+OUT_CHAL="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -signetchallenge=51 2>/dev/null)"
+if printf '%s' "$OUT_CHAL" | grep -q -- '--signet-challenge=51'; then
+  echo "ok - -signetchallenge=51 forwards"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -signetchallenge=51 forwards (got: $OUT_CHAL)"
+  FAIL=$((FAIL + 1))
+fi
+
+assert_fail_msg "-signetchallenge rejects non-hex" "Error: -signetchallenge must be hex, not 'abc'." \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -signetchallenge=abc
+assert_fail_msg "-signetchallenge rejects duplicates" "Error: -signetchallenge cannot be multiple values." \
+  env RBITCOIN_NODE="$FAKE" "$SHIM" --print-cmd -datadir="$DATADIR" -regtest -signetchallenge=51 -signetchallenge=51
+
+OUT_BF="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -blockfilterindex 2>/dev/null)"
+OUT_BF0="$("$SHIM" --print-cmd -datadir="$DATADIR" -regtest -blockfilterindex=0 2>/dev/null)"
+if printf '%s' "$OUT_BF" | grep -q -- '--block-filter-index' \
+  && printf '%s' "$OUT_BF0" | grep -q -- '--block-filter-index=0'; then
+  echo "ok - -blockfilterindex maps to --block-filter-index"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - -blockfilterindex maps (bare: $OUT_BF zero: $OUT_BF0)"
   FAIL=$((FAIL + 1))
 fi
 

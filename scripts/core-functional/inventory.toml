@@ -320,8 +320,7 @@ status = "run"
 
 [[test]]
 name = "feature_signet.py"
-status = "skip"
-reason = "core-log"
+status = "run"
 
 [[test]]
 name = "feature_startupnotify.py"
@@ -459,8 +458,7 @@ status = "run"
 
 [[test]]
 name = "mempool_limit.py"
-status = "skip"
-reason = "core-log"
+status = "run"
 
 [[test]]
 name = "mempool_package_limits.py"
@@ -853,9 +851,7 @@ status = "run"
 
 [[test]]
 name = "rpc_getblockfilter.py"
-status = "skip"
-reason = "core-internal"
-analog = "none (no compact filters)"
+status = "run"
 
 [[test]]
 name = "rpc_getblockfrompeer.py"

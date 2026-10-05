@@ -56,10 +56,14 @@ those Core aliases. The shim sets `RBITCOIN_RPC_WAIT_TIP_IDLE=1` on the child so
 Production (unset) waits only for the accept that was running when the RPC
 arrived. The same child env sets `RBITCOIN_RPC_PACKAGE_DIALECT=1` so
 `submitpackage` matches Core `IsChildWithParents` (`-25`) and in-package
-maxfeerate overlay. Production (unset) is sequential admit. The RPC proxy
-rewrites multi-tx `testmempoolaccept` abort-class rows (`missing-inputs` /
+maxfeerate overlay. Production (unset) still package-evaluates a
+child-with-parents remainder that failed min relay, the dynamic mempool
+floor, or missing inputs. The RPC proxy rewrites multi-tx
+`testmempoolaccept` abort-class rows (`missing-inputs` /
 `max-fee-exceeded` / `bip125-replacement-disallowed`) to `{txid,wtxid}`; the
-node keeps earlier `allowed: true`. The proxy answers `gettxoutsetinfo`
+node keeps earlier `allowed: true`. `getmempoolinfo.maxmempool` on the
+proxy is the node weight budget divided by 4, so it lines up with `bytes`
+(virtual size) after the shim's 4× `-maxmempool` map. The proxy answers `gettxoutsetinfo`
 with `getblockcount`, `getbestblockhash`, and `txouts: -1` so
 `rpc_scantxoutset.py` can compare an empty scan. The node does not
 implement that method. `rpc_packages.py` `run` includes that named shim
@@ -202,7 +206,7 @@ merely touch net or RPC (too slow). Default `cargo test` is the PR pin
 ship PR (see [`releases.md`](./releases.md)). The `release-extra` job in
 `release-gate.yml` fails when a ship PR did not get a green
 `core-functional`, `overlay-functional`, and `warnet-example`.
-The `core-functional` job is **30 minutes** (77 `test_runner` jobs: 71
+The `core-functional` job is **30 minutes** (80 `test_runner` jobs: 74
 inventory `run`; Core expands transport twins and `wallet_txn_*` flags).
 
 When that job is red, the inner loop is **local**, not another CI wait.
