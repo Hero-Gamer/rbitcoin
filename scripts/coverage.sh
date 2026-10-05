@@ -147,7 +147,9 @@ PY
   SHA="${GITHUB_SHA:-$(git rev-parse HEAD)}"
   python3 "$ROOT/scripts/coverage-badge.py" \
     --lh "$LCOV_HIT" --lf "$LCOV_TOT" --gate 92 \
-    --sha "$SHA" --scope production --out "$ROOT/coverage/badge.json"
+    --sha "$SHA" --scope production \
+    --lcov "$ROOT/coverage/lcov.info" \
+    --out "$ROOT/coverage/badge.json"
   echo "Wrote coverage/badge.json (${LCOV_PCT}% production)"
   echo "Note: full branch coverage requires nightly --branch; region-partial lines may still appear in text report."
   echo "Tip: set COVERAGE_CLEAN=1 only when you need a cold instrumented rebuild."
