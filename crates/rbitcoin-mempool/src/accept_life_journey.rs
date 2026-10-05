@@ -708,12 +708,11 @@ fn sigop_reopen_and_compact(life: &mut Life, dir: &rbitcoin_store::testutil::Tem
     assert_eq!(life.mp.live_count(), 0);
 }
 
-/// One mempool from the first orphan to a full pool: relay order, RBF,
-/// cluster caps, packages, a block, a reorg, a raised `-minrelaytxfee`, and
-/// eviction, against one chain view. Sigop-adjusted size, the shared block
-/// sigop budget, and overlay reopen/compact run first on that same pool.
+/// Sigop-adjusted size, the block sigop budget, and reopen/compact. Each
+/// beat restores an empty pool. This is not the accept-life story: nothing
+/// here is a coin that story later spends.
 #[test]
-fn mempool_accept_life() {
+fn sigop_adjusted_size_budget_and_reopen() {
     let dir = tmp_dir();
     let mut life = Life {
         mp: ActiveMempool::open_or_create(&dir).unwrap(),
@@ -728,6 +727,23 @@ fn mempool_accept_life() {
     sigop_rbf_package_and_cluster(&mut life);
     sigop_block_budget(&mut life);
     sigop_reopen_and_compact(&mut life, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One mempool from the first orphan to a full pool: relay order, RBF,
+/// cluster caps, packages, a block, a reorg, a raised `-minrelaytxfee`, and
+/// eviction, against one chain view.
+#[test]
+fn mempool_accept_life() {
+    let dir = tmp_dir();
+    let mut life = Life {
+        mp: ActiveMempool::open_or_create(&dir).unwrap(),
+        chain: LifeChain::default(),
+        tip: ChainTipCtx {
+            height: 200,
+            mtp: u32::MAX,
+        },
+    };
     orphan_parks_then_promotes(&mut life);
     invalid_or_spent_parent_does_not_park(&mut life);
     let (rbf_coin, rbf_winner) = full_rbf_and_staged_commit(&mut life);

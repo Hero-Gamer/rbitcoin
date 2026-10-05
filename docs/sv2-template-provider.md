@@ -187,10 +187,10 @@ fits; a chunk that would pass 80_000 is skipped.
 No new flag.
 
 `select_budgets_sigops_skip_and_continue` pins the budget, the base fee
-under a delta, and the exact-80_000 edge. `mempool_accept_life` pins
-admission against the same cap. `hub_live_journey` reads fee and sigop
+under a delta, and the exact-80_000 edge. `sigop_adjusted_size_budget_and_reopen`
+pins admission against the same cap. `hub_live_journey` reads fee and sigop
 cost through the hub call (reserve 0 fits a 79,920-cost tx; a caller
-reserving 400 does not). `rpc_regtest_chain_ops` pins GBT `fee` beside
+reserving 400 does not). `rpc_regtest_mature_chain_ops` pins GBT `fee` beside
 `sigops`.
 
 ---
