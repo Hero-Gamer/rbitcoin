@@ -519,19 +519,12 @@ impl Query {
         Ok(())
     }
 
-    /// True when more creates cannot change the already-full page.
-    pub(crate) fn history_page_closed(
-        &self,
-        joined: &[ShJoinedOut],
-        filter: &HistoryFilter,
-        rest: &[Fk],
-    ) -> Result<bool, QueryError> {
+    /// The limited page already has its rows, and `after_txid` is in the join
+    /// when the caller asked for one.
+    fn history_page_full(joined: &[ShJoinedOut], filter: &HistoryFilter) -> bool {
         let Some(limit) = filter.limit else {
-            return Ok(false);
+            return false;
         };
-        if rest.is_empty() {
-            return Ok(false);
-        }
         if let Some(after) = filter.after_txid {
             let open = HistoryFilter {
                 limit: None,
@@ -539,14 +532,27 @@ impl Query {
                 ..filter.clone()
             };
             let seen = history_items_from_joined(joined, &open);
-            if !seen.iter().any(|i| i.txid == after) {
-                return Ok(false);
+            if !seen.rows.iter().any(|i| i.txid == after) {
+                return false;
             }
         }
-        let page = history_items_from_joined(joined, filter);
-        if page.len() < limit {
-            return Ok(false);
+        history_items_from_joined(joined, filter).rows.len() >= limit
+    }
+
+    /// How many leading `rest` creates can still change a full page.
+    ///
+    /// One height read and one spent-range read for the whole tail. The join
+    /// loop calls this once, so a full page does not re-read that tail per wave.
+    fn history_tail_keep(
+        &self,
+        joined: &[ShJoinedOut],
+        filter: &HistoryFilter,
+        rest: &[Fk],
+    ) -> Result<usize, QueryError> {
+        if rest.is_empty() {
+            return Ok(0);
         }
+        let page = history_items_from_joined(joined, filter).rows;
         let edge = page.last().map(|i| i.height).unwrap_or(0);
         let heights = self.store.tx_height_get_batch(rest)?;
         if heights.len() != rest.len() {
@@ -555,13 +561,30 @@ impl Query {
             ));
         }
         match filter.order {
-            HistoryOrder::HeightAsc => Ok(heights.iter().all(|h| i64::from(h.unwrap_or(0)) > edge)),
+            HistoryOrder::HeightAsc => Ok(heights
+                .iter()
+                .take_while(|h| i64::from(h.unwrap_or(0)) <= edge)
+                .count()),
             HistoryOrder::NewestFirst => {
                 let ranges = self.store.tx_spent_range_batch(rest)?;
-                Ok(heights
-                    .iter()
-                    .zip(ranges)
-                    .all(|(h, range)| i64::from(h.unwrap_or(0)) < edge && range.is_none()))
+                if ranges.len() != rest.len() {
+                    return Err(StoreError::Corrupt(
+                        "invariant: SH spent-range batch length",
+                    ));
+                }
+                let reach = self.store.spent_ranges_reach(&ranges, edge)?;
+                if reach.len() != rest.len() {
+                    return Err(StoreError::Corrupt(
+                        "invariant: SH spent-range batch length",
+                    ));
+                }
+                let mut keep = 0usize;
+                for (i, (h, hot)) in heights.iter().zip(reach).enumerate() {
+                    if i64::from(h.unwrap_or(0)) >= edge || hot {
+                        keep = i.saturating_add(1);
+                    }
+                }
+                Ok(keep)
             }
         }
     }
@@ -638,6 +661,7 @@ impl Query {
         let mut class_a_us = 0u128;
         let mut spends_us = 0u128;
         let mut offset = 0usize;
+        let mut stop_at: Option<usize> = None;
         for wave in sh_join_waves(&fks, wave_n) {
             let t_a = std::time::Instant::now();
             let creates = self.expand_create_fks_wave(scripthash, wave, need)?;
@@ -646,7 +670,15 @@ impl Query {
             out.extend(self.join_spends_wave(&creates, need, view)?);
             spends_us = spends_us.saturating_add(t_s.elapsed().as_micros());
             offset = offset.saturating_add(wave.len());
-            if paging && self.history_page_closed(&out, page.expect("paging"), &fks[offset..])? {
+            if !paging {
+                continue;
+            }
+            let filter = page.expect("paging");
+            if stop_at.is_none() && Self::history_page_full(&out, filter) {
+                let keep = self.history_tail_keep(&out, filter, &fks[offset..])?;
+                stop_at = Some(offset.saturating_add(keep));
+            }
+            if stop_at.is_some_and(|end| offset >= end) {
                 break;
             }
         }

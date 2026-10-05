@@ -1,3 +1,24 @@
+fn assert_unspent_newest_page_stops(
+    q: &Query,
+    quiet_sh: [u8; 32],
+    tip_cb_txid: [u8; 32],
+    quiet_old: rbitcoin_primitives::Fk,
+) {
+    use crate::scripthash::HistoryOrder::NewestFirst;
+
+    q.store().reset_txid_get_many();
+    assert_eq!(
+        sh_page(q, &quiet_sh, NewestFirst, None).unwrap(),
+        [tip_cb_txid],
+        "newest-first page is the tip create"
+    );
+    let scanned = q.store().txid_get_many_fks();
+    assert!(
+        !scanned.contains(&quiet_old.0),
+        "an unspent newest-first page stops before older creates: {scanned:?}"
+    );
+}
+
 fn sh_page(
     q: &Query,
     sh: &[u8; 32],
@@ -11,6 +32,7 @@ fn sh_page(
         ..crate::scripthash::HistoryFilter::open()
     };
     Ok(q.scripthash_history_filtered(sh, &filter)?
+        .rows
         .iter()
         .map(|i| i.txid)
         .collect())
@@ -29,8 +51,11 @@ fn sh_history_caps() {
     let probe_sh = script_hash(&[0x52]);
     let add_probe_output = |ta: &mut TxApply| {
         ta.tx.output_count += 1;
-        ta.outputs
-            .push(OutputRecord::unspent(1, vec![0x52]));
+        ta.outputs.push(OutputRecord::unspent(1, vec![0x52]));
+    };
+    let add_quiet_output = |ta: &mut TxApply| {
+        ta.tx.output_count += 1;
+        ta.outputs.push(OutputRecord::unspent(1, vec![0x53]));
     };
     let mut prev = Fk::NULL;
     let mut parent = None;
@@ -38,6 +63,9 @@ fn sh_history_caps() {
     for h in 0..5u32 {
         let (header, mut ta) = coinbase_block(h, prev, parent);
         add_probe_output(&mut ta);
+        if h >= 1 {
+            add_quiet_output(&mut ta);
+        }
         parent = Some(header.hash);
         cb_txids.push(ta.tx.txid);
         prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
@@ -46,6 +74,10 @@ fn sh_history_caps() {
 
     let (h5, mut cb5) = coinbase_block(5, prev, parent);
     add_probe_output(&mut cb5);
+    add_quiet_output(&mut cb5);
+    let tip_cb_txid = cb5.tx.txid;
+    let quiet_sh = script_hash(&[0x53]);
+    let quiet_old = q.block_tx_fks(Height(1)).unwrap()[0];
     let mut spend = cb5.clone();
     spend.tx.output_count = 1;
     spend.outputs.truncate(1);
@@ -108,13 +140,15 @@ fn sh_history_caps() {
         [spend_txid],
         "the newest row spends the oldest create"
     );
+    assert_unspent_newest_page_stops(&q, quiet_sh, tip_cb_txid, quiet_old);
 
     let view = q.pin_sh_chain_view().unwrap().expect("sh view");
     let page = crate::scripthash::HistoryFilter::esplora_chain_page(None);
     let mut slot = None;
     let rows = q
         .scripthash_history_filtered_slot_in(&sh, &page, &mut slot, &view)
-        .expect("paged history skips the unpaged cap");
+        .expect("paged history skips the unpaged cap")
+        .rows;
     assert!(!rows.is_empty());
     assert!(
         slot.is_none(),
@@ -122,7 +156,8 @@ fn sh_history_caps() {
     );
     let sums = q
         .scripthash_history_summary_filtered_slot_in(&sh, &page, &mut slot, &view)
-        .expect("paged summary skips the unpaged cap");
+        .expect("paged summary skips the unpaged cap")
+        .rows;
     assert!(!sums.is_empty());
     assert!(slot.is_none());
     let err = q
