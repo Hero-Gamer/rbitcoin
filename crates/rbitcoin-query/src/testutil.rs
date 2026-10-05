@@ -112,6 +112,11 @@ impl FixtureChain for Query {
     }
 }
 
+/// One-output join that fits Esplora's last-1 cap.
+pub fn sh_join_slot_small() -> Arc<ShJoinSlot> {
+    ShJoinSlot::with_spender_fk_count(0)
+}
+
 /// SH join whose packed size exceeds Esplora's 16 MiB last-1 + last-bulk cap.
 pub fn sh_join_slot_over_16mib() -> Arc<ShJoinSlot> {
     const CAP: usize = 16 * 1024 * 1024;

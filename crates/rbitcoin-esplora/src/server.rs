@@ -437,6 +437,14 @@ impl Drop for InflightGuard {
     }
 }
 
+/// A singleflight waiter must not put its scripthash back over a newer last-1.
+fn publish_last_sh(c: &mut ClientJoins, sh: &[u8; 32], slot: Arc<ShJoinSlot>) {
+    let keep = c.last_sh.as_ref().map(|(k, _)| k == sh).unwrap_or(true);
+    if keep {
+        c.last_sh = Some((*sh, slot));
+    }
+}
+
 struct ClientJoins {
     last_sh: Option<([u8; 32], Arc<ShJoinSlot>)>,
     last_bulk: HashMap<[u8; 32], Arc<ShJoinSlot>>,
@@ -581,7 +589,7 @@ impl AppState {
                 if let Some(s) = slot {
                     let mut g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(c) = g.clients.get_mut(id) {
-                        c.last_sh = Some((*sh, s));
+                        publish_last_sh(c, sh, s);
                         c.last_req = Instant::now();
                         retain_join_budget(c);
                     }
@@ -611,7 +619,7 @@ impl AppState {
                 if let Some(s) = slot {
                     let mut g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(c) = g.clients.get_mut(id) {
-                        c.last_sh = Some((*sh, s));
+                        publish_last_sh(c, sh, s);
                         c.last_req = Instant::now();
                         retain_join_budget(c);
                     }
@@ -1462,6 +1470,61 @@ mod tests {
         assert!(
             cache.lock().unwrap().last_sh_key("c1").is_none(),
             "oversize last-1 is used then not retained"
+        );
+    }
+
+    #[test]
+    fn late_waiter_keeps_a_newer_last_sh() {
+        let (_dir, q) = temp_query("join-late-waiter-last-sh");
+        let cache = Arc::new(Mutex::new(JoinCache::default()));
+        let st = Arc::new(join_only_state(Arc::new(q), Arc::clone(&cache)));
+        let sh_old = [0x11u8; 32];
+        let sh_new = [0x22u8; 32];
+        let slot = rbitcoin_query::testutil::sh_join_slot_small();
+        let (leader_in, leader_in_rx) = std::sync::mpsc::channel::<()>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let st_l = Arc::clone(&st);
+        let slot_l = Arc::clone(&slot);
+        let leader = std::thread::spawn(move || {
+            st_l.with_sh_join(Some("c1"), &sh_old, |s| {
+                *s = Some(slot_l);
+                let _ = leader_in.send(());
+                let _ = release_rx.recv();
+            });
+        });
+        leader_in_rx.recv().expect("leader entered f");
+        let (waiter_in, waiter_in_rx) = std::sync::mpsc::channel::<()>();
+        let (waiter_go, waiter_go_rx) = std::sync::mpsc::channel::<()>();
+        let st_w = Arc::clone(&st);
+        let slot_w = Arc::clone(&slot);
+        let st_n = Arc::clone(&st);
+        let slot_n = Arc::clone(&slot);
+        let waiter = std::thread::spawn(move || {
+            st_w.with_sh_join(Some("c1"), &sh_old, |s| {
+                *s = Some(slot_w);
+                let _ = waiter_in.send(());
+                let _ = waiter_go_rx.recv();
+                st_n.with_sh_join(Some("c1"), &sh_new, |n| {
+                    *n = Some(slot_n);
+                });
+            });
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            waiter_in_rx.try_recv().is_err(),
+            "waiter must block on the leader, not run the join itself"
+        );
+        let _ = release.send(());
+        waiter_in_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter entered f after the leader finished");
+        let _ = waiter_go.send(());
+        leader.join().expect("leader");
+        waiter.join().expect("waiter");
+        assert_eq!(
+            cache.lock().unwrap().last_sh_key("c1"),
+            Some(sh_new),
+            "a late waiter must not put the old scripthash back over a newer last-1"
         );
     }
 
