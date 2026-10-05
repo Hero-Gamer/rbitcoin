@@ -38,4 +38,4 @@ lands, this finding is not fully fixed.
 `chain::tests::hostile_peer_session`,
 `peer::tests::peer_header_dos_and_self_announce`,
 `compact::tests::prefilled_64_byte_body_without_coinbase_is_not_a_block`;
-`rbitcoin-rpc` `methods::tests::rpc_regtest_chain_ops`.
+`rbitcoin-rpc` `methods::tests::rpc_regtest_from_genesis`.

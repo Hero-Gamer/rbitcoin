@@ -31,5 +31,5 @@ the height push and nVersion 4.
 `block::structure_rule_tests::s7_regtest_rejects_bip34_missing_at_height_1`,
 `s7_regtest_bip34_activation_height_override`,
 `params::tests::bip34_hash_gates_bip30_like_core`; `rbitcoin-rpc`
-`rpc_regtest_chain_ops` (`generatetoaddress` at height 1, `getdeploymentinfo`
+`rpc_regtest_from_genesis` (`generatetoaddress` at height 1, `getdeploymentinfo`
 bip34 active).
