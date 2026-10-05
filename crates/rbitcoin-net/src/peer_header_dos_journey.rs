@@ -1128,6 +1128,16 @@ async fn ancient_weaker_fork_disconnects(
     );
 }
 
+/// Clearnet externalip, then onion and i2p on the same address book.
+/// `--no-discover` and the external address set here are what the overlay
+/// beat checks, and the onion address stays set for the i2p beat.
+#[test]
+fn self_announce_clearnet_then_overlay() {
+    let peers = crate::peers::PeerHub::new();
+    self_announce_clearnet(&peers);
+    self_announce_overlay(&peers);
+}
+
 /// externalip is sent once, again after a day, and not when it is loopback
 /// or `--no-discover` is set.
 fn self_announce_clearnet(peers: &std::sync::Arc<crate::peers::PeerHub>) {
@@ -1234,9 +1244,9 @@ fn self_announce_overlay(peers: &std::sync::Arc<crate::peers::PeerHub>) {
     );
 }
 
-/// One peer. Verack order, unknown parents, header floods, minchainwork,
-/// and self-announce share this hub. CLTV activates at 111 so a rejected
-/// header can log Core's reason on the same chain.
+/// One peer. Verack order, unknown parents, header floods, and minchainwork
+/// share this hub. CLTV activates at 111 so a rejected header can log Core's
+/// reason on the same chain.
 #[tokio::test]
 async fn peer_header_dos_and_self_announce() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("hdr-dos");
@@ -1277,8 +1287,6 @@ async fn peer_header_dos_and_self_announce() {
     }
     ancient_weaker_fork_disconnects(&hub, &peers).await;
     empty_locator_needs_a_body(&hub);
-    self_announce_clearnet(&peers);
-    self_announce_overlay(&peers);
 
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(dir);
