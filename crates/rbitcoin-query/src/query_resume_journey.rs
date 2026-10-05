@@ -79,8 +79,18 @@ fn resume_most_work_header_path() {
 
     let x_tip = x.last().unwrap();
     let x_tip_fk = q.get_header_by_hash(&x_tip.hash).unwrap().unwrap().0;
-    put_header_fork(&q, (x_tip_fk, x_tip.hash), 1_000, 12_000);
-    let path = without_w(32);
+    // Longer than the 32-cap. Scored on a stack a recursive walk of this
+    // band would overflow; the production walk is a heap stack.
+    const DEEP: u32 = 256;
+    put_header_fork(&q, (x_tip_fk, x_tip.hash), 1_000, DEEP);
+    let path = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024)
+            .spawn_scoped(scope, || without_w(32))
+            .expect("spawn")
+            .join()
+            .expect("deep resume walk")
+    });
     assert_eq!(path.len(), 32, "capped walk length");
     assert_eq!((path[0].height, path[31].height), (1, 32));
 

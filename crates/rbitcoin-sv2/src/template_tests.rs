@@ -1,4 +1,4 @@
-use crate::test_chain::{padded_chain, padded_chain_with, TestChain};
+use crate::test_chain::{copy_chain, padded_chain_with, shared_regtest, TestChain};
 use crate::testutil::TpClient;
 use crate::{run_sv2_tp, Sv2TpConfig, SETUP_TIMEOUT, WRITE_TIMEOUT};
 use bitcoin::consensus::encode::serialize;
@@ -24,6 +24,23 @@ use template_distribution_sv2::{
 const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
 const OP_TRUE: u8 = 0x51;
 const OP_CHECKSIG: u8 = 0xac;
+
+fn mock_live_tip(tc: &TestChain) {
+    let tip_time = tc.chain.tip_header().expect("tip").time;
+    tc.chain.clock.set_mock(i64::from(tip_time));
+}
+
+/// Stale tip, two hubs from one pad: an empty pool and a heavy pool. Each
+/// leaves IBD on its own, so the latch cannot be shared.
+#[tokio::test(flavor = "multi_thread")]
+async fn ibd_holds_the_last_budget_and_an_empty_template() {
+    let heavy = shared_regtest(1);
+    let empty = copy_chain(&heavy, "sv2-ibd-empty");
+    tokio::join!(
+        sync_gate_holds_constraints_until_a_fresh_tip(&empty),
+        constraints_while_ibd_keep_the_last_budget(&heavy),
+    );
+}
 
 fn spend(coinbase: Txid, fee: u64, script_pubkey: ScriptBuf) -> Transaction {
     Transaction {
@@ -156,9 +173,8 @@ async fn expect_prev_hash(c: &mut TpClient, tc: &TestChain, template_id: u64, ne
 
 #[tokio::test(flavor = "multi_thread")]
 async fn template_budget_fees_coinbase_and_merkle_path() {
-    let tc = padded_chain("sv2-template", 3);
-    // Tip time as "now": the padded chain is out of IBD for this test.
-    tc.chain.clock.set_mock(i64::from(tc.tip_time));
+    let tc = shared_regtest(3);
+    mock_live_tip(&tc);
     let cheap = ScriptBuf::from_bytes(vec![OP_TRUE]);
     let a = spend(tc.coinbases[0], 3_000, cheap.clone());
     let b = spend(tc.coinbases[1], 2_000, cheap);
@@ -214,8 +230,8 @@ async fn template_budget_fees_coinbase_and_merkle_path() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn template_resent_constraints_do_not_rebuild() {
-    let tc = padded_chain("sv2-template-resent", 1);
-    tc.chain.clock.set_mock(i64::from(tc.tip_time));
+    let tc = shared_regtest(1);
+    mock_live_tip(&tc);
     // 16_000 sigop cost: excluded under a u16::MAX client reserve.
     let heavy = spend(
         tc.coinbases[0],
@@ -254,8 +270,8 @@ async fn template_resent_constraints_do_not_rebuild() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn template_constraint_rebuilds_are_rate_limited() {
-    let tc = padded_chain("sv2-template-rate", 1);
-    tc.chain.clock.set_mock(i64::from(tc.tip_time));
+    let tc = shared_regtest(1);
+    mock_live_tip(&tc);
     // 16_000 sigop cost: excluded under a u16::MAX client reserve.
     let heavy = spend(
         tc.coinbases[0],
@@ -295,9 +311,7 @@ async fn template_constraint_rebuilds_are_rate_limited() {
     tp.shutdown().await;
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn sync_gate_holds_constraints_until_a_fresh_tip() {
-    let tc = padded_chain("sv2-gate", 0);
+async fn sync_gate_holds_constraints_until_a_fresh_tip(tc: &TestChain) {
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         chain: Arc::clone(&tc.chain),
@@ -332,7 +346,7 @@ async fn sync_gate_holds_constraints_until_a_fresh_tip() {
             .expect("template after the fresh tip")
             .expect("message")
     };
-    check_template(&mut c, &tc, first, &[], true).await;
+    check_template(&mut c, tc, first, &[], true).await;
 
     tp.shutdown().await;
 }
@@ -340,9 +354,7 @@ async fn sync_gate_holds_constraints_until_a_fresh_tip() {
 /// A constraints flood while the node is in IBD must not close the session.
 /// Nothing is queued to build, so the post-template 8-replacement close does
 /// not apply. The tip that leaves IBD builds the last budget.
-#[tokio::test(flavor = "multi_thread")]
-async fn constraints_while_ibd_keep_the_last_budget() {
-    let tc = padded_chain("sv2-ibd-hold", 1);
+async fn constraints_while_ibd_keep_the_last_budget(tc: &TestChain) {
     // 16_000 sigop cost: excluded under a u16::MAX client reserve.
     let heavy = spend(
         tc.coinbases[0],
@@ -392,7 +404,7 @@ async fn constraints_while_ibd_keep_the_last_budget() {
             .expect("template after the fresh tip")
             .expect("message")
     };
-    check_template(&mut c, &tc, first, &[], true).await;
+    check_template(&mut c, tc, first, &[], true).await;
     let extra = tokio::time::timeout(Duration::from_millis(500), c.recv()).await;
     assert!(extra.is_err(), "one template for the last budget");
 
@@ -411,7 +423,7 @@ struct FirstTemplate {
 }
 
 async fn first_template(tc: &TestChain) -> FirstTemplate {
-    tc.chain.clock.set_mock(i64::from(tc.tip_time));
+    mock_live_tip(tc);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         chain: Arc::clone(&tc.chain),
@@ -484,9 +496,9 @@ async fn first_template(tc: &TestChain) -> FirstTemplate {
 /// solution that meets it still becomes the tip.
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_solution_checks_pow_before_accept() {
+    let tc = shared_regtest(0);
     use template_distribution_sv2::MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_SUCCESS;
 
-    let tc = padded_chain("sv2-pow-precheck", 0);
     tc.chain.set_prefill_compact(true);
     let FirstTemplate {
         tp,
@@ -527,6 +539,7 @@ async fn submit_solution_checks_pow_before_accept() {
     let solved = header.block_hash();
     assert_eq!(tc.chain.tip_header().unwrap().block_hash(), solved);
     assert_eq!(tc.chain.cmpct_prefill_indexes(&solved), Some(vec![0]));
+    tc.chain.set_prefill_compact(false);
 
     tp.shutdown().await;
 }
@@ -536,7 +549,7 @@ async fn submit_solution_checks_pow_before_accept() {
 /// with. The txid, and so the merkle root, does not cover the witness.
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_solution_without_coinbase_witness_is_accepted() {
-    let tc = padded_chain("sv2-no-cb-witness", 0);
+    let tc = shared_regtest(0);
     let FirstTemplate {
         tp,
         mut c,
@@ -573,7 +586,7 @@ async fn submit_solution_without_coinbase_witness_is_accepted() {
 /// stays bare: a filled witness without a commitment is not valid (BIP141).
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_solution_without_witness_commitment_is_accepted() {
-    let tc = padded_chain("sv2-no-commitment", 0);
+    let tc = shared_regtest(0);
     let FirstTemplate {
         tp,
         mut c,
@@ -615,7 +628,7 @@ async fn submit_solution_without_witness_commitment_is_accepted() {
 /// still consensus-valid (above MTP, under now + 2h), so it becomes the tip.
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_solution_ahead_of_the_rolled_time_is_accepted() {
-    let tc = padded_chain("sv2-fast-clock", 0);
+    let tc = shared_regtest(0);
     let FirstTemplate {
         tp,
         mut c,
@@ -643,8 +656,8 @@ async fn submit_solution_ahead_of_the_rolled_time_is_accepted() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn constraints_flood_closes_the_session() {
-    let tc = padded_chain("sv2-template-flood", 0);
-    tc.chain.clock.set_mock(i64::from(tc.tip_time));
+    let tc = shared_regtest(0);
+    mock_live_tip(&tc);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         chain: Arc::clone(&tc.chain),
@@ -687,8 +700,8 @@ async fn constraints_flood_closes_the_session() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tip_event_rebuilds_a_template_built_on_its_prev_hash() {
-    let tc = padded_chain("sv2-template-tip-race", 1);
-    tc.chain.clock.set_mock(i64::from(tc.tip_time));
+    let tc = shared_regtest(1);
+    mock_live_tip(&tc);
     let paid = spend(
         tc.coinbases[0],
         10_000,
@@ -719,8 +732,9 @@ async fn tip_event_rebuilds_a_template_built_on_its_prev_hash() {
     let tip = tc.chain.tip_header().expect("tip").block_hash();
     let h = tc.chain.query.tip_height().expect("tip height").0;
     let script = ScriptBuf::from_bytes(vec![OP_TRUE]);
-    let x = mine_regtest_paying(tip, tc.tip_time + 1, h + 1, script, vec![paid.clone()]);
-    let y = mine_empty_regtest(x.block_hash(), tc.tip_time + 2, h + 2);
+    let now = tc.chain.tip_header().expect("tip").time;
+    let x = mine_regtest_paying(tip, now + 1, h + 1, script, vec![paid.clone()]);
+    let y = mine_empty_regtest(x.block_hash(), now + 2, h + 2);
     let loaded = tc
         .chain
         .confirm_wire_load_phase(&[(Height(h + 1), x), (Height(h + 2), y)])

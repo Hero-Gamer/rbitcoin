@@ -3772,11 +3772,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mdir);
     }
 
-    #[test]
-    fn expire_stale_drops_old_tx_without_a_new_accept() {
-        let (store_dir, q, cbs) = pad_one_cb();
+    fn expire_stale_drops_old_tx_without_a_new_accept(q: &Arc<Query>, cbs: &[Txid]) {
         let dir = tmp();
-        let hub = MempoolHub::open(&dir, q).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         let tid = tx.compute_txid();
@@ -3788,7 +3786,6 @@ mod tests {
         assert_eq!(hub.live_count(), 0);
         assert!(!hub.contains(&tid));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// One scan visits 256 live txs. With more than that expired, the survivors
@@ -3828,11 +3825,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn try_expire_stale_skips_when_the_order_lock_is_held() {
-        let (store_dir, q, cbs) = pad_one_cb();
+    fn try_expire_stale_skips_when_the_order_lock_is_held(q: &Arc<Query>, cbs: &[Txid]) {
         let dir = tmp();
-        let hub = MempoolHub::open(&dir, q).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         hub.note_mock_now(1);
         let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
@@ -3847,7 +3842,6 @@ mod tests {
         assert_eq!(hub.expire_stale(), 1);
         assert!(!hub.contains(&tid));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     fn record_fee_sample(hub: &MempoolHub, height: u32, rate_sat_kvb: u64) {
@@ -4491,40 +4485,30 @@ mod tests {
 
     /// Non-coinbase, no BIP68 time-lock: no `block_tx_fks` and no create MTP.
     /// A satisfied time-lock spend must survive `evict_after_reorg`.
-    #[test]
-    fn get_coin_skips_block_tx_fks_and_mtp_without_time_lock() {
+    fn get_coin_skips_block_tx_fks_and_mtp_without_time_lock(q: &Arc<Query>, cbs: &[Txid]) {
         use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
         use rbitcoin_primitives::Height;
         use rbitcoin_store::script_hash;
 
-        let store_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
         let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (tip, tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            3,
-        );
+        let tip_h = q.tip_height().expect("tip").0;
+        let fk = q.tip_header_fk().unwrap().expect("tip header");
+        let rec = q.get_header(fk).unwrap();
+        let tip = bitcoin::BlockHash::from_byte_array(rec.hash);
+        let next = tip_h + 1;
         let spk = ScriptBuf::from_bytes(vec![0x51]);
         let confirmed = spend_true(cbs[0], 1_000, spk.clone());
         let b = rbitcoin_consensus::mine_regtest_paying(
             tip,
-            tip_time + 600,
-            103,
+            rec.timestamp + 600,
+            next,
             spk.clone(),
             vec![confirmed.clone()],
         );
-        accept_and_connect_block(&q, &params, Height(103), &b, Milestone::NONE).unwrap();
+        accept_and_connect_block(q, &params, Height(next), &b, Milestone::NONE).unwrap();
         q.apply_sh_pending().unwrap();
-        let q = Arc::new(q);
         let mp = tmp();
-        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let _ = hub.sample_reset_perf();
         let child = Transaction {
@@ -4670,34 +4654,14 @@ mod tests {
             "evict_after_reorg must not drop a still-valid BIP68 time lock"
         );
         let _ = std::fs::remove_dir_all(&mp);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Confirm/RBF unindex must drop `relay_seq` / `accept_at` for the gone
     /// wtxid and leave a still-live sibling indexed.
-    #[test]
-    fn unindex_drops_relay_seq_and_accept_at() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        let store_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            2,
-        );
-        let q = Arc::new(q);
+    fn unindex_drops_relay_seq_and_accept_at(q: &Arc<Query>, cbs: &[Txid]) {
         let spk = ScriptBuf::from_bytes(vec![0x51]);
         let mp = tmp();
-        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         hub.note_mock_now(10);
         let gone = spend_true(cbs[0], 1_000, spk.clone());
@@ -4716,34 +4680,15 @@ mod tests {
         assert!(!hub.tx_inv_due(&gone_w));
         assert!(hub.tx_inv_due(&stay_w));
         let _ = std::fs::remove_dir_all(&mp);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Without `setmocktime`, INV age must still elapse on wall clock
     /// (`mempool_accept_wtxid` wait_for_broadcast; mock_now==0 must not freeze).
-    #[test]
-    fn tx_inv_due_uses_wall_clock_when_mocktime_unset() {
+    fn tx_inv_due_uses_wall_clock_when_mocktime_unset(q: &Arc<Query>, cbs: &[Txid]) {
         use bitcoin::script::ScriptBuf;
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
 
-        let store_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            1,
-        );
-        let q = Arc::new(q);
         let mp = tmp();
-        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         assert_eq!(hub.mock_now.load(Ordering::Relaxed), 0);
         let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
@@ -4769,7 +4714,6 @@ mod tests {
         );
         assert!(hub.any_tx_inv_due());
         let _ = std::fs::remove_dir_all(&mp);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// While relay is off, per-block remove is deferred; enabling relay runs purge.
@@ -4995,25 +4939,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn startup_recomputes_unknown_sigops_with_configured_reserve() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        let store_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            1,
-        );
+    fn startup_recomputes_unknown_sigops_with_configured_reserve(q: &Arc<Query>, cbs: &[Txid]) {
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -5053,7 +4979,7 @@ mod tests {
         }
         let hub = MempoolHub::open_with_weight_persist_and_sigop_reserve(
             &mempool_dir,
-            Arc::new(q),
+            Arc::clone(q),
             rbitcoin_mempool::DEFAULT_MAX_MEMPOOL_WEIGHT,
             true,
             Some(0),
@@ -5076,7 +5002,6 @@ mod tests {
         assert!(hub.select_block_template(core_reserve).is_empty());
         assert!(hub.contains(&txid));
         let _ = std::fs::remove_dir_all(&mempool_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]
@@ -5404,8 +5329,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    fn pad_one_cb() -> (std::path::PathBuf, Arc<Query>, Vec<Txid>) {
-        pad_cbs(1)
+    /// One 3-coinbase maturity pad. Each chapter opens its own mempool.
+    /// The last chapter connects a block on this chain.
+    #[test]
+    fn shared_maturity_pad_journey() {
+        let (store_dir, q, cbs) = pad_cbs(3);
+        expire_stale_drops_old_tx_without_a_new_accept(&q, &cbs);
+        try_expire_stale_skips_when_the_order_lock_is_held(&q, &cbs);
+        unindex_drops_relay_seq_and_accept_at(&q, &cbs);
+        tx_inv_due_uses_wall_clock_when_mocktime_unset(&q, &cbs);
+        startup_recomputes_unknown_sigops_with_configured_reserve(&q, &cbs);
+        submit_package_rpc_admits_cpfp_below_minrelay(&q, &cbs);
+        mempool_under_pressure(&q, &cbs);
+        accept_package_child_fail_restores_rbf_victims(&q, &cbs);
+        fee_snapshot_live_totals_match_list_live_meta(&q, &cbs);
+        accept_commit_does_not_query_under_write(&q, &cbs);
+        mempool_tx_snapshot_two_live_and_accept_while_held(&q, &cbs);
+        mempool_tx_snapshot_refresh_reuses_tx_arc(&q, &cbs);
+        get_coin_skips_block_tx_fks_and_mtp_without_time_lock(&q, &cbs);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Coinbases at heights `1..=n`, each with 100 confirmations.
@@ -5431,11 +5373,9 @@ mod tests {
         (store_dir, Arc::new(q), cbs)
     }
 
-    #[test]
-    fn submit_package_rpc_admits_cpfp_below_minrelay() {
-        let (store_dir, q, cbs) = pad_one_cb();
+    fn submit_package_rpc_admits_cpfp_below_minrelay(q: &Arc<Query>, cbs: &[Txid]) {
         let dir = tmp();
-        let hub = MempoolHub::open(&dir, q).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
         assert!(
@@ -5470,14 +5410,11 @@ mod tests {
         assert!(hub.try_contains(&parent.compute_txid()));
         assert!(hub.try_contains(&child.compute_txid()));
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn mempool_under_pressure() {
-        let (store_dir, q, cbs) = pad_one_cb();
+    fn mempool_under_pressure(q: &Arc<Query>, cbs: &[Txid]) {
         let dir = tmp();
-        let hub = MempoolHub::open(&dir, q).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let parent = spend_true(cbs[0], 1, ScriptBuf::from_bytes(vec![0x51]));
         assert!(matches!(
@@ -5583,32 +5520,12 @@ mod tests {
             "child of rejected parent must poison descendants"
         );
         let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn accept_package_child_fail_restores_rbf_victims() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        let store_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            1,
-        );
-        let q = Arc::new(q);
+    fn accept_package_child_fail_restores_rbf_victims(q: &Arc<Query>, cbs: &[Txid]) {
         let spk = ScriptBuf::from_bytes(vec![0x51]);
         let mp = tmp();
-        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let low = Transaction {
             version: Version::TWO,
@@ -5678,7 +5595,6 @@ mod tests {
             "hub package rollback must restore the RBF victim"
         );
         let _ = std::fs::remove_dir_all(&mp);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]
@@ -6002,28 +5918,9 @@ mod tests {
     }
 
     /// Fee-snapshot refresh publishes live count/vsize/total_fee (GET /mempool).
-    #[test]
-    fn fee_snapshot_live_totals_match_list_live_meta() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        let store_dir = tmp();
+    fn fee_snapshot_live_totals_match_list_live_meta(q: &Arc<Query>, cbs: &[Txid]) {
         let mp_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            1,
-        );
-        let q = Arc::new(q);
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let a = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         hub.accept_tx(&a).expect("admit");
@@ -6049,7 +5946,6 @@ mod tests {
             (expect_count, expect_vsize, expect_fee)
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Production accept must not run on a tokio worker (reactor starvation).
@@ -6311,11 +6207,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn accept_commit_does_not_query_under_write() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+    fn accept_commit_does_not_query_under_write(q: &Arc<Query>, cbs: &[Txid]) {
         use rbitcoin_mempool::UtxoProvider;
-        use rbitcoin_primitives::Height;
         use std::sync::atomic::{AtomicU64, Ordering};
         use std::thread;
 
@@ -6340,23 +6233,8 @@ mod tests {
             }
         }
 
-        let store_dir = tmp();
         let mp_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _tip_time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            1,
-        );
-        let q = Arc::new(q);
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let hits = Arc::new(AtomicU64::new(0));
         let probe = ProbeUtxo {
@@ -6372,7 +6250,6 @@ mod tests {
             "QueryUtxoProvider must not run while inner write is held"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]
@@ -6455,29 +6332,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn mempool_tx_snapshot_two_live_and_accept_while_held() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
+    fn mempool_tx_snapshot_two_live_and_accept_while_held(q: &Arc<Query>, cbs: &[Txid]) {
         use std::thread;
 
-        let store_dir = tmp();
         let mp_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            3,
-        );
-        let q = Arc::new(q);
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let spk = ScriptBuf::from_bytes(vec![0x51]);
         let a = spend_true(cbs[0], 1_000, spk.clone());
@@ -6514,31 +6373,11 @@ mod tests {
         );
         assert!(snap2.get(&cid).unwrap().json.get().is_none());
         let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    #[test]
-    fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
-        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-        use rbitcoin_primitives::Height;
-
-        let store_dir = tmp();
+    fn mempool_tx_snapshot_refresh_reuses_tx_arc(q: &Arc<Query>, cbs: &[Txid]) {
         let mp_dir = tmp();
-        let q = Query::open_or_create_tiny(&store_dir).unwrap();
-        let params = ChainParams::regtest();
-        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-        let (_tip, _time, cbs) = rbitcoin_consensus::pad_empty_from(
-            &q,
-            &params,
-            genesis.block_hash(),
-            genesis.header.time,
-            1,
-            102,
-            2,
-        );
-        let q = Arc::new(q);
-        let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::clone(q)).unwrap();
         hub.set_relay_enabled(true);
         let a = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
         hub.accept_tx(&a).expect("a");
@@ -6564,6 +6403,5 @@ mod tests {
         assert!(!Arc::ptr_eq(&e3a.tx, &e3b.tx), "new admit gets its own Arc");
         assert!(e3b.json.get().is_none());
         let _ = std::fs::remove_dir_all(&mp_dir);
-        let _ = std::fs::remove_dir_all(&store_dir);
     }
 }

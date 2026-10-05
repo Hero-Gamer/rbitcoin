@@ -1,12 +1,14 @@
-use crate::test_chain::padded_chain;
+use crate::test_chain::shared_regtest;
 use crate::testutil::TpClient;
 use crate::{run_sv2_tp, Sv2TpConfig, MAX_SESSIONS, MAX_STALE_GRACE, SETUP_TIMEOUT, WRITE_TIMEOUT};
 use common_messages_sv2::{
     SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
+use rbitcoin_net::ChainHub;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use template_distribution_sv2::MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR;
 
@@ -23,6 +25,24 @@ async fn connect_when_free(addr: SocketAddr, pk: [u8; 32]) -> TpClient {
     }
 }
 
+/// One stale regtest chain. Each beat is its own listener. The two setup
+/// deadlines overlap. The write-deadline pin is process-wide, so that beat
+/// runs after the others have accepted.
+#[tokio::test]
+async fn listener_rejects_bad_sessions_on_one_chain() {
+    let tc = shared_regtest(0);
+    let chain = Arc::clone(&tc.chain);
+    tokio::join!(
+        setup_connection_success_errors_and_session_cap(Arc::clone(&chain)),
+        authority_key_prints_in_key_utils_base58check(Arc::clone(&chain)),
+        silent_sockets_are_dropped_at_the_setup_deadline(Arc::clone(&chain)),
+        session_without_constraints_is_dropped_at_the_setup_deadline(Arc::clone(&chain)),
+        oversized_client_frame_closes_the_session(Arc::clone(&chain)),
+        out_of_range_cert_validity_or_stale_grace_refuses_to_start(Arc::clone(&chain)),
+    );
+    client_that_stops_reading_is_dropped_at_the_write_deadline(chain).await;
+}
+
 async fn expect_error(c: &mut TpClient, flags: u32, code: &str) {
     let mut f = c.recv().await.expect("setup reply");
     assert_eq!(f.msg_type, MESSAGE_TYPE_SETUP_CONNECTION_ERROR);
@@ -36,12 +56,10 @@ async fn expect_error(c: &mut TpClient, flags: u32, code: &str) {
     );
 }
 
-#[tokio::test]
-async fn setup_connection_success_errors_and_session_cap() {
-    let tc = padded_chain("sv2-listener", 0);
+async fn setup_connection_success_errors_and_session_cap(chain: Arc<ChainHub>) {
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        chain: tc.chain.clone(),
+        chain,
         authority_secret: [7; 32],
         cert_validity: Duration::from_secs(3600),
         stale_grace: Duration::from_secs(10),
@@ -94,14 +112,12 @@ async fn setup_connection_success_errors_and_session_cap() {
 
 /// key-utils 1.2.0 vector: SRI clients configure the TP authority key in
 /// this form, so the handle must print it, and a client must connect with it.
-#[tokio::test]
-async fn authority_key_prints_in_key_utils_base58check() {
+async fn authority_key_prints_in_key_utils_base58check(chain: Arc<ChainHub>) {
     let secret = bitcoin::base58::decode_check("zmBEmPhqo3A92FkiLVvyCz6htc3e53ph3ZbD4ASqGaLjwnFLi")
         .expect("vector secret");
-    let tc = padded_chain("sv2-authority-key", 0);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        chain: std::sync::Arc::clone(&tc.chain),
+        chain,
         authority_secret: secret.try_into().expect("32-byte secret"),
         cert_validity: Duration::from_secs(3600),
         stale_grace: Duration::from_secs(10),
@@ -127,15 +143,13 @@ async fn authority_key_prints_in_key_utils_base58check() {
 
 /// Silent sockets take every slot at accept; the setup deadline must close
 /// them so a real client gets in.
-#[tokio::test]
-async fn silent_sockets_are_dropped_at_the_setup_deadline() {
+async fn silent_sockets_are_dropped_at_the_setup_deadline(chain: Arc<ChainHub>) {
     use tokio::io::AsyncReadExt;
 
-    let tc = padded_chain("sv2-setup-deadline", 0);
     let setup_timeout = Duration::from_millis(300);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        chain: std::sync::Arc::clone(&tc.chain),
+        chain,
         authority_secret: [7; 32],
         cert_validity: Duration::from_secs(3600),
         stale_grace: Duration::from_secs(10),
@@ -169,13 +183,11 @@ async fn silent_sockets_are_dropped_at_the_setup_deadline() {
 /// A TDP session without `CoinbaseOutputConstraints` never gets a template
 /// and never writes, so the setup deadline also covers the first constraints.
 /// Other frames before them do not reset it.
-#[tokio::test]
-async fn session_without_constraints_is_dropped_at_the_setup_deadline() {
-    let tc = padded_chain("sv2-constraints-deadline", 0);
+async fn session_without_constraints_is_dropped_at_the_setup_deadline(chain: Arc<ChainHub>) {
     let setup_timeout = Duration::from_millis(300);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        chain: std::sync::Arc::clone(&tc.chain),
+        chain,
         authority_secret: [7; 32],
         cert_validity: Duration::from_secs(3600),
         stale_grace: Duration::from_secs(10),
@@ -223,16 +235,14 @@ async fn session_without_constraints_is_dropped_at_the_setup_deadline() {
 
 /// A client that floods requests and never reads jams the TP's writes; the
 /// write deadline must close the session instead of stalling it forever.
-#[tokio::test]
-async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
-    let tc = padded_chain("sv2-write-deadline", 0);
+async fn client_that_stops_reading_is_dropped_at_the_write_deadline(chain: Arc<ChainHub>) {
     let write_timeout = Duration::from_millis(200);
     // Pin before accept. Drop clears it so other tests keep autotune.
     #[cfg(target_os = "linux")]
     let _send_buf = crate::test_send_buffer::pin(8 * 1024);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        chain: std::sync::Arc::clone(&tc.chain),
+        chain,
         authority_secret: [7; 32],
         cert_validity: Duration::from_secs(3600),
         stale_grace: Duration::from_secs(10),
@@ -259,6 +269,7 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
     // leaves the session idle so the deadline never starts. Yield so the
     // session task runs; a ready send does not, and the flood only fills
     // the kernel buffer.
+    let started = Instant::now();
     let outcome = tokio::time::timeout(Duration::from_secs(5), async {
         for id in 1..=1_000_000u64 {
             c.request_transaction_data(id).await?;
@@ -273,17 +284,20 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
         Ok(Ok(())) => panic!("socket buffers never filled"),
         Err(_) => panic!("session must close once its write stalls past the deadline"),
     }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "stalled write took {:?}",
+        started.elapsed()
+    );
     tp.shutdown().await;
 }
 
 /// The largest legitimate client frame (a `SubmitSolution` with a full
 /// `B064K` coinbase) keeps the session; a larger frame closes it.
-#[tokio::test]
-async fn oversized_client_frame_closes_the_session() {
-    let tc = padded_chain("sv2-frame-cap", 0);
+async fn oversized_client_frame_closes_the_session(chain: Arc<ChainHub>) {
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
-        chain: std::sync::Arc::clone(&tc.chain),
+        chain,
         authority_secret: [7; 32],
         cert_validity: Duration::from_secs(3600),
         stale_grace: Duration::from_secs(10),
@@ -318,9 +332,7 @@ async fn oversized_client_frame_closes_the_session() {
     tp.shutdown().await;
 }
 
-#[tokio::test]
-async fn out_of_range_cert_validity_or_stale_grace_refuses_to_start() {
-    let tc = padded_chain("sv2-listener-range", 0);
+async fn out_of_range_cert_validity_or_stale_grace_refuses_to_start(chain: Arc<ChainHub>) {
     for (cert_validity, stale_grace) in [
         (Duration::from_secs(u64::from(u32::MAX) + 1), Duration::ZERO),
         (
@@ -330,7 +342,7 @@ async fn out_of_range_cert_validity_or_stale_grace_refuses_to_start() {
     ] {
         let e = run_sv2_tp(Sv2TpConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
-            chain: tc.chain.clone(),
+            chain: Arc::clone(&chain),
             authority_secret: [7; 32],
             cert_validity,
             stale_grace,
