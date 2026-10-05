@@ -409,13 +409,17 @@ fn legacy_spans<'a>(tx: &Transaction, wire: &'a [u8]) -> Option<WitnessWire<'a>>
 const OUTPOINT_LEN: usize = 36;
 const SEQUENCE_LEN: usize = 4;
 
+/// Single SHA-256 of prevouts, sequences, and outputs. `None` is the connect
+/// path that skipped sighash.
+type SighashMidstates = [Option<[u8; 32]>; 3];
+
 /// Txid from the non-witness slices, and BIP143/341 single-SHA midstates from
 /// the same bytes. Outpoint is the first 36 bytes of each input; sequence is
 /// the last 4. Outputs are the vout slice after the compact-size count.
 fn hash_wire_sighash(
     tx: &Transaction,
     spans: &WitnessWire<'_>,
-) -> Option<([u8; 32], [Option<[u8; 32]>; 3])> {
+) -> Option<([u8; 32], SighashMidstates)> {
     let mut txid_eng = sha256d::Hash::engine();
     let mut sha_prev = sha256::Hash::engine();
     let mut sha_seq = sha256::Hash::engine();
@@ -467,7 +471,7 @@ fn sigops_and_out_sum(tx: &Transaction) -> (u64, u64) {
     (sigops, out_sum)
 }
 
-fn sighash_midstates(tx: &Transaction) -> [Option<[u8; 32]>; 3] {
+fn sighash_midstates(tx: &Transaction) -> SighashMidstates {
     let mut sha_prev = sha256::Hash::engine();
     let mut sha_seq = sha256::Hash::engine();
     let mut sha_out = sha256::Hash::engine();
