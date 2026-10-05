@@ -316,7 +316,7 @@ impl I2pDialer {
     async fn stream_connect_once(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
         let mut s = TcpStream::connect(self.sam_addr)
             .await
-            .map_err(|e| NetError::Encode(format!("i2p sam stream connect: {e}")))?;
+            .map_err(|e| NetError::Encode(format!("i2p sam dial: {e}")))?;
         hello(&mut s).await?;
         write_line(
             &mut s,
@@ -513,6 +513,20 @@ async fn read_line(s: &mut TcpStream) -> Result<String, NetError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refused_local_sam_dial_is_not_a_dead_session() {
+        let refused = NetError::Encode("i2p sam dial: Connection refused (os error 111)".into());
+        assert!(
+            !session_dead(&refused),
+            "a refused local SAM port must not rotate the installed session"
+        );
+        let reply = NetError::Encode("i2p sam stream: STREAM STATUS RESULT=CANT_REACH_PEER".into());
+        assert!(!session_dead(&reply));
+        let invalid = NetError::Encode("i2p sam stream: SESSION STATUS RESULT=INVALID_ID".into());
+        assert!(session_dead(&invalid));
+    }
+
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
