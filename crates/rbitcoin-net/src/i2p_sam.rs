@@ -72,6 +72,13 @@ fn installed() -> Result<I2pDialer, NetError> {
         .ok_or_else(|| NetError::Encode("i2p dial requires SAM (--i2p-sam)".into()))
 }
 
+/// Error from the SAM TCP connect that opens a stream. A refused local
+/// port uses this text. It must not contain `STREAM CONNECT:`, which
+/// `session_dead` treats as a dead installed session.
+fn sam_dial_error(err: &std::io::Error) -> NetError {
+    NetError::Encode(format!("i2p sam dial: {err}"))
+}
+
 fn session_dead(err: &NetError) -> bool {
     if stream_socket_dead(err) {
         return true;
@@ -316,7 +323,7 @@ impl I2pDialer {
     async fn stream_connect_once(&self, dest_b32: &str) -> Result<TcpStream, NetError> {
         let mut s = TcpStream::connect(self.sam_addr)
             .await
-            .map_err(|e| NetError::Encode(format!("i2p sam dial: {e}")))?;
+            .map_err(|e| sam_dial_error(&e))?;
         hello(&mut s).await?;
         write_line(
             &mut s,
@@ -514,12 +521,28 @@ async fn read_line(s: &mut TcpStream) -> Result<String, NetError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn refused_local_sam_dial_is_not_a_dead_session() {
-        let refused = NetError::Encode("i2p sam dial: Connection refused (os error 111)".into());
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_local_sam_dial_is_not_a_dead_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let sam_addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let dialer = I2pDialer {
+            sam_addr,
+            session_id: "refused".into(),
+            destination: "dest".into(),
+            forward_port: None,
+        };
+        let refused = dialer
+            .stream_connect_once("abcdef.b32.i2p")
+            .await
+            .expect_err("closed SAM port");
         assert!(
             !session_dead(&refused),
-            "a refused local SAM port must not rotate the installed session"
+            "a refused local SAM port must not rotate the installed session: {refused}"
+        );
+        assert!(
+            matches!(refused, NetError::Encode(ref s) if s.starts_with("i2p sam dial:")),
+            "the dial path must use sam_dial_error: {refused}"
         );
         let reply = NetError::Encode("i2p sam stream: STREAM STATUS RESULT=CANT_REACH_PEER".into());
         assert!(!session_dead(&reply));
