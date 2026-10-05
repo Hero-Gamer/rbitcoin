@@ -18,7 +18,9 @@ Fixed
   after the package; a tx that was admitted and then dropped is
   `mempool full`. Package-admitted txs use the same relay-age clock as
   an individual admit, and `prioritisetransaction` deltas count in the
-  feerate announced to peers.
+  feerate announced to peers. A member whose own feerate is above
+  `maxfeerate` is rejected and does not rescue the rest of the package.
+  An individual admit still reports the transactions it replaced.
 - **Spending an unspendable output is a missing input.** A script that
   starts with `OP_RETURN`, or is longer than 10_000 bytes, is not a coin.
   Spending it fails `bad-txns-inputs-missingorspent`.

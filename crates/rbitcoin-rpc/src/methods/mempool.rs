@@ -1391,7 +1391,7 @@ pub(crate) fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
     if let Some(failed) = submitpackage_fee_burn_precheck(ctx, &txs, max_feerate, max_burn)? {
         return Ok(failed);
     }
-    Ok(submitpackage_admit(ctx, mp, &txs, max_feerate, dialect))
+    Ok(submitpackage_admit(ctx, mp, &txs, max_feerate))
 }
 
 fn submitpackage_conflict_result(txs: &[Transaction]) -> Value {
@@ -1461,7 +1461,6 @@ fn submitpackage_admit(
     mp: &MempoolHub,
     txs: &[Transaction],
     max_feerate: u64,
-    dialect: bool,
 ) -> Value {
     let mut tx_results = serde_json::Map::new();
     let mut replaced = Vec::new();
@@ -1501,7 +1500,24 @@ fn submitpackage_admit(
             tx_results.insert(wtxid, json!({ "txid": txid_s }));
         }
     }
-    for (tx, row) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
+    // Core compares each member's own feerate with `maxfeerate` before
+    // that member can enter, including a parent that exists only in this
+    // package. Such a member is not submitted: package feerate must not
+    // rescue it, and it must not rescue the others (`rpc_packages.py`).
+    let mut eval_txs = Vec::new();
+    let mut over_max = Vec::new();
+    for tx in to_admit {
+        if package_tx_fee_exceeds_max(ctx, &tx, txs, max_feerate) {
+            over_max.push(tx);
+        } else {
+            eval_txs.push(tx);
+        }
+    }
+    let package_eval = over_max.is_empty();
+    for (tx, row) in eval_txs
+        .iter()
+        .zip(mp.submit_package_rpc_eval(&eval_txs, package_eval))
+    {
         match row.result {
             Ok(ok) => {
                 mp.note_unbroadcast(ok.txid);
@@ -1532,18 +1548,21 @@ fn submitpackage_admit(
                     hash_hex_display(&tx.compute_wtxid().to_byte_array()),
                     json!({
                         "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
-                        "error": submitpackage_member_error(
-                            ctx,
-                            tx,
-                            txs,
-                            max_feerate,
-                            dialect,
-                            &e,
-                        ),
+                        "error": submitpackage_member_error(&e),
                     }),
                 );
             }
         }
+    }
+    for tx in over_max {
+        any_fail = true;
+        tx_results.insert(
+            hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+            json!({
+                "txid": hash_hex_display(&tx.compute_txid().to_byte_array()),
+                "error": "max feerate exceeded",
+            }),
+        );
     }
     let package_msg = if any_fail {
         "transaction failed"
@@ -1557,22 +1576,12 @@ fn submitpackage_admit(
     })
 }
 
-fn submitpackage_member_error(
-    ctx: &RpcContext,
-    tx: &Transaction,
-    package: &[Transaction],
-    max_feerate: u64,
-    dialect: bool,
-    e: &impl std::fmt::Display,
-) -> String {
+fn submitpackage_member_error(e: &impl std::fmt::Display) -> String {
     let mapped = accept_reject_reason(e);
-    if mapped != "missing-inputs" {
-        return mapped;
+    if mapped == "missing-inputs" {
+        return "bad-txns-inputs-missingorspent".into();
     }
-    if dialect && package_tx_fee_exceeds_max(ctx, tx, package, max_feerate) {
-        return "max feerate exceeded".into();
-    }
-    "bad-txns-inputs-missingorspent".into()
+    mapped
 }
 
 pub(crate) fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {

@@ -55,10 +55,10 @@ those Core aliases. The shim sets `RBITCOIN_RPC_WAIT_TIP_IDLE=1` on the child so
 `getblockcount` waits until the tip-accept lane is empty (`sync_blocks`).
 Production (unset) waits only for the accept that was running when the RPC
 arrived. The same child env sets `RBITCOIN_RPC_PACKAGE_DIALECT=1` so
-`submitpackage` matches Core `IsChildWithParents` (`-25`) and in-package
-maxfeerate overlay. Production (unset) still package-evaluates a
-child-with-parents remainder that failed min relay, the dynamic mempool
-floor, or missing inputs. The RPC proxy rewrites multi-tx
+`submitpackage` matches Core `IsChildWithParents` (`-25`). A member above
+`maxfeerate` is rejected either way and does not rescue the package.
+Production (unset) still package-evaluates a child-with-parents remainder
+that failed min relay, the dynamic mempool floor, or missing inputs. The RPC proxy rewrites multi-tx
 `testmempoolaccept` abort-class rows (`missing-inputs` /
 `max-fee-exceeded` / `bip125-replacement-disallowed`) to `{txid,wtxid}`; the
 node keeps earlier `allowed: true`. `getmempoolinfo.maxmempool` on the

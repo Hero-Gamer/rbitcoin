@@ -2163,6 +2163,98 @@ fn submitpackage_child_fail_keeps_parent() {
 }
 
 #[test]
+fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (low_hex, low) = mature_coinbase_spend(
+        &ctx,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    dispatch(&ctx, "sendrawtransaction", vec![json!(low_hex), json!(0)]).unwrap();
+    let parent = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: low.input[0].previous_output.txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 12_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+        }],
+    };
+    let parent_vb = rbitcoin_consensus::policy::get_virtual_size(parent.weight().to_wu());
+    let child_vb = rbitcoin_consensus::policy::get_virtual_size(child.weight().to_wu());
+    let parent_fee = 2_000u64;
+    let child_fee = 10_000u64;
+    let max_feerate = parent_fee.div_ceil(parent_vb.max(1));
+    assert!(
+        parent_fee <= max_feerate.saturating_mul(parent_vb),
+        "parent fee must stay within maxfeerate {max_feerate}"
+    );
+    assert!(
+        child_fee > max_feerate.saturating_mul(child_vb),
+        "child fee must exceed maxfeerate {max_feerate} vsize {child_vb}"
+    );
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![
+            json!([
+                hex_encode(serialize(&parent)),
+                hex_encode(serialize(&child))
+            ]),
+            json!(max_feerate),
+        ],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    let child_w = hash_hex_display(&child.compute_wtxid().to_byte_array());
+    assert_eq!(
+        pkg["tx-results"][&child_w]["error"],
+        json!("max feerate exceeded"),
+        "{pkg}"
+    );
+    let low_txid = hash_hex_display(&low.compute_txid().to_byte_array());
+    assert_eq!(
+        pkg["replaced-transactions"],
+        json!([low_txid]),
+        "the replacement parent must name the tx it evicted, got {pkg}"
+    );
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert!(mp.contains(&parent.compute_txid()));
+    assert!(!mp.contains(&child.compute_txid()));
+    assert!(!mp.contains(&low.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rpc_submit_nonstandard_version_is_version() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2379,6 +2471,9 @@ fn pressure_tiny_weight() {
     let vsize = rbitcoin_consensus::policy::get_virtual_size(probe.weight().to_wu());
     let minrelay_fee = vsize.div_ceil(10);
     let (low_hex, low) = spend_generated_coinbase(&fee_ctx, 1, cb - minrelay_fee, spk.clone());
+    // Child fee stays under the default 10_000 sat/vB `maxfeerate`. A 1 sat
+    // output would burn almost the whole coinbase and skip package eval.
+    let child_fee = 1_000u64;
     let low_child = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -2392,10 +2487,15 @@ fn pressure_tiny_weight() {
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(1),
+            value: Amount::from_sat(cb - minrelay_fee - child_fee),
             script_pubkey: spk,
         }],
     };
+    let child_vb = rbitcoin_consensus::policy::get_virtual_size(low_child.weight().to_wu());
+    assert!(
+        child_fee <= 10_000u64.saturating_mul(child_vb),
+        "child fee {child_fee} must stay within default maxfeerate, vsize {child_vb}"
+    );
     let pkg = dispatch(
         &fee_ctx,
         "submitpackage",

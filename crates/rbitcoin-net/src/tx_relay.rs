@@ -3200,6 +3200,17 @@ impl MempoolHub {
     /// None`. A tx that only cleared the fee floor inside the remainder reports
     /// that remainder, in package order.
     pub fn submit_package_rpc(&self, txs: &[Transaction]) -> Vec<SubmitPackageRow> {
+        self.submit_package_rpc_eval(txs, true)
+    }
+
+    /// Same as [`Self::submit_package_rpc`]. `package_eval` false keeps each
+    /// individual result: an RPC `maxfeerate` miss must not be waived by the
+    /// child-with-parents feerate (`rpc_packages.py`).
+    pub fn submit_package_rpc_eval(
+        &self,
+        txs: &[Transaction],
+        package_eval: bool,
+    ) -> Vec<SubmitPackageRow> {
         let mut out: Vec<Result<AcceptResult, AcceptError>> =
             txs.iter().map(|tx| self.accept_tx_defer_trim(tx)).collect();
         let rest: Vec<Transaction> = txs
@@ -3211,7 +3222,7 @@ impl MempoolHub {
             })
             .map(|(tx, _)| tx.clone())
             .collect();
-        if rest.len() >= 2 {
+        if package_eval && rest.len() >= 2 {
             match self.accept_package(&rest) {
                 Ok(_) => {}
                 Err(AcceptError::Policy("mempool full")) => {
@@ -3237,7 +3248,14 @@ impl MempoolHub {
                 .as_ref()
                 .is_some_and(|ids: &Vec<Txid>| ids.contains(&id));
             if self.try_contains(&id) {
-                if let Some(ok) = self.live_accept_result(&id) {
+                if let Some(mut ok) = self.live_accept_result(&id) {
+                    // `live_accept_result` only rebuilds fee and weight. The
+                    // individual admit already named who it replaced.
+                    if let Ok(prev) = &slot {
+                        ok.replaced = prev.replaced.clone();
+                        ok.replaced_scripthashes = prev.replaced_scripthashes.clone();
+                        ok.replaced_txs = prev.replaced_txs.clone();
+                    }
                     slot = Ok(ok);
                 }
             } else if slot.is_ok() {
