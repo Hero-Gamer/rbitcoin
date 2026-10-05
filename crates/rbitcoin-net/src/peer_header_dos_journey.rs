@@ -801,8 +801,9 @@ fn empty_locator_needs_a_body(hub: &crate::chain::ChainHub) {
     );
 }
 
-/// A bad block disconnects a plain peer. noban keeps the session and scores nothing.
-async fn noban_bad_block_is_not_punished(
+/// A bad block disconnects a plain peer. noban and manual peers keep the
+/// session and score nothing (Core `MaybeDiscourageAndDisconnect`).
+async fn noban_and_manual_bad_block_is_not_punished(
     hub: &crate::chain::ChainHub,
     peers: &std::sync::Arc<crate::peers::PeerHub>,
 ) {
@@ -861,6 +862,30 @@ async fn noban_bad_block_is_not_punished(
     assert!(misbehavior_disconnects(BAN_SCORE_THRESHOLD, None));
     assert!(!misbehavior_disconnects(BAN_SCORE_THRESHOLD - 1, None));
     peers.set_noban(false);
+
+    // `--connect` and `addnode` peers are `manual`.
+    let manual = live_peer_as(peers, 18477, 26, crate::peers::PeerConnType::Manual);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(bad_pow.block_hash());
+    on_block(hub, &out_tx, &mut follow, Some(manual.as_ref()), &bad_pow)
+        .await
+        .unwrap();
+    assert!(
+        !manual.stop.load(Ordering::SeqCst),
+        "Core never disconnects a manual peer for misbehavior"
+    );
+    assert_eq!(follow.ban_score, 0, "a manual peer gathers no score");
+    assert!(
+        !misbehavior_disconnects(BAN_SCORE_THRESHOLD, Some(manual.as_ref())),
+        "a manual peer at the threshold stays connected"
+    );
+    // Core answers `sendaddrv2` after `verack` with `fDisconnect`, not
+    // `Misbehaving`, so a manual peer is still dropped.
+    on_sendaddrv2(&mut follow, Some(manual.as_ref()));
+    assert!(
+        manual.stop.load(Ordering::SeqCst),
+        "a protocol violation still drops a manual peer"
+    );
 }
 
 /// Core `IsBlockMutated`: a coinbase-less body with a 64-byte tx is dropped
@@ -1275,7 +1300,7 @@ async fn peer_header_dos_and_self_announce() {
 
     tall_unknown_parent_skips_reconstruct(&hub, &peers).await;
     header_reject_punishes_except_time(&hub).await;
-    noban_bad_block_is_not_punished(&hub, &peers).await;
+    noban_and_manual_bad_block_is_not_punished(&hub, &peers).await;
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     merkle_mismatch_forgets_the_ask(&hub, &peers).await;
     duplicate_pair_disconnects(&hub, &peers).await;

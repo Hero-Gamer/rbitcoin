@@ -91,6 +91,20 @@ fn live_peer(
     nonce: u64,
     inbound: bool,
 ) -> std::sync::Arc<crate::peers::LivePeer> {
+    let conn = if inbound {
+        crate::peers::PeerConnType::Inbound
+    } else {
+        crate::peers::PeerConnType::OutboundFullRelay
+    };
+    live_peer_as(peers, port, nonce, conn)
+}
+
+fn live_peer_as(
+    peers: &std::sync::Arc<crate::peers::PeerHub>,
+    port: u16,
+    nonce: u64,
+    conn: crate::peers::PeerConnType,
+) -> std::sync::Arc<crate::peers::LivePeer> {
     use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_network::VersionMessage;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -105,11 +119,7 @@ fn live_peer(
         start_height: 0,
         relay: true,
     };
-    let conn = if inbound {
-        crate::peers::PeerConnType::Inbound
-    } else {
-        crate::peers::PeerConnType::OutboundFullRelay
-    };
+    let inbound = conn == crate::peers::PeerConnType::Inbound;
     peers.register(addr, addr, &ver, inbound, conn)
 }
 

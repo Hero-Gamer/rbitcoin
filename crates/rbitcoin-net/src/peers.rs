@@ -2358,10 +2358,17 @@ impl PeerHub {
     }
 
     fn dial_manual_net(&self, addr: &crate::NetAddr) -> Result<(), String> {
-        match addr.socket_addr() {
-            Some(ip) => self.dial(ip, PeerConnType::Manual),
-            None => self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual),
+        self.dial_manual_target(DialTarget::from_net(*addr))
+    }
+
+    /// Core `AlreadyConnectedToHost` / `AlreadyConnectedToAddressPort`:
+    /// `addnode` opens no second session to an endpoint that is connected
+    /// or still dialling, and the RPC still succeeds.
+    fn dial_manual_target(&self, target: DialTarget) -> Result<(), String> {
+        if self.is_target_live(&target) || self.is_target_dialing(&target) {
+            return Ok(());
         }
+        self.dial_target(target, PeerConnType::Manual)
     }
 
     pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
@@ -2394,13 +2401,13 @@ impl PeerHub {
     pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
         self.note_default_port(default_port);
         match cmd {
-            "onetry" => self.dial_resolved(node, PeerConnType::Manual),
+            "onetry" => self.dial_resolved(node),
             "add" => {
                 self.manual_hosts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(node.to_string());
-                let _ = self.dial_resolved(node, PeerConnType::Manual);
+                let _ = self.dial_resolved(node);
                 Ok(())
             }
             "remove" => {
@@ -2451,7 +2458,7 @@ impl PeerHub {
         Ok(DialTarget::Socket(addr))
     }
 
-    fn dial_resolved(&self, node: &str, typ: PeerConnType) -> Result<(), String> {
+    fn dial_resolved(&self, node: &str) -> Result<(), String> {
         let target = self.host_dial_target(node)?;
         match &target {
             DialTarget::Socket(addr) => {
@@ -2467,7 +2474,7 @@ impl PeerHub {
                     .insert(target.net_addr());
             }
         }
-        self.dial_target(target, typ)
+        self.dial_manual_target(target)
     }
 
     fn dial_target(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
@@ -3552,6 +3559,55 @@ mod tests {
         let got = take_dials(&mut rx);
         assert_eq!(got.len(), 1, "only the onion has no live session: {got:?}");
         assert_eq!(got[0].target, DialTarget::from_net(onion), "{got:?}");
+    }
+
+    #[test]
+    fn addnode_skips_an_endpoint_that_is_connected_or_dialling() {
+        let hub = PeerHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.set_dialer(tx);
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18446);
+        let live = hub.register(
+            ip,
+            ip,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        // Core `AlreadyConnectedToHost` / `AlreadyConnectedToAddressPort`.
+        hub.addnode_host("127.0.0.1:18446", "onetry", 18444)
+            .unwrap();
+        hub.addnode_host("127.0.0.1:18446", "add", 18444).unwrap();
+        hub.addnode(ip, "onetry").unwrap();
+        let got = take_dials(&mut rx);
+        assert!(
+            got.is_empty(),
+            "a connected endpoint is not dialled again: {got:?}"
+        );
+
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let dialing = hub.dial_in_flight(&DialTarget::from_net(onion));
+        hub.addnode_host(&onion.to_string(), "onetry", 18444)
+            .unwrap();
+        let got = take_dials(&mut rx);
+        assert!(got.is_empty(), "nor is one still dialling: {got:?}");
+        drop(dialing);
+        hub.addnode_host(&onion.to_string(), "onetry", 18444)
+            .unwrap();
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].target, DialTarget::from_net(onion), "{got:?}");
+
+        live.request_disconnect();
+        hub.addnode_host("127.0.0.1:18446", "onetry", 18444)
+            .unwrap();
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 1, "once the session ends, onetry dials: {got:?}");
+        assert_eq!(got[0].target, DialTarget::Socket(ip), "{got:?}");
+        assert_eq!(got[0].typ, PeerConnType::Manual, "{got:?}");
     }
 
     #[tokio::test]
