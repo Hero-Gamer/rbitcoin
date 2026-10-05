@@ -5,7 +5,7 @@
 //! via [`TxPrecompute::finish_spent`] when prevouts exist.
 
 use bitcoin::consensus::encode::{Encodable, VarInt};
-use bitcoin::hashes::{sha256, sha256d, Hash};
+use bitcoin::hashes::{sha256, sha256d, Hash, HashEngine};
 use bitcoin::{Transaction, TxOut};
 use rbitcoin_primitives::script_sigop_count;
 use std::collections::HashSet;
@@ -43,13 +43,18 @@ impl TxPrecompute {
         Self::from_tx_inner(tx, false)
     }
 
-    /// Ids from the **wire slice** (wtxid = `sha256d(wire)`; txid = that when
-    /// stripped == wire). `sighash` fills BIP143/341 midstates like [`Self::from_tx`].
-    pub fn from_tx_wire(tx: &Transaction, wire: &[u8], sighash: bool) -> Self {
+    /// Ids from the **wire slice** (wtxid = `sha256d(wire)`). A witness txid is
+    /// SHA256d of `version || vin || vout || locktime` on that slice. Legacy
+    /// and the 10-byte flag-zero tx hash the whole slice once.
+    ///
+    /// `None` when `wire` is not that tx's encoding. `sighash` still fills
+    /// BIP143/341 midstates like [`Self::from_tx`].
+    pub fn from_tx_wire(tx: &Transaction, wire: &[u8], sighash: bool) -> Option<Self> {
         let has_witness = uses_segwit_serialization(tx);
         let wtxid = sha256d::Hash::hash(wire).to_byte_array();
-        let (txid, base_size) = if has_witness {
-            hash_stripped_txid(tx)
+        let (txid, base_size) = if has_witness && !flag_zero_tx(tx, wire) {
+            let spans = witness_wire(tx, wire)?;
+            (hash_witness_txid(&spans), spans.base_len())
         } else {
             (wtxid, wire.len())
         };
@@ -59,7 +64,7 @@ impl TxPrecompute {
         } else {
             [None, None, None]
         };
-        Self {
+        Some(Self {
             txid,
             wtxid,
             base_size,
@@ -72,7 +77,7 @@ impl TxPrecompute {
             sha_outputs,
             sha_amounts: None,
             sha_scriptpubkeys: None,
-        }
+        })
     }
 
     fn from_tx_inner(tx: &Transaction, sighash: bool) -> Self {
@@ -288,24 +293,69 @@ pub fn pres_for_tip(
     (Arc::from(v), skip)
 }
 
-fn hash_stripped_txid(tx: &Transaction) -> ([u8; 32], usize) {
+/// BIP144 non-witness slices. `None` unless `wire` is `version || 00 01 || vin || vout || witness || locktime`.
+struct WitnessWire<'a> {
+    version: &'a [u8],
+    vin: &'a [u8],
+    vout: &'a [u8],
+    locktime: &'a [u8],
+}
+
+impl WitnessWire<'_> {
+    fn base_len(&self) -> usize {
+        self.version.len() + self.vin.len() + self.vout.len() + self.locktime.len()
+    }
+}
+
+fn flag_zero_wire(wire: &[u8]) -> bool {
+    wire.len() == FLAG_ZERO_TX_LEN && wire.get(4..6) == Some(&[0, 0])
+}
+
+/// Core's flag-0 10-byte tx: empty vin and vout, not a BIP144 marker.
+fn flag_zero_tx(tx: &Transaction, wire: &[u8]) -> bool {
+    flag_zero_wire(wire) && tx.input.is_empty() && tx.output.is_empty()
+}
+
+fn witness_wire<'a>(tx: &Transaction, wire: &'a [u8]) -> Option<WitnessWire<'a>> {
+    if !uses_segwit_serialization(tx) || flag_zero_wire(wire) {
+        return None;
+    }
+    if wire.get(4..6) != Some(&[0, 1]) {
+        return None;
+    }
+    let vin_len = VarInt(tx.input.len() as u64).size()
+        + tx.input
+            .iter()
+            .map(|input| input.base_size())
+            .sum::<usize>();
+    let vout_len = VarInt(tx.output.len() as u64).size()
+        + tx.output.iter().map(|output| output.size()).sum::<usize>();
+    let wit_len = tx
+        .input
+        .iter()
+        .map(|input| input.witness.size())
+        .sum::<usize>();
+    let vin_end = 6usize.checked_add(vin_len)?;
+    let vout_end = vin_end.checked_add(vout_len)?;
+    let lock_at = vout_end.checked_add(wit_len)?;
+    if lock_at.checked_add(4)? != wire.len() {
+        return None;
+    }
+    Some(WitnessWire {
+        version: wire.get(..4)?,
+        vin: wire.get(6..vin_end)?,
+        vout: wire.get(vin_end..vout_end)?,
+        locktime: wire.get(lock_at..)?,
+    })
+}
+
+fn hash_witness_txid(spans: &WitnessWire<'_>) -> [u8; 32] {
     let mut eng = sha256d::Hash::engine();
-    let mut base_size = 0usize;
-    base_size += enc(&mut eng, &tx.version);
-    let n_in = VarInt(tx.input.len() as u64);
-    base_size += enc(&mut eng, &n_in);
-    for txin in &tx.input {
-        base_size += enc(&mut eng, &txin.previous_output);
-        base_size += enc(&mut eng, &txin.script_sig);
-        base_size += enc(&mut eng, &txin.sequence);
-    }
-    let n_out = VarInt(tx.output.len() as u64);
-    base_size += enc(&mut eng, &n_out);
-    for txout in &tx.output {
-        base_size += enc(&mut eng, txout);
-    }
-    base_size += enc(&mut eng, &tx.lock_time);
-    (sha256d::Hash::from_engine(eng).to_byte_array(), base_size)
+    eng.input(spans.version);
+    eng.input(spans.vin);
+    eng.input(spans.vout);
+    eng.input(spans.locktime);
+    sha256d::Hash::from_engine(eng).to_byte_array()
 }
 
 fn sigops_and_out_sum(tx: &Transaction) -> (u64, u64) {
@@ -399,7 +449,7 @@ pub fn decode_block_precomputes(
         let end = cur.position() as usize;
         let wire = payload.get(start..end)?;
         let t = Instant::now();
-        pres.push(TxPrecompute::from_tx_wire(&tx, wire, sighash));
+        pres.push(TxPrecompute::from_tx_wire(&tx, wire, sighash)?);
         hash_ns = hash_ns.saturating_add(t.elapsed().as_nanos() as u64);
         txdata.push(tx);
     }
@@ -544,6 +594,44 @@ mod tests {
         tx
     }
 
+    /// One empty witness and one non-empty, so the witness section is not a single stack.
+    fn two_input_witness() -> Transaction {
+        let mut tx = legacy_1in();
+        tx.input.push(TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x22; 32]),
+                vout: 3,
+            },
+            script_sig: ScriptBuf::from_bytes(vec![0x01, 0x02]),
+            sequence: Sequence::ZERO,
+            witness: Witness::new(),
+        });
+        tx.input[0].script_sig = ScriptBuf::new();
+        tx.input[0].witness = Witness::from_slice(&[vec![0x30; 71], vec![0x02; 33]]);
+        tx.output.push(TxOut {
+            value: Amount::from_sat(9),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x52]),
+        });
+        tx
+    }
+
+    fn coinbase_witness_nonce() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![0x04, 0x01, 0x00, 0x00, 0x00]),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0xab; 32]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
     #[test]
     fn tx_precompute_matches_legacy() {
         assert_matches_rust_bitcoin(&legacy_1in());
@@ -592,20 +680,37 @@ mod tests {
     #[test]
     fn from_tx_wire_matches_from_tx_on_legacy_and_witness() {
         use bitcoin::consensus::encode::serialize;
-        for tx in [legacy_1in(), p2wpkh_like()] {
-            let raw = serialize(&tx);
-            let w = TxPrecompute::from_tx_wire(&tx, &raw, true);
-            let full = TxPrecompute::from_tx(&tx);
-            assert_eq!(w.txid, full.txid, "txid");
-            assert_eq!(w.wtxid, full.wtxid, "wtxid");
-            assert_eq!(w.base_size, full.base_size, "base_size");
-            assert_eq!(w.total_size, full.total_size, "total_size");
+        let txs = [
+            legacy_1in(),
+            p2wpkh_like(),
+            two_input_witness(),
+            coinbase_witness_nonce(),
+        ];
+        for tx in &txs {
+            let raw = serialize(tx);
+            let spans = witness_wire(tx, &raw);
+            if uses_segwit_serialization(tx) {
+                let spans = spans.expect("witness wire spans");
+                let base =
+                    spans.version.len() + spans.vin.len() + spans.vout.len() + spans.locktime.len();
+                assert_eq!(base, tx.base_size());
+            } else {
+                assert!(spans.is_none());
+            }
+            let w = TxPrecompute::from_tx_wire(tx, &raw, true).expect("spans");
+            let full = TxPrecompute::from_tx(tx);
+            assert_eq!(w.txid, tx.compute_txid().to_byte_array(), "txid");
+            assert_eq!(w.wtxid, sha256d::Hash::hash(&raw).to_byte_array(), "wtxid");
+            assert_eq!(w.base_size, tx.base_size(), "base_size");
+            assert_eq!(w.total_size, raw.len(), "total_size");
+            assert_eq!(w.total_size, tx.total_size());
+            assert_eq!(w.txid, full.txid);
+            assert_eq!(w.wtxid, full.wtxid);
             assert_eq!(w.sigops, full.sigops, "sigops");
             assert_eq!(w.out_sum, full.out_sum, "out_sum");
             assert_eq!(w.has_witness, full.has_witness, "has_witness");
             assert_eq!(w.sha_prevouts, full.sha_prevouts);
-            assert_eq!(w.wtxid, sha256d::Hash::hash(&raw).to_byte_array());
-            let c = TxPrecompute::from_tx_wire(&tx, &raw, false);
+            let c = TxPrecompute::from_tx_wire(tx, &raw, false).expect("spans");
             assert_eq!(c.txid, full.txid);
             assert_eq!(c.wtxid, full.wtxid);
             assert_eq!(c.sha_prevouts, None);
@@ -613,6 +718,18 @@ mod tests {
                 assert_eq!(c.txid, c.wtxid, "legacy wtxid == txid");
             }
         }
+        let flag = decode_flag_zero_tx(&[2, 0, 0, 0, 0, 0, 7, 0, 0, 0]).expect("flag zero");
+        let raw = [2u8, 0, 0, 0, 0, 0, 7, 0, 0, 0];
+        assert!(
+            witness_wire(&flag, &raw).is_none(),
+            "flag-zero is one slice"
+        );
+        let w = TxPrecompute::from_tx_wire(&flag, &raw, false).expect("flag zero");
+        assert_eq!(w.txid, sha256d::Hash::hash(&raw).to_byte_array());
+        assert_eq!(w.wtxid, w.txid);
+        assert_eq!(w.base_size, flag.base_size());
+        assert_eq!(w.total_size, raw.len());
+        assert!(TxPrecompute::from_tx_wire(&p2wpkh_like(), &raw, false).is_none());
     }
 
     #[test]
