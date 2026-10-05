@@ -79,26 +79,26 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 
 | ID | Rule | Error signal | Test |
 |----|------|--------------|------|
-| S1 | Block has ≥1 tx | `BadBlock("no transactions")` | `structure_rule_tests::s1_rejects_empty_txdata` |
-| S2 | First tx is coinbase; without one, any 64-byte tx marks the body mutated (Core `IsBlockMutated`) | `BadBlock("first tx not coinbase")`, `BadBlock("merkle mutated by a 64-byte tx")` (both `bad-cb-missing`) | `structure_rule_tests::s2_rejects_non_coinbase_first`, `no_coinbase_with_a_64_byte_tx_is_mutated` |
-| S3 | No later coinbase | `BadBlock("coinbase not first")` (`bad-cb-multiple`) | `structure_rule_tests::s3_rejects_second_coinbase`; tip cache `chain::tests::hostile_peer_session` |
+| S1 | Block has ≥1 tx | `BadBlock("no transactions")` (`bad-blk-length`) | `rpc_regtest_from_genesis` submit of an empty body |
+| S2 | First tx is coinbase; without one, any 64-byte tx marks the body mutated (Core `IsBlockMutated`) | `BadBlock("first tx not coinbase")`, `BadBlock("merkle mutated by a 64-byte tx")` (both `bad-cb-missing`) | `rpc_regtest_from_genesis` submit of a non-coinbase first tx; `no_coinbase_with_a_64_byte_tx_is_mutated` |
+| S3 | No later coinbase | `BadBlock("coinbase not first")` (`bad-cb-multiple`) | `rpc_regtest_mature_chain_ops` (`chain_ops_submit_repeated_txids`); tip cache `chain::tests::hostile_peer_session` |
 | S4 | Weight ≤ 4_000_000 WU | `BadBlock("…weight…")` | `s4_rejects_overweight_block`, `s4_weight_4_000_000_accepts_4_000_001_rejects` |
 | S5 | Unique txids | `BadBlock("duplicate txid")` (`bad-txns-inputs-missingorspent`, as Core rejects the second copy at connect) | `structure_rule_tests::s5_rejects_duplicate_txid`; tip cache `chain::tests::hostile_peer_session` |
 | S6 | Merkle root matches txids, checked before every other body rule; a repeated tail (CVE-2012-2459) is mutated | `BadBlock("merkle root mismatch")`, `BadBlock("bad-txns-duplicate")` | `structure_rule_tests::s6_rejects_merkle_root_mismatch`, `body_rules_run_after_the_header_merkle_check` (+ `merkle_root_bytes_single_and_odd`; store `merkle_mutation_flags_a_repeated_tail_at_any_level`) |
 | S7 | BIP34 height in coinbase (h≥1) | `BadBlock("bip34…")` | `s7_rejects_bip34_missing_at_height_1`, `s7_bip34_not_required_at_height_0`, `s7_regtest_rejects_bip34_missing_at_height_1`, `s7_regtest_bip34_activation_height_override` |
 | S8 | Witness commitment when any witness; reject witness before SegWit activation | missing / mismatch / `BadBlock("unexpected witness before segwit")` | `s8_rejects_missing_witness_commitment`, `s8_rejects_wrong_witness_commitment`; `consensus_rules::header_and_spending_boundaries` (connect-path pre-activation reject) |
-| S9 | Coinbase scriptSig length 2..=100, after the merkle check | `bad-cb-length` | `s9_rejects_bad_cb_length_short`, `s9_rejects_bad_cb_length_long`, `short_coinbase_under_a_real_header_is_merkle_mismatch` |
-| S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `s10_rejects_vout_toolarge` |
-| S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `s11_rejects_excessive_legacy_sigops` (20_000 accept / 20_001 reject) |
+| S9 | Coinbase scriptSig length 2..=100, after the merkle check | `bad-cb-length` | `submitblock_coinbase_script_rejects_match_core` (under 2 and 101 reject; a padded height push and 100 bytes connect); `short_coinbase_under_a_real_header_is_merkle_mismatch` |
+| S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `rpc_regtest_from_genesis` submit (`bad-txns-vout-toolarge` above MAX_MONEY; MAX_MONEY is `bad-cb-amount`); sum of two under-max outputs: `s10_rejects_txouttotal_toolarge` |
+| S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `submitblock_coinbase_script_rejects_match_core` (20_000 connect / 20_001 reject) |
 | S12 | Connect: P2SH + witness sigops (BIP16/BIP141); P2SH scriptSig opcode `> OP_16` → 0; witness sigops whenever the WITNESS script flag is set (every block except the BIP16 exception, as in Core) | `bad-blk-sigops` | `sigop_cost_tests::*` + `p2sh_sigops_non_push_scriptsig_is_zero` + `witness_sigops_gated_on_witness_flag` + `script_flags_follow_core_exception_table` |
-| S13 | Every tx including coinbase has ≥1 output | `no outputs` | `s13_rejects_coinbase_empty_vout`; `header_and_spending_boundaries` (non-coinbase empty `vout`) |
+| S13 | Every tx including coinbase has ≥1 output | `no outputs` | `rpc_regtest_from_genesis` submit of a coinbase with no outputs (`bad-txns-vout-empty`); `header_and_spending_boundaries` (non-coinbase empty `vout`) |
 | S14 | Stripped size ≤ 1_000_000 | `block stripped size too large` | `s14_stripped_size_1_000_000_accepts_1_000_001_rejects` |
 | S15 | Every tx has ≥1 input | `no inputs` | `s15_rejects_empty_vin` |
 | S16 | Tx stripped size ≤ 1_000_000 | `bad-txns-oversize` | `s16_tx_stripped_size_1_000_000_accepts_1_000_001_rejects` |
 | S17 | No duplicate outpoints in a tx | `bad-txns-inputs-duplicate` | `s17_rejects_duplicate_outpoints` |
 | S18 | Non-coinbase inputs non-null | `bad-txns-prevout-null` | `s18_rejects_non_coinbase_null_prevout` |
 
-Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs`.
+Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs` for the rows that still name a unit there. S1, S2, S10, and S13 are `submitblock` on `rpc_regtest_from_genesis`. S3 is `rpc_regtest_mature_chain_ops`. S9 and S11 are `submitblock_coinbase_script_rejects_match_core`.
 
 ## B. Header — `validate_header` / helpers
 
