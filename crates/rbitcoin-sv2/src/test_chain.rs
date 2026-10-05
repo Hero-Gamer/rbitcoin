@@ -3,6 +3,7 @@ use rbitcoin_consensus::{accept_and_connect_block, pad_empty_from, ChainParams, 
 use rbitcoin_net::{ChainHub, MempoolHub};
 use rbitcoin_primitives::Height;
 use rbitcoin_query::testutil::{tiny_query_labeled, TempDir};
+use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) struct TestChain {
@@ -47,5 +48,69 @@ pub(crate) fn padded_chain_with(label: &str, spendable: u32, params: ChainParams
         mempool,
         coinbases,
         tip_time,
+    }
+}
+
+/// A private hub copied from one process-wide regtest pad (3 spendable
+/// coinbases). `spendable` is how many of those coinbases the chapter uses.
+/// The pad is connected once; each caller gets a copy so parallel tests do
+/// not share a tip or a mempool.
+pub(crate) fn shared_regtest(spendable: u32) -> TestChain {
+    use std::sync::OnceLock;
+    assert!(
+        spendable <= 3,
+        "shared regtest pad has 3 spendable coinbases"
+    );
+    static PAD: OnceLock<TestChain> = OnceLock::new();
+    let src = PAD.get_or_init(|| {
+        let tc = padded_chain("sv2-shared", 3);
+        tc.chain.query.flush().expect("flush shared pad");
+        tc
+    });
+    // The pad is quiescent after init. Copies only read it.
+    copy_quiescent(src, "sv2-shared")
+}
+
+/// Second hub on a copy of `src`'s store. The mempool is empty either way.
+/// `ChainHub::in_ibd` latches per hub, so a chapter that leaves IBD cannot
+/// share the hub with a chapter that must start stale.
+pub(crate) fn copy_chain(src: &TestChain, label: &str) -> TestChain {
+    src.chain.query.flush().expect("flush before copy");
+    copy_quiescent(src, label)
+}
+
+fn copy_quiescent(src: &TestChain, label: &str) -> TestChain {
+    let dir = TempDir::labeled(label).expect("temp");
+    copy_tree_except(src._dir.path(), dir.path(), "mempool");
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).expect("open copy");
+    let chain = Arc::new(ChainHub::new(q, src.chain.params.clone(), Milestone::NONE));
+    let mp = dir.path().join("mempool");
+    std::fs::create_dir_all(&mp).unwrap();
+    let mempool = MempoolHub::open(&mp, Arc::clone(&chain.query)).unwrap();
+    mempool.set_relay_enabled(true);
+    assert!(chain.attach_mempool(Arc::clone(&mempool)).is_ok());
+    TestChain {
+        _dir: dir,
+        chain,
+        mempool,
+        coinbases: src.coinbases.clone(),
+        tip_time: src.tip_time,
+    }
+}
+
+fn copy_tree_except(src: &Path, dst: &Path, skip: &str) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        if ent.file_name() == skip {
+            continue;
+        }
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_tree_except(&ent.path(), &to, skip);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
     }
 }
