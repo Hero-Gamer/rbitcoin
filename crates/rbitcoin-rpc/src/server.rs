@@ -1391,10 +1391,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The two-minute cap is inside the handler. The response is the JSON-RPC
-    /// tip, not an empty 408.
+    /// A short deadline still returns the JSON-RPC tip, not an empty 408.
+    /// The two-minute numeric cap is `wait_timeout_ms_caps_at_two_minutes`.
     #[tokio::test]
-    async fn long_poll_at_the_cap_returns_a_json_body() {
+    async fn long_poll_deadline_returns_the_tip() {
         let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-cap").expect("dir");
         let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
         let hub = rbitcoin_net::ChainHub::new(
@@ -1421,23 +1421,36 @@ mod tests {
             .await
             .unwrap();
         let missing = "00".repeat(32);
+        // Long enough that a 50 ms sleep slice cannot return early, short
+        // enough that the suite does not sleep the two-minute cap.
+        let timeout_ms = 200u64;
         let req = serde_json::json!({
             "jsonrpc": "1.0",
             "id": 1,
             "method": "waitforblock",
-            "params": [missing, crate::methods::RPC_WAIT_TIMEOUT_MS]
+            "params": [missing, timeout_ms]
         });
+        let started = std::time::Instant::now();
         let (st, body) = tokio::time::timeout(
-            std::time::Duration::from_secs(150),
+            std::time::Duration::from_secs(3),
             post_raw(tcp_addr(&handle), &handle.auth, req.to_string().as_bytes()),
         )
         .await
-        .expect("capped long-poll must return");
+        .expect("deadline must return");
+        let elapsed = started.elapsed();
         assert_eq!(st, 200, "{body:?}");
         let body = body.expect("json-rpc body");
         assert!(
             body.get("result").is_some_and(|r| !r.is_null()),
-            "cap returns the tip, got {body}"
+            "deadline returns the tip, got {body}"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "waitforblock returned before its deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "waitforblock slept past a short deadline: {elapsed:?}"
         );
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

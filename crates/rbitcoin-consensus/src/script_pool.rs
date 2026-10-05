@@ -137,16 +137,28 @@ impl Wave {
     }
 }
 
-static PUBLISHER: Mutex<Option<thread::Thread>> = Mutex::new(None);
+static PUBLISHERS: Mutex<Vec<thread::Thread>> = Mutex::new(Vec::new());
 
+/// Register the scripts stage that should be woken, or clear the caller.
+///
+/// `None` removes the calling thread. Two stages in one process each
+/// register; a single slot dropped the first stage's wakes.
 pub(crate) fn set_script_publisher(t: Option<thread::Thread>) {
-    *PUBLISHER.lock().unwrap_or_else(|p| p.into_inner()) = t;
+    let mut g = PUBLISHERS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = t {
+        g.retain(|p| p.id() != t.id());
+        g.push(t);
+    } else {
+        let id = thread::current().id();
+        g.retain(|p| p.id() != id);
+    }
 }
 
-/// Wake the scripts stage thread (wave complete, `scriptq` send, or shutdown).
+/// Wake every registered scripts stage (wave complete, `scriptq` send, or shutdown).
 pub fn unpark_script_publisher() {
-    let t = PUBLISHER.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    if let Some(t) = t {
+    // Drop the guard before unpark: a woken stage may register or clear.
+    let threads = PUBLISHERS.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    for t in threads {
         t.unpark();
     }
 }
@@ -1016,5 +1028,133 @@ mod tests {
         arm.go();
         wave.join().expect("join").expect("wave ok");
         occupy.release();
+    }
+
+    /// Two script stages park in one process. The second registration must
+    /// not steal wakes from the first, and clearing the second must leave
+    /// the first registered.
+    #[test]
+    fn second_stage_keeps_the_first_publisher_wake() {
+        let phase = Arc::new(AtomicUsize::new(0));
+        let a_registered = Arc::new(AtomicBool::new(false));
+        let b_registered = Arc::new(AtomicBool::new(false));
+        let release_b = Arc::new(AtomicBool::new(false));
+        let b_cleared = Arc::new(AtomicBool::new(false));
+        let wakes = Arc::new(AtomicUsize::new(0));
+
+        let phase_a = Arc::clone(&phase);
+        let a_flag = Arc::clone(&a_registered);
+        let b_flag_for_a = Arc::clone(&b_registered);
+        let wakes_a = Arc::clone(&wakes);
+        let a = thread::spawn(move || {
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    set_script_publisher(None);
+                }
+            }
+            set_script_publisher(Some(thread::current()));
+            let _clear = Clear;
+            a_flag.store(true, Ordering::Release);
+            let start = Instant::now();
+            while !b_flag_for_a.load(Ordering::Acquire) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "second stage did not register"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            for _ in 0..2 {
+                let attempt = Instant::now();
+                loop {
+                    // Drop a stale unpark permit so the next park waits for this round.
+                    thread::park_timeout(Duration::ZERO);
+                    phase_a.store(1, Ordering::Release);
+                    let t0 = Instant::now();
+                    thread::park_timeout(Duration::from_millis(400));
+                    if phase_a.load(Ordering::Acquire) == 2 {
+                        phase_a.store(0, Ordering::Release);
+                        if t0.elapsed() < Duration::from_millis(250) {
+                            wakes_a.fetch_add(1, Ordering::Release);
+                        }
+                        break;
+                    }
+                    assert!(
+                        attempt.elapsed() < Duration::from_secs(2),
+                        "script stage was not woken"
+                    );
+                }
+            }
+        });
+
+        let b_flag = Arc::clone(&b_registered);
+        let start_b = Arc::clone(&a_registered);
+        let release = Arc::clone(&release_b);
+        let cleared = Arc::clone(&b_cleared);
+        let b = thread::spawn(move || {
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    set_script_publisher(None);
+                }
+            }
+            let start = Instant::now();
+            while !start_b.load(Ordering::Acquire) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "first stage did not register"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            set_script_publisher(Some(thread::current()));
+            let _clear = Clear;
+            b_flag.store(true, Ordering::Release);
+            while !release.load(Ordering::Acquire) {
+                thread::park_timeout(Duration::from_millis(20));
+            }
+            set_script_publisher(None);
+            cleared.store(true, Ordering::Release);
+        });
+
+        let drive = |want: usize| {
+            let start = Instant::now();
+            loop {
+                if phase.load(Ordering::Acquire) == 1 {
+                    thread::sleep(Duration::from_millis(20));
+                    if phase.load(Ordering::Acquire) == 1 {
+                        break;
+                    }
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "stage did not park"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            phase.store(2, Ordering::Release);
+            unpark_script_publisher();
+            let start = Instant::now();
+            while wakes.load(Ordering::Acquire) < want {
+                assert!(
+                    start.elapsed() < Duration::from_secs(1),
+                    "wake {want} did not land"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+
+        drive(1);
+        release_b.store(true, Ordering::Release);
+        let start = Instant::now();
+        while !b_cleared.load(Ordering::Acquire) {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "second stage did not clear"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drive(2);
+        a.join().expect("stage a");
+        b.join().expect("stage b");
     }
 }

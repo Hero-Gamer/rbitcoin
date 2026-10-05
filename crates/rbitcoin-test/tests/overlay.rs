@@ -9,10 +9,10 @@ use rbitcoin_net::{NetAddr, OnlyNet};
 use rbitcoin_node::{NodeConfig, P2pListen};
 use rbitcoin_test::mine::spend_anyone_can_spend;
 use rbitcoin_test::overlay::{
-    base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, live_p2p_lock, localaddresses,
-    require_env, socks_electrum_rpc, socks_http_get, spawn_node, wait_file, wait_i2p_stream,
-    wait_jsonrpc, wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion,
-    write_rpc_token, OverlayEnv,
+    base_node, ephemeral_addr, i2p_b32_from_dest, jsonrpc, localaddresses, require_env,
+    socks_electrum_rpc, socks_http_get, spawn_node, wait_file, wait_i2p_stream, wait_jsonrpc,
+    wait_onion_port, wait_p2p_onion, wait_peer_network, wait_socks_onion, write_rpc_token,
+    OverlayEnv,
 };
 use rbitcoin_test::TempDir;
 use serde_json::json;
@@ -55,7 +55,6 @@ async fn generate_n(rpc: SocketAddr, n: u32) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_onion_two_node_v2() {
-    let _live = live_p2p_lock().await;
     let env = require_env();
     let b_dir = TempDir::new().unwrap();
     let a_dir = TempDir::new().unwrap();
@@ -99,7 +98,6 @@ async fn tor_onion_two_node_v2() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tor_wallet_hs_electrum_esplora() {
-    let _live = live_p2p_lock().await;
     let env = require_env();
     let dir = TempDir::new().unwrap();
     let rpc = ephemeral_addr();
@@ -161,7 +159,6 @@ async fn tor_wallet_hs_electrum_esplora() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn i2p_sam_two_node() {
-    let _live = live_p2p_lock().await;
     let env = require_env();
     let b_dir = TempDir::new().unwrap();
     let a_dir = TempDir::new().unwrap();
@@ -242,7 +239,6 @@ async fn i2p_sam_two_node() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cjdns_tun_two_node() {
-    let _live = live_p2p_lock().await;
     let env = require_env();
     let b_dir = TempDir::new().unwrap();
     let a_dir = TempDir::new().unwrap();
@@ -325,7 +321,6 @@ async fn cjdns_tun_two_node() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ephemeral_socks_isolated_broadcast() {
-    let _live = live_p2p_lock().await;
     let env = require_env();
     let b_dir = TempDir::new().unwrap();
     let a_dir = TempDir::new().unwrap();
