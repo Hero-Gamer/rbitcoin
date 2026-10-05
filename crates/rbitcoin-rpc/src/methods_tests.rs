@@ -214,6 +214,80 @@ fn signet_reports_default_challenge_and_unknown_filtertype_is_minus_five() {
 }
 
 #[test]
+fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
+    use bitcoin::bip158::{BlockFilter, FilterHeader};
+    use bitcoin::hashes::Hash;
+
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (hex, _spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
+    ctx.query.set_block_filter_index(true).unwrap();
+    assert_eq!(ctx.query.filter_index_next(), Some(0));
+
+    let missing = dispatch(&ctx, "getblockfilter", vec![json!("11".repeat(32))]).unwrap_err();
+    assert_eq!(missing["code"], ERR_INVALID_ADDRESS_OR_KEY);
+    assert_eq!(missing["message"], "Block not found");
+
+    let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+    let height1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let g = dispatch(&ctx, "getblockfilter", vec![genesis.clone()]).unwrap();
+    let one_before = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap();
+    let tip_before = dispatch(&ctx, "getblockfilter", vec![tip.clone()]).unwrap();
+    assert!(
+        tip_before["filter"].as_str().unwrap().len() > 2,
+        "{tip_before}"
+    );
+
+    let body = rbitcoin_primitives::hex_decode(g["filter"].as_str().unwrap()).unwrap();
+    let fk = ctx
+        .query
+        .store()
+        .confirmed
+        .get(Height(0))
+        .unwrap()
+        .expect("genesis header");
+    assert_eq!(
+        ctx.query
+            .commit_window_filters(0, &[(BlockFilter::new(&body), fk)])
+            .unwrap(),
+        1
+    );
+    let g_sealed = dispatch(&ctx, "getblockfilter", vec![genesis]).unwrap();
+    assert_eq!(g_sealed, g, "sealed genesis filter must match the rebuild");
+
+    let one = dispatch(&ctx, "getblockfilter", vec![height1]).unwrap();
+    assert_eq!(one["filter"], one_before["filter"]);
+    assert_ne!(
+        one["header"], one_before["header"],
+        "sealing the parent must change the child filter header"
+    );
+    let parent = FilterHeader::from_byte_array(
+        rbitcoin_primitives::hex_decode(g["header"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let child = BlockFilter::new(
+        &rbitcoin_primitives::hex_decode(one["filter"].as_str().unwrap()).unwrap(),
+    );
+    assert_eq!(
+        one["header"],
+        json!(rbitcoin_primitives::hex_encode(
+            child.filter_header(&parent).as_byte_array()
+        ))
+    );
+
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    let stale = dispatch(&ctx, "getblockfilter", vec![tip]).unwrap();
+    assert_eq!(
+        stale["filter"], tip_before["filter"],
+        "a stored block off the best chain still has a basic filter"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn blockchain_empty_store() {
     let (ctx, dir) = ctx_empty();
     let count = dispatch(&ctx, "getblockcount", vec![]).unwrap();
