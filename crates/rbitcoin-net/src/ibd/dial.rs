@@ -577,10 +577,12 @@ pub(crate) fn disconnect_peer(
     let Some(idx) = slots.iter().position(|s| s.id == peer && s.alive) else {
         return;
     };
-    let addr = slots[idx].addr;
+    let net = slots[idx].net;
     slots[idx].alive = false;
     let _ = slots[idx].cmd_tx.send(PeerCmd::Shutdown);
-    record_stall_kick(addr_cooldown, addr_strikes, addr, Instant::now());
+    if let Some(sock) = net.socket_addr().filter(|s| !s.ip().is_unspecified()) {
+        record_stall_kick(addr_cooldown, addr_strikes, sock, Instant::now());
+    }
 }
 
 /// Bump the process-local strike count and set `addr_cooldown`.
@@ -604,26 +606,30 @@ pub(crate) fn record_stall_kick(
 pub(crate) fn note_dead_without_block_bytes(
     book: &mut AddrMan,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
-    addr: SocketAddr,
+    addr: crate::NetAddr,
     first_data_ms: u64,
     now: Instant,
 ) {
     if first_data_ms != 0 {
         return;
     }
-    book.note_connect_failed(addr, false);
-    addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
+    book.note_connect_failed_addr(addr, false);
+    if let Some(sock) = addr.socket_addr().filter(|s| !s.ip().is_unspecified()) {
+        addr_cooldown.insert(sock, now + STALL_ADDR_COOLDOWN);
+    }
 }
 
 /// Misbehavior-threshold death. Cools the dial even after a block body was counted.
 pub(crate) fn note_misbehavior_dead(
     book: &mut AddrMan,
     addr_cooldown: &mut HashMap<SocketAddr, Instant>,
-    addr: SocketAddr,
+    addr: crate::NetAddr,
     now: Instant,
 ) {
-    book.note_connect_failed(addr, false);
-    addr_cooldown.insert(addr, now + STALL_ADDR_COOLDOWN);
+    book.note_connect_failed_addr(addr, false);
+    if let Some(sock) = addr.socket_addr().filter(|s| !s.ip().is_unspecified()) {
+        addr_cooldown.insert(sock, now + STALL_ADDR_COOLDOWN);
+    }
 }
 
 /// One stall rule: if a peer has outstanding block getdata and no **block**
@@ -985,7 +991,7 @@ mod tests {
         book.note_connected(lemon);
         let mut cooldown = HashMap::new();
         let now = Instant::now();
-        note_dead_without_block_bytes(&mut book, &mut cooldown, lemon, 0, now);
+        note_dead_without_block_bytes(&mut book, &mut cooldown, crate::NetAddr::Ip(lemon), 0, now);
         assert!(
             book.flags(&lemon).failed_last_connect(),
             "no block bytes → last-resort"
@@ -997,7 +1003,7 @@ mod tests {
 
         let good = addr(5);
         book.note_connected(good);
-        note_dead_without_block_bytes(&mut book, &mut cooldown, good, 42, now);
+        note_dead_without_block_bytes(&mut book, &mut cooldown, crate::NetAddr::Ip(good), 42, now);
         assert!(
             !book.flags(&good).failed_last_connect(),
             "peer that sent block bytes keeps its connected rank"
@@ -1012,7 +1018,7 @@ mod tests {
         book.note_connected(lemon);
         let mut cooldown = HashMap::new();
         let now = Instant::now();
-        note_misbehavior_dead(&mut book, &mut cooldown, lemon, now);
+        note_misbehavior_dead(&mut book, &mut cooldown, crate::NetAddr::Ip(lemon), now);
         assert!(
             book.flags(&lemon).failed_last_connect(),
             "a misbehavior death is a failed connect"
