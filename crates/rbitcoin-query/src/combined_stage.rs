@@ -552,12 +552,15 @@ mod tests {
             "wave_intake must not clone raw payloads for the asked set"
         );
         for &h in asked.iter().take(16) {
-            assert!(q.block_queue_raw_payload(h).unwrap().is_some());
+            let a = q.block_queue_raw_payload(h).unwrap().expect("raw");
+            let b = q.block_queue_raw_payload(h).unwrap().expect("raw");
+            assert!(std::sync::Arc::ptr_eq(&a, &b));
+            assert_eq!(a.as_slice(), &[h as u8; 64]);
         }
         assert_eq!(
             q.block_queue_take_raw_clone_n(),
-            16,
-            "only the decode prefix may clone"
+            0,
+            "lookup decode borrows the queued frame"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
