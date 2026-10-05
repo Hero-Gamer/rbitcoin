@@ -132,6 +132,12 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     continue;
                 }
             };
+            // Linux autotunes SO_SNDBUF up to tcp_wmem max. write() keeps
+            // completing into that buffer after the peer stops reading, so
+            // the deadline does not start. The write-deadline test pins a
+            // small buffer on the accepted socket.
+            #[cfg(all(test, target_os = "linux"))]
+            test_send_buffer::apply(&stream);
             let Ok(slot) = slots.clone().try_acquire_owned() else {
                 rbitcoin_log::warn!("sv2: reject {peer} (at max_sessions={MAX_SESSIONS})");
                 drop(stream);
@@ -178,6 +184,63 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
         task,
         sessions,
     })
+}
+
+/// Accepted-socket `SO_SNDBUF` for
+/// `client_that_stops_reading_is_dropped_at_the_write_deadline`.
+///
+/// `write()` returns as soon as the bytes fit in the send buffer. With
+/// autotune that is several MiB, so a client that never reads still looks
+/// like a live writer and the deadline never starts.
+#[cfg(all(test, target_os = "linux"))]
+mod test_send_buffer {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::net::TcpStream;
+
+    static BUF: AtomicU32 = AtomicU32::new(0);
+
+    pub(crate) struct Guard;
+
+    pub(crate) fn pin(bytes: u32) -> Guard {
+        BUF.store(bytes, Ordering::SeqCst);
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            BUF.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn apply(stream: &TcpStream) {
+        let n = BUF.load(Ordering::SeqCst);
+        if n == 0 {
+            return;
+        }
+        unsafe extern "C" {
+            fn setsockopt(fd: i32, level: i32, opt: i32, val: *const i32, len: u32) -> i32;
+            fn getsockopt(fd: i32, level: i32, opt: i32, val: *mut i32, len: *mut u32) -> i32;
+        }
+        // linux/asm-generic/socket.h: SOL_SOCKET = 1, SO_SNDBUF = 7.
+        let fd = stream.as_raw_fd();
+        let val = n as i32;
+        // SAFETY: `fd` is the accepted stream. `val` is one i32 and `len` is
+        // its size. SOL_SOCKET / SO_SNDBUF take that pointer.
+        let rc = unsafe { setsockopt(fd, 1, 7, &val, 4) };
+        assert_eq!(rc, 0, "SO_SNDBUF: {}", std::io::Error::last_os_error());
+        let mut got = 0i32;
+        let mut len = 4u32;
+        // SAFETY: same socket. `got` is one i32 and `len` is in-out its size.
+        let rc = unsafe { getsockopt(fd, 1, 7, &mut got, &mut len) };
+        assert_eq!(rc, 0, "SO_SNDBUF get: {}", std::io::Error::last_os_error());
+        // The kernel doubles the value for bookkeeping. Above 64KiB means the
+        // pin did not stick and autotune is still in effect.
+        assert!(
+            got > 0 && got <= 64 * 1024,
+            "SO_SNDBUF stayed {got} after requesting {n}"
+        );
+    }
 }
 
 #[cfg(test)]
