@@ -584,7 +584,10 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     };
     let mut below = mine(4);
     let cb = below.txdata[0].compute_txid();
-    below.txdata.push(spend(OutPoint { txid: cb, vout: 0 }, u64::MAX));
+    // Inside the money range. CheckBlock would report `bad-txns-vout-toolarge`
+    // before this same-block coinbase is immature.
+    let over_in = Amount::MAX_MONEY.to_sat();
+    below.txdata.push(spend(OutPoint { txid: cb, vout: 0 }, over_in));
     let mut miss = mine(5);
     let ghost = OutPoint {
         txid: Txid::from_byte_array([0x22; 32]),
@@ -615,7 +618,7 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     let mut young_prev = mine(9);
     young_prev
         .txdata
-        .push(spend(OutPoint { txid: prev_cb, vout: 0 }, u64::MAX));
+        .push(spend(OutPoint { txid: prev_cb, vout: 0 }, over_in));
     let no_vin = commit(no_vin);
     for (block, want) in [
         (commit(empty), "bad-blk-length"),

@@ -112,10 +112,10 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 | **H04** | `time > MTP(11)` | journey: `mtp+1` accepts | journey: `time == mtp` rejects |
 | **H05** | `time <= now + 2h` | `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` (`now+7200`) | same test (`now+7201`); `h8_rejects_timestamp_too_far_in_future` |
 | **H06** | Version not retired by BIP34/66/65 | `h9_version_floors_at_bip34_66_65` (v2 @ BIP34, v3 @ BIP66, v4 @ BIP65 / regtest h=1) | same test (v1 @ BIP34, v2 @ BIP66, v3 @ BIP65 / regtest v3) |
-| **L01** | ≥1 transaction | `rpc_regtest_from_genesis` good `submitblock` | same (empty body → `bad-blk-length`) |
+| **L01** | ≥1 transaction | `rpc_regtest_from_genesis` good `submitblock` | same (empty body → `bad-blk-length`, including an equal-work sibling in `submitblock_equal_work_sibling_checkblock_rejects`) |
 | **L02** | Merkle root matches unique txid tree | `s6_rejects_merkle_root_mismatch` (matching accepts) | same; odd-leaf: `merkle_root_bytes_single_and_odd` |
 | **L03** | Stripped size `<= 1_000_000` | `s14_stripped_size_1_000_000_accepts_1_000_001_rejects` | same (`1_000_001`) |
-| **L04** | First tx is the only coinbase | `rpc_regtest_from_genesis` good `submitblock` | same (`bad-cb-missing`); second coinbase `rpc_regtest_mature_chain_ops` (`bad-cb-multiple`) |
+| **L04** | First tx is the only coinbase | `rpc_regtest_from_genesis` good `submitblock` | same (`bad-cb-missing`); second coinbase `rpc_regtest_mature_chain_ops` and `submitblock_equal_work_sibling_checkblock_rejects` (`bad-cb-multiple`) |
 | **L05** | Legacy sigop **count** `<= 20_000` | `submitblock_coinbase_script_rejects_match_core` (`20_000`) | same (`20_001` → `bad-blk-sigops`) |
 | **L06** | ≥1 input | `s15_rejects_empty_vin` (one input accepts) | same (empty `vin` on non-coinbase) |
 | **L07** | ≥1 output | `rpc_regtest_from_genesis` good `submitblock`; journey non-coinbase empty `vout` | same (coinbase with no outputs → `bad-txns-vout-empty`) |

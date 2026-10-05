@@ -79,9 +79,9 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 
 | ID | Rule | Error signal | Test |
 |----|------|--------------|------|
-| S1 | Block has ≥1 tx | `BadBlock("no transactions")` (`bad-blk-length`) | `rpc_regtest_from_genesis` submit of an empty body |
-| S2 | First tx is coinbase; without one, any 64-byte tx marks the body mutated (Core `IsBlockMutated`) | `BadBlock("first tx not coinbase")`, `BadBlock("merkle mutated by a 64-byte tx")` (both `bad-cb-missing`) | `rpc_regtest_from_genesis` submit of a non-coinbase first tx; `no_coinbase_with_a_64_byte_tx_is_mutated` |
-| S3 | No later coinbase | `BadBlock("coinbase not first")` (`bad-cb-multiple`) | `rpc_regtest_mature_chain_ops` (`chain_ops_submit_repeated_txids`); tip cache `chain::tests::hostile_peer_session` |
+| S1 | Block has ≥1 tx | `BadBlock("no transactions")` (`bad-blk-length`) | `rpc_regtest_from_genesis` and `submitblock_equal_work_sibling_checkblock_rejects` |
+| S2 | First tx is coinbase; without one, any 64-byte tx marks the body mutated (Core `IsBlockMutated`) | `BadBlock("first tx not coinbase")`, `BadBlock("merkle mutated by a 64-byte tx")` (both `bad-cb-missing`) | `rpc_regtest_from_genesis` and `submitblock_equal_work_sibling_checkblock_rejects`; `no_coinbase_with_a_64_byte_tx_is_mutated` |
+| S3 | No later coinbase | `BadBlock("coinbase not first")` (`bad-cb-multiple`) | `rpc_regtest_mature_chain_ops` (`chain_ops_submit_repeated_txids`) and `submitblock_equal_work_sibling_checkblock_rejects`; tip cache `chain::tests::hostile_peer_session` |
 | S4 | Weight ≤ 4_000_000 WU | `BadBlock("…weight…")` | `s4_rejects_overweight_block`, `s4_weight_4_000_000_accepts_4_000_001_rejects` |
 | S5 | Unique txids | `BadBlock("duplicate txid")` (`bad-txns-inputs-missingorspent`, as Core rejects the second copy at connect) | `structure_rule_tests::s5_rejects_duplicate_txid`; tip cache `chain::tests::hostile_peer_session` |
 | S6 | Merkle root matches txids, checked before every other body rule; a repeated tail (CVE-2012-2459) is mutated | `BadBlock("merkle root mismatch")`, `BadBlock("bad-txns-duplicate")` | `structure_rule_tests::s6_rejects_merkle_root_mismatch`, `body_rules_run_after_the_header_merkle_check` (+ `merkle_root_bytes_single_and_odd`; store `merkle_mutation_flags_a_repeated_tail_at_any_level`) |
@@ -98,7 +98,7 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 | S17 | No duplicate outpoints in a tx | `bad-txns-inputs-duplicate` | `s17_rejects_duplicate_outpoints` |
 | S18 | Non-coinbase inputs non-null | `bad-txns-prevout-null` | `s18_rejects_non_coinbase_null_prevout` |
 
-Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs` for the rows that still name a unit there. S1, S2, S10, and S13 are `submitblock` on `rpc_regtest_from_genesis`. S3 is `rpc_regtest_mature_chain_ops`. S9 and S11 are `submitblock_coinbase_script_rejects_match_core`.
+Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs` for the rows that still name a unit there. S1, S2, S10, and S13 are `submitblock` on `rpc_regtest_from_genesis`. S1–S3 on an equal-work sibling are `submitblock_equal_work_sibling_checkblock_rejects`. S3 on a tip extend is `rpc_regtest_mature_chain_ops`. S9 and S11 are `submitblock_coinbase_script_rejects_match_core`.
 
 ## B. Header — `validate_header` / helpers
 

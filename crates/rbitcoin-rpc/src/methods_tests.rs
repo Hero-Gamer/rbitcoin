@@ -4354,6 +4354,65 @@ fn submitblock_store_fault_does_not_cache_block_invalid() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// An equal-work sibling does not connect, so `submitblock` is the CheckBlock
+/// that block ever gets. Layout rejects are cached; a valid sibling is held.
+#[test]
+fn submitblock_equal_work_sibling_checkblock_rejects() {
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mine_on = |prev: bitcoin::BlockHash, height: u32, time: u32| {
+        rbitcoin_consensus::mine_regtest_paying(prev, time, height, op_true.clone(), vec![])
+    };
+    let t0 = hub.tip_header().unwrap().time;
+    let b1 = mine_on(hub.tip_hash().unwrap(), 1, t0 + 1);
+    let b2 = mine_on(b1.block_hash(), 2, t0 + 2);
+    for b in [&b1, &b2] {
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(b))]).unwrap();
+        assert!(r.is_null(), "{r}");
+    }
+    let parent = b1.block_hash();
+    let commit = |mut block: Block| {
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .unwrap_or_else(|| bitcoin::TxMerkleNode::from_byte_array([0; 32]));
+        regrind(&mut block);
+        block
+    };
+    let mut empty = mine_on(parent, 2, t0 + 10);
+    empty.txdata.clear();
+    let mut no_cb = mine_on(parent, 2, t0 + 11);
+    no_cb.txdata[0].input[0].previous_output = bitcoin::OutPoint {
+        txid: Txid::from_byte_array([0x11; 32]),
+        vout: 0,
+    };
+    assert_ne!(
+        no_cb.txdata[0].base_size(),
+        64,
+        "this body is a real non-coinbase, not a 64-byte merkle node"
+    );
+    let other_cb = mine_on(parent, 3, t0 + 12).txdata.remove(0);
+    let mut two_cb = mine_on(parent, 2, t0 + 13);
+    two_cb.txdata.push(other_cb);
+    let valid = mine_on(parent, 2, t0 + 14);
+    for (block, want) in [
+        (commit(empty), "bad-blk-length"),
+        (commit(no_cb), "bad-cb-missing"),
+        (commit(two_cb), "bad-cb-multiple"),
+    ] {
+        let hash = block.block_hash();
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert_eq!(r, want, "{hash}");
+        assert!(hub.is_block_invalid(&hash), "{want} is cached on {hash}");
+        let again = dispatch(&ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert_eq!(again, "duplicate-invalid", "{want} resubmit");
+    }
+    let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&valid))]).unwrap();
+    assert_eq!(r, "inconclusive", "a valid equal-work sibling is held");
+    assert!(!hub.is_block_invalid(&valid.block_hash()));
+    assert_eq!(hub.tip_hash(), Some(b2.block_hash()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A sibling that spends the coin the current tip also spent is a competing
 /// block, not a permanent `duplicate-invalid`.
 #[test]

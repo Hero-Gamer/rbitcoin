@@ -68,7 +68,10 @@ netgroup, and the subsidy table. Empty body, coinbase position, coinbase
 scriptSig length, a single output over `MAX_MONEY`, a coinbase with no
 outputs, and the legacy sigop cap are `submitblock` on
 `rpc_regtest_from_genesis`, `rpc_regtest_mature_chain_ops`, or
-`submitblock_coinbase_script_rejects_match_core`. The
+`submitblock_coinbase_script_rejects_match_core`. An equal-work sibling
+that never connects still reports `bad-blk-length`, `bad-cb-missing`, and
+`bad-cb-multiple` from `submitblock_equal_work_sibling_checkblock_rejects`,
+and a resubmit is `duplicate-invalid`. The
 next change that touches one of them applies the two rules above. It does
 not add another witness, and the list is not a permanent exception.
 Optional leftovers (more HTTP methods on `cross_surface`, a tiny
