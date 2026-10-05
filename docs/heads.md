@@ -37,18 +37,18 @@ spk hash    ──► scripthash.head/NN.mphf+.val  sealed BDZ3 main (2-bit g + 
 ## Lookup path (txid → create_fk)
 
 1. Live pipeline pin by prev_txid (same Weak as outs).
-2. **Open** wave: every unsealed OA (insert tail + in-flight seal), newest-first — probe, two-shot `txid.body`.
-3. Unfinished keys: **sealed-hot** (ages 1..=3), same two-shot + walk.
-4. Still unfinished or **unconnected** after those: **cold** (sealed ages ≥4).
+2. **Open** wave: every unsealed OA (insert tail + in-flight seal), newest-first — one probe, then two-shot `txid.body`. Retire keys whose create is fence-connected.
+3. Still unfinished: each **sealed** segment, newest first. Fuse + one MPHF batch (or the sealed OA), then the same two-shot identity, then retire. A fence-connected hit skips every older segment. An unconnected body match does not.
 
-`TipThenAny` / `TipOnly` still run later waves after an unconnected earlier
-hit so a connected sibling in an older age can win.
+`TipThenAny` / `TipOnly` still walk older segments after an unconnected earlier
+hit so a connected sibling can win.
 
-## Three-wave probe (not page-cache)
+## Sealed-age probe split (not page-cache)
 
-`sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) splits sealed-hot vs
-cold. Open is its own wave. It is not an IO flag. `RWF_DONTCACHE`
-is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze).
+`sealed_age_from_index` vs `HEAD_PROBE_HOT_MAX_AGE` (3) still labels sealed
+age for stats and for the `SealedHot` / `Cold` probe-coverage split. Lookup
+does not union ages 1..=3 before identity. It is not an IO flag.
+`RWF_DONTCACHE` is retired ([`SCHEMA.md`](../SCHEMA.md) Schema 17 freeze).
 
 ## Confirm stages (head contact only)
 
@@ -56,9 +56,10 @@ Allowed/Forbidden IO and in-flight prune: [`invariants.md`](./invariants.md).
 Roles: [`concurrency.md`](./concurrency.md).
 
 **lookup** is the only stage that probes `tx.head`: BQ-ahead TipOnly
-`get_fk_by_txid_batch` (same **3-wave** open / sealed-hot / cold; sealed-hot
-and cold only unfinished keys). In-page hop keeps 8 `(depth, fk)` on the
-stack and spills past that; page grouping and the uring stream are unchanged.
+`get_fk_by_txid_batch` (open wave, then each sealed segment newest-first;
+a segment runs only for keys still unfinished). In-page hop keeps 8
+`(depth, fk)` on the stack and spills past that; page grouping and the
+uring stream are unchanged.
 Combined `head_loc` cdf3 was ~90% on late-mainnet — not enough to pay a
 full-depth probe for every key. Revisit if leftover-split `wave` cdf3 is
 &lt;60%. Write inserts via `head_insert_many` on `ibd-confirm-head` (Drain ∥

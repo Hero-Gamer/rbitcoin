@@ -1047,8 +1047,7 @@ impl Store {
     /// Batch head resolve for plan stamp: txid → (fk, body_range).
     ///
     /// Confirm uses **`TipOnly`**: unconnected first-hits are dropped; a connected
-    /// sibling is recovered via [`Self::resolve_txid`] (covers cold-segment
-    /// instances the hot wave would miss after an unconnected hit).
+    /// sibling in an older segment still wins.
     pub fn get_fk_by_txid_batch(
         &self,
         txids: &[[u8; 32]],
@@ -1058,9 +1057,9 @@ impl Store {
 
     /// Batch resolve with explicit mode (RPC may use [`TxidResolveMode::TipThenAny`]).
     ///
-    /// Uses the same hot/cold probe machine as [`TxTable::get_fk_by_txid_batch`]:
-    /// an unconnected hot hit does **not** skip the cold wave, and every
-    /// body_txid match in a wave is considered so a connected sibling wins.
+    /// Uses the same open-then-sealed machine as [`TxTable::get_fk_by_txid_batch`]:
+    /// an unconnected hit does **not** skip older segments, and every
+    /// body_txid match in a segment is considered so a connected sibling wins.
     pub fn get_fk_by_txid_batch_mode(
         &self,
         txids: &[[u8; 32]],
@@ -3593,8 +3592,8 @@ mod tests {
     }
 
     /// Connected sibling in a **cold** sealed age must beat a newer unconnected
-    /// hot hit (`TipThenAny` and `TipOnly`). Wave 1 is only open+3; skipping
-    /// wave 2 after an unconnected hot cand would regress to the newer row.
+    /// hot hit (`TipThenAny` and `TipOnly`). Stopping after the unconnected
+    /// newer cand would regress to that row.
     #[test]
     fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
         use crate::address_head::HeadLayout;
