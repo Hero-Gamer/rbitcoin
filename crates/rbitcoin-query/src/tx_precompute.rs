@@ -783,49 +783,56 @@ mod tests {
         );
     }
 
+    fn assert_wire_matches_from_tx(tx: &Transaction) {
+        use bitcoin::consensus::encode::serialize;
+        let raw = serialize(tx);
+        let spans = witness_wire(tx, &raw);
+        if uses_segwit_serialization(tx) {
+            let spans = spans.expect("witness wire spans");
+            let base =
+                spans.version.len() + spans.vin.len() + spans.vout.len() + spans.locktime.len();
+            assert_eq!(base, tx.base_size());
+        } else {
+            assert!(spans.is_none());
+        }
+        let w = TxPrecompute::from_tx_wire(tx, &raw, true).expect("spans");
+        let full = TxPrecompute::from_tx(tx);
+        assert_eq!(w.txid, tx.compute_txid().to_byte_array(), "txid");
+        assert_eq!(w.wtxid, sha256d::Hash::hash(&raw).to_byte_array(), "wtxid");
+        assert_eq!(w.base_size, tx.base_size(), "base_size");
+        assert_eq!(w.total_size, raw.len(), "total_size");
+        assert_eq!(w.total_size, tx.total_size());
+        assert_eq!(w.txid, full.txid);
+        assert_eq!(w.wtxid, full.wtxid);
+        assert_eq!(w.sigops, full.sigops, "sigops");
+        assert_eq!(w.out_sum, full.out_sum, "out_sum");
+        assert_eq!(w.has_witness, full.has_witness, "has_witness");
+        assert_eq!(w.sha_prevouts, full.sha_prevouts);
+        let c = TxPrecompute::from_tx_wire(tx, &raw, false).expect("spans");
+        assert_eq!(c.txid, full.txid);
+        assert_eq!(c.wtxid, full.wtxid);
+        assert_eq!(c.sha_prevouts, None);
+        if !c.has_witness {
+            assert_eq!(c.txid, c.wtxid, "legacy wtxid == txid");
+        }
+    }
+
     #[test]
     fn from_tx_wire_matches_from_tx_on_legacy_and_witness() {
-        use bitcoin::consensus::encode::serialize;
-        let txs = [
+        for tx in [
             legacy_1in(),
             p2wpkh_like(),
             two_input_witness(),
             coinbase_witness_nonce(),
-        ];
-        for tx in &txs {
-            let raw = serialize(tx);
-            let spans = witness_wire(tx, &raw);
-            if uses_segwit_serialization(tx) {
-                let spans = spans.expect("witness wire spans");
-                let base =
-                    spans.version.len() + spans.vin.len() + spans.vout.len() + spans.locktime.len();
-                assert_eq!(base, tx.base_size());
-            } else {
-                assert!(spans.is_none());
-            }
-            let w = TxPrecompute::from_tx_wire(tx, &raw, true).expect("spans");
-            let full = TxPrecompute::from_tx(tx);
-            assert_eq!(w.txid, tx.compute_txid().to_byte_array(), "txid");
-            assert_eq!(w.wtxid, sha256d::Hash::hash(&raw).to_byte_array(), "wtxid");
-            assert_eq!(w.base_size, tx.base_size(), "base_size");
-            assert_eq!(w.total_size, raw.len(), "total_size");
-            assert_eq!(w.total_size, tx.total_size());
-            assert_eq!(w.txid, full.txid);
-            assert_eq!(w.wtxid, full.wtxid);
-            assert_eq!(w.sigops, full.sigops, "sigops");
-            assert_eq!(w.out_sum, full.out_sum, "out_sum");
-            assert_eq!(w.has_witness, full.has_witness, "has_witness");
-            assert_eq!(w.sha_prevouts, full.sha_prevouts);
-            let c = TxPrecompute::from_tx_wire(tx, &raw, false).expect("spans");
-            assert_eq!(c.txid, full.txid);
-            assert_eq!(c.wtxid, full.wtxid);
-            assert_eq!(c.sha_prevouts, None);
-            if !c.has_witness {
-                assert_eq!(c.txid, c.wtxid, "legacy wtxid == txid");
-            }
+        ] {
+            assert_wire_matches_from_tx(&tx);
         }
-        let flag = decode_flag_zero_tx(&[2, 0, 0, 0, 0, 0, 7, 0, 0, 0]).expect("flag zero");
+    }
+
+    #[test]
+    fn flag_zero_wire_is_one_slice() {
         let raw = [2u8, 0, 0, 0, 0, 0, 7, 0, 0, 0];
+        let flag = decode_flag_zero_tx(&raw).expect("flag zero");
         assert!(
             witness_wire(&flag, &raw).is_none(),
             "flag-zero is one slice"
