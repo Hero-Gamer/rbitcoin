@@ -1049,19 +1049,6 @@ fn s13_rejects_coinbase_empty_vout() {
 }
 
 #[test]
-fn s11_rejects_excessive_legacy_sigops() {
-    let mut ok = coinbase(0);
-    ok.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_000]);
-    validate_block_structure(&block_with(vec![ok]), &ctx_h(0)).expect("20_000 legacy sigops");
-    let mut cb = coinbase(0);
-    // 20_001 × OP_CHECKSIG × WITNESS_SCALE(4) = 80_004 > MAX 80_000.
-    cb.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_001]);
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "sigops");
-}
-
-#[test]
 fn s10_rejects_txouttotal_toolarge() {
     // Two outputs each under MAX_MONEY but sum over.
     let half = 11_000_000 * 100_000_000u64; // 11M BTC each

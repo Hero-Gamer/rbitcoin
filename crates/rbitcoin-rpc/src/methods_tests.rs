@@ -4581,6 +4581,20 @@ fn submitblock_coinbase_script_rejects_match_core() {
     too_long.header.merkle_root = too_long.compute_merkle_root().unwrap();
     regrind(&mut too_long);
     assert_eq!(submit(&too_long), "bad-cb-length");
+
+    // The 101-byte script did not connect, so the next height is still 3.
+    // Legacy sigops cost is 20_000 × 4. The next CHECKSIG is over the cap.
+    let mut sig_ok = mine_claiming(3);
+    sig_ok.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_000]);
+    sig_ok.header.merkle_root = sig_ok.compute_merkle_root().unwrap();
+    regrind(&mut sig_ok);
+    let r = submit(&sig_ok);
+    assert!(r.is_null(), "20_000 legacy sigops connects: {r}");
+    let mut sig_bad = mine_claiming(4);
+    sig_bad.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_001]);
+    sig_bad.header.merkle_root = sig_bad.compute_merkle_root().unwrap();
+    regrind(&mut sig_bad);
+    assert_eq!(submit(&sig_bad), "bad-blk-sigops");
 }
 
 include!("regtest_chain_ops_journey.rs");
