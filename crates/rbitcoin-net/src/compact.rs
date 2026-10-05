@@ -263,9 +263,22 @@ pub(crate) fn apply_block_transactions(
 
 /// BIP152: filled slots must merkle to the compact header and not be a
 /// Core `IsBlockMutated` body (empty → getdata).
+/// Equal adjacent txids keep `Block::check_merkle_root` (the odd-node duplicate
+/// matches CVE-2012-2459) and still must not be treated as this header's block.
+pub(crate) fn merkle_body_mutated(txdata: &[Transaction]) -> bool {
+    let leaves: Vec<[u8; 32]> = txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect();
+    rbitcoin_store::merkle_root_mutated(&leaves).1
+}
+
 fn finish_reconstructed(header: Header, txdata: Vec<Transaction>) -> Result<Block, Vec<u64>> {
     let block = Block { header, txdata };
-    if !block.check_merkle_root() || rbitcoin_consensus::block_mutated_without_coinbase(&block) {
+    if !block.check_merkle_root()
+        || merkle_body_mutated(&block.txdata)
+        || rbitcoin_consensus::block_mutated_without_coinbase(&block)
+    {
         return Err(Vec::new());
     }
     Ok(block)
@@ -666,6 +679,16 @@ mod tests {
             missing.is_empty(),
             "merkle-mutated fill must getdata (empty missing), got {missing:?}"
         );
+    }
+
+    #[test]
+    fn repeated_pair_with_matching_root_is_not_a_block() {
+        let cb = coinbase();
+        let block = sealed_block(vec![cb.clone(), cb]);
+        assert!(block.check_merkle_root());
+        assert!(merkle_body_mutated(&block.txdata));
+        let err = finish_reconstructed(block.header, block.txdata).expect_err("mutated pair");
+        assert!(err.is_empty(), "getdata the hash, got {err:?}");
     }
 
     #[test]

@@ -941,6 +941,79 @@ async fn merkle_mismatch_forgets_the_ask(
     assert_eq!(hub.tip_hash(), Some(tip));
 }
 
+/// CVE-2012-2459: two identical transactions keep `check_merkle_root` and are
+/// still not a block. Tip follow disconnects and does not cache the hash.
+async fn duplicate_pair_disconnects(
+    hub: &crate::chain::ChainHub,
+    peers: &std::sync::Arc<crate::peers::PeerHub>,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::{OutPoint, Sequence, TxIn, TxOut, Version};
+    use bitcoin::{Amount, ScriptBuf, Transaction, Witness};
+
+    let cb = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x01, 0x01]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let mut block = bitcoin::Block {
+        header: bitcoin::block::Header {
+            version: bitcoin::block::Version::TWO,
+            prev_blockhash: hub.tip_hash().unwrap(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: hub.tip_header().unwrap().time.saturating_add(3),
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        },
+        txdata: vec![cb.clone(), cb],
+    };
+    block.header.merkle_root = block.compute_merkle_root().expect("pair");
+    assert!(
+        block.check_merkle_root(),
+        "the duplicated pair still matches the header root"
+    );
+    let hash = block.block_hash();
+    let tip = hub.tip_hash().unwrap();
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let sender = live_peer(peers, 18476, 25, true);
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks.insert(hash);
+    hub.note_asked_block(hash);
+    rbitcoin_log::capture_logs(true);
+    on_block(
+        hub,
+        &out_tx,
+        &mut follow,
+        Some(sender.as_ref()),
+        &block,
+    )
+    .await
+    .unwrap();
+    assert!(
+        logs_have("Block mutated: bad-txns-duplicate"),
+        "the drop names the duplicate pair"
+    );
+    assert!(
+        sender.stop.load(Ordering::SeqCst),
+        "tip follow disconnects a duplicate-pair body"
+    );
+    assert!(
+        !hub.is_block_invalid(&hash),
+        "the real body for this hash must stay acceptable"
+    );
+    assert!(!follow.requested_blocks.contains(&hash));
+    assert_eq!(hub.tip_hash(), Some(tip));
+}
+
 /// A block whose header fails contextual checks still logs Core's reject reason.
 async fn rejected_header_logs_core_reason(hub: &crate::chain::ChainHub) {
     use bitcoin::block::Version;
@@ -1195,6 +1268,7 @@ async fn peer_header_dos_and_self_announce() {
     noban_bad_block_is_not_punished(&hub, &peers).await;
     sixty_four_byte_body_is_mutated(&hub, &peers).await;
     merkle_mismatch_forgets_the_ask(&hub, &peers).await;
+    duplicate_pair_disconnects(&hub, &peers).await;
     rejected_header_logs_core_reason(&hub).await;
 
     let tip = hub.tip_height().unwrap();
