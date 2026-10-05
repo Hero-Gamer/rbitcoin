@@ -463,27 +463,26 @@ fn id_idx_wave(
     ctx: &mut crate::IoCtx<'_>,
     had_id: &mut [bool],
 ) -> Result<(), StoreError> {
-    use crate::head_resolve_pick::{
-        miss_peeks_in_prefix, next_id_shot, pick_winner, ID_FILL_CHUNK,
-    };
-    use std::collections::HashMap;
+    use crate::head_resolve_pick::{next_id_shot, walk_id_prefix, ID_FILL_CHUNK};
+    use crate::int_map::{U64Map, U64Set};
 
     let n = cands_by_key.len();
     let mut filled = vec![0usize; n];
     let mut skip = vec![false; n];
     let mut started = vec![false; n];
+    let mut key_miss = vec![0u64; n];
     for ki in 0..n {
         let done = key_finished(ki, picked, connected, heights);
         skip[ki] = done;
         started[ki] = !done;
     }
-    let mut id_map: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut id_map: U64Map<[u8; 32]> = U64Map::default();
 
     for take in [ID_FILL_CHUNK, usize::MAX] {
         let shot = next_id_shot(cands_by_key, &filled, &skip, take);
         let mut need: Vec<Fk> = Vec::new();
         {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = U64Set::default();
             for fk in shot {
                 let Some(id) = fk.get() else {
                     continue;
@@ -515,19 +514,16 @@ fn id_idx_wave(
             }
             let cands = &cands_by_key[ki];
             let nfill = filled[ki];
-            if pick_winner(cands, nfill, &txids[ki], &id_map, None).is_some() {
+            // A prior segment may already hold an unconnected body. Do not
+            // replace it unless this prefix connects, or this is the last
+            // cand and nothing is picked yet.
+            let fallback = heights.is_some() && nfill >= cands.len() && picked[ki].is_none();
+            let walked = walk_id_prefix(cands, nfill, &txids[ki], &id_map, heights, fallback);
+            if walked.had_body {
                 had_id[ki] = true;
             }
-            if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, heights) {
-                crate::head_resolve_stats::add_hit_rank(rank);
-                note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
-                skip[ki] = true;
-                continue;
-            }
-            if heights.is_none() || nfill < cands.len() || picked[ki].is_some() {
-                continue;
-            }
-            if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, None) {
+            key_miss[ki] = walked.miss;
+            if let Some((fk, rank)) = walked.winner {
                 crate::head_resolve_stats::add_hit_rank(rank);
                 note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
                 skip[ki] = true;
@@ -539,12 +535,7 @@ fn id_idx_wave(
         if !started[ki] {
             continue;
         }
-        *miss_peeks = miss_peeks.saturating_add(miss_peeks_in_prefix(
-            &cands_by_key[ki],
-            filled[ki],
-            &txids[ki],
-            &id_map,
-        ));
+        *miss_peeks = miss_peeks.saturating_add(key_miss[ki]);
     }
     Ok(())
 }
