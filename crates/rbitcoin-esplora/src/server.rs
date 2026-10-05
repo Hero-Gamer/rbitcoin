@@ -402,6 +402,8 @@ struct InflightJoin {
     /// `None` = still running. `Some(slot)` = finished (`slot` may be empty).
     done: Mutex<Option<Option<Arc<ShJoinSlot>>>>,
     cv: std::sync::Condvar,
+    /// Start order of the leader. Waiters publish this stamp.
+    seq: u64,
 }
 
 impl InflightJoin {
@@ -437,16 +439,30 @@ impl Drop for InflightGuard {
     }
 }
 
-/// A singleflight waiter must not put its scripthash back over a newer last-1.
-fn publish_last_sh(c: &mut ClientJoins, sh: &[u8; 32], slot: Arc<ShJoinSlot>) {
-    let keep = c.last_sh.as_ref().map(|(k, _)| k == sh).unwrap_or(true);
-    if keep {
-        c.last_sh = Some((*sh, slot));
+/// Publish last-1 only when this join started at or after the one stored.
+///
+/// The leader stamps the counter before `f` runs. A waiter publishes that
+/// same stamp, so waking after a newer script is not a newer start.
+/// Matching on the scripthash alone would refuse a later sequential script.
+fn publish_last_sh(c: &mut ClientJoins, sh: &[u8; 32], slot: Arc<ShJoinSlot>, seq: u64) {
+    let stored = c
+        .last_sh
+        .as_ref()
+        .map(|(_, _, stored_seq)| *stored_seq)
+        .unwrap_or(0);
+    if seq >= stored {
+        c.last_sh = Some((*sh, slot, seq));
     }
 }
 
+fn take_join_seq(c: &mut ClientJoins) -> u64 {
+    c.join_seq = c.join_seq.saturating_add(1);
+    c.join_seq
+}
+
 struct ClientJoins {
-    last_sh: Option<([u8; 32], Arc<ShJoinSlot>)>,
+    last_sh: Option<([u8; 32], Arc<ShJoinSlot>, u64)>,
+    join_seq: u64,
     last_bulk: HashMap<[u8; 32], Arc<ShJoinSlot>>,
     last_req: Instant,
     inflight: HashMap<[u8; 32], Arc<InflightJoin>>,
@@ -456,6 +472,7 @@ impl Default for ClientJoins {
     fn default() -> Self {
         Self {
             last_sh: None,
+            join_seq: 0,
             last_bulk: HashMap::new(),
             last_req: Instant::now(),
             inflight: HashMap::new(),
@@ -473,7 +490,7 @@ impl JoinCache {
     fn last_sh_key(&self, id: &str) -> Option<[u8; 32]> {
         self.clients
             .get(id)
-            .and_then(|c| c.last_sh.as_ref().map(|(k, _)| *k))
+            .and_then(|c| c.last_sh.as_ref().map(|(k, _, _)| *k))
     }
 
     #[cfg(test)]
@@ -502,7 +519,7 @@ fn cap_bulk(c: &mut ClientJoins) {
     let last_sh_bytes = c
         .last_sh
         .as_ref()
-        .map(|(_, s)| s.packed_bytes())
+        .map(|(_, s, _)| s.packed_bytes())
         .unwrap_or(0);
     let mut bytes: usize =
         last_sh_bytes.saturating_add(c.last_bulk.values().map(|s| s.packed_bytes()).sum());
@@ -523,7 +540,7 @@ fn cap_bulk(c: &mut ClientJoins) {
 fn retain_join_budget(c: &mut ClientJoins) {
     if c.last_sh
         .as_ref()
-        .is_some_and(|(_, s)| s.packed_bytes() > JOIN_BULK_CAP)
+        .is_some_and(|(_, s, _)| s.packed_bytes() > JOIN_BULK_CAP)
     {
         c.last_sh = None;
     }
@@ -582,14 +599,15 @@ impl AppState {
             sweep_clients(&mut g.clients, Instant::now());
             let c = g.clients.entry(id.to_string()).or_default();
             c.last_req = Instant::now();
-            if c.last_sh.as_ref().is_some_and(|(k, _)| k == sh) {
-                let mut slot = c.last_sh.as_ref().map(|(_, s)| s.clone());
+            if c.last_sh.as_ref().is_some_and(|(k, _, _)| k == sh) {
+                let seq = take_join_seq(c);
+                let mut slot = c.last_sh.as_ref().map(|(_, s, _)| s.clone());
                 drop(g);
                 let r = f(&mut slot);
                 if let Some(s) = slot {
                     let mut g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(c) = g.clients.get_mut(id) {
-                        publish_last_sh(c, sh, s);
+                        publish_last_sh(c, sh, s, seq);
                         c.last_req = Instant::now();
                         retain_join_budget(c);
                     }
@@ -597,18 +615,21 @@ impl AppState {
                 return r;
             }
             if let Some(inf) = c.inflight.get(sh).cloned() {
-                Err(inf)
+                let seq = inf.seq;
+                Err((inf, seq))
             } else {
+                let seq = take_join_seq(c);
                 let inf = Arc::new(InflightJoin {
                     done: Mutex::new(None),
                     cv: std::sync::Condvar::new(),
+                    seq,
                 });
                 c.inflight.insert(*sh, Arc::clone(&inf));
-                Ok(inf)
+                Ok((inf, seq))
             }
         };
-        let inf = match inflight {
-            Err(inf) => {
+        let (inf, seq) = match inflight {
+            Err((inf, seq)) => {
                 let mut d = inf.done.lock().unwrap_or_else(|p| p.into_inner());
                 while d.is_none() {
                     d = inf.cv.wait(d).unwrap_or_else(|p| p.into_inner());
@@ -619,14 +640,14 @@ impl AppState {
                 if let Some(s) = slot {
                     let mut g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(c) = g.clients.get_mut(id) {
-                        publish_last_sh(c, sh, s);
+                        publish_last_sh(c, sh, s, seq);
                         c.last_req = Instant::now();
                         retain_join_budget(c);
                     }
                 }
                 return r;
             }
-            Ok(inf) => inf,
+            Ok((inf, seq)) => (inf, seq),
         };
         let mut slot = {
             let g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
@@ -646,7 +667,7 @@ impl AppState {
                 c.last_req = Instant::now();
                 c.inflight.remove(sh);
                 if let Some(s) = slot {
-                    c.last_sh = Some((*sh, s));
+                    publish_last_sh(c, sh, s, seq);
                 }
                 retain_join_budget(c);
             }
@@ -1493,20 +1514,24 @@ mod tests {
             });
         });
         leader_in_rx.recv().expect("leader entered f");
+        let slot_b = Arc::clone(&slot);
+        st.with_sh_join(Some("c1"), &sh_new, |n| {
+            *n = Some(slot_b);
+        });
+        assert_eq!(
+            cache.lock().unwrap().last_sh_key("c1"),
+            Some(sh_new),
+            "a newer script that finishes while the older leader is inside f is last-1"
+        );
         let (waiter_in, waiter_in_rx) = std::sync::mpsc::channel::<()>();
         let (waiter_go, waiter_go_rx) = std::sync::mpsc::channel::<()>();
         let st_w = Arc::clone(&st);
         let slot_w = Arc::clone(&slot);
-        let st_n = Arc::clone(&st);
-        let slot_n = Arc::clone(&slot);
         let waiter = std::thread::spawn(move || {
             st_w.with_sh_join(Some("c1"), &sh_old, |s| {
                 *s = Some(slot_w);
                 let _ = waiter_in.send(());
                 let _ = waiter_go_rx.recv();
-                st_n.with_sh_join(Some("c1"), &sh_new, |n| {
-                    *n = Some(slot_n);
-                });
             });
         });
         std::thread::sleep(Duration::from_millis(50));
@@ -1515,11 +1540,16 @@ mod tests {
             "waiter must block on the leader, not run the join itself"
         );
         let _ = release.send(());
+        leader.join().expect("leader");
+        assert_eq!(
+            cache.lock().unwrap().last_sh_key("c1"),
+            Some(sh_new),
+            "an older leader that finishes after a newer script must not replace last-1"
+        );
         waiter_in_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("waiter entered f after the leader finished");
         let _ = waiter_go.send(());
-        leader.join().expect("leader");
         waiter.join().expect("waiter");
         assert_eq!(
             cache.lock().unwrap().last_sh_key("c1"),

@@ -28,5 +28,7 @@ Fixed
 - **Outbound dial keeps one onion or I2P seat when clearnet fills the
   batch.** A dead overlay peer is recorded on its real address. An
   unspecified version socket is not inserted into addrman.
-- **An Esplora singleflight waiter does not put an older scripthash back
-  over a newer last-1** for the same client.
+- **An Esplora singleflight join does not put an older scripthash back
+  over a newer last-1** for the same client. That includes a leader that
+  is still inside its handler when the newer script finishes, and a waiter
+  that resumes after it.
