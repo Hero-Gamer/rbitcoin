@@ -21,6 +21,7 @@ use crate::error::StoreError;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Raw row removed by [`BlockQueue::take_raw`] (lookup consume).
 #[derive(Debug, Clone)]
@@ -43,8 +44,13 @@ pub struct QueuedBlock {
 /// Wire bytes or a post-lookup charge (decoded `Block` lives on Query).
 #[derive(Debug, Clone)]
 enum QueuedBody {
-    Raw(Vec<u8>),
-    Promoted { charge: u64 },
+    /// `Vec` inside the `Arc` so [`BlockQueue::take_raw`] can unwrap the
+    /// allocation when lookup holds the last handle. `Arc<[u8]>` cannot
+    /// `try_unwrap` (the slice is unsized).
+    Raw(Arc<Vec<u8>>),
+    Promoted {
+        charge: u64,
+    },
 }
 
 impl QueuedBody {
@@ -57,7 +63,7 @@ impl QueuedBody {
 
     fn payload(&self) -> &[u8] {
         match self {
-            Self::Raw(v) => v,
+            Self::Raw(v) => v.as_slice(),
             Self::Promoted { .. } => &[],
         }
     }
@@ -172,7 +178,7 @@ impl BlockQueue {
                 height,
                 hash,
                 header_fk,
-                body: QueuedBody::Raw(payload),
+                body: QueuedBody::Raw(Arc::new(payload)),
                 n_inputs,
                 resolve_complete: false,
                 sender,
@@ -226,7 +232,10 @@ impl BlockQueue {
         let id = *self.height_to_id.get(&height)?;
         let e = self.index.get_mut(&id)?;
         let payload = match &mut e.body {
-            QueuedBody::Raw(v) => std::mem::take(v),
+            QueuedBody::Raw(v) => {
+                let arc = std::mem::replace(v, Arc::new(Vec::new()));
+                Arc::try_unwrap(arc).unwrap_or_else(|shared| (*shared).clone())
+            }
             QueuedBody::Promoted { .. } => return None,
         };
         let e = self.index.get(&id)?;
@@ -394,13 +403,13 @@ impl BlockQueue {
         )
     }
 
-    /// Clone one still-raw payload by height. Promoted / missing → `None`.
-    pub fn raw_payload(&self, height: u32) -> Option<Vec<u8>> {
+    /// Another handle on the still-raw frame. Promoted / missing → `None`.
+    ///
+    /// Clones the `Arc`, not the bytes. [`Self::take_raw_clone_n`] counts
+    /// `raw_payloads` materializations only.
+    pub fn raw_payload(&self, height: u32) -> Option<Arc<Vec<u8>>> {
         match self.entry_for_height(height).map(|e| &e.body) {
-            Some(QueuedBody::Raw(v)) => {
-                self.raw_clones.fetch_add(1, Ordering::Relaxed);
-                Some(v.clone())
-            }
+            Some(QueuedBody::Raw(v)) => Some(Arc::clone(v)),
             _ => None,
         }
     }
@@ -418,7 +427,7 @@ impl BlockQueue {
             }
             if let QueuedBody::Raw(v) = &e.body {
                 self.raw_clones.fetch_add(1, Ordering::Relaxed);
-                out.push((e.height, v.clone()));
+                out.push((e.height, v.as_slice().to_vec()));
             }
         }
         out
@@ -786,10 +795,13 @@ mod tests {
         }
         let _ = q.take_raw_clone_n();
         assert!(q.has_raw(3));
-        assert_eq!(q.take_raw_clone_n(), 0);
-        assert_eq!(q.raw_payload(3).unwrap().len(), 8);
-        assert_eq!(q.take_raw_clone_n(), 1);
-        let _ = q.promote_wave(&[(3, 16)]).unwrap();
+        let first = q.raw_payload(3).unwrap();
+        let second = q.raw_payload(3).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.as_slice(), &[3u8; 8]);
+        assert_eq!(q.take_raw_clone_n(), 0, "an Arc bump is not a frame copy");
+        let taken = q.take_raw(3).unwrap();
+        assert_eq!(taken.payload.as_slice(), first.as_slice());
         assert!(!q.has_raw(3));
         assert!(q.raw_payload(3).is_none());
         assert_eq!(q.take_raw_clone_n(), 0);

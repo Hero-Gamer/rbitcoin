@@ -275,7 +275,7 @@ pub fn confirm_bq_resolve_wave_capped(
             };
             let t_dec = Instant::now();
             let decoded = rbitcoin_query::decode_block_precomputes(
-                &payload,
+                &payload[..],
                 !crate::milestone::skips_on_query(milestone, query, h, &hash),
             );
             let wall = t_dec.elapsed().as_nanos() as u64;

@@ -1668,7 +1668,10 @@ impl Query {
     }
 
     /// Raw frame only. `None` when missing or already promoted.
-    pub fn block_queue_raw_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
+    pub fn block_queue_raw_payload(
+        &self,
+        height: u32,
+    ) -> Result<Option<std::sync::Arc<Vec<u8>>>, QueryError> {
         let g = self.block_queue.lock().unwrap();
         Ok(g.raw_payload(height))
     }
