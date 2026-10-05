@@ -63,7 +63,7 @@ cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' --list >"$OU
 
 read -r n_new n_old < <(python3 "$ROOT/scripts/mutants_queue.py" split \
   --list "$OUT/all.txt" --diff "$OUT/new.diff" \
-  --cursor "$CURSOR" \
+  --cursor "$CURSOR" --head "$head_sha" \
   --out-new "$OUT/new.txt" --out-old "$OUT/old.txt")
 new_skip="$(python3 "$ROOT/scripts/mutants_queue.py" show --cursor "$CURSOR" --key new_skip)"
 old_index="$(python3 "$ROOT/scripts/mutants_queue.py" show --cursor "$CURSOR" --key old_index)"

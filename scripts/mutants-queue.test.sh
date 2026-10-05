@@ -230,7 +230,8 @@ diff --git a/crates/new/a.rs b/crates/new/a.rs
 +fn new_line() {}
 EOF
 python3 "$PY" split --list "$tmp/split-list.txt" --diff "$tmp/split-diff.txt" \
-  --cursor "$tmp/split-cursor.json" --out-new "$tmp/split-new.txt" --out-old "$tmp/split-old.txt" >/dev/null
+  --cursor "$tmp/split-cursor.json" --head feedface \
+  --out-new "$tmp/split-new.txt" --out-old "$tmp/split-old.txt" >/dev/null
 assert_ok "split resumes the old queue at the saved name" \
   test "$(head -n 1 "$tmp/split-old.txt")" = "crates/old/c.rs:3:1: replace a with b in o3"
 assert_ok "split keeps the new mutant on the new side" \
@@ -242,6 +243,23 @@ python3 "$PY" advance-side --cursor "$tmp/split-cursor.json" --side old \
   --elapsed 0 --budget 1000 --new-left 1 --old-left 2
 assert_ok "advancing the backlog stores the next mutant name" \
   grep -q '"old_name": "crates/old/a.rs:1:1: replace a with b in o1"' "$tmp/split-cursor.json"
+
+# new_skip already covers the one new mutant. Those names are not walked,
+# and the new phase finishes so the next diff starts at HEAD.
+printf '%s\n' '{"new_base":"abc","new_skip":2,"old_index":0,"old_name":"","new_cap_used":false,"run_id":""}' >"$tmp/stuck.json"
+python3 "$PY" split --list "$tmp/split-list.txt" --diff "$tmp/split-diff.txt" \
+  --cursor "$tmp/stuck.json" --head feedface \
+  --out-new "$tmp/stuck-new.txt" --out-old "$tmp/stuck-old.txt" >/dev/null
+stuck_sched="$(python3 "$PY" schedule --new "$tmp/stuck-new.txt" --old "$tmp/stuck-old.txt" \
+  --budget 1000 --batch-sec 200 --cap 1)"
+assert_ok "a covered new_skip schedules none of the sliced-off new name" \
+  bash -c '! printf "%s\n" "$1" | grep -q "crates/new/a.rs:1:1: replace a with b in n1"' _ "$stuck_sched"
+assert_ok "a covered new_skip still schedules the backlog" \
+  grep -q "crates/old/" <<<"$stuck_sched"
+assert_ok "a covered new_skip moves new_base to HEAD" \
+  grep -q '"new_base": "feedface"' "$tmp/stuck.json"
+assert_ok "a covered new_skip clears the skip" \
+  grep -q '"new_skip": 0' "$tmp/stuck.json"
 
 printf '%s\n' '{"new_base":"abc","new_skip":0,"old_index":0,"old_name":"","new_cap_used":false,"run_id":"7"}' >"$tmp/cap.json"
 python3 "$PY" mark-cap --cursor "$tmp/cap.json" --elapsed 500 --budget 1000 --new-left 2 --old-left 2

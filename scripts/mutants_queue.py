@@ -313,6 +313,11 @@ def advance_side(
             cursor["old_name"] = queued[old_offset % len(queued)]
         else:
             cursor["old_name"] = ""
+        # Backlog work does not rewind a new phase that is already done.
+        # The old combined advance() reported new_done on this same check.
+        if int(cursor.get("new_skip", 0)) >= n_new:
+            cursor["new_base"] = head
+            cursor["new_skip"] = 0
     else:
         raise ValueError("side")
     cursor["new_cap_used"] = cap_consumed(
@@ -406,6 +411,7 @@ def main(argv: list[str]) -> int:
     split_p.add_argument("--list", type=Path, required=True)
     split_p.add_argument("--diff", type=Path, required=True)
     split_p.add_argument("--cursor", type=Path, required=True)
+    split_p.add_argument("--head", required=True)
     split_p.add_argument("--out-new", type=Path, required=True)
     split_p.add_argument("--out-old", type=Path, required=True)
 
@@ -502,7 +508,15 @@ def main(argv: list[str]) -> int:
         n_new, n_old = len(new), len(old)
         cursor = read_cursor(args.cursor)
         new_skip = int(cursor.get("new_skip", 0))
-        if new_skip:
+        # A skip that already covers this list finished the new phase on a
+        # previous shape of the diff. Drop those names and move the base,
+        # matching advance() when new_skip >= n_new. Leaving the skip in
+        # place would hide every later new mutant.
+        if new_skip >= n_new:
+            cursor["new_base"] = args.head
+            cursor["new_skip"] = 0
+            new = []
+        elif new_skip:
             new = new[new_skip:]
         rotated, start = resume_old(
             old, int(cursor.get("old_index", 0)), str(cursor.get("old_name", ""))
