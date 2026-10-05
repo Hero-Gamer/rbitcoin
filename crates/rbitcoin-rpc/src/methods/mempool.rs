@@ -70,13 +70,59 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
 /// Exact 8-decimal BTC JSON number (Core `ValueFromAmount`). Avoids f64 drift
 /// against `Decimal` comparisons in the functional suite.
 fn accept_fees_json(fee_sat: u64, weight: u64, wtxid: &str) -> Value {
-    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight);
-    let sat_kvb = fee_sat.saturating_mul(1000).checked_div(vsize).unwrap_or(0);
+    accept_fees_parts(fee_sat, fee_sat, weight, &[wtxid.to_string()])
+}
+
+fn accept_fees_parts(base_sat: u64, eff_sat: u64, weight: u64, includes: &[String]) -> Value {
+    let vsize = rbitcoin_consensus::policy::get_virtual_size(weight).max(1);
+    let sat_kvb = eff_sat.saturating_mul(1000).checked_div(vsize).unwrap_or(0);
     json!({
-        "base": sat_btc_json(fee_sat as i64),
+        "base": sat_btc_json(base_sat as i64),
         "effective-feerate": sat_btc_json(sat_kvb as i64),
-        "effective-includes": [wtxid],
+        "effective-includes": includes,
     })
+}
+
+/// Own modified feerate, or the package remainder when `fee_with` is set.
+fn submit_fees_json(
+    mp: &MempoolHub,
+    txid: &Txid,
+    base_fee: u64,
+    weight: u64,
+    wtxid: &str,
+    fee_with: Option<&[Txid]>,
+) -> Value {
+    if let Some(ids) = fee_with.filter(|ids| ids.len() >= 2) {
+        let mut eff = 0i128;
+        let mut vsize_sum = 0u64;
+        let mut inc = Vec::with_capacity(ids.len());
+        for id in ids {
+            let base = mp.get_live_meta(id).map(|(fee, _)| fee).unwrap_or(0);
+            let delta = mp.fee_delta(id);
+            eff = eff
+                .saturating_add(i128::from(base))
+                .saturating_add(i128::from(delta));
+            let w = mp.get_live_adjusted_weight(id).unwrap_or(0);
+            vsize_sum = vsize_sum.saturating_add(rbitcoin_consensus::policy::get_virtual_size(w));
+            let Some(wt) = mp.wtxid_of(id) else {
+                inc.clear();
+                break;
+            };
+            inc.push(hash_hex_display(&wt.to_byte_array()));
+        }
+        if inc.len() == ids.len() && vsize_sum > 0 {
+            return accept_fees_parts(
+                base_fee,
+                eff.max(0) as u64,
+                vsize_sum.saturating_mul(4),
+                &inc,
+            );
+        }
+    }
+    let modified = i128::from(base_fee)
+        .saturating_add(i128::from(mp.fee_delta(txid)))
+        .max(0) as u64;
+    accept_fees_parts(base_fee, modified, weight, &[wtxid.to_string()])
 }
 
 pub(crate) fn sat_btc_json(sat: i64) -> Value {
@@ -1455,8 +1501,8 @@ fn submitpackage_admit(
             tx_results.insert(wtxid, json!({ "txid": txid_s }));
         }
     }
-    for (tx, res) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
-        match res {
+    for (tx, row) in to_admit.iter().zip(mp.submit_package_rpc(&to_admit)) {
+        match row.result {
             Ok(ok) => {
                 mp.note_unbroadcast(ok.txid);
                 mp.mark_local_origin(ok.txid);
@@ -1469,7 +1515,14 @@ fn submitpackage_admit(
                     json!({
                         "txid": hash_hex_display(&ok.txid.to_byte_array()),
                         "vsize": rbitcoin_consensus::policy::get_virtual_size(ok.weight),
-                        "fees": accept_fees_json(ok.fee_sat, ok.weight, &wtxid),
+                        "fees": submit_fees_json(
+                            mp,
+                            &ok.txid,
+                            ok.fee_sat,
+                            ok.weight,
+                            &wtxid,
+                            row.fee_with.as_deref(),
+                        ),
                     }),
                 );
             }

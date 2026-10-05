@@ -897,11 +897,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             ),
             alert_notify: config.alert_notify.clone(),
         };
-        let miner: Option<Arc<dyn RpcRegtest>> = if config.network == Network::Regtest {
-            Some(Arc::new(HubRegtest(Arc::clone(&node.hub))))
-        } else {
-            None
-        };
+        // OP_TRUE signet is mine-on-demand, same as regtest. Any other
+        // challenge needs a signer we do not have.
+        let op_true_signet = config.network == Network::Signet
+            && config
+                .signet_challenge
+                .as_ref()
+                .is_some_and(|s| s.as_bytes() == [0x51]);
+        let miner: Option<Arc<dyn RpcRegtest>> =
+            if config.network == Network::Regtest || op_true_signet {
+                Some(Arc::new(HubRegtest(Arc::clone(&node.hub))))
+            } else {
+                None
+            };
         match run_rpc(
             rcfg,
             Arc::clone(&node.hub.query),

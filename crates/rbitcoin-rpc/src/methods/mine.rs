@@ -20,11 +20,27 @@ pub(crate) fn require_regtest(ctx: &RpcContext, method: &str) -> Result<(), Valu
     Ok(())
 }
 
+/// Regtest, or signet whose challenge is exactly `OP_TRUE` (mine-on-demand).
+fn allow_local_miner(ctx: &RpcContext) -> bool {
+    if ctx.network == Network::Regtest {
+        return true;
+    }
+    ctx.network == Network::Signet
+        && ctx.chain.as_ref().is_some_and(|c| {
+            c.params
+                .signet_challenge
+                .as_ref()
+                .is_some_and(|s| s.as_bytes() == [0x51])
+        })
+}
+
 pub(crate) fn require_regtest_miner<'a>(
     ctx: &'a RpcContext,
     method: &str,
 ) -> Result<&'a dyn RpcRegtest, Value> {
-    require_regtest(ctx, method)?;
+    if !allow_local_miner(ctx) {
+        return Err(rpc_error(ERR_MISC, format!("{method} is regtest only")));
+    }
     ctx.regtest
         .as_deref()
         .ok_or_else(|| rpc_error(ERR_MISC, format!("{method} requires a live chain hub")))
@@ -220,8 +236,8 @@ pub(crate) fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
         }));
     }
     let hashes = miner
-        .generate_to_script(1, script, extra)
-        .map_err(|e| generateblock_validity_error(&e))?;
+        .generate_to_script(1, script, extra.clone())
+        .map_err(|e| generateblock_missing_input_error(&e.to_string(), &extra))?;
     let hash = hashes
         .first()
         .ok_or_else(|| rpc_error(ERR_MISC, "generateblock produced no block"))?;
@@ -229,6 +245,23 @@ pub(crate) fn generateblock(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
 }
 
 /// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
+///
+/// A single submitted transaction whose inputs are not coins includes Core's
+/// `CheckTxInputs` debug text (`feature_block.py`).
+fn generateblock_missing_input_error(e: &str, extra: &[Transaction]) -> Value {
+    let s = e.strip_prefix("consensus: ").unwrap_or(e);
+    if extra.len() == 1 && s.contains("bad-txns-inputs-missingorspent") {
+        let txid = extra[0].compute_txid();
+        return rpc_error(
+            ERR_VERIFY_ERROR,
+            format!(
+                "TestBlockValidity failed: bad-txns-inputs-missingorspent, CheckTxInputs: inputs missing/spent in transaction {txid}"
+            ),
+        );
+    }
+    generateblock_validity_error(e)
+}
+
 /// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
 pub(crate) fn generateblock_validity_error(e: &str) -> Value {
     let s = e.strip_prefix("consensus: ").unwrap_or(e);
@@ -894,6 +927,9 @@ pub(crate) fn getmininginfo(ctx: &RpcContext) -> Result<Value, Value> {
         .unwrap_or(1);
     m.insert("blockmintxfee".into(), sat_btc_json(min_sat as i64));
     m.insert("chain".into(), json!(chain_name(ctx.network)));
+    if let Some(challenge) = super::chain::signet_challenge_hex(ctx) {
+        m.insert("signet_challenge".into(), json!(challenge));
+    }
     m.insert("bits".into(), json!(format!("{bits:08x}")));
     m.insert("target".into(), json!(format!("{target:064x}")));
     m.insert(
@@ -1290,6 +1326,9 @@ fn submit_reject_reason(e: &rbitcoin_net::NetError) -> String {
     }
     if s.contains("pow invalid") || s.contains("InvalidPow") || s.contains("high-hash") {
         return "high-hash".into();
+    }
+    if s.contains("signet solution invalid") {
+        return "bad-signet-blksig".into();
     }
     for needle in [
         "bad-txns-nonfinal",

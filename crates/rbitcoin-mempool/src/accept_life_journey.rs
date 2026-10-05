@@ -555,10 +555,8 @@ fn sigop_rbf_package_and_cluster(life: &mut Life) {
     let (parent, child) = cpfp_heavy_child(op);
     let pkg = [parent.clone(), child.clone()];
     let min = policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
-    assert!(!ActiveMempool::package_meets_min_relay(
-        &pkg, &utxos, min, 20
-    ));
-    assert!(ActiveMempool::package_meets_min_relay(&pkg, &utxos, min, 0));
+    assert!(!life.mp.package_meets_min_relay(&pkg, &utxos, min, 20));
+    assert!(life.mp.package_meets_min_relay(&pkg, &utxos, min, 0));
     assert!(matches!(
         life.mp.accept_package(&pkg, &utxos, TIP_OK),
         Err(AcceptError::Policy("min relay fee"))

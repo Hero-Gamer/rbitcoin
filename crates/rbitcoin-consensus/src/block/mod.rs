@@ -2452,6 +2452,11 @@ fn resolve_prevout(
             let tx = block.txdata.get(pj).ok_or(ConsensusError::MissingPrevout)?;
             let v = op.vout as usize;
             let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
+            // Core `AddCoins` never inserts `IsUnspendable` (leading OP_RETURN
+            // or script larger than MAX_SCRIPT_SIZE), so the spend is missing.
+            if crate::policy::is_unspendable(o.script_pubkey.as_bytes()) {
+                return Err(ConsensusError::MissingPrevout);
+            }
             acc.in_n = acc.in_n.saturating_add(1);
             acc.same_n = acc.same_n.saturating_add(1);
             return Ok(ResolvedPrevout {
@@ -2473,6 +2478,7 @@ fn resolve_prevout(
     // hard invariants (load must fill schema-13 identity + denserels).
     enum PinLook {
         Mismatch,
+        Unspendable,
         Hit { txout: TxOut, input_sigops: u64 },
     }
 
@@ -2483,6 +2489,9 @@ fn resolve_prevout(
             |value, script, parent_txid| {
                 if parent_txid != prev_txid {
                     return PinLook::Mismatch;
+                }
+                if crate::policy::is_unspendable(script) {
+                    return PinLook::Unspendable;
                 }
                 PinLook::Hit {
                     txout: TxOut {
@@ -2511,6 +2520,7 @@ fn resolve_prevout(
                     create_fk: prev_fk,
                 });
             }
+            Some(PinLook::Unspendable) => return Err(ConsensusError::MissingPrevout),
             Some(PinLook::Mismatch) => {
                 acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
                 #[cfg(test)]

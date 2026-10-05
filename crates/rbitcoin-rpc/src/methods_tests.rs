@@ -179,6 +179,41 @@ fn getorphantxs_is_hidden_and_lists_parked() {
 }
 
 #[test]
+fn signet_reports_default_challenge_and_unknown_filtertype_is_minus_five() {
+    let (ctx, dir) = ctx_empty();
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert!(info.get("signet_challenge").is_none());
+    let mining = dispatch(&ctx, "getmininginfo", vec![]).unwrap();
+    assert!(mining.get("signet_challenge").is_none());
+
+    let (mut signet, dir_signet) = ctx_empty();
+    signet.network = Network::Signet;
+    let expect = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+    let info = dispatch(&signet, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(info["chain"], "signet");
+    assert_eq!(info["signet_challenge"], json!(expect));
+    let mining = dispatch(&signet, "getmininginfo", vec![]).unwrap();
+    assert_eq!(mining["signet_challenge"], json!(expect));
+    assert_eq!(mining["blocks"], 0);
+    assert!(mining.get("currentblocktx").is_none());
+    assert!(mining.get("currentblockweight").is_none());
+
+    let err = dispatch(
+        &ctx,
+        "getblockfilter",
+        vec![json!("00".repeat(32)), json!("unknown")],
+    )
+    .unwrap_err();
+    assert_eq!(err["code"], ERR_INVALID_ADDRESS_OR_KEY);
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown filtertype"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir_signet);
+}
+
+#[test]
 fn blockchain_empty_store() {
     let (ctx, dir) = ctx_empty();
     let count = dispatch(&ctx, "getblockcount", vec![]).unwrap();
@@ -2293,25 +2328,20 @@ fn pressure_tiny_weight() {
         vec![json!([low_hex, hex_encode(serialize(&low_child))])],
     )
     .unwrap();
-    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert_eq!(pkg["package_msg"], "success", "{pkg}");
     let parent_w = hash_hex_display(&low.compute_wtxid().to_byte_array());
     let child_w = hash_hex_display(&low_child.compute_wtxid().to_byte_array());
-    let parent_err = pkg["tx-results"][&parent_w]["error"].as_str().unwrap_or("");
-    assert!(
-        parent_err.contains("mempool min fee not met"),
-        "parent must stay individual min-fee fail, got {pkg}"
-    );
     assert_eq!(
-        pkg["tx-results"][&child_w]["error"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{pkg}"
+        pkg["tx-results"][&parent_w]["fees"]["effective-includes"].clone(),
+        json!([parent_w, child_w]),
+        "paying child must clear the dynamic floor with the parent, got {pkg}"
     );
-    assert!(!fee_ctx
+    assert!(fee_ctx
         .mempool
         .as_ref()
         .unwrap()
         .contains(&low.compute_txid()));
-    assert!(!fee_ctx
+    assert!(fee_ctx
         .mempool
         .as_ref()
         .unwrap()

@@ -324,9 +324,13 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
 pub const MEMPOOL_RECENT_CAP: usize = 32;
 
 fn package_rpc_retry(e: &AcceptError) -> bool {
+    // A parent under the dynamic mempool floor is still package-eligible:
+    // Core `AcceptPackage` CPFPs it when the child pays.
     matches!(
         e,
-        AcceptError::Orphaned { .. } | AcceptError::Policy("min relay fee")
+        AcceptError::Orphaned { .. }
+            | AcceptError::Policy("min relay fee")
+            | AcceptError::Policy("mempool min fee")
     )
 }
 
@@ -664,6 +668,15 @@ fn expired_roots_in(order: &BTreeMap<(u64, Wtxid), Txid>, now: u64, lim: u64) ->
         }
     }
     roots
+}
+
+/// One `submitpackage` member after individual accept, package CPFP, and trim.
+#[derive(Debug)]
+pub struct SubmitPackageRow {
+    pub result: Result<AcceptResult, AcceptError>,
+    /// Remainder whose modified fees make up this tx's effective feerate.
+    /// `None` when the tx was admitted on its own.
+    pub fee_with: Option<Vec<Txid>>,
 }
 
 impl MempoolHub {
@@ -1687,7 +1700,15 @@ impl MempoolHub {
         from: Option<u64>,
     ) -> Result<AcceptResult, AcceptError> {
         crate::reactor::assert_not_reactor("mempool accept");
-        self.accept_with_utxo(tx, &self.utxo_provider(), from)
+        self.accept_with_utxo(tx, &self.utxo_provider(), from, false)
+    }
+
+    /// Admit one `submitpackage` member without trimming and without parking.
+    ///
+    /// The package trims once at the end. A missing-input child stays a
+    /// reconsiderable error so the parent can be retried with it.
+    fn accept_tx_defer_trim(&self, tx: &Transaction) -> Result<AcceptResult, AcceptError> {
+        self.accept_with_utxo(tx, &self.utxo_provider(), None, true)
     }
 
     /// Prepare under read lock; scripts off-lock. Parking is the caller's job.
@@ -1742,6 +1763,7 @@ impl MempoolHub {
         tx: &Transaction,
         utxo: &impl rbitcoin_mempool::UtxoProvider,
         from: Option<u64>,
+        defer_trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
         utxo.note_spender(tx);
         let t0 = Instant::now();
@@ -1758,6 +1780,11 @@ impl MempoolHub {
         let prep = match self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us) {
             Ok(p) => p,
             Err(e) => {
+                if defer_trim && matches!(e, AcceptError::Orphaned { .. }) {
+                    let us = t0.elapsed().as_micros() as u64;
+                    self.meter_accept_stages(lock_us, stages);
+                    return self.finish_accept_err(us, e);
+                }
                 if let AcceptError::Orphaned { missing, .. } = &e {
                     if missing
                         .iter()
@@ -1805,7 +1832,11 @@ impl MempoolHub {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
-            let r = g.commit_after_script(tx, prep);
+            let r = if defer_trim {
+                g.commit_after_script_defer_trim(tx, prep)
+            } else {
+                g.commit_after_script(tx, prep)
+            };
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             r
@@ -1976,7 +2007,7 @@ impl MempoolHub {
             g.take_orphan_children(parent)
         };
         for child in children {
-            let _ = self.accept_with_utxo(&child, utxo, None);
+            let _ = self.accept_with_utxo(&child, utxo, None, false);
         }
     }
 
@@ -2300,11 +2331,14 @@ impl MempoolHub {
         let t0 = Instant::now();
         let utxo = self.utxo_provider();
         let sat_kvb = self.min_relay_sat_kvb();
-        let bps = self.lock_read().graph.bytes_per_sigop();
-        let member_min = if ActiveMempool::package_meets_min_relay(txs, &utxo, sat_kvb, bps) {
-            Some(0)
-        } else {
-            None
+        let member_min = {
+            let g = self.lock_read();
+            let bps = g.graph.bytes_per_sigop();
+            if g.package_meets_min_relay(txs, &utxo, sat_kvb, bps) {
+                Some(0)
+            } else {
+                None
+            }
         };
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
@@ -2363,6 +2397,9 @@ impl MempoolHub {
             for old in &r.replaced {
                 self.unindex_txid(old);
             }
+            // Same relay-age clock as an individual admit (`mempool_limit.py` INV).
+            let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
+            self.insert_relay_maps(r.txid, tx.compute_wtxid(), seq);
             self.index_txid(
                 r.txid,
                 tx,
@@ -3158,12 +3195,13 @@ impl MempoolHub {
 
     /// Sequential submitpackage: keep successes, then package-evaluate
     /// min-relay / missing-input remainders (Core `AcceptPackage`).
-    pub fn submit_package_rpc(
-        &self,
-        txs: &[Transaction],
-    ) -> Vec<Result<AcceptResult, AcceptError>> {
+    ///
+    /// Trim runs once at the end. A tx admitted on its own reports `fee_with =
+    /// None`. A tx that only cleared the fee floor inside the remainder reports
+    /// that remainder, in package order.
+    pub fn submit_package_rpc(&self, txs: &[Transaction]) -> Vec<SubmitPackageRow> {
         let mut out: Vec<Result<AcceptResult, AcceptError>> =
-            txs.iter().map(|tx| self.accept_tx(tx)).collect();
+            txs.iter().map(|tx| self.accept_tx_defer_trim(tx)).collect();
         let rest: Vec<Transaction> = txs
             .iter()
             .zip(out.iter())
@@ -3174,17 +3212,52 @@ impl MempoolHub {
             .map(|(tx, _)| tx.clone())
             .collect();
         if rest.len() >= 2 {
-            let _ = self.accept_package(&rest);
-        }
-        for (tx, slot) in txs.iter().zip(out.iter_mut()) {
-            if slot.is_ok() {
-                continue;
+            match self.accept_package(&rest) {
+                Ok(_) => {}
+                Err(AcceptError::Policy("mempool full")) => {
+                    let rest_ids: std::collections::BTreeSet<Txid> =
+                        rest.iter().map(|t| t.compute_txid()).collect();
+                    for (tx, slot) in txs.iter().zip(out.iter_mut()) {
+                        if rest_ids.contains(&tx.compute_txid()) && slot.is_err() {
+                            *slot = Err(AcceptError::Policy("mempool full"));
+                        }
+                    }
+                }
+                Err(_) => {}
             }
-            if let Some(ok) = self.live_accept_result(&tx.compute_txid()) {
-                *slot = Ok(ok);
-            }
         }
-        out
+        self.trim_over_budget();
+        let package_kept =
+            rest.len() >= 2 && rest.iter().all(|tx| self.try_contains(&tx.compute_txid()));
+        let fee_with = package_kept.then(|| rest.iter().map(|tx| tx.compute_txid()).collect());
+        let mut rows = Vec::with_capacity(txs.len());
+        for (tx, mut slot) in txs.iter().zip(out) {
+            let id = tx.compute_txid();
+            let in_package = fee_with
+                .as_ref()
+                .is_some_and(|ids: &Vec<Txid>| ids.contains(&id));
+            if self.try_contains(&id) {
+                if let Some(ok) = self.live_accept_result(&id) {
+                    slot = Ok(ok);
+                }
+            } else if slot.is_ok() {
+                slot = Err(AcceptError::Policy("mempool full"));
+            }
+            rows.push(SubmitPackageRow {
+                result: slot,
+                fee_with: in_package.then(|| fee_with.clone().unwrap_or_default()),
+            });
+        }
+        rows
+    }
+
+    /// Core `LimitMempoolSize` after a package: no member is protected.
+    fn trim_over_budget(&self) {
+        let gone = {
+            let mut g = self.lock_write();
+            g.evict_to_budget(None).unwrap_or_default()
+        };
+        self.unindex_evicted(&gone);
     }
 
     fn live_accept_result(&self, txid: &Txid) -> Option<AcceptResult> {
@@ -5504,8 +5577,134 @@ mod tests {
         };
         let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
         assert!(
-            rows.iter().all(|r| r.is_ok()),
+            rows.iter().all(|r| r.result.is_ok()),
             "below-min-relay parent + paying child must admit, got {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| r.fee_with.as_ref().is_some_and(|ids| ids.len() == 2)),
+            "package-eval remainder is the effective-feerate set, got {rows:?}"
+        );
+        assert!(hub.try_contains(&parent.compute_txid()));
+        assert!(hub.try_contains(&child.compute_txid()));
+
+        // Child also spends a parent already in the mempool. The package
+        // remainder is only the under-fee parent plus the child.
+        let sponsor = spend_true(cbs[1], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+        assert!(hub.accept_tx(&sponsor).is_ok());
+        let poor = spend_true(cbs[2], 1, ScriptBuf::from_bytes(vec![0x51]));
+        assert!(matches!(
+            hub.accept_tx(&poor),
+            Err(AcceptError::Policy("min relay fee"))
+        ));
+        let in_val = (50_0000_0000 - 10_000) + (50_0000_0000 - 1);
+        let sponsored = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: poor.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: OutPoint {
+                        txid: sponsor.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(in_val - 50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
+            }],
+        };
+        let rows = hub.submit_package_rpc(&[poor.clone(), sponsored.clone()]);
+        assert!(
+            rows.iter().all(|r| r.result.is_ok()),
+            "in-mempool sponsor must not hide the CPFP remainder, got {rows:?}"
+        );
+        assert!(hub.try_contains(&poor.compute_txid()));
+        assert!(hub.try_contains(&sponsored.compute_txid()));
+        // Package-eval members must join the same relay-age log as an
+        // individual admit, or an inbound peer never INV them (`mempool_limit.py`).
+        let at = hub
+            .accept_time(&poor.compute_wtxid())
+            .expect("package-admitted parent has an accept time");
+        assert!(hub.accept_time(&sponsored.compute_wtxid()).is_some());
+        assert!(!hub.tx_inv_due(&poor.compute_wtxid()));
+        hub.note_mock_now(at.saturating_add(30));
+        assert!(hub.tx_inv_due(&poor.compute_wtxid()));
+        assert!(hub.tx_inv_due(&sponsored.compute_wtxid()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn submit_package_rpc_cpf_ps_parent_under_mempool_min_fee() {
+        let (_store, owned_q, owned_cbs) = pad_cbs(4);
+        let q = &owned_q;
+        let cbs = owned_cbs.as_slice();
+        let dir = tmp();
+        // One ~36kWU output fits; the second forces eviction and raises the floor.
+        let hub = MempoolHub::open_with_weight(&dir, Arc::clone(q), 50_000).unwrap();
+        hub.set_relay_enabled(true);
+        let heavy = ScriptBuf::from_bytes(vec![0x51; 9_000]);
+        let filler = spend_true(cbs[0], 100_000, heavy.clone());
+        let bumper = spend_true(cbs[1], 200_000, heavy);
+        assert!(
+            hub.accept_tx(&filler).is_ok(),
+            "filler must enter before the pool is over budget"
+        );
+        assert!(
+            hub.accept_tx(&bumper).is_ok(),
+            "higher-fee bumper must evict the filler"
+        );
+        assert!(
+            !hub.try_contains(&filler.compute_txid()),
+            "filler must have been evicted"
+        );
+        let floor = hub.mempool_min_fee_sat_kvb();
+        assert!(
+            floor > rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+            "eviction must raise the dynamic floor, got {floor}"
+        );
+        let parent = spend_true(cbs[2], 500, ScriptBuf::from_bytes(vec![0x51]));
+        assert!(
+            matches!(
+                hub.accept_tx(&parent),
+                Err(AcceptError::Policy("mempool min fee"))
+            ),
+            "parent clears static min relay and fails the dynamic floor, got {:?}",
+            hub.accept_tx(&parent)
+        );
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_0000_0000 - 500 - 50_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x63]),
+            }],
+        };
+        let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+        assert!(
+            rows.iter().all(|r| r.result.is_ok()),
+            "dynamic-floor parent + paying child must admit, got {rows:?}"
         );
         assert!(hub.try_contains(&parent.compute_txid()));
         assert!(hub.try_contains(&child.compute_txid()));
@@ -6359,7 +6558,8 @@ mod tests {
             write_hits: Arc::clone(&hits),
         };
         let tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
-        hub.accept_with_utxo(&tx, &probe, None).expect("accept");
+        hub.accept_with_utxo(&tx, &probe, None, false)
+            .expect("accept");
         assert_eq!(
             hits.load(Ordering::Relaxed),
             0,
@@ -6421,7 +6621,7 @@ mod tests {
             }],
         };
         let h = Arc::clone(&hub);
-        let join = thread::spawn(move || h.accept_with_utxo(&tx, &stall, None));
+        let join = thread::spawn(move || h.accept_with_utxo(&tx, &stall, None, false));
         let start = Instant::now();
         while !entered.load(Ordering::Acquire) {
             assert!(

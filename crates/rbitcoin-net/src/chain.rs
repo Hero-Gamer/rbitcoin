@@ -11,8 +11,8 @@ use bitcoin::{Block, BlockHash, CompactTarget, ScriptBuf, Target, Transaction, T
 use rbitcoin_consensus::{
     accept_and_connect_block_preverified, confirm_wire_load_from_plan as consensus_load_from_plan,
     confirm_wire_load_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
-    mine_regtest_paying, validate_header, validate_header_on_parent, ChainParams, Milestone,
-    PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
+    mine_op_true_signet_paying, mine_regtest_paying, validate_header, validate_header_on_parent,
+    ChainParams, Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
 };
 use rbitcoin_log::info;
 use rbitcoin_primitives::{Fk, Height};
@@ -1749,10 +1749,50 @@ impl ChainHub {
             .ok_or(NetError::Protocol("generate: no tip hash"))?;
         let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
         let time = self.generate_block_time(tip_h, tip_time);
-        Ok(mine_regtest_paying(
+        self.mine_paying_block(
             prev,
             time,
             tip_h.saturating_add(1),
+            script_pubkey,
+            extra_txs,
+        )
+    }
+
+    /// Regtest uses the trivial-bits miner. An `OP_TRUE` signet uses signet
+    /// bits and an empty BIP325 solution so `generatetoaddress` can extend
+    /// that challenge the way Bitcoin Core's miner does.
+    fn mine_paying_block(
+        &self,
+        prev: BlockHash,
+        time: u32,
+        height: u32,
+        script_pubkey: ScriptBuf,
+        extra_txs: Vec<Transaction>,
+    ) -> Result<bitcoin::Block, NetError> {
+        let op_true = self
+            .params
+            .signet_challenge
+            .as_ref()
+            .is_some_and(|s| s.as_bytes() == [0x51]);
+        if !op_true {
+            return Ok(mine_regtest_paying(
+                prev,
+                time,
+                height,
+                script_pubkey,
+                extra_txs,
+            ));
+        }
+        let bits = self
+            .tip_header()
+            .map(|h| h.bits)
+            .ok_or(NetError::Protocol("generate: no tip header"))?;
+        Ok(mine_op_true_signet_paying(
+            &self.params,
+            prev,
+            time,
+            height,
+            bits,
             script_pubkey,
             extra_txs,
         ))
@@ -1761,65 +1801,35 @@ impl ChainHub {
     /// Mine `nblocks` paying `script_pubkey` and accept each via [`Self::accept_block`].
     ///
     /// Regtest harness only. Extra txs go in the first block. Ensures genesis.
+    ///
+    /// PoW runs on the caller, not on `tip-accept`, so an `OP_TRUE` signet
+    /// grind can use extra cores. Accept stays on the lane. A peer block that
+    /// wins the tip during the grind is mined again.
     pub fn generate_to_script(
         &self,
         nblocks: u32,
         script_pubkey: ScriptBuf,
         extra_txs: Vec<Transaction>,
     ) -> Result<Vec<BlockHash>, NetError> {
-        crate::tip_accept::run_on_tip_accept(|| {
-            self.generate_to_script_inner(nblocks, script_pubkey, extra_txs)
-        })
-    }
-
-    fn generate_to_script_inner(
-        &self,
-        nblocks: u32,
-        script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
-    ) -> Result<Vec<BlockHash>, NetError> {
-        self.ensure_genesis_inner()?;
         if nblocks == 0 {
             return Ok(Vec::new());
         }
         if nblocks > 10_000 {
             return Err(NetError::Consensus("nblocks too large (max 10000)".into()));
         }
+        self.ensure_genesis()?;
         // Serialize tip-read + mine + accept so concurrent generateblock
         // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
         let _guard = self.generate_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut hashes = Vec::with_capacity(nblocks as usize);
         let mut extras = extra_txs;
         for i in 0..nblocks {
-            let tip_h = self
-                .tip_height()
-                .ok_or(NetError::Protocol("generate: no tip"))?;
-            let prev = self
-                .tip_hash()
-                .ok_or(NetError::Protocol("generate: no tip hash"))?;
-            let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-            let time = self.generate_block_time(tip_h, tip_time);
             let txs = if i == 0 {
                 std::mem::take(&mut extras)
             } else {
                 Vec::new()
             };
-            let block = mine_regtest_paying(
-                prev,
-                time,
-                tip_h.saturating_add(1),
-                script_pubkey.clone(),
-                txs,
-            );
-            let hash = block.block_hash();
-            match self.accept_block_inner(Arc::new(block))? {
-                AcceptOutcome::Accepted { .. } => hashes.push(hash),
-                other => {
-                    return Err(NetError::Consensus(format!(
-                        "generate did not extend tip: {other:?}"
-                    )));
-                }
-            }
+            hashes.push(self.mine_and_accept_paying(script_pubkey.clone(), txs)?);
         }
         if let Err(e) = self.query.apply_sh_pending() {
             rbitcoin_log::warn!("generate: SH write-behind drain: {e}");
@@ -1828,6 +1838,49 @@ impl ChainHub {
             rbitcoin_log::warn!("generate: index write-behind drain: {e}");
         }
         Ok(hashes)
+    }
+
+    /// Mine one block on this thread, then accept it on `tip-accept`.
+    fn mine_and_accept_paying(
+        &self,
+        script_pubkey: ScriptBuf,
+        txs: Vec<Transaction>,
+    ) -> Result<BlockHash, NetError> {
+        for _attempt in 0..4 {
+            let tip_h = self
+                .tip_height()
+                .ok_or(NetError::Protocol("generate: no tip"))?;
+            let prev = self
+                .tip_hash()
+                .ok_or(NetError::Protocol("generate: no tip hash"))?;
+            let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
+            let time = self.generate_block_time(tip_h, tip_time);
+            let block = self.mine_paying_block(
+                prev,
+                time,
+                tip_h.saturating_add(1),
+                script_pubkey.clone(),
+                txs.clone(),
+            )?;
+            let hash = block.block_hash();
+            let accepted = crate::tip_accept::run_on_tip_accept(|| {
+                if self.tip_hash() != Some(prev) {
+                    return Ok(false);
+                }
+                match self.accept_block_inner(std::sync::Arc::new(block))? {
+                    AcceptOutcome::Accepted { .. } => Ok(true),
+                    other => Err(NetError::Consensus(format!(
+                        "generate did not extend tip: {other:?}"
+                    ))),
+                }
+            })?;
+            if accepted {
+                return Ok(hash);
+            }
+        }
+        Err(NetError::Consensus(
+            "generate lost the tip during proof-of-work".into(),
+        ))
     }
 
     /// Disconnect `hash` and descendants from the tip. Remember hashes only;

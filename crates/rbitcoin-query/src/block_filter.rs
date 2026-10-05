@@ -7,6 +7,7 @@
 
 use bitcoin::bip158::{BlockFilter, FilterHash, FilterHeader, GcsFilterWriter};
 use bitcoin::hashes::Hash;
+use bitcoin::{Block, OutPoint};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_store::{
     read_index_window, BlockFilterRecord, BlockFilterSlot, BlockFilterTable, IndexHeight,
@@ -219,6 +220,74 @@ impl Query {
         Ok(self
             .block_filter_table()
             .and_then(|t| t.next_height().0.checked_sub(1)))
+    }
+
+    /// Filter bytes and header for `hash`.
+    ///
+    /// Best-chain heights use the sealed index when the watermark has caught
+    /// up. A hash that is stored but not on the best chain (or not sealed
+    /// yet) is built from the Class A body: non-`OP_RETURN` output scripts,
+    /// then each spent prevout script.
+    pub fn basic_filter_for_hash(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
+        if let Some(h) = self.height_of_hash(hash)? {
+            if let Some(row) = self.basic_filter_at(h.0)? {
+                return Ok(Some(row));
+            }
+            let block = self.reconstruct_block_at_height(h)?;
+            return Ok(Some(self.basic_filter_from_wire_block(&block)?));
+        }
+        let Some(block) = self.reconstruct_archived_block(hash)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.basic_filter_from_wire_block(&block)?))
+    }
+
+    fn basic_filter_from_wire_block(
+        &self,
+        block: &Block,
+    ) -> Result<(Vec<u8>, FilterHeader), QueryError> {
+        let hash = block.block_hash().to_byte_array();
+        let mut spent: Vec<Vec<u8>> = Vec::new();
+        for tx in &block.txdata {
+            for inp in &tx.input {
+                if inp.previous_output == OutPoint::null() {
+                    continue;
+                }
+                let txid = inp.previous_output.txid.to_byte_array();
+                let Some((_, rec)) = self.get_tx_by_txid(&txid)? else {
+                    return Err(StoreError::Corrupt(
+                        "invariant: blockfilter prevout missing",
+                    ));
+                };
+                let out = self.tx_output(&rec, inp.previous_output.vout)?;
+                spent.push(out.script);
+            }
+        }
+        let outputs: Vec<&[u8]> = block
+            .txdata
+            .iter()
+            .flat_map(|tx| tx.output.iter().map(|o| o.script_pubkey.as_bytes()))
+            .collect();
+        let spent_refs: Vec<&[u8]> = spent.iter().map(|s| s.as_slice()).collect();
+        let filter = basic_filter_from_scripts(&hash, outputs, spent_refs)?;
+        let prev = self.parent_basic_filter_header(&block.header.prev_blockhash.to_byte_array())?;
+        let header = filter.filter_header(&prev);
+        Ok((filter.content.clone(), header))
+    }
+
+    fn parent_basic_filter_header(&self, prev_hash: &[u8; 32]) -> Result<FilterHeader, QueryError> {
+        if *prev_hash == [0u8; 32] {
+            return Ok(FilterHeader::from_byte_array([0u8; 32]));
+        }
+        if let Some(h) = self.height_of_hash(prev_hash)? {
+            if let Some((_, header)) = self.basic_filter_at(h.0)? {
+                return Ok(header);
+            }
+        }
+        Ok(FilterHeader::from_byte_array([0u8; 32]))
     }
 
     /// Filter bytes and header at `height`. `None` past the watermark.
