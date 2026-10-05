@@ -157,11 +157,13 @@ to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
    and [`docs/crash-recovery.md`](./docs/crash-recovery.md) over inventing
    new design notes.
 2. Prefer **high-level functional/integration tests** over unit tests
-   ([`TESTING.md`](./TESTING.md)).
+   ([`TESTING.md`](./TESTING.md)). A branch no peer, client, or operator can
+   trigger is removed rather than covered by a unit.
 3. Every PR must keep production line coverage **≥ 92%** (`LH*100 >= LF*92`).
    Nightly branch coverage stays ≥90% when measured. Same bar as CI via
    `./scripts/coverage.sh`. CRAP `--fail-above 30` with the allowlist in
-   `.cargo-crap.toml`.
+   `.cargo-crap.toml`. Hold the floor by covering from the surface journey
+   or by deleting unreachable lines, not by adding a private-helper test.
 4. Target is **production server-side** node software (wallet backends, etc.).
    Tip-mode mempool + tx relay are **in scope**; no pruning/GUI/end-user wallet/
    mining without an explicit plan change.
@@ -191,9 +193,10 @@ to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
    call graphs. Fixture JSON/hex and tests that read **datadir** bytes are
    not this rule. Prefer **one** [true journey](./TESTING.md#true-journeys)
    over a twin unit for the same reject. A `#[test]` that only calls other
-   tests is not a journey. A small unit is the exception when a real peer,
-   client, or operator session cannot reach the behavior. Core functional
-   is nightly, not a substitute for that journey.
+   tests is not a journey. A small unit is only for a consensus or schema
+   result a real peer, client, or operator session cannot reach without an
+   absurd chain. Any other behavior no session can trigger is deleted, not
+   unit-tested. Core functional is nightly, not a substitute for that journey.
 9. **RAM and CPU are design inputs.** This node indexes chain-scale
    structures (tens of millions of keys, hundred-MiB arrays, GiB-class
    heads). Iterating those structures is expensive. Every algorithm should
@@ -295,8 +298,9 @@ IO; they do not package zips. GitHub Releases:
 
 ## Code review checklist
 
-- [ ] Behavior covered by a true journey (or a justified unit next to a
-      pure helper a real session cannot reach). No caller-of-tests, no twin
+- [ ] Behavior covered by a true journey (or a justified unit whose result
+      is consensus or schema math a real session cannot reach). A behavior
+      no session can trigger is deleted. No caller-of-tests, no twin
       for the same reject. Core functional is not the PR pin
       ([`TESTING.md`](./TESTING.md#true-journeys)).
 - [ ] Core-facing RPC / P2P / Electrum / Esplora: [`COMPAT.md`](./COMPAT.md)

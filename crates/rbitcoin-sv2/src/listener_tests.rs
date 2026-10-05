@@ -5,6 +5,7 @@ use common_messages_sv2::{
     SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
+use std::io;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use template_distribution_sv2::MESSAGE_TYPE_REQUEST_TRANSACTION_DATA_ERROR;
@@ -226,6 +227,9 @@ async fn session_without_constraints_is_dropped_at_the_setup_deadline() {
 async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
     let tc = padded_chain("sv2-write-deadline", 0);
     let write_timeout = Duration::from_millis(200);
+    // Pin before accept. Drop clears it so other tests keep autotune.
+    #[cfg(target_os = "linux")]
+    let _send_buf = crate::test_send_buffer::pin(8 * 1024);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         chain: std::sync::Arc::clone(&tc.chain),
@@ -237,7 +241,9 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
     })
     .await
     .expect("listen");
-    let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
+    // Pin the receive window too. A small SO_SNDBUF still drains while this
+    // socket ACKs into an autotuned window, so write() never stalls.
+    let mut c = TpClient::connect_recv_buffer(tp.local_addr, tp.authority_pubkey, Some(2048))
         .await
         .expect("handshake");
     c.setup_connection(TDP, 2, 2, 0).await.unwrap();
@@ -247,29 +253,26 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
     // stale tip holds the template, so constraints add no traffic.
     c.coinbase_output_constraints(0, 0).await.unwrap();
 
-    // Each unknown id answers RequestTransactionData.Error, which the
-    // client never reads: the TP blocks on write, then stops reading.
-    let mut jammed = false;
-    for id in 1..=1_000_000u64 {
-        let sent = tokio::time::timeout(write_timeout, c.request_transaction_data(id)).await;
-        // A stall past the write deadline, or a fast write error once the
-        // closed session turns sends into EPIPE: the pipe is dead either way.
-        if !matches!(sent, Ok(Ok(()))) {
-            jammed = true;
-            break;
+    // Each unknown id answers RequestTransactionData.Error. This client never
+    // reads those frames. Keep sending until the stalled write closes the
+    // socket: a cancelled send is not a full window, and stopping there
+    // leaves the session idle so the deadline never starts. Yield so the
+    // session task runs; a ready send does not, and the flood only fills
+    // the kernel buffer.
+    let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+        for id in 1..=1_000_000u64 {
+            c.request_transaction_data(id).await?;
+            tokio::task::yield_now().await;
         }
-    }
-    assert!(jammed, "socket buffers never filled");
-    tokio::time::sleep(write_timeout * 3).await;
-
-    let drained = tokio::time::timeout(Duration::from_secs(10), async {
-        while c.recv().await.is_ok() {}
+        Ok::<(), io::Error>(())
     })
     .await;
-    assert!(
-        drained.is_ok(),
-        "session must close once its write stalls past the deadline"
-    );
+    match outcome {
+        Ok(Err(e)) if e.kind() != io::ErrorKind::TimedOut => {}
+        Ok(Err(e)) => panic!("client write timed out; session stayed open: {e}"),
+        Ok(Ok(())) => panic!("socket buffers never filled"),
+        Err(_) => panic!("session must close once its write stalls past the deadline"),
+    }
     tp.shutdown().await;
 }
 

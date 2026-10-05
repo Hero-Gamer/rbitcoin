@@ -10,7 +10,7 @@ use template_distribution_sv2::{
     MESSAGE_TYPE_COINBASE_OUTPUT_CONSTRAINTS, MESSAGE_TYPE_REQUEST_TRANSACTION_DATA,
     MESSAGE_TYPE_SUBMIT_SOLUTION,
 };
-use tokio::net::TcpStream;
+use tokio::net::TcpSocket;
 
 pub struct TpClient {
     conn: NoiseConn,
@@ -19,7 +19,35 @@ pub struct TpClient {
 impl TpClient {
     /// TCP connect and complete the NX handshake against `authority_pubkey`.
     pub async fn connect(addr: SocketAddr, authority_pubkey: [u8; 32]) -> io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        Self::connect_recv_buffer(addr, authority_pubkey, None).await
+    }
+
+    /// [`Self::connect`] with `SO_RCVBUF` pinned when `recv_buffer` is set.
+    ///
+    /// An unset buffer autotunes up to `tcp_rmem` max. The peer's `write()`
+    /// then keeps completing, because this socket ACKs everything into that
+    /// window. Setting the option turns autotune off. The kernel doubles the
+    /// value; the handshake reply still fits.
+    pub(crate) async fn connect_recv_buffer(
+        addr: SocketAddr,
+        authority_pubkey: [u8; 32],
+        recv_buffer: Option<u32>,
+    ) -> io::Result<Self> {
+        let socket = match addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => TcpSocket::new_v6()?,
+        };
+        if let Some(n) = recv_buffer {
+            socket.set_recv_buffer_size(n)?;
+            // Doubled for bookkeeping, and at least `tcp_rmem` min.
+            let got = socket.recv_buffer_size()?;
+            if got > 64 * 1024 {
+                return Err(io::Error::other(format!(
+                    "SO_RCVBUF stayed {got} after requesting {n}"
+                )));
+            }
+        }
+        let stream = socket.connect(addr).await?;
         let initiator = noise_sv2::Initiator::from_raw_k(authority_pubkey)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?;
         Ok(Self {
