@@ -112,6 +112,27 @@ async fn wallet_pages_after_txid(addr: SocketAddr, sh1: &str) {
     }
     let (st, body) = http_get(addr, &format!("/scripthash/{sh1}/txs?after_txid=zz")).await;
     assert_eq!(st, 422, "{body}");
+    let (st, body) = http_get(addr, &format!("/scripthash/{sh1}/txs/chain/{t3}")).await;
+    assert_eq!(st, 200, "{body}");
+    let page: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let ids: Vec<&str> = page.iter().filter_map(|v| v["txid"].as_str()).collect();
+    assert_eq!(ids, vec![t1.as_str()]);
+
+    foreign_chain_cursor_is_not_this_page(addr, sh1, &t1, &t3).await;
+}
+
+async fn foreign_chain_cursor_is_not_this_page(addr: SocketAddr, sh1: &str, t1: &str, t3: &str) {
+    let t2 = block_hash_hex(&pay_txid(0x22));
+    for path in [
+        format!("/scripthash/{sh1}/txs?after_txid={t2}"),
+        format!("/scripthash/{sh1}/txs/summary?after_txid={t2}"),
+        format!("/scripthash/{sh1}/txs/chain/{t2}"),
+    ] {
+        let (st, body) = http_get(addr, &path).await;
+        assert_eq!(st, 422, "{path}: {body}");
+        assert!(body.contains("after_txid not found"), "{body}");
+        assert!(!body.contains(t1) && !body.contains(t3), "{path}: {body}");
+    }
 }
 
 async fn wallet_posts_scripthashes(addr: SocketAddr, a: [&str; 2], sh: [&str; 2]) {
@@ -150,6 +171,7 @@ async fn wallet_posts_scripthashes(addr: SocketAddr, a: [&str; 2], sh: [&str; 2]
     .await;
     assert_eq!(st, 422, "{resp}");
     assert!(resp.contains("after_txid not found"), "{resp}");
+    cursor_outside_one_script_is_422(addr, a[0], sh[0], &t1, &t2, &t3).await;
     let too: Vec<String> = (0..301).map(|_| "aa".repeat(32)).collect();
     let (st, resp) = http_post(
         addr,
@@ -159,6 +181,24 @@ async fn wallet_posts_scripthashes(addr: SocketAddr, a: [&str; 2], sh: [&str; 2]
     .await;
     assert_eq!(st, 422, "{resp}");
     assert!(resp.contains("body too long"), "{resp}");
+}
+
+async fn cursor_outside_one_script_is_422(
+    addr: SocketAddr,
+    address: &str,
+    sh: &str,
+    t1: &str,
+    t2: &str,
+    t3: &str,
+) {
+    let only = serde_json::to_vec(&json!([sh])).unwrap();
+    let (st, resp) = http_post(addr, &format!("/scripthashes/txs?after_txid={t2}"), &only).await;
+    assert_eq!(st, 422, "{resp}");
+    assert!(resp.contains("after_txid not found"), "{resp}");
+    assert!(!resp.contains(t1) && !resp.contains(t3), "{resp}");
+    let (st, resp) = http_get(addr, &format!("/address/{address}/txs?after_txid={t2}")).await;
+    assert_eq!(st, 422, "{resp}");
+    assert!(resp.contains("after_txid not found"), "{resp}");
 }
 
 /// Packed SH `/txs` runs on `spawn_blocking`, so tip height still answers on

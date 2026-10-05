@@ -119,6 +119,18 @@ impl HistoryFilter {
     }
 }
 
+/// Rows after [`apply_history_filter`].
+///
+/// `cursor_missing` is set when `after_txid` was given and that tx is not in
+/// the history. `rows` is then empty, so a caller that serves them does not
+/// restart the first page. A cursor that is the last row is not missing:
+/// `rows` is empty and `cursor_missing` is false (the next page).
+#[derive(Debug)]
+pub struct FilteredHistory<T> {
+    pub rows: Vec<T>,
+    pub cursor_missing: bool,
+}
+
 /// Apply [`HistoryFilter`] to an already-built history list (no store I/O).
 ///
 /// Does not re-sort input beyond the filter's [`HistoryOrder`]. Window is applied
@@ -126,7 +138,7 @@ impl HistoryFilter {
 pub fn apply_history_filter(
     items: &[ScriptHashHistoryItem],
     filter: &HistoryFilter,
-) -> Vec<ScriptHashHistoryItem> {
+) -> FilteredHistory<ScriptHashHistoryItem> {
     let from = i64::from(filter.from_height);
     let mut out: Vec<ScriptHashHistoryItem> = items
         .iter()
@@ -153,11 +165,16 @@ pub fn apply_history_filter(
         }
     }
 
+    let mut cursor_missing = false;
     if let Some(after) = filter.after_txid {
         if let Some(pos) = out.iter().position(|i| i.txid == after) {
             out = out.split_off(pos.saturating_add(1));
+        } else {
+            // Not this history. Empty, not the first page: a wallet that
+            // retries the same cursor must not loop.
+            cursor_missing = true;
+            out.clear();
         }
-        // If after_txid not found, Esplora-like behavior: return from start (no skip).
     }
 
     if let Some(lim) = filter.limit {
@@ -165,13 +182,16 @@ pub fn apply_history_filter(
             out.truncate(lim);
         }
     }
-    out
+    FilteredHistory {
+        rows: out,
+        cursor_missing,
+    }
 }
 
 fn history_items_from_joined(
     joined: &[ShJoinedOut],
     filter: &HistoryFilter,
-) -> Vec<ScriptHashHistoryItem> {
+) -> FilteredHistory<ScriptHashHistoryItem> {
     let mut by_txid: BTreeMap<[u8; 32], (i64, Fk)> = BTreeMap::new();
     let to_excl = filter.to_height;
     for rec in joined {
@@ -223,8 +243,11 @@ fn history_items_from_joined(
 fn summaries_from_joined(
     joined: &[ShJoinedOut],
     filter: &HistoryFilter,
-) -> Vec<ScriptHashTxSummary> {
-    let items = history_items_from_joined(joined, filter);
+) -> FilteredHistory<ScriptHashTxSummary> {
+    let FilteredHistory {
+        rows: items,
+        cursor_missing,
+    } = history_items_from_joined(joined, filter);
     let mut net: HashMap<Fk, i64> = HashMap::new();
     for rec in joined {
         net.entry(rec.out.create_tx_fk)
@@ -236,15 +259,18 @@ fn summaries_from_joined(
                 .or_insert(0i64.saturating_sub(rec.out.value));
         }
     }
-    items
-        .into_iter()
-        .map(|it| ScriptHashTxSummary {
-            txid: it.txid,
-            value: net.get(&it.tx_fk).copied().unwrap_or(0),
-            height: it.height,
-            tx_fk: it.tx_fk,
-        })
-        .collect()
+    FilteredHistory {
+        rows: items
+            .into_iter()
+            .map(|it| ScriptHashTxSummary {
+                txid: it.txid,
+                value: net.get(&it.tx_fk).copied().unwrap_or(0),
+                height: it.height,
+                tx_fk: it.tx_fk,
+            })
+            .collect(),
+        cursor_missing,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -962,7 +988,9 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        self.scripthash_history_filtered(scripthash, &HistoryFilter::open())
+        Ok(self
+            .scripthash_history_filtered(scripthash, &HistoryFilter::open())?
+            .rows)
     }
 
     /// Confirmed history for `scripthash` as of `view` (open filter).
@@ -971,7 +999,9 @@ impl Query {
         scripthash: &[u8; 32],
         view: &ChainView,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        self.scripthash_history_filtered_in(scripthash, &HistoryFilter::open(), view)
+        Ok(self
+            .scripthash_history_filtered_in(scripthash, &HistoryFilter::open(), view)?
+            .rows)
     }
 
     /// Confirmed history for a scripthash, filtered by height window / limit / cursor.
@@ -985,9 +1015,12 @@ impl Query {
         &self,
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
-    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+    ) -> Result<FilteredHistory<ScriptHashHistoryItem>, QueryError> {
         let Some(view) = self.pin_sh_chain_view()? else {
-            return Ok(Vec::new());
+            return Ok(FilteredHistory {
+                rows: Vec::new(),
+                cursor_missing: filter.after_txid.is_some(),
+            });
         };
         self.scripthash_history_filtered_in(scripthash, filter, &view)
     }
@@ -997,7 +1030,7 @@ impl Query {
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
         view: &ChainView,
-    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+    ) -> Result<FilteredHistory<ScriptHashHistoryItem>, QueryError> {
         let joined = self.sh_join_limited(
             scripthash,
             ShJoinNeed::HISTORY,
@@ -1015,7 +1048,9 @@ impl Query {
         scripthash: &[u8; 32],
         slot: &mut Option<Arc<ShJoinSlot>>,
     ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
-        self.scripthash_history_filtered_slot(scripthash, &HistoryFilter::open(), slot)
+        Ok(self
+            .scripthash_history_filtered_slot(scripthash, &HistoryFilter::open(), slot)?
+            .rows)
     }
 
     /// Slot-aware [`Self::scripthash_history_filtered`].
@@ -1024,10 +1059,13 @@ impl Query {
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
         slot: &mut Option<Arc<ShJoinSlot>>,
-    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+    ) -> Result<FilteredHistory<ScriptHashHistoryItem>, QueryError> {
         let Some(view) = self.pin_sh_chain_view()? else {
             *slot = None;
-            return Ok(Vec::new());
+            return Ok(FilteredHistory {
+                rows: Vec::new(),
+                cursor_missing: filter.after_txid.is_some(),
+            });
         };
         self.scripthash_history_filtered_slot_in(scripthash, filter, slot, &view)
     }
@@ -1039,7 +1077,7 @@ impl Query {
         filter: &HistoryFilter,
         slot: &mut Option<Arc<ShJoinSlot>>,
         view: &ChainView,
-    ) -> Result<Vec<ScriptHashHistoryItem>, QueryError> {
+    ) -> Result<FilteredHistory<ScriptHashHistoryItem>, QueryError> {
         if self.page_without_full_slot(scripthash, filter, slot, view)? {
             return self.scripthash_history_filtered_in(scripthash, filter, view);
         }
@@ -1058,7 +1096,7 @@ impl Query {
         scripthash: &[u8; 32],
         filter: &HistoryFilter,
         view: &ChainView,
-    ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
+    ) -> Result<FilteredHistory<ScriptHashTxSummary>, QueryError> {
         let joined = self.sh_join_limited(
             scripthash,
             ShJoinNeed::HISTORY,
@@ -1075,7 +1113,7 @@ impl Query {
         filter: &HistoryFilter,
         slot: &mut Option<Arc<ShJoinSlot>>,
         view: &ChainView,
-    ) -> Result<Vec<ScriptHashTxSummary>, QueryError> {
+    ) -> Result<FilteredHistory<ScriptHashTxSummary>, QueryError> {
         if self.page_without_full_slot(scripthash, filter, slot, view)? {
             return self.scripthash_history_summary_filtered_in(scripthash, filter, view);
         }
@@ -1488,10 +1526,11 @@ mod history_filter_tests {
     fn open_filter_keeps_all_height_asc() {
         let items = vec![item(10, 1), item(5, 2), item(20, 3)];
         let got = apply_history_filter(&items, &HistoryFilter::open());
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].height, 5);
-        assert_eq!(got[1].height, 10);
-        assert_eq!(got[2].height, 20);
+        assert!(!got.cursor_missing);
+        assert_eq!(got.rows.len(), 3);
+        assert_eq!(got.rows[0].height, 5);
+        assert_eq!(got.rows[1].height, 10);
+        assert_eq!(got.rows[2].height, 20);
     }
 
     #[test]
@@ -1500,7 +1539,7 @@ mod history_filter_tests {
         let f = HistoryFilter::height_window(5, Some(15));
         let got = apply_history_filter(&items, &f);
         assert_eq!(
-            got.iter().map(|i| i.height).collect::<Vec<_>>(),
+            got.rows.iter().map(|i| i.height).collect::<Vec<_>>(),
             vec![5, 10]
         );
     }
@@ -1510,8 +1549,8 @@ mod history_filter_tests {
         let items = vec![item(1, 1), item(100, 2)];
         let f = HistoryFilter::height_window(50, None);
         let got = apply_history_filter(&items, &f);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].height, 100);
+        assert_eq!(got.rows.len(), 1);
+        assert_eq!(got.rows[0].height, 100);
     }
 
     #[test]
@@ -1521,7 +1560,7 @@ mod history_filter_tests {
         f.order = HistoryOrder::NewestFirst;
         let got = apply_history_filter(&items, &f);
         assert_eq!(
-            got.iter().map(|i| i.height).collect::<Vec<_>>(),
+            got.rows.iter().map(|i| i.height).collect::<Vec<_>>(),
             vec![3, 2, 1]
         );
     }
@@ -1540,13 +1579,17 @@ mod history_filter_tests {
             order: HistoryOrder::NewestFirst,
         };
         let got = apply_history_filter(&items, &f);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].height, 20);
-        assert_eq!(got[0].txid[0], 2);
+        assert!(!got.cursor_missing);
+        assert_eq!(got.rows.len(), 1);
+        assert_eq!(got.rows[0].height, 20);
+        assert_eq!(got.rows[0].txid[0], 2);
     }
 
+    /// A cursor that is not in this history is not the first page. Serving
+    /// those rows made `?after_txid=` of some other confirmed tx restart
+    /// the wallet at the newest row.
     #[test]
-    fn after_txid_unknown_does_not_skip() {
+    fn after_txid_missing_is_not_the_first_page() {
         let items = vec![item(10, 1), item(20, 2)];
         let f = HistoryFilter {
             from_height: 0,
@@ -1556,8 +1599,8 @@ mod history_filter_tests {
             order: HistoryOrder::NewestFirst,
         };
         let got = apply_history_filter(&items, &f);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].height, 20);
+        assert!(got.cursor_missing);
+        assert!(got.rows.is_empty());
     }
 
     #[test]
@@ -1579,8 +1622,8 @@ mod history_filter_tests {
             order: HistoryOrder::HeightAsc,
         };
         let got = apply_history_filter(&items, &f);
-        assert_eq!(got.len(), 3);
-        assert_eq!(got[0].height, 1);
-        assert_eq!(got[2].height, 3);
+        assert_eq!(got.rows.len(), 3);
+        assert_eq!(got.rows[0].height, 1);
+        assert_eq!(got.rows[2].height, 3);
     }
 }
