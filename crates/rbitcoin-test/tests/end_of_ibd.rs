@@ -36,13 +36,6 @@ fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
     }
 }
 
-async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
 fn reserve_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -421,7 +414,6 @@ async fn extend_one(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn end_of_ibd_follow() {
-    let _live = live_p2p_lock().await;
     let wall = llvm_cov_wall(90, 180);
     tokio::time::timeout(wall, follow_journey())
         .await
@@ -576,7 +568,6 @@ async fn follow_journey() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn end_of_ibd_sh_interrupt() {
-    let _live = live_p2p_lock().await;
     let wall = llvm_cov_wall(120, 240);
     tokio::time::timeout(wall, sh_interrupt_journey())
         .await
@@ -837,7 +828,6 @@ async fn sh_interrupt_journey() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn end_of_ibd_work_fork() {
-    let _live = live_p2p_lock().await;
     let wall = llvm_cov_wall(30, 90);
     tokio::time::timeout(wall, work_fork_journey())
         .await

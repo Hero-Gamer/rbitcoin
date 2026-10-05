@@ -4,8 +4,8 @@
 //! skip, hop serve, dual live seeders, post-IBD tip follow, getheaders gap
 //! fill, product `run_p2p --blocksonly --connect`. Hard wall timeouts; hang-free on
 //! CI-class hosts. Handshake / compact / feeler / inbound-full / hub reorg
-//! live in the same binary. Live `P2PNode` tests serialize on `live_p2p_lock`
-//! (process-wide script pool); hub-only reorgs do not.
+//! live in the same binary. Live topologies may overlap: each script stage
+//! registers its thread. Hub-only reorgs do not run a `P2PNode`.
 
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
@@ -156,17 +156,6 @@ fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
     }
 }
 
-/// One live `P2PNode` topology at a time: process-wide `rbtc-scripts` steal
-/// plus confirm OS threads (overlapping abort under llvm-cov heap-corrupts).
-/// Take it before a test's wall timeout so the wall times the test, not the
-/// queue behind other live tests.
-async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
 const RPC_BEARER: &str = "Bearer pass"; // `{datadir}/rpc.token` written by the tests
 
 fn ephemeral_addr() -> SocketAddr {
@@ -267,7 +256,6 @@ async fn http_post(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
 /// Two nodes, seed has genesis+1, peer IBD-syncs the short path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_node_header_and_block_sync() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -315,7 +303,6 @@ async fn p2p_timeout_getaddr_and_keepalive_ping() {
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncWriteExt;
 
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -862,7 +849,6 @@ async fn p2p_compact_hb_getblocktxn_and_orphan() {
     use bitcoin::Amount;
     use rbitcoin_test::mine::spend_anyone_can_spend;
 
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -1495,7 +1481,6 @@ fn pin_select_node_to_evict_ranking() {
 async fn p2p_feeler_completes_and_closes() {
     use rbitcoin_net::PeerConnType;
 
-    let _live = live_p2p_lock().await;
     let fut = async {
         rbitcoin_log::capture_logs(true);
         let seed_dir = TempDir::new().unwrap();
@@ -1553,7 +1538,6 @@ async fn p2p_feeler_completes_and_closes() {
 /// `max_inbound=1`: a second outbound follow is refused; the first session stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_inbound_full_rejects_extra() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         pin_select_node_to_evict_ranking();
         let seed_dir = TempDir::new().unwrap();
@@ -1631,7 +1615,6 @@ async fn p2p_inbound_full_rejects_extra() {
 /// Seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_after_restart_via_reconstruct() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -1746,7 +1729,6 @@ fn pin_restart_empty_and_same_process_bq_residue(seed: &P2PNode) {
 /// Mid-node serve after IBD: leaf syncs from mid, not the original seeder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_relay_path() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         let d0 = TempDir::new().unwrap();
         let d1 = TempDir::new().unwrap();
@@ -1779,7 +1761,6 @@ async fn three_node_relay_path() {
 /// IBD with two live seeder peers (8-block seed).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ibd_two_peers() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let mid_dir = TempDir::new().unwrap();
@@ -1824,7 +1805,6 @@ async fn ibd_two_peers() {
 /// Multi-peer IBD: dead address + live seeder (dial book tries both). Slim (4 blocks).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ibd_skips_dead_peer() {
-    let _live = live_p2p_lock().await;
     let seed_dir = TempDir::new().unwrap();
     let peer_dir = TempDir::new().unwrap();
 
@@ -1856,7 +1836,6 @@ async fn ibd_skips_dead_peer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_after_ibd() {
     use std::sync::Arc;
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -1967,7 +1946,6 @@ async fn tip_follow_after_ibd() {
 /// (not only unsolicited inv/headers announces).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tip_follow_getheaders_catches_missed_blocks() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         let seed_dir = TempDir::new().unwrap();
         let peer_dir = TempDir::new().unwrap();
@@ -2821,7 +2799,6 @@ async fn pin_blocksonly_seeder_tx_disconnects(
 /// while connected. `max_run_secs=0` stays a node-crate unit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn node_run_p2p_short() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         use rbitcoin_node::{run_p2p, NodeConfig};
         use rbitcoin_primitives::Network;
@@ -3143,7 +3120,6 @@ async fn pong_first_ping_then_go_silent(node: &P2PNode) -> rbitcoin_net::V2Plain
 /// stops ponging is dropped by the same clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mocktime_generate_keeps_ponging_peer() {
-    let _live = live_p2p_lock().await;
     let fut = async {
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();

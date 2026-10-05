@@ -112,8 +112,10 @@ checklist.
 - **SH create_count:** last-page reserved is stamped by the **appender**.
   Query/cap probes are read-only (walk when reserved is 0). Do not pwrite
   the last page from the join path.
-- **Live `P2PNode` tests:** one topology at a time **per test process**
-  (`live_p2p_lock`). Do not “fix” flakes with `RUST_TEST_THREADS=1`.
+- **Live `P2PNode` tests:** topologies in one process may overlap. Each
+  script stage registers its thread; `unpark_script_publisher` wakes every
+  registered stage. Do not serialize the suite with a process mutex. Do not
+  “fix” flakes with `RUST_TEST_THREADS=1`.
   [`TESTING.md`](../TESTING.md).
 - **Default CI is the pin.** Unlabeled PRs: `cargo test`, not Core
   functional. Coverage: production LCOV **≥ 92%** floor. Journey tests run

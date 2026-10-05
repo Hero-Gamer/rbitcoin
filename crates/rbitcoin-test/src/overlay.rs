@@ -48,13 +48,6 @@ fn req_addr(name: &str) -> SocketAddr {
     req(name).parse().unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
-pub async fn live_p2p_lock() -> tokio::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await
-}
-
 pub fn ephemeral_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
