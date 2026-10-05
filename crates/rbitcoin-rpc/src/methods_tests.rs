@@ -4354,6 +4354,58 @@ fn submitblock_store_fault_does_not_cache_block_invalid() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sibling that spends the coin the current tip also spent is a competing
+/// block, not a permanent `duplicate-invalid`.
+#[test]
+fn submitblock_sibling_spend_is_not_cached_invalid() {
+    use rbitcoin_primitives::Height;
+
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    let mature = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
+    let spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint {
+                txid: mature.txdata[0].compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: op_true.clone(),
+        }],
+    };
+    let parent = hub.tip_hash().unwrap();
+    let t0 = hub.tip_header().unwrap().time;
+    let height = hub.tip_height().unwrap() + 1;
+    let b2 = rbitcoin_consensus::mine_regtest_paying(
+        parent,
+        t0 + 1,
+        height,
+        op_true.clone(),
+        vec![spend.clone()],
+    );
+    let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b2))]).unwrap();
+    assert!(r.is_null(), "{r}");
+    let sibling =
+        rbitcoin_consensus::mine_regtest_paying(parent, t0 + 2, height, op_true, vec![spend]);
+    let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&sibling))]).unwrap();
+    assert_eq!(r, "inconclusive", "{r}");
+    assert!(
+        !hub.is_block_invalid(&sibling.block_hash()),
+        "a competing spend must stay submittable"
+    );
+    let again = dispatch(&ctx, "submitblock", vec![json!(block_hex(&sibling))]).unwrap();
+    assert_ne!(again, "duplicate-invalid", "{again}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `CheckTxInputs`: a confirmed txid with no output at `vout` is a
 /// missing input, not a store fault.
 #[test]

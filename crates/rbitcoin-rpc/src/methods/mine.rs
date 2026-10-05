@@ -1076,6 +1076,22 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
     }
 }
 
+/// True when `block`'s parent header is the active tip. A known ancestor that
+/// is not the tip is a competing block; tip spentness does not apply.
+fn parent_extends_tip(
+    query: &rbitcoin_query::Query,
+    block: &Block,
+) -> Result<bool, rbitcoin_store::StoreError> {
+    use rbitcoin_store::StoreError;
+    let prev = block.header.prev_blockhash.to_byte_array();
+    let parent_fk = match query.get_header_by_hash(&prev) {
+        Ok(Some((fk, _))) => fk,
+        Ok(None) | Err(StoreError::NotFound) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(query.tip_header_fk()? == Some(parent_fk))
+}
+
 /// Spend height of `block` when its parent is confirmed. The tip parent is a
 /// header-fk compare. Any other parent uses the best-chain hash index.
 fn cheap_spend_height(
@@ -1125,6 +1141,7 @@ fn cheap_immature_coinbase(
 fn read_confirmed_prevout(
     query: &rbitcoin_query::Query,
     op: bitcoin::OutPoint,
+    at_tip: bool,
 ) -> Result<Option<(rbitcoin_primitives::Fk, bitcoin::TxOut)>, rbitcoin_store::StoreError> {
     use rbitcoin_store::StoreError;
     let tid = op.txid.to_byte_array();
@@ -1138,7 +1155,10 @@ fn read_confirmed_prevout(
     if op.vout >= rec.output_count {
         return Ok(None);
     }
-    if query.is_outpoint_spent(&tid, op.vout)? {
+    // Tip spentness is the parent chain only when this block extends the tip.
+    // A sibling can spend a coin the current tip also spent; caching that as
+    // invalid drops the competing block for the rest of the process.
+    if at_tip && query.is_outpoint_spent(&tid, op.vout)? {
         return Ok(None);
     }
     let out = match query
@@ -1170,6 +1190,7 @@ fn cheap_submit_tx_reject(
 ) -> Result<Option<String>, rbitcoin_store::StoreError> {
     use bitcoin::{OutPoint, TxOut};
     let spend_height = cheap_spend_height(query, block)?;
+    let parent_is_tip = parent_extends_tip(query, block)?;
     // Core CheckMerkleRoot runs before every body rule. A repeat that keeps
     // the root (CVE-2012-2459) is the only bad-txns-duplicate. Any other
     // repeat spends a coin its first copy spent.
@@ -1228,7 +1249,7 @@ fn cheap_submit_tx_reject(
             let txout = if let Some(o) = created.get(&op) {
                 o.clone()
             } else {
-                let Some((fk, out)) = read_confirmed_prevout(query, op)? else {
+                let Some((fk, out)) = read_confirmed_prevout(query, op, parent_is_tip)? else {
                     return Ok(Some("bad-txns-inputs-missingorspent".into()));
                 };
                 if let Some(h) = spend_height {
