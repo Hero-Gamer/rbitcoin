@@ -99,7 +99,7 @@ Confirm stores a snapshot height after annotations are written and does not `syn
 | Class A bodies replay and the tip window read (`txid.body`, `txout`, `seqsigwit`, `input`, `txstat`) | No. A torn page cannot be rebuilt | Same `sync_data`, which advances durable-through `D` to that snapshot. Open revalidates `(D, tip]` (at least the last 6) when the marker is present, and from genesis when it is missing |
 | Scripthash heads, `tx.head` | Yes, from Class A | No barrier `fsync`. SH write-behind syncs the SH tables before it advances `scripthash.include_hwm` (a tip block, the end of a catch-up burst, or ≥1 s since the last advance); recovery replays the idempotent appends above that HWM. `sync=` on `tip: accept` |
 | BIP-352 tweaks (`sp_tweaks.*`) | Yes, backfill from Class A | Each put syncs body, then idx. Open drops heights above the tip and fits the last record to its `n_tx` |
-| Mempool sidecar | No. RAM is source of truth | Leave the 5 s path |
+| Mempool sidecar | No. RAM is source of truth. Open keeps an in-range prefix and moves an unreadable image aside | 5 s path and shutdown `flush`: `sync_data` body, then slots, then meta |
 
 `tx.head` meta and the spend marker use the same parent-directory `fsync` as `tip_seal` after tmp+rename. Windows denies that directory handle; the file was already synced. A missing `spend_durable` revalidates and replays from genesis. `checkblocks=0` still walks from genesis when a marker is present.
 
@@ -107,10 +107,11 @@ Confirm stores a snapshot height after annotations are written and does not `syn
 
 Private, **not** Class A. RAM graph is source of truth; files may lag.
 
-- **Order:** packed `tx.body` tail first, then LIVE slots, then meta. `persist_due` `pwrite`s only new LIVE slot records (not the full table). A crash after a grown body and before new slots loses admits; it does not claim LIVE ranges past durable body. Compact is tmp+rename of packed images (reclaim).
-- **5 s admits:** `persist_due` (no fsync) from the tip-follow perf tick. Crash may lose ≤5 s of admits (relay re-fetch). Shutdown `flush` still generation-bumps and `sync_data`s.
+- **Order:** `persist_due` and shutdown `flush` write the packed `tx.body` tail, `sync_data` that file, then write LIVE slots and `sync_data` those, then `meta`. `persist_due` `pwrite`s only new LIVE slot records (not the full table). A crash after the body sync and before the new slots loses those admits. Open skips a LIVE row whose `body_off + body_len` sits past the logical body and keeps the in-range prefix. Compact stays tmp+rename of packed images (reclaim).
+- **5 s admits:** one `fdatasync` of the dirty body, then the slot sync, per dirty interval, from the tip-follow perf tick. Admits that missed that sync can still be lost (relay re-fetch). Shutdown `flush` generation-bumps and uses the same sync order.
+- **Unreadable image:** bad magic, a schema this binary does not accept, or an in-range payload that does not decode or whose txid does not match the slot. Open moves `meta`, `slots`, `tx.body`, and their `.tmp` files under `mempool/torn-<unix>/` and starts empty. `fee_history` and `fee_history.log` stay. An IO error (the mempool path is not a directory, or the open returns IO rather than corrupt, magic, or schema) still fails startup. Class A is untouched.
 - **DEAD:** already-durable slots are one-record `pwrite`. An admit that never hit disk stays RAM-only (crash loses it). Do not dump the full slot table on strip — that would write LIVE rows whose body is still in the unpersisted tail.
-- **Leftover schema 1:** convert on open (recode LIVE payloads, tmp+rename like compact). Vin aux is empty; SH reindex batch-fills. Unknown schema still refuses — wipe `{datadir}/mempool/` (Class A kept). See [`OPERATOR.md`](../OPERATOR.md).
+- **Leftover schema 1:** convert on open (recode LIVE payloads, tmp+rename like compact). Vin aux is empty; SH reindex batch-fills. Unknown schema takes the unreadable-image path above.
 
 ## Operator
 

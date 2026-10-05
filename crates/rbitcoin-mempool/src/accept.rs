@@ -519,8 +519,38 @@ impl ActiveMempool {
     }
 
     /// `persist=false` abandons any on-disk live set (Core `-persistmempool=0`).
+    ///
+    /// Bad magic, an unknown schema, or an in-range payload that does not
+    /// decode is moved aside and the open retries empty. IO errors propagate.
     pub fn open_with_limit_persist(
         dir: impl Into<std::path::PathBuf>,
+        max_weight: u64,
+        persist: bool,
+    ) -> Result<Self, MempoolError> {
+        let dir = dir.into();
+        match Self::open_loaded(&dir, max_weight, persist) {
+            Ok(mp) => Ok(mp),
+            Err(e) if Self::unreadable_sidecar(&e) => {
+                let aside = crate::store::quarantine_sidecar(&dir)?;
+                rbitcoin_log::warn!(
+                    "mempool: unreadable sidecar ({e}); moved to {} and starting empty",
+                    aside.display()
+                );
+                Self::open_loaded(&dir, max_weight, persist)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn unreadable_sidecar(err: &MempoolError) -> bool {
+        matches!(
+            err,
+            MempoolError::BadMagic | MempoolError::BadSchema(_) | MempoolError::Corrupt(_)
+        )
+    }
+
+    fn open_loaded(
+        dir: &std::path::Path,
         max_weight: u64,
         persist: bool,
     ) -> Result<Self, MempoolError> {
@@ -594,7 +624,7 @@ impl ActiveMempool {
         self.store.persist_due()
     }
 
-    /// Time-based sidecar persist (5 s, no fsync). Body tail then new LIVE slots.
+    /// Time-based sidecar persist (5 s). Body `sync_data`, then new LIVE slots, then meta.
     pub fn persist_due(&mut self) -> Result<(), MempoolError> {
         self.store.persist_due()
     }
@@ -668,8 +698,8 @@ impl ActiveMempool {
     /// Accept a single transaction under Libre policy + cluster limits.
     ///
     /// RAM graph is source of truth. Packed body is appended in RAM; sidecar
-    /// write waits for [`Self::persist_due`] (5 s) or [`Self::flush`].
-    /// Crash may lose ≤5 s of admits.
+    /// write waits for [`Self::persist_due`] (5 s, body synced before LIVE slots)
+    /// or [`Self::flush`]. Crash may lose admits since the last persist.
     /// When prevouts are missing from both mempool and chain UTXO, the tx is
     /// parked in the [`Orphanage`] (weight budget) and
     /// [`AcceptError::Orphaned`] is returned — not a hard peer reject.

@@ -8,14 +8,17 @@
 //! | `{datadir}/mempool/tx.body` | **This file** — unconfirmed live set only |
 //!
 //! Schema **3** packed live records (schema 2 + per-record sigop cost). Body is append-only (`body_persisted_len`);
-//! `persist_due` writes the dirty tail then slots+meta. Compact copies packed
-//! payload ranges. DEAD of a durable slot is one-record `pwrite`.
+//! `persist_due` syncs the dirty tail, then syncs new LIVE slots, then writes meta.
+//! Compact copies packed payload ranges. DEAD of a durable slot is one-record `pwrite`.
+//! Open keeps LIVE rows inside the logical body and returns [`MempoolError::Corrupt`]
+//! for an in-range payload that does not decode. The hub moves that image aside.
 //!
 //! # Transport (phase 5b M2)
 //!
 //! Process-owned buffers (`meta` fields + `slots` / `body` `Vec`s) are the
 //! source of truth. Sidecar files are updated with normal `read`/`write` /
-//! `pwrite`-style IO — **no `memmap2`**. Flush bumps generation and `sync_data`.
+//! `pwrite`-style IO — **no `memmap2`**. Flush bumps generation and `sync_data`
+//! of the body before slots, then slots before meta.
 
 use crate::error::MempoolError;
 use crate::packed::{
@@ -153,6 +156,11 @@ impl Mempool {
             mp.body[4..6].copy_from_slice(&MEM_SCHEMA.to_le_bytes());
             mp.persist_slots_and_meta()?;
         }
+        // Validate before deleting abandoned compact tmps so a corrupt image
+        // can still be moved aside with those tmps.
+        mp.load_live_txs()?;
+        mp.drop_slots_past_body()?;
+        discard_abandoned_tmps(&mp.dir)?;
         Ok(mp)
     }
 
@@ -183,28 +191,21 @@ impl Mempool {
 
     /// Persist buffers, bump generation, and fsync sidecar files.
     ///
-    /// Admits persist on [`Self::persist_due`] (5 s, no fsync). A crash may lose
-    /// admits since the last persist. [`Self::flush`] is the durable checkpoint
-    /// (generation + fsync). Body is written before LIVE slots.
+    /// Admits persist on [`Self::persist_due`] (5 s, body `sync_data` before
+    /// LIVE slots). A crash may lose admits since the last persist.
+    /// [`Self::flush`] is the durable checkpoint (generation + the same order).
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_body_then_slots()?;
-        self.meta_file
-            .sync_data()
-            .map_err(|e| MempoolError::io(self.dir.join("meta"), e))?;
-        self.slots_file
-            .sync_data()
-            .map_err(|e| MempoolError::io(self.dir.join("slots"), e))?;
-        self.body_file
-            .sync_data()
-            .map_err(|e| MempoolError::io(self.dir.join("tx.body"), e))?;
+        self.sync_meta()?;
         Ok(())
     }
 
     /// Time-based body persist: dirty admits wait [`PERSIST_INTERVAL_MS`].
     ///
-    /// No fsync. Body tail first, then `pwrite` of new LIVE slot records, then
-    /// meta. DEAD of durable slots is [`Self::mark_slot_dead`]. Flush / grow /
+    /// Body tail is `sync_data`'d, then new LIVE slot records are written and
+    /// synced, then meta. One `fdatasync` of the dirty body per dirty interval.
+    /// DEAD of durable slots is [`Self::mark_slot_dead`]. Flush / grow /
     /// compact still rewrite the full slot table.
     pub fn persist_due(&mut self) -> Result<(), MempoolError> {
         if !self.body_dirty {
@@ -217,12 +218,13 @@ impl Mempool {
         self.persist_body_tail()?;
         self.pwrite_live_slots_since(old_persisted)?;
         self.persist_meta()?;
+        self.sync_meta()?;
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
         Ok(())
     }
 
-    /// Best-effort alias of [`Self::persist_due`] (no generation bump / no fsync).
+    /// Best-effort alias of [`Self::persist_due`] (no generation bump).
     pub fn persist_if_dirty(&mut self) -> Result<(), MempoolError> {
         self.persist_due()
     }
@@ -296,6 +298,9 @@ impl Mempool {
             n += end - start;
         }
         self.last_slot_write_bytes = n as u64;
+        self.slots_file
+            .sync_data()
+            .map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
     }
 
@@ -558,10 +563,14 @@ impl Mempool {
         Ok(())
     }
 
-    /// Load all LIVE txs from slots/body for graph rebuild.
+    /// Load LIVE txs whose packed bytes sit inside the logical body.
+    ///
+    /// A slot past that length is the issue 859 tear (slots reached disk, the
+    /// body tail did not). Those rows are skipped. An in-range record that does
+    /// not decode, or whose txid does not match the slot, fails the whole open.
     pub fn load_live_txs(&self) -> Result<Vec<LiveTx>, MempoolError> {
         let mut out = Vec::new();
-        let logical = body_logical_len(&self.body)?;
+        let logical = body_logical_len(&self.body)? as u64;
         for slot in 0..self.slot_cap {
             let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
             if self.slots[off] != SLOT_LIVE {
@@ -569,15 +578,52 @@ impl Mempool {
             }
             let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
             let body_len =
-                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as usize;
-            if body_off as usize + body_len > logical || body_len < BODY_TX_PREFIX {
+                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+            if live_slot_past_body(body_off, body_len, logical) {
+                continue;
+            }
+            if (body_len as usize) < BODY_TX_PREFIX {
                 return Err(MempoolError::Corrupt("live slot body range"));
             }
             let start = body_off as usize;
-            let packed = decode_packed_live(&self.body[start..start + body_len])?;
+            let packed = decode_packed_live(&self.body[start..start + body_len as usize])?;
+            let slot_txid =
+                Txid::from_byte_array(self.slots[off + 16..off + 48].try_into().unwrap());
+            if packed.txid != slot_txid {
+                return Err(MempoolError::Corrupt("live slot txid"));
+            }
             out.push(LiveTx { slot, packed });
         }
         Ok(out)
+    }
+
+    /// Mark LIVE rows past the durable body FREE and publish that slot table.
+    ///
+    /// [`Self::load_live_txs`] already skips them. Clearing the bytes keeps a
+    /// later compact from refusing the same tear.
+    fn drop_slots_past_body(&mut self) -> Result<(), MempoolError> {
+        let logical = self.body_persisted_len;
+        let mut changed = false;
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE {
+                continue;
+            }
+            let body_off = u64::from_le_bytes(self.slots[off + 4..off + 12].try_into().unwrap());
+            let body_len =
+                u32::from_le_bytes(self.slots[off + 12..off + 16].try_into().unwrap()) as u64;
+            if !live_slot_past_body(body_off, body_len, logical) {
+                continue;
+            }
+            self.slots[off] = SLOT_FREE;
+            self.live_count = self.live_count.saturating_sub(1);
+            changed = true;
+        }
+        if changed {
+            self.persist_slots_and_meta()?;
+            self.sync_meta()?;
+        }
+        Ok(())
     }
 
     /// True if at least one FREE or DEAD slot can be reused.
@@ -659,7 +705,7 @@ impl Mempool {
         Ok(logical as u64)
     }
 
-    /// Write the dirty body tail, then LIVE slots, then meta (no fsync).
+    /// Write the dirty body tail and `sync_data` it before any LIVE slot names it.
     ///
     /// Append-safe: a crash after a grown body and before new slots loses admits;
     /// old LIVE ranges stay a prefix of the new body. Packed compact must not
@@ -697,6 +743,9 @@ impl Mempool {
         self.body_file
             .set_len(logical)
             .map_err(|e| MempoolError::io(&body_path, e))?;
+        self.body_file
+            .sync_data()
+            .map_err(|e| MempoolError::io(&body_path, e))?;
         self.body_persisted_len = logical;
         Ok(())
     }
@@ -731,6 +780,7 @@ impl Mempool {
             .map_err(|e| MempoolError::io(path, e))?;
         file.write_all(bytes)
             .map_err(|e| MempoolError::io(path, e))?;
+        file.sync_data().map_err(|e| MempoolError::io(path, e))?;
         Ok(())
     }
 
@@ -768,6 +818,14 @@ impl Mempool {
         self.meta_file
             .write_all(&meta)
             .map_err(|e| MempoolError::io(&meta_path, e))?;
+        Ok(())
+    }
+
+    fn sync_meta(&mut self) -> Result<(), MempoolError> {
+        let path = self.dir.join("meta");
+        self.meta_file
+            .sync_data()
+            .map_err(|e| MempoolError::io(&path, e))?;
         Ok(())
     }
 
@@ -828,28 +886,55 @@ fn write_file_synced(path: &Path, bytes: &[u8]) -> Result<(), MempoolError> {
     Ok(())
 }
 
-/// Finish a compact install interrupted between the two renames.
+/// Finish a compact install interrupted after the body rename.
 ///
-/// Both tmps: neither rename landed — discard. `slots.tmp` only: body rename
-/// landed — finish slots. `tx.body.tmp` only: discard. No tmp (crash after both
-/// renames, before meta): packed body+slots with stale `live_count` still load.
+/// `slots.tmp` only: body rename landed — finish slots before the image is
+/// read. Both tmps, or a body tmp alone: leave them. A successful open deletes
+/// them ([`discard_abandoned_tmps`]). An unreadable image is moved aside with
+/// them still present.
 fn finish_pending_compact(dir: &Path) -> Result<(), MempoolError> {
     let body_tmp = dir.join("tx.body.tmp");
     let slots_tmp = dir.join("slots.tmp");
-    match (body_tmp.exists(), slots_tmp.exists()) {
-        (true, true) => {
-            let _ = fs::remove_file(&body_tmp);
-            let _ = fs::remove_file(&slots_tmp);
-        }
-        (false, true) => {
-            fs::rename(&slots_tmp, dir.join("slots")).map_err(|e| MempoolError::io(dir, e))?;
-        }
-        (true, false) => {
-            let _ = fs::remove_file(&body_tmp);
-        }
-        (false, false) => {}
+    if !body_tmp.exists() && slots_tmp.exists() {
+        fs::rename(&slots_tmp, dir.join("slots")).map_err(|e| MempoolError::io(dir, e))?;
     }
     Ok(())
+}
+
+fn discard_abandoned_tmps(dir: &Path) -> Result<(), MempoolError> {
+    for name in ["tx.body.tmp", "slots.tmp"] {
+        let path = dir.join(name);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| MempoolError::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn live_slot_past_body(body_off: u64, body_len: u64, logical: u64) -> bool {
+    body_off.saturating_add(body_len) > logical
+}
+
+/// Move an unreadable mempool sidecar aside. Fee history stays in `dir`.
+pub(crate) fn quarantine_sidecar(dir: &Path) -> Result<PathBuf, MempoolError> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut dest = dir.join(format!("torn-{secs}"));
+    let mut n = 0u32;
+    while dest.exists() {
+        n = n.saturating_add(1);
+        dest = dir.join(format!("torn-{secs}-{n}"));
+    }
+    fs::create_dir(&dest).map_err(|e| MempoolError::io(&dest, e))?;
+    for name in ["meta", "slots", "tx.body", "slots.tmp", "tx.body.tmp"] {
+        let src = dir.join(name);
+        if src.exists() {
+            fs::rename(&src, dest.join(name)).map_err(|e| MempoolError::io(&src, e))?;
+        }
+    }
+    Ok(dest)
 }
 
 fn accepted_schema(schema: u16) -> Result<u16, MempoolError> {

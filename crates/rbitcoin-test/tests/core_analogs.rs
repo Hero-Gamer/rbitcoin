@@ -4,9 +4,9 @@
 //! cannot `run`. These scenarios keep the behavior we still want:
 //!
 //! 1. `--milestone` skip-below / check-above + mempool persist + leftover
-//!    pool through catch-up then tip-mode purge, then missing prevout still
-//!    fails when scripts are skipped (`feature_assumevalid.py`,
-//!    `mempool_persist.py`)
+//!    pool through catch-up then tip-mode purge, torn sidecar open, then
+//!    missing prevout still fails when scripts are skipped
+//!    (`feature_assumevalid.py`, `mempool_persist.py`)
 //! 2. Reconstruct height 1 after wiping `tx.head/` (`feature_reindex*.py`)
 //! 3. BIP158 basic filters built from Class A match the reference builder,
 //!    including below a seqsigwit prune (`rpc_getblockfilter.py`,
@@ -49,9 +49,8 @@ fn analog_milestone_and_mempool_persist() {
 
     let mp_dir = td.path().join("mempool");
     let q_arc = Arc::new(q);
-    let (empty_body, fee_sat) = {
+    let fee_sat = {
         let hub = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
-        let empty_body = std::fs::read(mp_dir.join("tx.body")).unwrap();
         hub.set_relay_enabled(true);
         let r = hub
             .accept_tx(&unconf)
@@ -59,7 +58,7 @@ fn analog_milestone_and_mempool_persist() {
         assert_eq!(r.txid, want);
         hub.flush().expect("SIGTERM-equivalent flush");
         assert!(hub.contains(&want));
-        (empty_body, r.fee_sat)
+        r.fee_sat
     };
     let hub2 = MempoolHub::open_with_weight(&mp_dir, Arc::clone(&q_arc), 50_000_000).unwrap();
     assert!(
@@ -71,7 +70,7 @@ fn analog_milestone_and_mempool_persist() {
     drop(hub2);
     let (tip, tip_time, h) =
         pin_restart_catchup_then_tip_purge(&mp_dir, &q_arc, &params, &chain, &want);
-    pin_leftover_slots_tmp_and_truncated_body(&mp_dir, &q_arc, &want, &empty_body);
+    pin_torn_mempool_persist(&mp_dir, &q_arc, &chain, &want);
 
     let q = q_arc.as_ref();
     let mut bad = spend_anyone_can_spend(spend_txid, 0, Amount::from_sat(47_0000_0000));
@@ -273,12 +272,43 @@ fn pin_restart_catchup_then_tip_purge(
     (blk.block_hash(), blk.header.time, h + 1)
 }
 
-fn pin_leftover_slots_tmp_and_truncated_body(
+/// Issue 859: a hard stop can publish `slots` ahead of `tx.body`. The hub open
+/// the node uses keeps the in-range prefix, quarantines an unreadable sidecar,
+/// and still accepts. A path that is not a directory still fails.
+fn pin_torn_mempool_persist(
     mp_dir: &Path,
     q: &Arc<Query>,
+    chain: &MatureRegtestChain,
     want: &bitcoin::Txid,
-    empty_body: &[u8],
 ) {
+    std::fs::write(mp_dir.join("fee_history"), b"fee-hist-v1").unwrap();
+    std::fs::write(mp_dir.join("fee_history.log"), b"fee-log-v1").unwrap();
+    pin_slots_tmp_finishes(mp_dir, q, want);
+
+    let tail = spend_anyone_can_spend(
+        chain.blocks[5].txdata[0].compute_txid(),
+        0,
+        Amount::from_sat(49_0000_0000),
+    );
+    let tail_id = tail.compute_txid();
+    assert_ne!(&tail_id, want);
+    let (body_prefix, slots_prefix, body_full, slots_full) =
+        flush_prefix_then_tail(mp_dir, q, want, &tail, &tail_id);
+    pin_prefix_kept_tail_dropped(mp_dir, q, want, &tail_id, &body_prefix, &slots_full);
+    pin_new_body_old_slots(mp_dir, q, want, &tail_id, &body_full, &slots_prefix);
+    pin_unreadable_sidecar_then_accept(
+        mp_dir,
+        q,
+        want,
+        &tail,
+        &tail_id,
+        &body_prefix,
+        &slots_prefix,
+    );
+    pin_file_path_still_fails(mp_dir, q);
+}
+
+fn pin_slots_tmp_finishes(mp_dir: &Path, q: &Arc<Query>, want: &bitcoin::Txid) {
     std::fs::copy(mp_dir.join("slots"), mp_dir.join("slots.tmp")).unwrap();
     assert!(mp_dir.join("slots.tmp").exists());
     let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
@@ -289,30 +319,172 @@ fn pin_leftover_slots_tmp_and_truncated_body(
     );
     assert_eq!(hub.live_count(), 1);
     assert!(hub.contains(want));
+}
+
+fn flush_prefix_then_tail(
+    mp_dir: &Path,
+    q: &Arc<Query>,
+    want: &bitcoin::Txid,
+    tail: &Transaction,
+    tail_id: &bitcoin::Txid,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let body_prefix = std::fs::read(mp_dir.join("tx.body")).unwrap();
+    let slots_prefix = std::fs::read(mp_dir.join("slots")).unwrap();
+    let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000).unwrap();
+    hub.set_relay_enabled(true);
+    hub.accept_tx(tail).expect("accept tail spend");
+    hub.flush().expect("flush prefix plus tail");
+    assert!(hub.contains(want) && hub.contains(tail_id));
     drop(hub);
+    let body_full = std::fs::read(mp_dir.join("tx.body")).unwrap();
+    let slots_full = std::fs::read(mp_dir.join("slots")).unwrap();
+    assert!(body_full.len() > body_prefix.len());
+    (body_prefix, slots_prefix, body_full, slots_full)
+}
 
-    let body = mp_dir.join("tx.body");
-    let bytes = std::fs::read(&body).unwrap();
-    assert!(bytes.len() > 1, "flushed body");
-    std::fs::write(&body, &bytes[..bytes.len() / 2]).unwrap();
-    let err = match MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000) {
-        Ok(_) => panic!("truncated body vs slots must refuse"),
-        Err(e) => e,
-    };
+fn pin_prefix_kept_tail_dropped(
+    mp_dir: &Path,
+    q: &Arc<Query>,
+    want: &bitcoin::Txid,
+    tail_id: &bitcoin::Txid,
+    body_prefix: &[u8],
+    slots_full: &[u8],
+) {
+    // Slots name the tail; the body file is the previous prefix (logical end
+    // on the first record). That is the issue 859 tear.
+    std::fs::write(mp_dir.join("tx.body"), body_prefix).unwrap();
+    std::fs::write(mp_dir.join("slots"), slots_full).unwrap();
+    let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
+        .expect("truncated body under later slots must open");
+    assert!(hub.contains(want), "in-range prefix stays");
+    assert!(!hub.contains(tail_id), "out-of-range tail is absent");
+    assert_eq!(hub.live_count(), 1);
+    assert_fee_history(mp_dir);
     assert!(
-        err.to_lowercase().contains("corrupt")
-            || err.to_lowercase().contains("slot")
-            || err.to_lowercase().contains("body")
-            || err.to_lowercase().contains("range"),
-        "expected disagree refuse, got {err}"
+        torn_asides(mp_dir).is_empty(),
+        "a skipped tail is not a quarantine"
     );
+}
 
-    std::fs::write(&body, empty_body).unwrap();
-    let err = match MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000) {
-        Ok(_) => panic!("an older body behind live slots must refuse"),
+fn pin_new_body_old_slots(
+    mp_dir: &Path,
+    q: &Arc<Query>,
+    want: &bitcoin::Txid,
+    tail_id: &bitcoin::Txid,
+    body_full: &[u8],
+    slots_prefix: &[u8],
+) {
+    std::fs::write(mp_dir.join("tx.body"), body_full).unwrap();
+    std::fs::write(mp_dir.join("slots"), slots_prefix).unwrap();
+    let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
+        .expect("new body and previous slots must open");
+    assert!(hub.contains(want), "previous live set stays");
+    assert!(
+        !hub.contains(tail_id),
+        "admit missing from the previous slots stays absent"
+    );
+    assert_fee_history(mp_dir);
+}
+
+fn pin_unreadable_sidecar_then_accept(
+    mp_dir: &Path,
+    q: &Arc<Query>,
+    want: &bitcoin::Txid,
+    tail: &Transaction,
+    tail_id: &bitcoin::Txid,
+    body_prefix: &[u8],
+    slots_prefix: &[u8],
+) {
+    std::fs::write(mp_dir.join("tx.body"), body_prefix).unwrap();
+    std::fs::write(mp_dir.join("slots"), slots_prefix).unwrap();
+    let mut body = std::fs::read(mp_dir.join("tx.body")).unwrap();
+    // Schema-3 txid starts 24 bytes into the packed record. Flip it so the
+    // slot's txid does not match the payload. The tx bytes still decode.
+    let txid_at = 16 + 24;
+    assert!(body.len() > txid_at, "payload has a txid");
+    body[txid_at] ^= 0xff;
+    std::fs::write(mp_dir.join("tx.body"), &body).unwrap();
+    let corrupt_body = std::fs::read(mp_dir.join("tx.body")).unwrap();
+    let corrupt_slots = std::fs::read(mp_dir.join("slots")).unwrap();
+    let corrupt_meta = std::fs::read(mp_dir.join("meta")).unwrap();
+    std::fs::write(mp_dir.join("slots.tmp"), b"slots-tmp").unwrap();
+    std::fs::write(mp_dir.join("tx.body.tmp"), b"body-tmp").unwrap();
+    let hub = MempoolHub::open_with_weight(mp_dir, Arc::clone(q), 50_000_000)
+        .expect("unreadable sidecar must open empty");
+    assert_eq!(hub.live_count(), 0);
+    assert!(!hub.contains(want));
+    assert!(!mp_dir.join("slots.tmp").exists());
+    assert!(!mp_dir.join("tx.body.tmp").exists());
+    let aside = sole_torn_aside(mp_dir);
+    assert_eq!(std::fs::read(aside.join("tx.body")).unwrap(), corrupt_body);
+    assert_eq!(std::fs::read(aside.join("slots")).unwrap(), corrupt_slots);
+    assert_eq!(std::fs::read(aside.join("meta")).unwrap(), corrupt_meta);
+    assert_eq!(
+        std::fs::read(aside.join("slots.tmp")).unwrap(),
+        b"slots-tmp"
+    );
+    assert_eq!(
+        std::fs::read(aside.join("tx.body.tmp")).unwrap(),
+        b"body-tmp"
+    );
+    assert_fee_history(mp_dir);
+    hub.set_relay_enabled(true);
+    let accepted = hub
+        .accept_tx(tail)
+        .expect("empty mempool after quarantine still accepts");
+    assert_eq!(accepted.txid, *tail_id);
+    assert!(hub.contains(tail_id));
+}
+
+fn pin_file_path_still_fails(mp_dir: &Path, q: &Arc<Query>) {
+    let not_dir = mp_dir.parent().unwrap().join("mempool-not-a-dir");
+    std::fs::write(&not_dir, b"file").unwrap();
+    let err = match MempoolHub::open_with_weight(&not_dir, Arc::clone(q), 50_000_000) {
+        Ok(_) => panic!("a file path must not open as a mempool directory"),
         Err(e) => e,
     };
-    assert!(err.contains("live slot body range"), "{err}");
+    let low = err.to_lowercase();
+    assert!(
+        low.contains("io") || low.contains("directory") || low.contains("not a directory"),
+        "expected an IO open failure, got {err}"
+    );
+    assert_eq!(std::fs::read(&not_dir).unwrap(), b"file");
+    assert!(
+        torn_asides(&not_dir).is_empty(),
+        "an IO failure must not quarantine"
+    );
+}
+
+fn assert_fee_history(mp_dir: &Path) {
+    assert_eq!(
+        std::fs::read(mp_dir.join("fee_history")).unwrap(),
+        b"fee-hist-v1"
+    );
+    assert_eq!(
+        std::fs::read(mp_dir.join("fee_history.log")).unwrap(),
+        b"fee-log-v1"
+    );
+}
+
+fn torn_asides(mp_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(mp_dir) else {
+        return out;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("torn-") {
+            out.push(ent.path());
+        }
+    }
+    out
+}
+
+fn sole_torn_aside(mp_dir: &Path) -> PathBuf {
+    let dirs = torn_asides(mp_dir);
+    assert_eq!(dirs.len(), 1, "one quarantine directory, got {dirs:?}");
+    dirs.into_iter().next().unwrap()
 }
 
 fn first_head_sidecar(head: &Path, ext: &str) -> PathBuf {
