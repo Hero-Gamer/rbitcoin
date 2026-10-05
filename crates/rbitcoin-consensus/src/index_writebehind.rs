@@ -546,7 +546,15 @@ fn run_writebehind(
             .name("rbtc-idx-cpu".into())
             .spawn_scoped(scope, || cpu_worker(query, rx, &resync, &stages))
             .expect("spawn index cpu worker");
-        let io = io_loop(query, stop, &resync, &stages, &tx, on_filters_caught_up);
+        let io = io_loop(
+            query,
+            stop,
+            &resync,
+            &stages,
+            &tx,
+            PROGRESS_EVERY,
+            on_filters_caught_up,
+        );
         drop(tx);
         let cpu = worker.join().expect("index cpu worker");
         io.and(cpu)
@@ -565,6 +573,7 @@ fn io_loop(
     resync: &AtomicBool,
     stages: &IndexStageMs,
     tx: &std::sync::mpsc::SyncSender<ReadyWindow>,
+    progress_every: Duration,
     on_filters_caught_up: impl FnOnce(),
 ) -> Result<(), ConsensusError> {
     let mut on_filters_caught_up = Some(on_filters_caught_up);
@@ -621,7 +630,7 @@ fn io_loop(
             });
         }
         if let Some(p) = pass.as_mut() {
-            if p.last_log.elapsed() >= PROGRESS_EVERY {
+            if p.last_log.elapsed() >= progress_every {
                 rbitcoin_log::info!(
                     "{}",
                     format_index_build_progress(&IndexBuildProgress {
@@ -687,7 +696,7 @@ mod tests {
             });
             rbitcoin_log::capture_logs(false);
             rbitcoin_log::capture_logs(true);
-            io_loop(query, stop, resync, stages, tx, on_caught).unwrap();
+            io_loop(query, stop, resync, stages, tx, PROGRESS_EVERY, on_caught).unwrap();
             let logs = rbitcoin_log::take_logs();
             rbitcoin_log::capture_logs(false);
             stop.store(true, Ordering::Relaxed);
@@ -702,8 +711,12 @@ mod tests {
 
     /// Seal from the current watermarks through the released tip.
     /// `hold_first` blocks the first window so a later window in the same
-    /// pass can cross [`PROGRESS_EVERY`].
-    fn drive_index_pass(query: &Query, hold_first: Duration) -> Vec<String> {
+    /// pass can cross `progress_every`.
+    fn drive_index_pass(
+        query: &Query,
+        hold_first: Duration,
+        progress_every: Duration,
+    ) -> Vec<String> {
         let stop = AtomicBool::new(false);
         let resync = AtomicBool::new(false);
         let stages = IndexStageMs::default();
@@ -740,7 +753,7 @@ mod tests {
             });
             rbitcoin_log::capture_logs(false);
             rbitcoin_log::capture_logs(true);
-            io_loop(query, &stop, &resync, &stages, &tx, || {
+            io_loop(query, &stop, &resync, &stages, &tx, progress_every, || {
                 stop.store(true, Ordering::Relaxed);
             })
             .unwrap();
@@ -1025,7 +1038,13 @@ mod tests {
         let pass_tip = resume + WINDOW_HEIGHTS;
         connect_coinbases(&q, resume, pass_tip, &mut prev_fk, &mut prev_hash);
         q.release_index_writebehind(Height(pass_tip));
-        let lines = drive_index_pass(&q, PROGRESS_EVERY + Duration::from_secs(2));
+        assert_eq!(PROGRESS_EVERY.as_secs(), 10);
+        let progress_every = Duration::from_secs(1);
+        let lines = drive_index_pass(
+            &q,
+            progress_every + Duration::from_millis(50),
+            progress_every,
+        );
         let heights = pass_tip + 1 - resume;
         assert!(
             lines
@@ -1049,7 +1068,7 @@ mod tests {
         let short_tip = short_from + 10;
         connect_coinbases(&q, short_from, short_tip, &mut prev_fk, &mut prev_hash);
         q.release_index_writebehind(Height(short_tip));
-        let lines = drive_index_pass(&q, Duration::ZERO);
+        let lines = drive_index_pass(&q, Duration::ZERO, PROGRESS_EVERY);
         assert!(
             lines
                 .iter()
@@ -1291,7 +1310,7 @@ mod tests {
         let stages = IndexStageMs::default();
         let (tx, rx) = sync_channel(1);
         drop(rx);
-        io_loop(&q, &stop, &resync, &stages, &tx, || {}).unwrap();
+        io_loop(&q, &stop, &resync, &stages, &tx, PROGRESS_EVERY, || {}).unwrap();
         let fin = finished_index_stages();
         progress::capture_finished(false);
         assert_eq!(fin, [("blockfilter build", 0, 0, u64::from(tip) + 1)]);
