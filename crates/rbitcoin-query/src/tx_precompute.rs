@@ -532,7 +532,7 @@ pub fn decode_block_precomputes(
     }
     let mut txdata = Vec::with_capacity(n);
     let mut pres = Vec::with_capacity(n);
-    let mut hash_ns = 0u64;
+    let t = Instant::now();
     for _ in 0..n {
         let start = cur.position() as usize;
         let tx = match decode_flag_zero_tx(&payload[start..]) {
@@ -544,12 +544,18 @@ pub fn decode_block_precomputes(
         };
         let end = cur.position() as usize;
         let wire = payload.get(start..end)?;
-        let t = Instant::now();
         pres.push(TxPrecompute::from_tx_wire(&tx, wire, sighash)?);
-        hash_ns = hash_ns.saturating_add(t.elapsed().as_nanos() as u64);
         txdata.push(tx);
     }
+    let hash_ns = t.elapsed().as_nanos() as u64;
     Some((bitcoin::block::Block { header, txdata }, pres, hash_ns))
+}
+
+/// Header + tx-count compact size + each precompute's wire length.
+///
+/// Matches a block payload when every `total_size` is that tx's slice.
+pub fn block_wire_len_from_pres(n_tx: usize, pres: &[TxPrecompute]) -> usize {
+    80 + VarInt(n_tx as u64).size() + pres.iter().map(|p| p.total_size).sum::<usize>()
 }
 
 fn enc(w: &mut impl bitcoin::io::Write, v: &impl Encodable) -> usize {
@@ -1020,6 +1026,26 @@ mod tests {
         assert_eq!(pres[0].txid, want.txid);
         assert_eq!(pres[0].wtxid, want.wtxid);
         assert_eq!(pres[0].sha_prevouts, None);
+    }
+
+    /// Queue-depth bytes are header + tx-count + each pres wire length.
+    /// A witness tx's `total_size` includes the witness; `base_size` does not.
+    #[test]
+    fn witness_block_wire_len_matches_payload() {
+        use bitcoin::blockdata::constants::genesis_block;
+        use bitcoin::consensus::encode::serialize;
+        use bitcoin::Network;
+        let mut block = genesis_block(Network::Regtest);
+        block.txdata = vec![p2wpkh_like(), legacy_1in()];
+        let raw = serialize(&block);
+        let (decoded, pres, _) = super::decode_block_precomputes(&raw, false).expect("decode");
+        assert!(pres[0].has_witness);
+        assert!(pres[0].total_size > pres[0].base_size);
+        assert!(!pres[1].has_witness);
+        assert_eq!(
+            super::block_wire_len_from_pres(decoded.txdata.len(), &pres),
+            raw.len()
+        );
     }
 
     #[test]

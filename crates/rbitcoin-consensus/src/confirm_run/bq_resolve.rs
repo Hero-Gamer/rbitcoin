@@ -120,7 +120,7 @@ pub struct BqResolveWaveStats {
     pub precompute_ns: u64,
     /// `push_resolve_keys` (this wave).
     pub collect_ns: u64,
-    /// TipOnly `get_fk_by_txid_batch` + slot sort (this wave).
+    /// TipOnly `get_fk_by_txid_batch` (this wave).
     pub head_ns: u64,
     /// TipOnly `create.loc` fill is inside [`Self::head_ns`] (`idx_ns`): one
     /// batch after identity waves, not on the held probe ring.
@@ -138,9 +138,10 @@ fn push_resolve_keys(
     pres: &[TxPrecompute],
     skip: &HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
     keys: &mut HashSet<[u8; 32], BuildHasherDefault<TxidHasher>>,
+    n_inputs: u32,
 ) -> Vec<([u8; 32], u32)> {
     let bip34 = params.bip34_active_at(height);
-    let mut spends = Vec::new();
+    let mut spends = Vec::with_capacity(n_inputs as usize);
     for (tx, p) in block.txdata.iter().zip(pres.iter()) {
         for inp in &tx.input {
             if inp.previous_output.is_null() {
@@ -318,6 +319,7 @@ pub fn confirm_bq_resolve_wave_capped(
             pres.as_ref(),
             &wave_creates,
             &mut all_keys,
+            n_inputs_at.get(&h).copied().unwrap_or(0),
         );
         if let Some((_, _, w)) = wires.last_mut() {
             w.spend_keys = Arc::from(spends);
@@ -332,9 +334,8 @@ pub fn confirm_bq_resolve_wave_capped(
     let mut layer = IdMap::default();
     let mut spent = U64Map::default();
     let mut n_out = U64Map::default();
-    let mut need: Vec<[u8; 32]> = all_keys.into_iter().collect();
+    let need: Vec<[u8; 32]> = all_keys.into_iter().collect();
     let t_head = Instant::now();
-    need.sort_by_cached_key(|txid| query.store().txs.head_primary_slot(txid));
 
     let drain_fence_hi = query.drain_and_fence_hi();
     if let Some(&hi) = selected.last() {
@@ -610,7 +611,7 @@ mod tests {
         let mut keys: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
             HashSet::with_hasher(BuildHasherDefault::default());
         let skip = HashSet::with_hasher(BuildHasherDefault::default());
-        let spends = push_resolve_keys(&params, height, &block, &pres, &skip, &mut keys);
+        let spends = push_resolve_keys(&params, height, &block, &pres, &skip, &mut keys, 1);
         assert_eq!(keys.len(), 1);
         assert!(keys.contains(&prev.to_byte_array()));
         assert_eq!(
@@ -621,7 +622,7 @@ mod tests {
         skip_same.insert(prev.to_byte_array());
         let mut keys2: HashSet<[u8; 32], BuildHasherDefault<TxidHasher>> =
             HashSet::with_hasher(BuildHasherDefault::default());
-        let skipped = push_resolve_keys(&params, height, &block, &pres, &skip_same, &mut keys2);
+        let skipped = push_resolve_keys(&params, height, &block, &pres, &skip_same, &mut keys2, 1);
         assert!(keys2.is_empty(), "same-wave creates are not TipOnly need");
         assert_eq!(
             skipped,

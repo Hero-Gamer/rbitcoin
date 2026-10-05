@@ -1964,7 +1964,16 @@ pub(crate) fn spawn_confirm_engine(
                 confirm_thr_stats::add_load_pack(&stats, t_recv.elapsed());
                 let drop_below = lb.drop_inflight_below;
                 let n = lb.items.len();
-                let wire: usize = lb.items.iter().map(|(_, _, w)| w.block.total_size()).sum();
+                let wire: usize = lb
+                    .items
+                    .iter()
+                    .map(|(_, _, w)| {
+                        rbitcoin_query::block_wire_len_from_pres(
+                            w.block.txdata.len(),
+                            w.pres.as_ref(),
+                        )
+                    })
+                    .sum();
                 queues_load.note_load_recv(n, wire);
                 let parent_ids = lb.parent_ids;
                 let claim_epoch = lb.epoch;
@@ -2479,7 +2488,12 @@ pub(crate) fn spawn_confirm_engine(
                                 let wire: usize = batch
                                     .items
                                     .iter()
-                                    .map(|(_, _, w)| w.block.total_size())
+                                    .map(|(_, _, w)| {
+                                        rbitcoin_query::block_wire_len_from_pres(
+                                            w.block.txdata.len(),
+                                            w.pres.as_ref(),
+                                        )
+                                    })
                                     .sum();
                                 // Take before the send: a take that loses to a
                                 // re-arm leaves its rows queued and is not sent.

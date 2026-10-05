@@ -1835,6 +1835,12 @@ fn get_fk_by_txid_batch_matches_single() {
     cached.sort_by_cached_key(|k| t.head_primary_slot(k));
     assert_eq!(keys, cached, "cached slot key must match by_key order");
     let batch = t.get_fk_by_txid_batch(&keys).unwrap();
+    let rev: Vec<[u8; 32]> = keys.iter().copied().rev().collect();
+    let batch_rev = t.get_fk_by_txid_batch(&rev).unwrap();
+    for (fwd, back) in batch.iter().zip(batch_rev.iter().rev()) {
+        assert_eq!(fwd.0, back.0);
+        assert_eq!(fwd.1.map(|(fk, _)| fk), back.1.map(|(fk, _)| fk));
+    }
     assert_eq!(batch.len(), 5);
     for (txid, row) in &batch {
         let single = t.probe_body_match_fk(txid).unwrap();
