@@ -4564,6 +4564,23 @@ fn submitblock_coinbase_script_rejects_match_core() {
     }
     let r = submit(&mine_claiming(1));
     assert!(r.is_null(), "the right height push connects: {r}");
+
+    // CheckTransaction length is 2..=100, after the merkle check and before BIP34.
+    let mut wide = mine_claiming(2);
+    let mut ss = rbitcoin_consensus::bip34_height_script(2);
+    ss.resize(100, 0x00);
+    wide.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(ss);
+    wide.header.merkle_root = wide.compute_merkle_root().unwrap();
+    regrind(&mut wide);
+    let r = submit(&wide);
+    assert!(r.is_null(), "a 100-byte coinbase scriptSig connects: {r}");
+    let mut too_long = mine_claiming(3);
+    let mut ss = rbitcoin_consensus::bip34_height_script(3);
+    ss.resize(101, 0x00);
+    too_long.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(ss);
+    too_long.header.merkle_root = too_long.compute_merkle_root().unwrap();
+    regrind(&mut too_long);
+    assert_eq!(submit(&too_long), "bad-cb-length");
 }
 
 include!("regtest_chain_ops_journey.rs");
