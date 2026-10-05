@@ -1,4 +1,4 @@
-use crate::test_chain::{copy_chain, padded_chain_with, shared_regtest, TestChain};
+use crate::test_chain::{padded_chain_with, shared_regtest, TestChain};
 use crate::testutil::TpClient;
 use crate::{run_sv2_tp, Sv2TpConfig, SETUP_TIMEOUT, WRITE_TIMEOUT};
 use bitcoin::consensus::encode::serialize;
@@ -28,18 +28,6 @@ const OP_CHECKSIG: u8 = 0xac;
 fn mock_live_tip(tc: &TestChain) {
     let tip_time = tc.chain.tip_header().expect("tip").time;
     tc.chain.clock.set_mock(i64::from(tip_time));
-}
-
-/// Stale tip, two hubs from one pad: an empty pool and a heavy pool. Each
-/// leaves IBD on its own, so the latch cannot be shared.
-#[tokio::test(flavor = "multi_thread")]
-async fn ibd_holds_the_last_budget_and_an_empty_template() {
-    let heavy = shared_regtest(1);
-    let empty = copy_chain(&heavy, "sv2-ibd-empty");
-    tokio::join!(
-        sync_gate_holds_constraints_until_a_fresh_tip(&empty),
-        constraints_while_ibd_keep_the_last_budget(&heavy),
-    );
 }
 
 fn spend(coinbase: Txid, fee: u64, script_pubkey: ScriptBuf) -> Transaction {
@@ -311,7 +299,9 @@ async fn template_constraint_rebuilds_are_rate_limited() {
     tp.shutdown().await;
 }
 
-async fn sync_gate_holds_constraints_until_a_fresh_tip(tc: &TestChain) {
+#[tokio::test(flavor = "multi_thread")]
+async fn sync_gate_holds_constraints_until_a_fresh_tip() {
+    let tc = shared_regtest(1);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         chain: Arc::clone(&tc.chain),
@@ -346,7 +336,7 @@ async fn sync_gate_holds_constraints_until_a_fresh_tip(tc: &TestChain) {
             .expect("template after the fresh tip")
             .expect("message")
     };
-    check_template(&mut c, tc, first, &[], true).await;
+    check_template(&mut c, &tc, first, &[], true).await;
 
     tp.shutdown().await;
 }
@@ -354,7 +344,9 @@ async fn sync_gate_holds_constraints_until_a_fresh_tip(tc: &TestChain) {
 /// A constraints flood while the node is in IBD must not close the session.
 /// Nothing is queued to build, so the post-template 8-replacement close does
 /// not apply. The tip that leaves IBD builds the last budget.
-async fn constraints_while_ibd_keep_the_last_budget(tc: &TestChain) {
+#[tokio::test(flavor = "multi_thread")]
+async fn constraints_while_ibd_keep_the_last_budget() {
+    let tc = shared_regtest(1);
     // 16_000 sigop cost: excluded under a u16::MAX client reserve.
     let heavy = spend(
         tc.coinbases[0],
@@ -404,7 +396,7 @@ async fn constraints_while_ibd_keep_the_last_budget(tc: &TestChain) {
             .expect("template after the fresh tip")
             .expect("message")
     };
-    check_template(&mut c, tc, first, &[], true).await;
+    check_template(&mut c, &tc, first, &[], true).await;
     let extra = tokio::time::timeout(Duration::from_millis(500), c.recv()).await;
     assert!(extra.is_err(), "one template for the last budget");
 

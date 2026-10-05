@@ -186,38 +186,53 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
     })
 }
 
-/// Accepted-socket `SO_SNDBUF` for
-/// `client_that_stops_reading_is_dropped_at_the_write_deadline`.
+/// Accepted-socket `SO_SNDBUF` for one listener.
 ///
 /// `write()` returns as soon as the bytes fit in the send buffer. With
 /// autotune that is several MiB, so a client that never reads still looks
-/// like a live writer and the deadline never starts.
+/// like a live writer and the deadline never starts. The pin is keyed by
+/// the listener address so another test's accept keeps autotune.
 #[cfg(all(test, target_os = "linux"))]
 mod test_send_buffer {
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
     use std::os::fd::AsRawFd;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{LazyLock, Mutex};
     use tokio::net::TcpStream;
 
-    static BUF: AtomicU32 = AtomicU32::new(0);
+    static PINS: LazyLock<Mutex<HashMap<SocketAddr, u32>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    pub(crate) struct Guard;
+    pub(crate) struct Guard {
+        addr: SocketAddr,
+    }
 
-    pub(crate) fn pin(bytes: u32) -> Guard {
-        BUF.store(bytes, Ordering::SeqCst);
-        Guard
+    pub(crate) fn pin(addr: SocketAddr, bytes: u32) -> Guard {
+        PINS.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(addr, bytes);
+        Guard { addr }
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            BUF.store(0, Ordering::SeqCst);
+            PINS.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.addr);
         }
     }
 
     pub(super) fn apply(stream: &TcpStream) {
-        let n = BUF.load(Ordering::SeqCst);
-        if n == 0 {
+        let Ok(addr) = stream.local_addr() else {
             return;
-        }
+        };
+        let n = {
+            let pins = PINS.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(n) = pins.get(&addr).copied() else {
+                return;
+            };
+            n
+        };
         unsafe extern "C" {
             fn setsockopt(fd: i32, level: i32, opt: i32, val: *const i32, len: u32) -> i32;
             fn getsockopt(fd: i32, level: i32, opt: i32, val: *mut i32, len: *mut u32) -> i32;

@@ -14,9 +14,11 @@
 
 ### True journeys
 
-A journey is one setup and one story. A peer, a client, or an operator does a sequence of things to that same node. Each beat asserts what they would observe: a response, a push, a reject, bytes on disk, a tip after reopen. The story should read like this node meeting the real network or a real client, and it should run as much of that path as the arc needs. One chain, one server, one session, the beats in order.
+A journey is one setup and one story. A peer, a client, or an operator does a sequence of things to that same node. Each beat asserts what they would observe: a response, a push, a reject, bytes on disk, a tip after reopen. The story should read like this node meeting the real network or a real client, and it should run as much of that path as the arc needs. One chain, one server, one session, the beats in order. That stays one `#[test]` when a later beat observes an earlier beat: a mined block, a spent coinbase, a grown chain, one mempool that is not reopened.
 
-A `#[test]` whose body only calls other tests is not a journey. Each callee still opens its own store, hub, or socket. The suite gains one name and the same N boots. Delete the callees. The journey writes the asserts. Do not keep the old functions as private bodies the new test calls.
+Distinct cases that only share a costly chain are separate `#[test]`s. Build that chain once in a `OnceLock`. Each test takes a private copy, or a fresh mempool on a query it does not modify. The fixture lives until the test binary exits. Deleting it while other tests run races the scheduler. Do not share a mutable hub, clock, or mempool across those tests.
+
+A `#[test]` whose body only calls other tests is neither shape. If each callee still opens its own store, the suite gains one name and the same N boots. If the callees are independent, give each its own name on the shared fixture. Do not keep the old functions as private bodies the new test calls.
 
 If no peer, client, or operator can cause the behavior, delete the behavior in the same change. A small test stays only when the function's return is the consensus or schema result and a session cannot reach it without an absurd chain: pure arithmetic, a codec with no socket, two networks that cannot be the same chain. Say which of those it is, next to the test. A small unit is not a cheaper substitute for a journey the session can already run. A tall chain the rest of the story never builds is a named second chapter on a second setup. Two setups only when the objects cannot be the same.
 

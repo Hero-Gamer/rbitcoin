@@ -27,6 +27,75 @@ async fn read_line_timeout(reader: &mut BufReader<&mut TcpStream>, buf: &mut Str
 const SP_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
 const SP_SPEND: &str = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
 
+struct ElectrumMaturity {
+    keep: TempDir,
+    tip: bitcoin::BlockHash,
+    tip_time: u32,
+    coinbases: Vec<bitcoin::Txid>,
+}
+
+/// Height-101 regtest with one mature coinbase. Built once per process.
+fn electrum_maturity() -> &'static ElectrumMaturity {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<ElectrumMaturity> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let keep = TempDir::new().unwrap();
+        let store = keep.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let q = Query::open_or_create_tiny(&store).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        rbitcoin_consensus::accept_and_connect_block(
+            &q,
+            &params,
+            rbitcoin_primitives::Height::GENESIS,
+            &genesis,
+            Milestone::NONE,
+        )
+        .unwrap();
+        let (tip, tip_time, coinbases) = rbitcoin_consensus::pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            101,
+            1,
+        );
+        // Quiescent after init. Each test copies this store.
+        q.flush().expect("flush electrum maturity pad");
+        ElectrumMaturity {
+            keep,
+            tip,
+            tip_time,
+            coinbases,
+        }
+    })
+}
+
+fn open_electrum_maturity(dir: &TempDir) -> (Query, bitcoin::BlockHash, u32, Vec<bitcoin::Txid>) {
+    let pad = electrum_maturity();
+    let store = dir.path().join("store");
+    std::fs::create_dir_all(&store).unwrap();
+    copy_store(pad.keep.path().join("store").as_path(), &store);
+    let q = Query::open_or_create_tiny(&store).unwrap();
+    (q, pad.tip, pad.tip_time, pad.coinbases.clone())
+}
+
+fn copy_store(src: &std::path::Path, dst: &std::path::Path) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_store(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), to).unwrap();
+        }
+    }
+}
+
 async fn pin_wallet_protocol_1_6(stream: &mut TcpStream) {
     let ver = rpc(stream, 40, "server.version", json!(["test", "1.6"])).await;
     assert_eq!(ver["result"][1].as_str(), Some("1.6"), "{ver}");
@@ -977,19 +1046,8 @@ fn block_touch_sees_spend_only_heights() {
     use rbitcoin_store::script_hash;
 
     let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
     let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let (tip, tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        101,
-        1,
-    );
+    let (q, tip, tip_time, coinbase_txids) = open_electrum_maturity(&dir);
     let spend = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -1073,24 +1131,11 @@ async fn electrum_mempool_notify_follows_funding_and_rbf() {
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    use rbitcoin_consensus::accept_and_connect_block;
     use rbitcoin_net::MempoolHub;
-    use rbitcoin_primitives::Height;
 
     let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
     let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        101,
-        1,
-    );
+    let (q, _tip, _tip_time, coinbase_txids) = open_electrum_maturity(&dir);
     let q = Arc::new(q);
     let mp = Arc::new(MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q)).unwrap());
     mp.set_relay_enabled(true);
@@ -1344,19 +1389,8 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     use rbitcoin_primitives::Height;
 
     let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
     let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let (tip, tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        101,
-        1,
-    );
+    let (q, tip, tip_time, coinbase_txids) = open_electrum_maturity(&dir);
     let q_arc = Arc::new(q);
     let mp = MempoolHub::open(dir.path().join("mempool"), Arc::clone(&q_arc)).unwrap();
     mp.set_relay_enabled(true);
@@ -1643,19 +1677,8 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
 
     const ASOF: &str = "1.4.2-asof";
     let dir = TempDir::new().unwrap();
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
     let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    let (tip, tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        101,
-        1,
-    );
+    let (q, tip, tip_time, coinbase_txids) = open_electrum_maturity(&dir);
     let create_spk = ScriptBuf::from_bytes(vec![0x52]);
     let p2wpkh_sats = 50_000u64;
     let value = 50_0000_0000 - 1_000 - p2wpkh_sats;

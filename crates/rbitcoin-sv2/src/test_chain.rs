@@ -71,14 +71,6 @@ pub(crate) fn shared_regtest(spendable: u32) -> TestChain {
     copy_quiescent(src, "sv2-shared")
 }
 
-/// Second hub on a copy of `src`'s store. The mempool is empty either way.
-/// `ChainHub::in_ibd` latches per hub, so a chapter that leaves IBD cannot
-/// share the hub with a chapter that must start stale.
-pub(crate) fn copy_chain(src: &TestChain, label: &str) -> TestChain {
-    src.chain.query.flush().expect("flush before copy");
-    copy_quiescent(src, label)
-}
-
 fn copy_quiescent(src: &TestChain, label: &str) -> TestChain {
     let dir = TempDir::labeled(label).expect("temp");
     copy_tree_except(src._dir.path(), dir.path(), "mempool");
