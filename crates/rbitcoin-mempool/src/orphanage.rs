@@ -250,6 +250,8 @@ impl Orphanage {
             .any(|p| self.peer_orphan_weight(*p) <= ORPHAN_RESERVED_WEIGHT_PER_PEER)
     }
 
+    /// Drop `peer` from the oldest orphan it announced. The tx stays when
+    /// another peer still announces it; only that peer's weight is released.
     fn evict_one_from_peer(&mut self, peer: u64) -> bool {
         let victim = self
             .fifo
@@ -263,7 +265,23 @@ impl Orphanage {
         let Some(txid) = victim else {
             return false;
         };
-        self.remove_txid(&txid);
+        let weight = {
+            let Some(e) = self.by_txid.get_mut(&txid) else {
+                return false;
+            };
+            if !e.announcers.remove(&peer) {
+                return false;
+            }
+            e.weight
+        };
+        self.sub_peer_weight(peer, weight);
+        let last = self
+            .by_txid
+            .get(&txid)
+            .is_some_and(|e| e.announcers.is_empty());
+        if last {
+            self.remove_txid(&txid);
+        }
         self.fifo.retain(|t| self.by_txid.contains_key(t));
         true
     }
@@ -504,6 +522,37 @@ mod tests {
         );
         let peer2_kept = o.announcers_of(&tx2.compute_txid()).contains(&2);
         assert!(peer2_kept, "peer 2 must keep its orphan");
+    }
+
+    /// Peer B re-announces peer A's orphan, then overflows its own reserve.
+    /// The eviction drops B only. The parent still delivers A's orphan.
+    #[test]
+    fn shared_announcer_eviction_keeps_the_other_peer() {
+        let mut o = Orphanage::new();
+        let parent = txid_n(8);
+        let mut miss = BTreeSet::new();
+        miss.insert(parent);
+        let tx_a = make_orphan(parent, 1);
+        let tid = tx_a.compute_txid();
+        assert!(o.insert_from(tx_a, miss.clone(), Some(1)));
+        assert!(o.add_announcer(&tid, 2));
+        for i in 0..80u8 {
+            let mut tx = make_orphan(parent, i.wrapping_add(3));
+            tx.input[0].witness = Witness::from_slice(&[vec![i.wrapping_add(3); 20_000]]);
+            tx.lock_time = LockTime::from_height(i as u32).unwrap();
+            o.insert_from(tx, miss.clone(), Some(2));
+        }
+        assert!(o.peer_orphan_weight(2) <= ORPHAN_RESERVED_WEIGHT_PER_PEER);
+        assert!(
+            o.contains(&tid),
+            "peer 1's orphan must survive peer 2's reserve"
+        );
+        assert!(o.announcers_of(&tid).contains(&1));
+        let kids = o.take_children_of(&parent);
+        assert!(
+            kids.iter().any(|tx| tx.compute_txid() == tid),
+            "the parent still delivers peer 1's orphan"
+        );
     }
 
     #[test]

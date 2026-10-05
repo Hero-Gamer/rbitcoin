@@ -690,23 +690,22 @@ fn apply_peer_dead(st: &mut IbdWorkState, peer_book: &mut AddrMan, peer: usize, 
     super::header_walk::forget_walk_peer(st, peer);
     if let Some(s) = st.slots.iter().find(|s| s.id == peer) {
         if reason == "peer misbehavior threshold" {
-            note_misbehavior_dead(peer_book, &mut st.addr_cooldown, s.addr, Instant::now());
+            note_misbehavior_dead(peer_book, &mut st.addr_cooldown, s.net, Instant::now());
         } else {
             note_dead_without_block_bytes(
                 peer_book,
                 &mut st.addr_cooldown,
-                s.addr,
+                s.net,
                 s.first_data_ms,
                 Instant::now(),
             );
         }
         let lat = s.first_data_ms.saturating_sub(s.connected_ms);
-        peer_book.apply_ibd_dead_speed(
-            s.addr,
-            lat,
-            s.rate.bps(),
-            st.addr_cooldown.contains_key(&s.addr),
-        );
+        let cooled = s
+            .net
+            .socket_addr()
+            .is_some_and(|sock| st.addr_cooldown.contains_key(&sock));
+        peer_book.apply_ibd_dead_speed_addr(s.net, lat, s.rate.bps(), cooled);
     }
     let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, &mut st.body, peer);
     st.reopen_for_densify(&freed);

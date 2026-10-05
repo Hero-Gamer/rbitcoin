@@ -281,6 +281,8 @@ pub struct Store {
     mtp_ring: std::sync::RwLock<MtpRing>,
     /// Latest confirm height plus one. Zero means no snapshot yet.
     spend_snapshot: std::sync::atomic::AtomicU64,
+    /// Serializes spend-marker publishes so a checkpoint cannot overwrite a clamp.
+    spend_marker: std::sync::Mutex<()>,
     /// First height of a confirm write whose spend annotate has not finished,
     /// plus one. Zero means none.
     spend_annotate_from: std::sync::atomic::AtomicU64,
@@ -373,6 +375,7 @@ impl Store {
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
+            spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -435,6 +438,7 @@ impl Store {
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
+            spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
             head_scale: layout.head_scale,
@@ -1135,6 +1139,78 @@ impl Store {
             .collect())
     }
 
+    /// True when every spent slot in `ranges` is unspent or its spender's
+    /// height is below `edge`. A multi-spender overflow is not below: the
+    /// caller must keep scanning.
+    pub fn spent_ranges_below(&self, ranges: &[(u64, u64)], edge: i64) -> Result<bool, StoreError> {
+        let opts: Vec<Option<(u64, u64)>> = ranges.iter().copied().map(Some).collect();
+        Ok(self.spent_ranges_reach(&opts, edge)?.iter().all(|hot| !hot))
+    }
+
+    /// One flag per range. True when a slot is a multi-spender or a single
+    /// spender's height is at or above `edge`. `None` and an empty span are cold.
+    pub fn spent_ranges_reach(
+        &self,
+        ranges: &[Option<(u64, u64)>],
+        edge: i64,
+    ) -> Result<Vec<bool>, StoreError> {
+        const SLOT: u64 = 8;
+        let mut reach = vec![false; ranges.len()];
+        let mut offs = Vec::new();
+        let mut owner = Vec::new();
+        for (ri, range) in ranges.iter().enumerate() {
+            let Some((start, len)) = *range else {
+                continue;
+            };
+            if len == 0 {
+                continue;
+            }
+            if !len.is_multiple_of(SLOT) {
+                return Err(StoreError::Corrupt("invariant: spent range length"));
+            }
+            let n = len / SLOT;
+            for i in 0..n {
+                offs.push(start.saturating_add(i.saturating_mul(SLOT)));
+                owner.push(ri);
+            }
+        }
+        let mut spenders: Vec<(usize, Fk)> = Vec::new();
+        for (chunk, own) in offs.chunks(4096).zip(owner.chunks(4096)) {
+            let metas = self.get_spender_meta_at_abs_batch(chunk)?;
+            if metas.len() != chunk.len() {
+                return Err(StoreError::Corrupt("invariant: spent meta batch length"));
+            }
+            for (meta, ri) in metas.into_iter().zip(own.iter().copied()) {
+                let Some((fk, flags, _)) = meta else {
+                    continue;
+                };
+                if flags & crate::compact::output_flags::MULTI_SPENDER != 0 {
+                    reach[ri] = true;
+                    continue;
+                }
+                if !fk.is_null() {
+                    spenders.push((ri, fk));
+                }
+            }
+        }
+        if spenders.is_empty() {
+            return Ok(reach);
+        }
+        let fks: Vec<Fk> = spenders.iter().map(|(_, fk)| *fk).collect();
+        let heights = self.tx_height_get_batch(&fks)?;
+        if heights.len() != spenders.len() {
+            return Err(StoreError::Corrupt(
+                "invariant: spender height batch length",
+            ));
+        }
+        for ((ri, _), h) in spenders.iter().zip(heights) {
+            if i64::from(h.unwrap_or(0)) >= edge {
+                reach[*ri] = true;
+            }
+        }
+        Ok(reach)
+    }
+
     /// Completion-driven loc→body io_uring pipeline (confirm load / prep).
     ///
     /// Jobs with pre-known `range` skip loc fill when `n_out` is already set.
@@ -1580,8 +1656,16 @@ impl Store {
         };
         self.txs.sync_replay_bodies()?;
         self.spenders.flush()?;
-        crate::spend_durable::SpendDurable::new(tip, tip).store(self.path())?;
+        self.store_spend_marker(tip, tip)?;
         Ok(t.elapsed().as_nanos() as u64)
+    }
+
+    /// Publish the marker at `min(requested, confirmed tip)` under [`Self::spend_marker`].
+    fn store_spend_marker(&self, annotated: u32, durable: u32) -> Result<(), StoreError> {
+        let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
+        let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+        crate::spend_durable::SpendDurable::new(annotated.min(tip), durable.min(tip))
+            .store(self.path())
     }
 
     /// Record the confirmed height whose annotations have been written.
@@ -1714,7 +1798,7 @@ impl Store {
             },
             _ => height,
         };
-        crate::spend_durable::SpendDurable::new(height, height).store(self.path())
+        self.store_spend_marker(height, height)
     }
 
     /// A disconnect below the marker lowers both heights to the new tip.
@@ -1733,6 +1817,7 @@ impl Store {
                     .map_or(0, |h| cur.min(u64::from(h.0) + 1));
                 (low != cur).then_some(low)
             });
+        let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
         let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {
             return Ok(());
         };

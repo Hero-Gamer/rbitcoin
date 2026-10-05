@@ -491,6 +491,9 @@ impl Store {
         self.flush_confirmed_only()?;
         self.rebuild_height_fence()?;
         self.persist_class_c_repair()?;
+        // Disconnect clamps in `Query`. Open revalidation shrinks here and
+        // then replay treats a marker above the new tip as already annotated.
+        self.clamp_spend_durable()?;
         report.tip_shrunk = true;
         report.tip_after = self.confirmed.tip_height().map(|h| h.0);
         Ok(())
@@ -674,12 +677,24 @@ mod tests {
         // Steal tip height 2 to point at G (false conf edge).
         s.confirmed.set(Height(2), g_fk).unwrap();
         s.flush_class_c_tip().unwrap();
+        crate::spend_durable::SpendDurable::new(5, 5)
+            .store(s.path())
+            .unwrap();
 
         let r = s.revalidate_tip_window_n(6).unwrap();
         assert!(r.tip_shrunk, "must shrink: {r:?}");
         assert_eq!(r.first_bad_reason, Some("prev_fk != confirmed parent"));
         assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
         assert_eq!(r.tip_after, Some(1));
+        let m = crate::spend_durable::SpendDurable::load(s.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.annotated_through(), 1);
+        assert_eq!(
+            m.durable_through(),
+            1,
+            "a marker above the shrunk tip is clamped"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

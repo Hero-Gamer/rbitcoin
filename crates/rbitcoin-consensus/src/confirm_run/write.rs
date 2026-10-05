@@ -399,6 +399,20 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConsensusError> {
     let Some(tip) = query.tip_height().map(|h| h.0) else {
         return Ok(0);
     };
+    // A marker above the tip is not a cursor for this chain. Shrink and a
+    // crash between the tip flush and the clamp both leave that file behind.
+    // Lower it before the `a == tip` skip, or the next confirm's spends are
+    // never rewritten.
+    let annotated = query
+        .store()
+        .spend_annotated_through()
+        .map_err(ConsensusError::from)?;
+    if annotated.is_some_and(|h| h > tip) {
+        query
+            .store()
+            .clamp_spend_durable()
+            .map_err(ConsensusError::from)?;
+    }
     let annotated = query
         .store()
         .spend_annotated_through()

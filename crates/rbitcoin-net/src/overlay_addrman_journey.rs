@@ -155,6 +155,39 @@ fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [c
     only.set_only_net(vec![OnlyNet::Cjdns]);
     assert_eq!(only.take_dial_candidates(8, &HashSet::new(), &[]), vec![cjdns_sock]);
 
+    let mut mixed = crate::seeds::AddrMan::new();
+    for i in 0..8u8 {
+        mixed.add(SocketAddr::from((Ipv4Addr::new(10, 0, 0, i), 8333)));
+    }
+    mixed.add_addr(onion);
+    let got = mixed.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    assert_eq!(got.len(), 8, "{got:?}");
+    assert!(
+        got.contains(&onion),
+        "a full clearnet batch still dials one onion: {got:?}"
+    );
+    let mut failed = mixed.clone();
+    failed.note_connect_failed_addr(onion, false);
+    let fresh = crate::NetAddr::Onion {
+        pk: [0x44; 32],
+        port: 8333,
+    };
+    failed.add_addr(fresh);
+    let got = failed.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    assert!(
+        got.contains(&fresh) && !got.contains(&onion),
+        "a failed onion loses to a fresh one: {got:?}"
+    );
+    let placeholder = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 8333));
+    failed.note_connect_failed(placeholder, false);
+    assert!(
+        failed
+            .entries()
+            .iter()
+            .all(|e| e.addr != crate::NetAddr::Ip(placeholder)),
+        "a version-message placeholder is not a peer"
+    );
+
     let dir = rbitcoin_query::testutil::TempDir::labeled("overlay-peers").unwrap();
     let path = dir.join("peers");
     book.save(&path).unwrap();

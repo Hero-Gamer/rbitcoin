@@ -20,6 +20,10 @@ use crate::asmap::AsMap;
 use crate::netaddr::{addr_allowed, NetAddr, OnlyNet};
 use crate::netgroup::{netgroup, select_diverse};
 
+fn net_addr_unspecified(addr: NetAddr) -> bool {
+    matches!(addr, NetAddr::Ip(s) if s.ip().is_unspecified())
+}
+
 /// Skip a recently dialed addr while any other candidate remains.
 pub(crate) const DIAL_ATTEMPT_RECENT: Duration = Duration::from_secs(10 * 60);
 
@@ -360,29 +364,62 @@ impl AddrMan {
             .copied()
             .filter_map(NetAddr::socket_addr)
             .collect();
-        let mut out: Vec<NetAddr> = self
+        let ip: Vec<NetAddr> = self
             .take_dial_candidates(max, &ip_ex, occupied)
             .into_iter()
             .map(NetAddr::from_socket)
             .collect();
-        if out.len() >= max {
-            return out;
+        let now = Instant::now();
+        let mut overlay: Vec<(u8, NetAddr)> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|a| matches!(a, NetAddr::Onion { .. } | NetAddr::I2p { .. }))
+            .filter(|a| self.dialable(*a) && !exclude.contains(a))
+            .map(|a| (self.flags_of(&a).dial_tier(), a))
+            .collect();
+        overlay.sort_by_key(|(tier, _)| *tier);
+        let ip_has_fresh = ip.iter().any(|a| self.flags_of(a).dial_tier() < 2);
+        if ip_has_fresh {
+            overlay.retain(|(tier, a)| {
+                *tier < 2
+                    && !self.flags_of(a).is_incompatible()
+                    && !self.recently_attempted_addr(*a, now)
+            });
+        } else if overlay
+            .iter()
+            .any(|(_, a)| !self.flags_of(a).is_incompatible())
+        {
+            overlay.retain(|(_, a)| !self.flags_of(a).is_incompatible());
+            if overlay
+                .iter()
+                .any(|(_, a)| !self.recently_attempted_addr(*a, now))
+            {
+                overlay.retain(|(_, a)| !self.recently_attempted_addr(*a, now));
+            }
         }
-        for &a in &self.order {
+        let mut out = ip;
+        // A full clearnet batch used to return before any onion or I2P row.
+        // Keep one slot for the best eligible overlay when the batch has room
+        // for more than a single peer.
+        if !overlay.is_empty() && out.len() >= max && max >= 2 {
+            out.pop();
+        }
+        for (_, a) in overlay {
             if out.len() >= max {
                 break;
-            }
-            if !matches!(a, NetAddr::Onion { .. } | NetAddr::I2p { .. })
-                || !self.dialable(a)
-                || exclude.contains(&a)
-            {
-                continue;
             }
             if !out.contains(&a) {
                 out.push(a);
             }
         }
         out
+    }
+
+    fn recently_attempted_addr(&self, addr: NetAddr, now: Instant) -> bool {
+        self.last_attempt
+            .get(&addr)
+            .is_some_and(|&t| now.saturating_duration_since(t) < DIAL_ATTEMPT_RECENT)
     }
 
     pub fn add(&mut self, addr: SocketAddr) {
@@ -618,6 +655,9 @@ impl AddrMan {
     }
 
     pub fn note_connect_failed_addr(&mut self, addr: NetAddr, incompatible: bool) {
+        if net_addr_unspecified(addr) {
+            return;
+        }
         self.add_addr(addr);
         if let Some(f) = self.by_addr.get_mut(&addr) {
             if incompatible {
@@ -631,8 +671,15 @@ impl AddrMan {
 
     /// Throughput / latency sample from an active session.
     pub fn note_speed(&mut self, addr: SocketAddr, latency_ms: u64, bytes_per_sec: u64) {
-        self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&NetAddr::from_socket(addr)) {
+        self.note_speed_addr(NetAddr::from_socket(addr), latency_ms, bytes_per_sec);
+    }
+
+    pub fn note_speed_addr(&mut self, addr: NetAddr, latency_ms: u64, bytes_per_sec: u64) {
+        if net_addr_unspecified(addr) {
+            return;
+        }
+        self.add_addr(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.apply_speed_sample(latency_ms, bytes_per_sec);
         }
@@ -641,8 +688,15 @@ impl AddrMan {
     /// IBD stall / relative-slow: force `SLOW`, clear `FAST` (mid-range samples
     /// would otherwise leave a prior FAST bit and keep `dial_tier` 0).
     pub fn note_ibd_slow(&mut self, addr: SocketAddr) {
-        self.add(addr);
-        if let Some(f) = self.by_addr.get_mut(&NetAddr::from_socket(addr)) {
+        self.note_ibd_slow_addr(NetAddr::from_socket(addr));
+    }
+
+    pub fn note_ibd_slow_addr(&mut self, addr: NetAddr) {
+        if net_addr_unspecified(addr) {
+            return;
+        }
+        self.add_addr(addr);
+        if let Some(f) = self.by_addr.get_mut(&addr) {
             f.insert(PeerFlags::HAS_CONNECTED);
             f.insert(PeerFlags::SLOW);
             f.remove(PeerFlags::FAST);
@@ -657,11 +711,24 @@ impl AddrMan {
         bps: Option<u64>,
         ibd_outlier: bool,
     ) {
+        self.apply_ibd_dead_speed_addr(NetAddr::from_socket(addr), latency_ms, bps, ibd_outlier);
+    }
+
+    pub fn apply_ibd_dead_speed_addr(
+        &mut self,
+        addr: NetAddr,
+        latency_ms: u64,
+        bps: Option<u64>,
+        ibd_outlier: bool,
+    ) {
+        if net_addr_unspecified(addr) {
+            return;
+        }
         if let Some(bps) = bps {
-            self.note_speed(addr, latency_ms, bps);
+            self.note_speed_addr(addr, latency_ms, bps);
         }
         if ibd_outlier {
-            self.note_ibd_slow(addr);
+            self.note_ibd_slow_addr(addr);
         }
     }
 

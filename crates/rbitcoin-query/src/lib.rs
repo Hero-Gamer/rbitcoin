@@ -178,8 +178,8 @@ pub use connect::{spawn_sh_writebehind, ConfirmPrepared};
 pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher, TxidMap, TxidSet};
 pub use in_flight::InFlight;
 pub use scripthash::{
-    BlockTouch, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance, ScriptHashChainStats,
-    ScriptHashHistoryItem, ScriptHashTxSummary, ScriptHashUtxo, ShJoinSlot,
+    BlockTouch, FilteredHistory, HistoryFilter, HistoryOrder, ScanUtxo, ScriptHashBalance,
+    ScriptHashChainStats, ScriptHashHistoryItem, ScriptHashTxSummary, ScriptHashUtxo, ShJoinSlot,
 };
 pub use spend_sync::SpendSync;
 pub use stamp::{

@@ -1067,18 +1067,21 @@ fn summary_page_sh(
         }
     }
     let filter = HistoryFilter::esplora_chain_page(after);
-    let (items, view) = match sh_at_view(
+    let (page, view) = match sh_at_view(
         st,
         sh,
         asof,
         |q, view| q.scripthash_history_summary_filtered_in(sh, &filter, view),
         |q, slot, view| q.scripthash_history_summary_filtered_slot_in(sh, &filter, slot, view),
-        Vec::new(),
+        cursor_page(after),
         client,
         None,
     ) {
         Ok(x) => x,
         Err(r) => return r,
+    };
+    let Some(items) = rows_or_cursor_missing(page) else {
+        return after_txid_not_found();
     };
     maybe_attach_view(
         match summaries_json(&st.query, &items) {
@@ -1137,18 +1140,21 @@ fn chain_page_sh(
     client: Option<&str>,
 ) -> Response {
     let filter = HistoryFilter::esplora_chain_page(after);
-    let (items, view) = match sh_at_view(
+    let (page, view) = match sh_at_view(
         st,
         sh,
         asof,
         |q, view| q.scripthash_history_filtered_in(sh, &filter, view),
         |q, slot, view| q.scripthash_history_filtered_slot_in(sh, &filter, slot, view),
-        Vec::new(),
+        cursor_page(after),
         client,
         None,
     ) {
         Ok(x) => x,
         Err(r) => return r,
+    };
+    let Some(items) = rows_or_cursor_missing(page) else {
+        return after_txid_not_found();
     };
     maybe_attach_view(
         match history_items_to_tx_json(&st.query, &items, st.network) {
@@ -1171,32 +1177,41 @@ fn combined_txs(
             return after_txid_not_found();
         }
     }
+    // Membership is this script's mempool rows. A tx sitting in the pool for
+    // some other script must not restart this script's first page.
+    let mempool_rows = if asof.is_none() {
+        mempool_txs_json(st, sh)
+    } else {
+        Vec::new()
+    };
     let after_in_mempool = after.is_some_and(|id| {
-        let tid = Txid::from_byte_array(id);
-        st.mempool.as_ref().is_some_and(|m| m.contains(&tid))
+        let hex = block_hash_hex(&id);
+        mempool_rows.iter().any(|v| v["txid"] == hex)
     });
     let mut out = Vec::new();
     if asof.is_none() && (after.is_none() || after_in_mempool) {
-        let rows = mempool_txs_json(st, sh);
         out.extend(match after {
-            Some(id) if after_in_mempool => skip_mempool_after(rows, &id),
-            _ => rows,
+            Some(id) if after_in_mempool => skip_mempool_after(mempool_rows, &id),
+            _ => mempool_rows,
         });
     }
     let chain_after = if after_in_mempool { None } else { after };
     let filter = HistoryFilter::esplora_chain_page(chain_after);
-    let (items, view) = match sh_at_view(
+    let (page, view) = match sh_at_view(
         st,
         sh,
         asof,
         |q, view| q.scripthash_history_filtered_in(sh, &filter, view),
         |q, slot, view| q.scripthash_history_filtered_slot_in(sh, &filter, slot, view),
-        Vec::new(),
+        cursor_page(chain_after),
         client,
         None,
     ) {
         Ok(x) => x,
         Err(r) => return r,
+    };
+    let Some(items) = rows_or_cursor_missing(page) else {
+        return after_txid_not_found();
     };
     maybe_attach_view(
         match history_items_to_tx_json(&st.query, &items, st.network) {
@@ -1274,14 +1289,29 @@ fn sort_txs_newest_first(rows: &mut [Value]) {
     });
 }
 
-fn skip_rows_after(rows: Vec<Value>, after: Option<[u8; 32]>) -> Vec<Value> {
+/// `None`: `after` was set and is not in `rows`. The first page is not a
+/// stand-in for a cursor this response does not contain.
+fn skip_rows_after(rows: Vec<Value>, after: Option<[u8; 32]>) -> Option<Vec<Value>> {
     let Some(id) = after else {
-        return rows;
+        return Some(rows);
     };
     let hex = block_hash_hex(&id);
-    match rows.iter().position(|v| v["txid"] == hex) {
-        Some(i) => rows[i.saturating_add(1)..].to_vec(),
-        None => rows,
+    let i = rows.iter().position(|v| v["txid"] == hex)?;
+    Some(rows[i.saturating_add(1)..].to_vec())
+}
+
+fn cursor_page<T>(after: Option<[u8; 32]>) -> rbitcoin_query::FilteredHistory<T> {
+    rbitcoin_query::FilteredHistory {
+        rows: Vec::new(),
+        cursor_missing: after.is_some(),
+    }
+}
+
+fn rows_or_cursor_missing<T>(page: rbitcoin_query::FilteredHistory<T>) -> Option<Vec<T>> {
+    if page.cursor_missing {
+        None
+    } else {
+        Some(page.rows)
     }
 }
 
@@ -1311,16 +1341,17 @@ fn combined_tx_vec(
         out.extend(mempool_txs_json(st, sh));
     }
     let filter = HistoryFilter::esplora_chain_page(None);
-    let (items, _) = sh_at_view(
+    let (page, _) = sh_at_view(
         st,
         sh,
         asof,
         |q, view| q.scripthash_history_filtered_in(sh, &filter, view),
         |q, slot, view| q.scripthash_history_filtered_slot_in(sh, &filter, slot, view),
-        Vec::new(),
+        cursor_page(None),
         None,
         bag,
     )?;
+    let items = page.rows;
     let chain = history_items_to_tx_json(&st.query, &items, st.network).map_err(store_err)?;
     out.extend(chain);
     Ok(out)
@@ -1334,16 +1365,17 @@ fn summary_vec(
     bag: Option<&mut JoinBag>,
 ) -> Result<Vec<Value>, Response> {
     let filter = HistoryFilter::esplora_chain_page(None);
-    let (items, _) = sh_at_view(
+    let (page, _) = sh_at_view(
         st,
         sh,
         asof,
         |q, view| q.scripthash_history_summary_filtered_in(sh, &filter, view),
         |q, slot, view| q.scripthash_history_summary_filtered_slot_in(sh, &filter, slot, view),
-        Vec::new(),
+        cursor_page(None),
         None,
         bag,
     )?;
+    let items = page.rows;
     match summaries_json(&st.query, &items) {
         Ok(Value::Array(v)) => Ok(v),
         Ok(_) => Ok(Vec::new()),
@@ -1375,7 +1407,9 @@ fn multi_txs(
     st.promote_bulk(client, bag);
     let mut rows = dedup_txid(rows);
     sort_txs_newest_first(&mut rows);
-    let rows = skip_rows_after(rows, after);
+    let Some(rows) = skip_rows_after(rows, after) else {
+        return after_txid_not_found();
+    };
     Json(rows).into_response()
 }
 
@@ -1412,7 +1446,9 @@ fn multi_summary(
                 .cmp(a["txid"].as_str().unwrap_or(""))
         })
     });
-    let rows = skip_rows_after(rows, after);
+    let Some(rows) = skip_rows_after(rows, after) else {
+        return after_txid_not_found();
+    };
     Json(rows).into_response()
 }
 

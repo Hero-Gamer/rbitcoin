@@ -2078,12 +2078,14 @@ fn pin_scripthash_views_on_pad(
     );
     assert_eq!(
         q.scripthash_history_filtered(&sh, &HistoryFilter::open())
-            .unwrap(),
+            .unwrap()
+            .rows,
         full
     );
     let heights = |f: &HistoryFilter| -> Vec<i64> {
         q.scripthash_history_filtered(&sh, f)
             .unwrap()
+            .rows
             .iter()
             .map(|i| i.height)
             .collect()
@@ -2110,7 +2112,8 @@ fn pin_scripthash_views_on_pad(
             &HistoryFilter::esplora_chain_page(None),
             &view,
         )
-        .unwrap();
+        .unwrap()
+        .rows;
     assert_eq!(rows.len(), 25);
     let value_of = |txid: [u8; 32]| rows.iter().find(|r| r.txid == txid).unwrap().value;
     assert_eq!(value_of(tip_cb), 50_0000_0000);

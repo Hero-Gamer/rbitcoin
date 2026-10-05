@@ -1785,14 +1785,17 @@ fn dispatch_pinned(
                 sh_join,
                 |q, view| {
                     q.scripthash_history_filtered_in(&sh, &filter, view)
+                        .map(|page| page.rows)
                         .map_err(|e| e.to_string())
                 },
                 |q, slot, view| {
                     q.scripthash_history_filtered_slot_in(&sh, &filter, slot, view)
+                        .map(|page| page.rows)
                         .map_err(|e| e.to_string())
                 },
                 |q, slot| {
                     q.scripthash_history_filtered_slot(&sh, &filter, slot)
+                        .map(|page| page.rows)
                         .map_err(|e| e.to_string())
                 },
             )?;
