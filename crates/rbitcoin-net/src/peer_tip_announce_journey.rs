@@ -13,6 +13,78 @@ fn op_true() -> ScriptBuf {
     ScriptBuf::from_bytes(vec![0x51])
 }
 
+struct TipAnnouncePad {
+    store: rbitcoin_query::testutil::TempDir,
+    // Confirmed-set seed still reads the builder store after that hub drops.
+    _built: rbitcoin_query::testutil::TempDir,
+}
+
+/// Height-102 regtest, built once. Each announce case opens a private copy.
+fn tip_announce_pad() -> &'static TipAnnouncePad {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<TipAnnouncePad> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let (built, hub) = crate::chain::tiny_regtest_hub_labeled("tip-announce-build");
+        hub.ensure_genesis().unwrap();
+        hub.generate_to_script(102, op_true(), vec![]).unwrap();
+        hub.query.flush().expect("flush tip-announce pad");
+        let store = rbitcoin_query::testutil::TempDir::labeled("tip-announce-pad")
+            .expect("tip pad");
+        copy_store_tree(built.path(), store.path());
+        TipAnnouncePad {
+            store,
+            _built: built,
+        }
+    })
+}
+
+fn copy_store_tree(src: &std::path::Path, dst: &std::path::Path) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
+}
+
+fn open_tip_announce_hub(
+    label: &str,
+) -> (rbitcoin_query::testutil::TempDir, crate::chain::ChainHub) {
+    let src = tip_announce_pad();
+    let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect("tip copy");
+    copy_store_tree(src.store.path(), dir.path());
+    let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).expect("open tip copy");
+    let hub = crate::chain::ChainHub::new(
+        q,
+        rbitcoin_consensus::ChainParams::regtest(),
+        rbitcoin_consensus::Milestone::NONE,
+    );
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+        .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    (dir, hub)
+}
+
+fn open_genesis_announce(
+    label: &str,
+    relay: bool,
+) -> (rbitcoin_query::testutil::TempDir, crate::chain::ChainHub) {
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled(label);
+    hub.ensure_genesis().unwrap();
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+        .unwrap();
+    mp.set_relay_enabled(relay);
+    assert!(hub.attach_mempool(mp).is_ok());
+    (dir, hub)
+}
+
+
 fn live_peer(
     peers: &std::sync::Arc<crate::peers::PeerHub>,
     port: u16,
@@ -147,7 +219,10 @@ fn cmpct_of(msgs: &[NetworkMessage]) -> Vec<BlockHash> {
 
 /// Genesis is still IBD and relay is off. Fee filter is the IBD amount, and
 /// `getblocks` of the tip itself must not invent an empty inv.
-fn tip_announce_ibd_feefilter_and_empty_inv(hub: &crate::chain::ChainHub) {
+#[test]
+fn tip_announce_ibd_feefilter_and_empty_inv() {
+    let (_dir, hub) = open_genesis_announce("tip-ibd", false);
+    let hub = &hub;
     assert!(hub.in_ibd(), "genesis tip is older than 24h");
     assert_eq!(
         outbound_feefilter_sats(hub, None),
@@ -169,7 +244,10 @@ fn tip_announce_ibd_feefilter_and_empty_inv(hub: &crate::chain::ChainHub) {
 }
 
 /// Headers peer gets one header. Inv peer gets `MSG_BLOCK`, not a witness inv.
-fn tip_announce_headers_versus_inv(hub: &crate::chain::ChainHub) {
+#[test]
+fn tip_announce_headers_versus_inv() {
+    let (_dir, hub) = open_genesis_announce("tip-hdr-inv", true);
+    let hub = &hub;
     use bitcoin::block::{Header, Version};
     use bitcoin::{CompactTarget, TxMerkleNode};
     let header = Header {
@@ -204,7 +282,10 @@ fn tip_announce_headers_versus_inv(hub: &crate::chain::ChainHub) {
 
 /// `Lagged` and a queued tip whose hash is no longer the hub tip both
 /// announce the current tip.
-fn tip_announce_recv_coalesces_to_tip(hub: &crate::chain::ChainHub) {
+#[test]
+fn tip_announce_recv_coalesces_to_tip() {
+    let (_dir, hub) = open_tip_announce_hub("tip-recv-coalesces-to-tip");
+    let hub = &hub;
     use rbitcoin_primitives::Height;
     let want = hub.tip_hash().unwrap();
     let height = hub.tip_height().unwrap();
@@ -233,7 +314,10 @@ fn tip_announce_recv_coalesces_to_tip(hub: &crate::chain::ChainHub) {
 }
 
 /// A stale `TipEvent` compact-announces the current tip, not the lagged hash.
-async fn tip_announce_compact_is_current_tip_only(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_compact_is_current_tip_only() {
+    let (_dir, hub) = open_tip_announce_hub("tip-compact-is-current-tip-only");
+    let hub = &hub;
     use rbitcoin_primitives::Height;
     let mid = hub.query.wire_header_at_height(Height(5)).unwrap();
     let tip_hash = hub.tip_hash().unwrap();
@@ -275,7 +359,10 @@ async fn tip_announce_compact_is_current_tip_only(hub: &crate::chain::ChainHub) 
 }
 
 /// Compact is one-block tip relay: the peer must already have `pprev`.
-async fn tip_announce_compact_requires_parent(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_compact_requires_parent() {
+    let (_dir, hub) = open_tip_announce_hub("tip-compact-requires-parent");
+    let hub = &hub;
     use rbitcoin_primitives::Height;
     let behind = hub
         .query
@@ -312,7 +399,10 @@ async fn tip_announce_compact_requires_parent(hub: &crate::chain::ChainHub) {
 
 /// A peer within eight headers gets headers. The same hash is not sent twice.
 /// A peer who only has the parent gets one header.
-fn tip_announce_near_marks_are_headers(hub: &crate::chain::ChainHub) {
+#[test]
+fn tip_announce_near_marks_are_headers() {
+    let (_dir, hub) = open_tip_announce_hub("tip-near-marks-are-headers");
+    let hub = &hub;
     let parent = hub.tip_header().unwrap().prev_blockhash;
     let ev = tip_event(hub, 0);
     assert_ann(
@@ -347,7 +437,10 @@ fn tip_announce_near_marks_are_headers(hub: &crate::chain::ChainHub) {
 
 /// Depth 5 is still compact. One deeper is a full block. A full block then
 /// releases the pending compact-fill slot.
-async fn tip_announce_depth_and_fill_slot(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_depth_and_fill_slot() {
+    let (_dir, hub) = open_tip_announce_hub("tip-depth-and-fill-slot");
+    let hub = &hub;
     use rbitcoin_primitives::Height;
     let tip_h = hub.tip_height().unwrap();
     let near = hub
@@ -412,7 +505,10 @@ async fn tip_announce_depth_and_fill_slot(hub: &crate::chain::ChainHub) {
 /// Tip announces do not `fetch_add` or `fetch_sub` `serve_inflight`. The
 /// writer still saturating-subs every `cmpctblock`, so an unpaired decrement
 /// must stay at zero and a burst must not fill the reconstruct cap.
-async fn tip_announce_serve_inflight_untouched(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_serve_inflight_untouched() {
+    let (_dir, hub) = open_tip_announce_hub("tip-serve-inflight-untouched");
+    let hub = &hub;
     use std::sync::atomic::Ordering;
     let hash = hub.tip_hash().unwrap();
     let peers = crate::peers::PeerHub::new();
@@ -485,7 +581,10 @@ fn hb_follow() -> PeerFollowState {
 
 /// `-prefillcompact` packs the remembered indexes on announce and on getdata.
 /// A bad index falls back to the coinbase. The send is logged.
-async fn tip_announce_prefill_knob(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_prefill_knob() {
+    let (_dir, hub) = open_tip_announce_hub("tip-prefill-knob");
+    let hub = &hub;
     use bitcoin::absolute::LockTime;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_primitives::Height;
@@ -569,7 +668,10 @@ async fn tip_announce_prefill_knob(hub: &crate::chain::ChainHub) {
 
 /// PoW-valid compact is relayed to other HB peers before connect. An invalid
 /// body does not become tip, and the sender is not announced back to.
-async fn tip_announce_hb_relays_before_connect(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_hb_relays_before_connect() {
+    let (_dir, hub) = open_tip_announce_hub("tip-hb-relays-before-connect");
+    let hub = &hub;
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -633,7 +735,10 @@ async fn tip_announce_hb_relays_before_connect(hub: &crate::chain::ChainHub) {
 }
 
 /// Compact prefills must not feed `extra_compact`. `blocktxn` bodies do.
-async fn tip_announce_blocktxn_feeds_extra(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_blocktxn_feeds_extra() {
+    let (_dir, hub) = open_tip_announce_hub("tip-blocktxn-feeds-extra");
+    let hub = &hub;
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
     use bitcoin::block::{Header, Version};
@@ -752,7 +857,10 @@ async fn tip_announce_blocktxn_feeds_extra(hub: &crate::chain::ChainHub) {
 
 /// After `sendcmpct` version 2, a header whose parent is the tip is
 /// `MSG_CMPCT_BLOCK` getdata.
-async fn tip_announce_header_getdata_is_compact(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_header_getdata_is_compact() {
+    let (_dir, hub) = open_tip_announce_hub("tip-header-getdata-is-compact");
+    let hub = &hub;
     let block = mine_child(hub, 50, vec![]);
     let hash = block.block_hash();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
@@ -779,7 +887,10 @@ async fn tip_announce_header_getdata_is_compact(hub: &crate::chain::ChainHub) {
 
 /// A headers-only parent is already known. The peer's child header is
 /// getdata, not another getheaders.
-async fn tip_announce_submitheader_child_getdata(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_submitheader_child_getdata() {
+    let (_dir, hub) = open_tip_announce_hub("tip-submitheader-child-getdata");
+    let hub = &hub;
     let parent = mine_child(hub, 70, vec![]);
     hub.process_submitted_header(&parent.header).unwrap();
     assert!(hub.knows_header(&parent.block_hash()));
@@ -824,7 +935,10 @@ async fn tip_announce_submitheader_child_getdata(hub: &crate::chain::ChainHub) {
 
 /// Unsolicited compact more than two above the validated tip is a header
 /// announcement: no reconstruct, no `getblocktxn`.
-async fn tip_announce_far_compact_is_header_only(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_far_compact_is_header_only() {
+    let (_dir, hub) = open_tip_announce_hub("tip-far-compact-is-header-only");
+    let hub = &hub;
     use bitcoin::bip152::HeaderAndShortIds;
     let tip_h = hub.tip_height().unwrap();
     let mut prev = hub.tip_hash().unwrap();
@@ -873,7 +987,10 @@ async fn tip_announce_far_compact_is_header_only(hub: &crate::chain::ChainHub) {
 
 /// Same-hash cached invalid stays connected. A child of a cached-invalid
 /// parent disconnects. An out-of-range prefilled index disconnects.
-async fn tip_announce_invalid_compact_disconnects(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_invalid_compact_disconnects() {
+    let (_dir, hub) = open_tip_announce_hub("tip-invalid-compact-disconnects");
+    let hub = &hub;
     use bitcoin::bip152::{HeaderAndShortIds, PrefilledTransaction};
     use rbitcoin_primitives::Height;
     let tip = hub.tip_hash().unwrap();
@@ -948,7 +1065,10 @@ async fn tip_announce_invalid_compact_disconnects(hub: &crate::chain::ChainHub) 
 
 /// First merkle-mutated unique fill asks for the block and does not
 /// `BLOCK_FAILED` the header. The second disconnects.
-async fn tip_announce_merkle_second_cmpct_disconnects(hub: &crate::chain::ChainHub) {
+#[tokio::test]
+async fn tip_announce_merkle_second_cmpct_disconnects() {
+    let (_dir, hub) = open_tip_announce_hub("tip-merkle-second-cmpct-disconnects");
+    let hub = &hub;
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
@@ -1004,7 +1124,10 @@ async fn tip_announce_merkle_second_cmpct_disconnects(hub: &crate::chain::ChainH
 
 /// After a reorg longer than eight blocks, announce inv until the peer's
 /// best header is on the new chain.
-fn tip_announce_reorg_inv_until_caught_up(hub: &crate::chain::ChainHub) {
+#[test]
+fn tip_announce_reorg_inv_until_caught_up() {
+    let (_dir, hub) = open_tip_announce_hub("tip-reorg-inv-until-caught-up");
+    let hub = &hub;
     use rbitcoin_primitives::Height;
     let sent_tip = hub.tip_hash().unwrap();
     let fork_h = hub.tip_height().unwrap() - 4;
@@ -1053,37 +1176,3 @@ fn tip_announce_reorg_inv_until_caught_up(hub: &crate::chain::ChainHub) {
     );
 }
 
-/// One peer at the tip. Header/inv announce, compact relay, and HB compact
-/// before connect share this hub so a catch-up reorg pad is not paid again.
-#[tokio::test]
-async fn peer_tip_announce() {
-    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("tip-announce");
-    hub.ensure_genesis().unwrap();
-    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
-        .unwrap();
-    mp.set_relay_enabled(false);
-    assert!(hub.attach_mempool(mp).is_ok());
-
-    tip_announce_ibd_feefilter_and_empty_inv(&hub);
-    hub.mempool().unwrap().set_relay_enabled(true);
-    tip_announce_headers_versus_inv(&hub);
-
-    hub.generate_to_script(102, op_true(), vec![]).unwrap();
-    tip_announce_recv_coalesces_to_tip(&hub);
-    tip_announce_compact_is_current_tip_only(&hub).await;
-    tip_announce_compact_requires_parent(&hub).await;
-    tip_announce_near_marks_are_headers(&hub);
-    tip_announce_depth_and_fill_slot(&hub).await;
-    tip_announce_serve_inflight_untouched(&hub).await;
-    tip_announce_prefill_knob(&hub).await;
-    tip_announce_hb_relays_before_connect(&hub).await;
-    tip_announce_blocktxn_feeds_extra(&hub).await;
-    tip_announce_header_getdata_is_compact(&hub).await;
-    tip_announce_submitheader_child_getdata(&hub).await;
-    tip_announce_far_compact_is_header_only(&hub).await;
-    tip_announce_invalid_compact_disconnects(&hub).await;
-    tip_announce_merkle_second_cmpct_disconnects(&hub).await;
-    tip_announce_reorg_inv_until_caught_up(&hub);
-
-    let _ = std::fs::remove_dir_all(dir);
-}
