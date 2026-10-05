@@ -1,32 +1,51 @@
 # Nightly workspace mutants. Not a required check.
-# New lines since the cursor run first, then a rotating backlog.
-# 5 hour budget, one workspace suite at a time. MISSED is an artifact,
-# not a failure. Owner: TESTING.md (Mutation testing).
+# Two jobs share an 8 hour mutant budget. Each job runs new mutants until
+# half of its own budget has elapsed, then the backlog. The second job
+# resumes the cursor and does not open another new window. The cursor and
+# MISSED lines live on the mutants-state branch, which outlives the
+# 14-day artifact. MISSED is not a failure. A failed push of that branch
+# fails the run. Owner: TESTING.md (Mutation testing).
 #
-# 03:47 UTC is 20:47 Pacific during PDT and 19:47 during PST. Minute 47
-# avoids the top-of-hour schedule queue. The 07:47 UTC cron on 2026-09-26
-# did not start until 12:29 UTC, so this is four hours earlier.
+# 00:47 UTC is 17:47 Pacific during PDT and 16:47 during PST. Minute 47
+# avoids the top-of-hour schedule queue. Three hours earlier than the
+# previous 03:47 UTC cron so the 8 hour budget finishes earlier in the
+# UTC day. A hosted job dies at 6 hours, so the budget is two jobs.
 
 name: mutants
 on:
   schedule:
-    - cron: "47 3 * * *"
+    - cron: "47 0 * * *"
   workflow_dispatch:
+
+# One writer for the state branch. A queued night waits; it does not
+# cancel the run that is publishing the cursor.
+concurrency:
+  group: mutants-nightly
+  cancel-in-progress: false
 
 permissions:
   contents: read
   actions: read
 
+env:
+  MUTANTS_STATE_BRANCH: mutants-state
+
 jobs:
-  mutants-nightly:
+  mutants-a:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 270
+    permissions:
+      contents: write
+      actions: read
     env:
       CARGO_INCREMENTAL: "1"
       CARGO_TERM_COLOR: never
       RUSTFLAGS: ""
       # Only test binaries go to /dev/shm; the mutants copy and target/ stay on disk.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/tmpfs-test-runner.sh
+      MUTANTS_BUDGET_SEC: "14400"
+      MUTANTS_RUN_ID: ${{ github.run_id }}
+      MUTANTS_PHASE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -36,27 +55,47 @@ jobs:
       - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-mutants@27.1.0
-      - name: previous cursor
+      - name: previous artifact cursor
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p mutants-nightly
+          mkdir -p mutants-artifact
           run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutants.yml --limit 20 \
             --json databaseId,status,conclusion \
             --jq '[.[] | select(.status=="completed")][0].databaseId')"
           if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
-            gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
-              --name mutants-cursor --dir mutants-nightly || true
+            for name in mutants-cursor-2 mutants-cursor-1 mutants-cursor; do
+              if gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                --name "$name" --dir mutants-artifact; then
+                break
+              fi
+            done
           fi
+      - name: restore state branch
+        run: |
+          set -euo pipefail
+          art=""
+          if [[ -f mutants-artifact/cursor.json ]]; then
+            art=mutants-artifact/cursor.json
+          elif [[ -f mutants-artifact/mutants-nightly/cursor.json ]]; then
+            art=mutants-artifact/mutants-nightly/cursor.json
+          fi
+          MUTANTS_ARTIFACT_CURSOR="$art" ./scripts/restore-mutants-state.sh mutants-nightly/cursor.json
       - name: nightly queue
         run: ./scripts/mutants-nightly.sh
+      - name: publish state branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MUTANTS_STATE_PUBLISH: "1"
+        run: ./scripts/publish-mutants-state.sh mutants-nightly/cursor.json mutants-nightly/missed.txt
       - name: summary
         if: always()
         run: |
           {
-            echo "### mutants nightly"
-            echo "Not required. Workspace tests. New code first, then the backlog."
+            echo "### mutants nightly (1/2)"
+            echo "Not required. Workspace tests. New code until half this job's budget, then the backlog."
             if [[ -f mutants-nightly/missed.txt ]]; then
               echo
               echo '```'
@@ -67,14 +106,101 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutants-cursor
+          name: mutants-cursor-1
           path: mutants-nightly/cursor.json
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: mutants-nightly
+          name: mutants-nightly-1
+          path: mutants-nightly/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  mutants-b:
+    needs: mutants-a
+    runs-on: ubuntu-latest
+    timeout-minutes: 270
+    permissions:
+      contents: write
+      actions: read
+    env:
+      CARGO_INCREMENTAL: "1"
+      CARGO_TERM_COLOR: never
+      RUSTFLAGS: ""
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/tmpfs-test-runner.sh
+      MUTANTS_BUDGET_SEC: "14400"
+      MUTANTS_RUN_ID: ${{ github.run_id }}
+      MUTANTS_PHASE: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@a5f673d0ba8626c3977bb416a1612774bc82181b # rustc 1.95.0
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: previous artifact cursor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p mutants-artifact
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow mutants.yml --limit 20 \
+            --json databaseId,status,conclusion \
+            --jq '[.[] | select(.status=="completed")][0].databaseId')"
+          if [[ -n "${run_id}" && "${run_id}" != "null" ]]; then
+            for name in mutants-cursor-2 mutants-cursor-1 mutants-cursor; do
+              if gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+                --name "$name" --dir mutants-artifact; then
+                break
+              fi
+            done
+          fi
+      - name: restore state branch
+        run: |
+          set -euo pipefail
+          art=""
+          if [[ -f mutants-artifact/cursor.json ]]; then
+            art=mutants-artifact/cursor.json
+          elif [[ -f mutants-artifact/mutants-nightly/cursor.json ]]; then
+            art=mutants-artifact/mutants-nightly/cursor.json
+          fi
+          MUTANTS_ARTIFACT_CURSOR="$art" ./scripts/restore-mutants-state.sh mutants-nightly/cursor.json
+      - name: nightly queue
+        run: ./scripts/mutants-nightly.sh
+      - name: publish state branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MUTANTS_STATE_PUBLISH: "1"
+        run: ./scripts/publish-mutants-state.sh mutants-nightly/cursor.json mutants-nightly/missed.txt
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### mutants nightly (2/2)"
+            echo "Not required. Resumes the state branch. No second new-mutant window after the first job used its half."
+            if [[ -f mutants-nightly/missed.txt ]]; then
+              echo
+              echo '```'
+              cat mutants-nightly/missed.txt
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutants-cursor-2
+          path: mutants-nightly/cursor.json
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutants-nightly-2
           path: mutants-nightly/
           if-no-files-found: ignore
           retention-days: 14
