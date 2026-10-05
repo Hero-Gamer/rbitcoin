@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # Time-boxed workspace mutants. New lines since the cursor first, then a
-# rotating backlog. MISSED is written for humans; it does not fail the run.
+# rotating backlog. One job spends the first half of its budget on new
+# mutants when both queues still have work, then the backlog. A later job
+# in the same night does not open another new window. MISSED is written
+# for humans; it does not fail the run.
 # Owner: TESTING.md (Mutation testing).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# 5 hours. One workspace suite is the unit of work, and two of them in
+# 4 hours for this job. The nightly workflow runs two of these, 8 hours
+# total. One workspace suite is the unit of work, and two of them in
 # parallel do not fit a hosted runner, so this is -j 1. The job timeout
-# is 30 minutes longer so the script can stop itself and upload artifacts.
-# GitHub-hosted jobs cannot run longer than 6 hours.
-BUDGET_SEC="${MUTANTS_BUDGET_SEC:-18000}"
+# is 30 minutes longer so the script can stop itself and the workflow can
+# publish the state branch. GitHub-hosted jobs cannot run longer than 6 hours.
+BUDGET_SEC="${MUTANTS_BUDGET_SEC:-14400}"
 # One cargo-mutants process per source file. 27.1.0 emits `..` struct
 # field deletes without applying --re, so a workspace-wide --re batch
 # retests every such delete. --file keeps that repeat inside this file.
@@ -24,8 +28,9 @@ OUT="${MUTANTS_OUT:-mutants-nightly}"
 
 mkdir -p "$OUT"
 if [[ ! -f "$CURSOR" ]]; then
-  printf '%s\n' '{"new_base":"","new_skip":0,"old_index":0}' >"$CURSOR"
+  printf '%s\n' '{"new_base":"","new_skip":0,"old_index":0,"old_name":"","new_cap_used":false,"run_id":""}' >"$CURSOR"
 fi
+python3 "$ROOT/scripts/mutants_queue.py" night --cursor "$CURSOR" --run-id "${MUTANTS_RUN_ID:-}"
 
 new_base="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("new_base",""))' "$CURSOR")"
 new_skip="$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("new_skip",0)))' "$CURSOR")"
@@ -56,38 +61,55 @@ echo "mutants-nightly: listing workspace mutants"
 # CLI --exclude replaces exclude_globs in .cargo/mutants.toml (same glob).
 cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' --list >"$OUT/all.txt"
 
-python3 "$ROOT/scripts/mutants_queue.py" order \
+read -r n_new n_old < <(python3 "$ROOT/scripts/mutants_queue.py" split \
   --list "$OUT/all.txt" --diff "$OUT/new.diff" \
-  --old-index "$old_index" --new-skip "$new_skip" >"$OUT/queue.txt"
+  --cursor "$CURSOR" --head "$head_sha" \
+  --out-new "$OUT/new.txt" --out-old "$OUT/old.txt")
+new_skip="$(python3 "$ROOT/scripts/mutants_queue.py" show --cursor "$CURSOR" --key new_skip)"
+old_index="$(python3 "$ROOT/scripts/mutants_queue.py" show --cursor "$CURSOR" --key old_index)"
+new_cap="$(python3 "$ROOT/scripts/mutants_queue.py" show --cursor "$CURSOR" --key new_cap_used)"
 
-read -r n_new n_old < <(python3 - "$OUT/all.txt" "$OUT/new.diff" <<'PY'
-import sys
-sys.path.insert(0, "scripts")
-from mutants_queue import changed_lines, load_mutants, parse_mutant
-mutants = load_mutants(open(sys.argv[1]).read())
-changed = changed_lines(open(sys.argv[2]).read())
-n_new = sum(1 for line in mutants if (p := parse_mutant(line)) and (p[0], p[1]) in changed)
-print(n_new, len(mutants) - n_new)
-PY
-)
+echo "mutants-nightly: new=$n_new skip=$new_skip old=$n_old index=$old_index budget=${BUDGET_SEC}s new_cap=$new_cap"
 
-echo "mutants-nightly: new=$n_new skip=$new_skip old=$n_old index=$old_index budget=${BUDGET_SEC}s"
-
-deadline=$((SECONDS + BUDGET_SEC))
 : >"$OUT/missed.txt"
 : >"$OUT/ran.txt"
 completed_total=0
 
-queue_len="$(grep -c . "$OUT/queue.txt" || true)"
-offset=0
-while ((offset < queue_len && SECONDS < deadline)); do
+new_len="$(grep -c . "$OUT/new.txt" || true)"
+old_len="$(grep -c . "$OUT/old.txt" || true)"
+new_off=0
+old_off=0
+start=$SECONDS
+deadline=$((start + BUDGET_SEC))
+while ((SECONDS < deadline)); do
   remain=$((deadline - SECONDS))
   if ((remain < 60)); then
     break
   fi
-  slice="$OUT/batch-$offset.names"
+  elapsed=$((SECONDS - start))
+  new_left=$((new_len - new_off))
+  old_left=$((old_len - old_off))
+  python3 "$ROOT/scripts/mutants_queue.py" mark-cap \
+    --cursor "$CURSOR" --elapsed "$elapsed" --budget "$BUDGET_SEC" \
+    --new-left "$new_left" --old-left "$old_left"
+  new_cap="$(python3 "$ROOT/scripts/mutants_queue.py" show --cursor "$CURSOR" --key new_cap_used)"
+  side="$(python3 "$ROOT/scripts/mutants_queue.py" next-side \
+    --elapsed "$elapsed" --budget "$BUDGET_SEC" \
+    --new-left "$new_left" --old-left "$old_left" \
+    --new-cap-used "$new_cap")"
+  if [[ -z "$side" ]]; then
+    break
+  fi
+  if [[ "$side" == "new" ]]; then
+    queue="$OUT/new.txt"
+    offset=$new_off
+  else
+    queue="$OUT/old.txt"
+    offset=$old_off
+  fi
+  slice="$OUT/batch-$side-$offset.names"
   python3 "$ROOT/scripts/mutants_queue.py" file-batch \
-    --queue "$OUT/queue.txt" --offset "$offset" --cap "$BATCH" >"$slice"
+    --queue "$queue" --offset "$offset" --cap "$BATCH" >"$slice"
   requested="$(grep -c . "$slice" || true)"
   if ((requested == 0)); then
     break
@@ -99,24 +121,24 @@ while ((offset < queue_len && SECONDS < deadline)); do
     escaped="$(python3 "$ROOT/scripts/mutants_queue.py" re "$line")"
     RE_ARGS+=(--re "$escaped")
   done <"$slice"
-  echo "mutants-nightly: batch at $offset ($requested mutants in $file, ${remain}s left)"
+  echo "mutants-nightly: batch side=$side at $offset ($requested mutants in $file, ${remain}s left)"
   set +e
   timeout --signal=TERM --kill-after=60s "$remain" \
     cargo mutants --workspace --exclude 'crates/rbitcoin-bench/**/*.rs' \
       --test-workspace=true --baseline=skip --caught --unviable \
       -j 1 --timeout "$MUTANT_TIMEOUT" \
       "${RE_ARGS[@]}" \
-      >"$OUT/batch-$offset.log" 2>&1
+      >"$OUT/batch-$side-$offset.log" 2>&1
   ec=$?
   set -e
-  grep -E '^MISSED' "$OUT/batch-$offset.log" >>"$OUT/missed.txt" || true
+  grep -E '^MISSED' "$OUT/batch-$side-$offset.log" >>"$OUT/missed.txt" || true
   # A clean exit consumed the slice. A killed process counts only the
   # requested names that printed an outcome, in order. Unfiltered
   # struct-field deletes in this file do not advance the cursor.
   if ((ec == 0)); then
     step=$requested
   else
-    step="$(python3 "$ROOT/scripts/mutants_queue.py" progress --log "$OUT/batch-$offset.log" --slice "$slice")"
+    step="$(python3 "$ROOT/scripts/mutants_queue.py" progress --log "$OUT/batch-$side-$offset.log" --slice "$slice")"
     if ((step > requested)); then
       step=$requested
     fi
@@ -125,16 +147,28 @@ while ((offset < queue_len && SECONDS < deadline)); do
       break
     fi
   fi
-  python3 "$ROOT/scripts/mutants_queue.py" advance \
-    --cursor "$CURSOR" --n-new "$n_new" --n-old "$n_old" \
-    --completed "$step" --head "$head_sha"
+  if [[ "$side" == "new" ]]; then
+    new_off=$((new_off + step))
+  else
+    old_off=$((old_off + step))
+  fi
+  now=$((SECONDS - start))
+  python3 "$ROOT/scripts/mutants_queue.py" advance-side \
+    --cursor "$CURSOR" --side "$side" --completed "$step" \
+    --n-new "$n_new" --n-old "$n_old" --head "$head_sha" \
+    --old-queue "$OUT/old.txt" --old-offset "$old_off" \
+    --elapsed "$now" --budget "$BUDGET_SEC" \
+    --new-left "$((new_len - new_off))" --old-left "$((old_len - old_off))"
   completed_total=$((completed_total + step))
-  offset=$((offset + step))
   if ((ec == 124)); then
     echo "mutants-nightly: budget exhausted after $completed_total mutants"
     break
   fi
 done
+
+python3 "$ROOT/scripts/mutants_queue.py" mark-cap \
+  --cursor "$CURSOR" --elapsed "$((SECONDS - start))" --budget "$BUDGET_SEC" \
+  --new-left "$((new_len - new_off))" --old-left "$((old_len - old_off))"
 
 # The default cursor path already lives in the artifact directory.
 if [[ ! "$CURSOR" -ef "$OUT/cursor.json" ]]; then
@@ -142,6 +176,6 @@ if [[ ! "$CURSOR" -ef "$OUT/cursor.json" ]]; then
 fi
 echo "mutants-nightly: completed=$completed_total missed=$(grep -c . "$OUT/missed.txt" || true)"
 if [[ -s "$OUT/missed.txt" ]]; then
-  echo "mutants-nightly: MISSED (not a failure; extend a journey or keep a guts unit)"
+  echo "mutants-nightly: MISSED (not a failure; extend a journey or delete the expression)"
   cat "$OUT/missed.txt"
 fi
