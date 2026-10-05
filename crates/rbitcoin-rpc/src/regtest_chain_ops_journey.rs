@@ -674,6 +674,18 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&honest))]).unwrap();
     assert!(r.is_null(), "the honest body still connects: {r}");
     assert_eq!(tip_count(ctx), before + 2);
+
+    // CheckBlock money range. MAX_MONEY is not `toolarge` (subsidy rejects
+    // it later). One satoshi over is.
+    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    let mut at_max = mine(10);
+    at_max.txdata[0].output[0].value = Amount::from_sat(MAX_MONEY);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(at_max)))]).unwrap();
+    assert_eq!(r, "bad-cb-amount", "MAX_MONEY is not toolarge: {r}");
+    let mut over = mine(11);
+    over.txdata[0].output[0].value = Amount::from_sat(MAX_MONEY + 1);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(over)))]).unwrap();
+    assert_eq!(r, "bad-txns-vout-toolarge");
 }
 
 /// Past 120 blocks and short of the 144 retarget window.

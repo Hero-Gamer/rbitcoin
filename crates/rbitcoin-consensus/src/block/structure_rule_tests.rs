@@ -1019,22 +1019,6 @@ fn p3_default_milestone_heights() {
 }
 
 #[test]
-fn s10_rejects_vout_toolarge() {
-    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
-    let mut zero = coinbase(0);
-    zero.output[0].value = Amount::ZERO;
-    validate_block_structure(&block_with(vec![zero]), &ctx_h(0)).unwrap();
-    let mut ok = coinbase(0);
-    ok.output[0].value = Amount::from_sat(MAX_MONEY);
-    validate_block_structure(&block_with(vec![ok]), &ctx_h(0)).expect("exactly MAX_MONEY");
-    let mut cb = coinbase(0);
-    cb.output[0].value = Amount::from_sat(MAX_MONEY + 1);
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "toolarge");
-}
-
-#[test]
 fn s13_rejects_coinbase_empty_vout() {
     validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();
     let mut cb = coinbase(0);
