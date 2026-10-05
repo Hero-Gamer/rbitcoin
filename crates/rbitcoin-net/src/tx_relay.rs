@@ -2069,9 +2069,10 @@ impl MempoolHub {
         self.tx_snap_dirty.store(true, Ordering::Release);
     }
 
-    /// Map API target blocks → engine depth (0–2 → default horizon of 1).
+    /// Map API target blocks → engine depth. `0` is the 1-block horizon.
+    /// Targets 1 and 2 stay on the curve (`fee-target-curve`).
     fn fee_depth(target_blocks: u32) -> u32 {
-        if target_blocks == 0 || target_blocks <= 2 {
+        if target_blocks == 0 {
             Self::DEFAULT_HORIZON_BLOCKS
         } else {
             target_blocks
@@ -3744,6 +3745,36 @@ mod tests {
             .as_nanos();
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("rbitcoin-txrelay-{n}-{seq}"))
+    }
+
+    /// `estimatesmartfee` / Electrum `blockchain.estimatefee` forward this rate.
+    /// Target 2 is the depth-2 curve point, not the 1-block horizon.
+    #[test]
+    fn confirm_target_two_is_the_two_block_rate() {
+        let store_dir = tmp();
+        let mp_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+        let mut snap = FeeSnapshot::empty(Instant::now());
+        let rates: Vec<Option<u64>> = FEE_SNAPSHOT_DEPTHS
+            .iter()
+            .enumerate()
+            .map(|(i, _)| Some(10_000 - i as u64 * 100))
+            .collect();
+        snap.depth_rates_sat_kvb = rates.clone();
+        hub.fee_dirty.store(false, Ordering::Release);
+        hub.fee_snapshot.store(Arc::new(snap));
+        let one = hub.estimate_fee_btc_per_kb(1);
+        let two = hub.estimate_fee_btc_per_kb(2);
+        let expect =
+            fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &rates, 2).unwrap() as f64 / 100_000_000.0;
+        assert!((two - expect).abs() < 1e-12, "two={two} expect={expect}");
+        assert!(
+            (one - two).abs() > 1e-12,
+            "target 2 must not collapse onto target 1 ({one})"
+        );
+        let _ = std::fs::remove_dir_all(&mp_dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]
