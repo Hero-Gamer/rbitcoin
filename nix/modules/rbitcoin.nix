@@ -123,6 +123,10 @@ let
     (toString cfg.sv2.tp.certValidity)
     "--sv2-tp-stale-grace"
     (toString cfg.sv2.tp.staleGrace)
+    "--sv2-tp-fee-delta"
+    (toString cfg.sv2.tp.feeDelta)
+    "--sv2-tp-template-interval"
+    (toString cfg.sv2.tp.templateInterval)
   ]
   ++ cfg.extraArgs;
 in
@@ -522,6 +526,18 @@ in
         type = types.ints.between 0 86400;
         default = 10;
         description = "Seconds a replaced tip's templates still answer RequestTransactionData and SubmitSolution.";
+      };
+
+      feeDelta = mkOption {
+        type = types.ints.unsigned;
+        default = 1000;
+        description = "Sats a same-tip rebuild must gain over a client's last template to be pushed.";
+      };
+
+      templateInterval = mkOption {
+        type = types.ints.between 1 86400;
+        default = 5;
+        description = "Seconds between fee checks; a fee push never comes sooner than this after a client's last template.";
       };
 
       openFirewall = mkOption {

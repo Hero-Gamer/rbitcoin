@@ -75,6 +75,8 @@ let
             authoritySecretFile = "/run/keys/sv2-authority";
             certValidity = 600;
             staleGrace = 0;
+            feeDelta = 0;
+            templateInterval = 30;
             openFirewall = true;
           };
         };
@@ -246,6 +248,8 @@ assert defaultCfg.sv2.tp.port == 8442;
 assert defaultCfg.sv2.tp.authoritySecretFile == null;
 assert defaultCfg.sv2.tp.certValidity == 3600;
 assert defaultCfg.sv2.tp.staleGrace == 10;
+assert defaultCfg.sv2.tp.feeDelta == 1000;
+assert defaultCfg.sv2.tp.templateInterval == 5;
 assert cfg.services.rbitcoin.p2p.port == 18444;
 assert cfg.services.rbitcoin.rpc.port == 18443;
 assert
@@ -324,6 +328,8 @@ assert builtins.match ".*--sv2-tp-authority-sec-file /run/keys/sv2-authority.*" 
 assert builtins.match ".*--sv2-tp-authority-sec .*" execStart == null;
 assert builtins.match ".*--sv2-tp-cert-validity 600.*" execStart != null;
 assert builtins.match ".*--sv2-tp-stale-grace 0.*" execStart != null;
+assert builtins.match ".*--sv2-tp-fee-delta 0.*" execStart != null;
+assert builtins.match ".*--sv2-tp-template-interval 30.*" execStart != null;
 assert builtins.match ".*--max-outbound 8$" execStart != null;
 assert builtins.elem "tor.service" service.after;
 assert builtins.elem "tor.service" service.wants;
