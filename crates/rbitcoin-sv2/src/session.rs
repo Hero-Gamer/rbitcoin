@@ -36,10 +36,13 @@ use tokio::time::Instant;
 
 const TDP_VERSION: u16 = 2;
 
-/// RAM trade (docs/sv2-template-provider.md): each session keeps its last
-/// few templates with their full txs, so `RequestTransactionData` and
-/// `SubmitSolution` do not depend on the mempool still holding them.
-const MAX_RETAINED: usize = 3;
+/// RAM trade (docs/sv2-template-provider.md): each session keeps its
+/// templates, so `RequestTransactionData` and `SubmitSolution` do not depend
+/// on the mempool still holding their txs. Fee pushes add one per interval
+/// on the same tip and a miner may still be on any of them, so the bound is
+/// a count, oldest (replaced tips first) dropped. Bodies are the mempool's
+/// `Arc`s: a template costs a pointer per tx until its txs leave the pool.
+const MAX_RETAINED: usize = 64;
 
 /// CPU trade: a `CoinbaseOutputConstraints` within this long of the last
 /// build waits out the rest of it, so a client cycling budgets costs at most
@@ -51,6 +54,13 @@ const CONSTRAINTS_COOLDOWN: Duration = Duration::from_secs(1);
 /// changes its budget minutes apart; past this many inside one cooldown the
 /// session is closed so the slot goes back to a real client.
 const MAX_SUPERSEDED_CONSTRAINTS: u32 = 8;
+
+/// Fee-delta push settings (docs/sv2-template-provider.md C1).
+#[derive(Clone, Copy)]
+pub(crate) struct FeePush {
+    pub delta: u64,
+    pub interval: Duration,
+}
 
 /// The templates one session was sent. Ids are strictly increasing.
 #[derive(Default)]
@@ -124,6 +134,7 @@ pub(crate) async fn serve(
     stale_grace: Duration,
     setup_timeout: Duration,
     write_timeout: Duration,
+    fee_push: FeePush,
 ) -> io::Result<()> {
     let deadline = Instant::now() + setup_timeout;
     let setup = async {
@@ -154,6 +165,7 @@ pub(crate) async fn serve(
         conn: writer,
         chain,
         stale_grace,
+        fee_push,
         constraints: None,
         templates: Templates::default(),
         built_at: None,
@@ -161,6 +173,8 @@ pub(crate) async fn serve(
         superseded: 0,
         holding: false,
         held_logged: false,
+        fee_check_at: None,
+        seen_updates: 0,
     };
     s.run(&mut frames, deadline).await
 }
@@ -173,6 +187,7 @@ struct Session {
     conn: NoiseWriter,
     chain: Arc<ChainHub>,
     stale_grace: Duration,
+    fee_push: FeePush,
     /// Last `CoinbaseOutputConstraints`: `(max_additional_size, sigops)`.
     constraints: Option<(u32, u16)>,
     templates: Templates,
@@ -186,6 +201,10 @@ struct Session {
     /// Cleared when a template is sent.
     holding: bool,
     held_logged: bool,
+    /// Next fee check: one interval after the last push or check.
+    fee_check_at: Option<Instant>,
+    /// `MempoolHub::template_updates` read before the last build.
+    seen_updates: u64,
 }
 
 impl Session {
@@ -221,6 +240,15 @@ impl Session {
                     if self.rebuild_at.is_some() =>
                 {
                     self.publish().await?;
+                }
+                // CPU trade: `template_updates` is a counter, not a notifier,
+                // so each session polls it once per interval and a moved
+                // counter costs one build under the mempool read lock: at
+                // most MAX_SESSIONS builds per interval.
+                _ = tokio::time::sleep_until(self.fee_check_at.unwrap_or_else(Instant::now)),
+                    if self.fee_check_at.is_some() =>
+                {
+                    self.check_fees().await?;
                 }
                 _ = tokio::time::sleep_until(setup_deadline), if self.constraints.is_none() => {
                     return Err(missed_setup_deadline());
@@ -275,14 +303,62 @@ impl Session {
         Ok(true)
     }
 
-    /// Build on the current tip and send it. No template while in IBD:
-    /// leaving IBD always comes with a new tip, which calls this again.
+    /// Build on the current tip and send it.
     async fn publish(&mut self) -> io::Result<()> {
         self.rebuild_at = None;
         self.superseded = 0;
-        let Some((size, sigops)) = self.constraints else {
+        match self.build().await? {
+            Some(t) => self.send(t).await,
+            None => Ok(()),
+        }
+    }
+
+    /// With the tip unchanged, send a rebuild whose fees reach the last sent
+    /// template's plus the delta. A rebuild on a new prev hash is dropped:
+    /// its tip event publishes. A queued constraints rebuild publishes the
+    /// latest mempool anyway, so the check leaves it alone.
+    async fn check_fees(&mut self) -> io::Result<()> {
+        self.fee_check_at = Some(Instant::now() + self.fee_push.interval);
+        let updates = self.chain.mempool().map_or(0, |m| m.template_updates());
+        if updates == self.seen_updates || self.rebuild_at.is_some() {
+            return Ok(());
+        }
+        // A check races ChainHub with no tip event in flight: a reorg pops the
+        // tip block by block and only signals once the new branch connects,
+        // so a tip read mid-disconnect can fail. The event that follows
+        // publishes; one skipped check does not end the session, and the next
+        // one retries the same mempool generation. No session reaches that
+        // window deterministically.
+        let t = match self.build().await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                rbitcoin_log::info!("sv2: fee check skipped ({e})");
+                return Ok(());
+            }
+        };
+        let Some(last) = self.templates.retained.back() else {
             return Ok(());
         };
+        // Same prev hash, same height: value_remaining differs by fees only.
+        if self.templates.current_prev == Some(t.prev_hash)
+            && t.value_remaining >= last.t.value_remaining.saturating_add(self.fee_push.delta)
+        {
+            self.send(t).await?;
+        }
+        Ok(())
+    }
+
+    /// Template for the session's constraints. `None` before constraints or
+    /// while in IBD: leaving IBD always comes with a new tip, which publishes.
+    async fn build(&mut self) -> io::Result<Option<template::Template>> {
+        let Some((size, sigops)) = self.constraints else {
+            return Ok(None);
+        };
+        // Read before the build: a tx admitted during it moves the counter
+        // past this, so the next check rebuilds. Stored only once the build
+        // returns: a failed one leaves the generation for the next check.
+        let updates = self.chain.mempool().map_or(0, |m| m.template_updates());
         let c = Arc::clone(&self.chain);
         let t = tokio::task::spawn_blocking(move || {
             let _g = BlockingRegion::enter();
@@ -292,14 +368,18 @@ impl Session {
         })
         .await
         .map_err(io::Error::other)??;
-        let Some(mut t) = t else {
+        self.seen_updates = updates;
+        if t.is_none() {
             self.holding = true;
             if !self.held_logged {
                 rbitcoin_log::info!("sv2: holding templates until the node leaves IBD");
                 self.held_logged = true;
             }
-            return Ok(());
-        };
+        }
+        Ok(t)
+    }
+
+    async fn send(&mut self, mut t: template::Template) -> io::Result<()> {
         self.holding = false;
         self.templates.last_id += 1;
         let template_id = self.templates.last_id;
@@ -316,7 +396,9 @@ impl Session {
             .to_message(template_id, new_prev)
             .map_err(|e| io::Error::other(format!("sv2 NewTemplate: {e:?}")))?;
         self.conn.send(MESSAGE_TYPE_NEW_TEMPLATE, msg).await?;
-        self.built_at = Some(Instant::now());
+        let sent = Instant::now();
+        self.built_at = Some(sent);
+        self.fee_check_at = Some(sent + self.fee_push.interval);
         self.templates.built_since_tip = true;
         if new_prev {
             self.conn

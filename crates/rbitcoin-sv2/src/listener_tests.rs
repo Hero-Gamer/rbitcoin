@@ -1,6 +1,9 @@
 use crate::test_chain::shared_regtest;
 use crate::testutil::TpClient;
-use crate::{run_sv2_tp, Sv2TpConfig, MAX_SESSIONS, MAX_STALE_GRACE, SETUP_TIMEOUT, WRITE_TIMEOUT};
+use crate::{
+    run_sv2_tp, Sv2TpConfig, FEE_DELTA, MAX_SESSIONS, MAX_STALE_GRACE, MAX_TEMPLATE_INTERVAL,
+    MIN_TEMPLATE_INTERVAL, SETUP_TIMEOUT, TEMPLATE_INTERVAL, WRITE_TIMEOUT,
+};
 use common_messages_sv2::{
     SetupConnectionError, SetupConnectionSuccess, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
     MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
@@ -49,6 +52,8 @@ async fn setup_connection_success_errors_and_session_cap() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -110,6 +115,8 @@ async fn authority_key_prints_in_key_utils_base58check() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -145,6 +152,8 @@ async fn silent_sockets_are_dropped_at_the_setup_deadline() {
         stale_grace: Duration::from_secs(10),
         setup_timeout,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -186,6 +195,8 @@ async fn session_without_constraints_is_dropped_at_the_setup_deadline() {
         stale_grace: Duration::from_secs(10),
         setup_timeout,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -241,6 +252,8 @@ async fn client_that_stops_reading_is_dropped_at_the_write_deadline() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -302,6 +315,8 @@ async fn oversized_client_frame_closes_the_session() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -332,15 +347,25 @@ async fn oversized_client_frame_closes_the_session() {
 }
 
 #[tokio::test]
-async fn out_of_range_cert_validity_or_stale_grace_refuses_to_start() {
+async fn out_of_range_timing_refuses_to_start() {
     let tc = shared_regtest(0);
     let chain = Arc::clone(&tc.chain);
-    for (cert_validity, stale_grace) in [
-        (Duration::from_secs(u64::from(u32::MAX) + 1), Duration::ZERO),
+    let hour = Duration::from_secs(3600);
+    let over = Duration::from_secs(1);
+    for (cert_validity, stale_grace, template_interval) in [
         (
-            Duration::from_secs(3600),
-            MAX_STALE_GRACE + Duration::from_secs(1),
+            Duration::from_secs(u64::from(u32::MAX) + 1),
+            Duration::ZERO,
+            TEMPLATE_INTERVAL,
         ),
+        (hour, MAX_STALE_GRACE + over, TEMPLATE_INTERVAL),
+        (hour, Duration::ZERO, Duration::ZERO),
+        (
+            hour,
+            Duration::ZERO,
+            MIN_TEMPLATE_INTERVAL - Duration::from_millis(1),
+        ),
+        (hour, Duration::ZERO, MAX_TEMPLATE_INTERVAL + over),
     ] {
         let e = run_sv2_tp(Sv2TpConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
@@ -350,6 +375,8 @@ async fn out_of_range_cert_validity_or_stale_grace_refuses_to_start() {
             stale_grace,
             setup_timeout: SETUP_TIMEOUT,
             write_timeout: WRITE_TIMEOUT,
+            fee_delta: FEE_DELTA,
+            template_interval,
         })
         .await
         .err()

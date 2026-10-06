@@ -20,9 +20,12 @@ use tokio::task::JoinHandle;
 
 pub use transport::Frame;
 
-/// Concurrent TDP sessions. RAM trade (CONTRIBUTING 9): each session retains
-/// the witness-serialized txs of its live templates (≤ ~4 MB × ~3), so the
-/// cap bounds retention at ≤ ~96 MB.
+/// Concurrent TDP sessions. RAM trade (CONTRIBUTING 9): each session keeps
+/// up to 64 templates sharing the mempool's tx bodies (about 24 KB of
+/// pointers per full template). Bodies that leave the pool stay alive while
+/// a template holds them: at most 64 × ~4 MB per session if every template's
+/// txs were replaced, ~2 GB across the cap, which costs the replacer
+/// replacement fees on every interval.
 pub(crate) const MAX_SESSIONS: usize = 8;
 
 /// Default [`Sv2TpConfig::setup_timeout`]. A session holds a slot from TCP
@@ -31,6 +34,23 @@ pub const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default [`Sv2TpConfig::write_timeout`].
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default [`Sv2TpConfig::fee_delta`] (stratum-mining `sv2-tp`
+/// `-sv2feedelta`).
+pub const FEE_DELTA: u64 = 1000;
+
+/// Default [`Sv2TpConfig::template_interval`] (stratum-mining `sv2-tp`
+/// `-templateinterval`).
+pub const TEMPLATE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Lower bound on [`Sv2TpConfig::template_interval`]. CPU trade: each check
+/// after a mempool change is one build under the mempool read lock, so a
+/// session costs at most ten per second.
+pub(crate) const MIN_TEMPLATE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Upper bound on [`Sv2TpConfig::template_interval`]; each check deadline is
+/// `Instant + template_interval`, which panics on overflow.
+pub const MAX_TEMPLATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Upper bound on [`Sv2TpConfig::stale_grace`]; the grace deadline is
 /// `Instant + stale_grace`, which panics on overflow.
@@ -54,6 +74,12 @@ pub struct Sv2TpConfig {
     /// A socket write that makes no progress this long closes the session,
     /// so a client that stops reading cannot hold a slot.
     pub write_timeout: Duration,
+    /// With the tip unchanged, a rebuild is pushed only when its fees are at
+    /// least this many sats above the session's last template.
+    pub fee_delta: u64,
+    /// Minimum time from a session's last push to a fee push; the mempool
+    /// is checked once per interval.
+    pub template_interval: Duration,
 }
 
 pub struct Sv2TpHandle {
@@ -102,6 +128,16 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             format!("sv2 stale_grace: over {}s", MAX_STALE_GRACE.as_secs()),
         ));
     }
+    if !(MIN_TEMPLATE_INTERVAL..=MAX_TEMPLATE_INTERVAL).contains(&config.template_interval) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "sv2 template_interval: want {}ms to {}s",
+                MIN_TEMPLATE_INTERVAL.as_millis(),
+                MAX_TEMPLATE_INTERVAL.as_secs()
+            ),
+        ));
+    }
     let keypair =
         Keypair::from_seckey_slice(&Secp256k1::new(), &config.authority_secret).map_err(|e| {
             io::Error::new(
@@ -115,6 +151,10 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
     let stale_grace = config.stale_grace;
     let setup_timeout = config.setup_timeout;
     let write_timeout = config.write_timeout;
+    let fee_push = session::FeePush {
+        delta: config.fee_delta,
+        interval: config.template_interval,
+    };
     let chain = config.chain;
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
@@ -165,6 +205,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     stale_grace,
                     setup_timeout,
                     write_timeout,
+                    fee_push,
                 )
                 .await
                 {

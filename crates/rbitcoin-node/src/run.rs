@@ -1938,6 +1938,8 @@ async fn start_sv2_tp(config: &NodeConfig, hub: &Arc<ChainHub>) -> Option<Sv2TpH
         stale_grace: Duration::from_secs(config.sv2_tp_stale_grace_secs),
         setup_timeout: rbitcoin_sv2::SETUP_TIMEOUT,
         write_timeout: rbitcoin_sv2::WRITE_TIMEOUT,
+        fee_delta: rbitcoin_sv2::FEE_DELTA,
+        template_interval: rbitcoin_sv2::TEMPLATE_INTERVAL,
     };
     match run_sv2_tp(cfg).await {
         Ok(h) => {
