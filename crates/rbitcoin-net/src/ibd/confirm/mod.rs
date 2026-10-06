@@ -574,9 +574,10 @@ fn reoffer_blocks_to_body_queue<'a>(
 /// drops its look-ahead plan before the next wave. When the wave is retried
 /// (a cascade, or a batched reject being isolated), turn on isolation
 /// before the re-arm and offer its bodies back after it, so lookup cannot
-/// rebuild the same wave from them. Write and scripts re-offer without a
-/// sender: load already checked these bodies for mutation. Returns false
-/// when the class does not re-arm (cancel, engine fault).
+/// rebuild the same wave from them. An engine fault's wave goes back the
+/// same way without isolation: the fault is no block's. Write and scripts
+/// re-offer without a sender: load already checked these bodies for
+/// mutation. Returns false when the class does not re-arm (cancel).
 ///
 /// Order: serialize, isolate, re-arm, insert. The insert must follow the
 /// re-arm: a body queued first could be selected by a lookup pass that read
@@ -590,14 +591,12 @@ fn rearm_after_reject(
     class: ConfirmRejectClass,
     wave: &[(u32, BlockHash, &bitcoin::Block)],
 ) -> bool {
-    if matches!(
-        class,
-        ConfirmRejectClass::Cancelled | ConfirmRejectClass::EngineFault
-    ) {
+    if class == ConfirmRejectClass::Cancelled {
         return false;
     }
     let retried = class.isolate_if_batched(wave.len()) == ConfirmRejectClass::Cascade;
-    let prepared = if retried {
+    let requeue = retried || class == ConfirmRejectClass::EngineFault;
+    let prepared = if requeue {
         prepare_offer_back(hub, wave.iter().map(|&(h, ha, b)| (h, ha, b, None)))
     } else {
         Vec::new()
@@ -609,7 +608,7 @@ fn rearm_after_reject(
     }
     hub.query.set_lookup_taken_hi(hub.tip_height());
     hub.query.set_lookup_started_hi(hub.tip_height());
-    if retried {
+    if requeue {
         offer_back(hub, prepared);
         feed.notify();
     }
@@ -1885,12 +1884,15 @@ pub(crate) fn spawn_confirm_engine(
                         .fetch_add(1, Ordering::Relaxed);
                     warn!("ibd: confirm scripts reject @ {height} (batch first {hash}): {e}");
                     let class = ConfirmRejectClass::from_consensus(&e);
-                    // A retried wave goes back with the batches dropped behind
-                    // it; a one-block verdict drops its block.
+                    // A retried or engine-faulted wave goes back with the
+                    // batches dropped behind it; a one-block verdict drops
+                    // its block.
                     let retried = class.isolate_if_batched(meta.heights_hashes.len())
                         == ConfirmRejectClass::Cascade;
                     let t_rearm = Instant::now();
-                    let wave: Vec<(u32, BlockHash, &bitcoin::Block)> = if retried {
+                    let wave: Vec<(u32, BlockHash, &bitcoin::Block)> = if retried
+                        || class == ConfirmRejectClass::EngineFault
+                    {
                         std::iter::once(&meta)
                             .chain(dropped)
                             .flat_map(|m| m.heights_hashes.iter().zip(&m.wire_blocks))

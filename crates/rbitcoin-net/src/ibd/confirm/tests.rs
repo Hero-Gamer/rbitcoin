@@ -1898,7 +1898,9 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
 
 /// A write or scripts reject re-arms lookup at the tip. A retried batched
 /// wave turns on isolation and goes back on the body queue; a one-block
-/// consensus reject does not.
+/// consensus reject does not. An engine fault's wave goes back without
+/// isolation. A torn store file faults lookup or load before write, so
+/// this is a unit check.
 #[test]
 fn reject_rearms_lookup_and_requeues_a_retried_wave() {
     use super::{rearm_after_reject, ConfirmRejectClass};
@@ -1950,17 +1952,25 @@ fn reject_rearms_lookup_and_requeues_a_retried_wave() {
         }
     }
 
+    let feed = ConfirmFeed::new();
     hub.query.set_lookup_taken_hi(Some(2));
-    assert!(!rearm_after_reject(
+    let gen = hub.query.lookup_taken_gen();
+    assert!(rearm_after_reject(
         &hub,
         &feed,
         ConfirmRejectClass::EngineFault,
         &wave
     ));
-    assert_eq!(
-        hub.query.lookup_taken_hi(),
-        Some(2),
-        "engine fault keeps lookup"
+    assert_ne!(
+        hub.query.lookup_taken_gen(),
+        gen,
+        "engine fault: load resets"
+    );
+    assert_eq!(hub.query.lookup_taken_hi(), Some(0), "engine fault");
+    assert!(!feed.single_block(), "an engine fault is not isolated");
+    assert!(
+        hub.query.block_queue_has_height(1) && hub.query.block_queue_has_height(2),
+        "engine fault: the wave is back on the queue"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
