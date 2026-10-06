@@ -110,6 +110,9 @@ IGNORE_FLAGS = frozenset(
         "nologratelimit",
         "print-cmd",
         "acceptnonstdtxn",
+        # Core script-check thread count. Validation outcome does not
+        # depend on it (p2p_segwit.py passes -par=1).
+        "par",
         # Libre has no Core IsStandard bare-multisig gate.
         "permitbaremultisig",
         "peerblockfilters",
