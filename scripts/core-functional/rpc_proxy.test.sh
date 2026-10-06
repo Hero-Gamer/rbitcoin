@@ -24,9 +24,53 @@ from rpc_proxy import (
     peel_authproxy_args,
     rewrite_core_maxfeerate,
     rewrite_testmempoolaccept_abort,
+    rewrite_unspendable_spend,
     shim_gettxoutsetinfo,
     whitelist_map,
 )
+
+txid = "ab" * 32
+native = {
+    "result": None,
+    "error": {
+        "code": -25,
+        "message": (
+            "TestBlockValidity failed: consensus: "
+            f"script verification failed: script too large txid={txid} vin=0"
+        ),
+    },
+    "id": 1,
+}
+assert rewrite_unspendable_spend("generateblock", native)
+assert native["error"]["message"] == (
+    "TestBlockValidity failed: bad-txns-inputs-missingorspent, "
+    f"CheckTxInputs: inputs missing/spent in transaction {txid}"
+), native
+op_return = {
+    "result": None,
+    "error": {
+        "code": -25,
+        "message": f"script verification failed: OP_RETURN txid={txid} vin=1",
+    },
+    "id": 1,
+}
+assert rewrite_unspendable_spend("generateblock", op_return)
+assert "inputs missing/spent" in op_return["error"]["message"]
+kept = {
+    "result": None,
+    "error": {"code": -25, "message": "TestBlockValidity failed: bad-txns-nonfinal"},
+    "id": 1,
+}
+assert not rewrite_unspendable_spend("generateblock", kept)
+assert kept["error"]["message"].endswith("bad-txns-nonfinal")
+other_method = {
+    "error": {
+        "code": -25,
+        "message": f"script verification failed: script too large txid={txid} vin=0",
+    }
+}
+assert not rewrite_unspendable_spend("submitblock", other_method)
+assert "script too large" in other_method["error"]["message"]
 
 seq = {
     "result": [

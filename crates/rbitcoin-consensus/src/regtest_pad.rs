@@ -23,15 +23,118 @@ pub const REGTEST_POW_BITS: u32 = 0x207f_ffff;
 pub const REGTEST_BLOCK_SPACING: u32 = 600;
 
 /// Grind `header.nonce` until PoW matches `header.bits`. Does not change version.
+///
+/// Regtest bits (`0x207fffff`) hit in the first few nonces. An `OP_TRUE`
+/// signet keeps genesis bits (`0x1e0377ae`), about 5e6 hashes. Past the
+/// trivial prefix the search reuses the SHA256 midstate of the first 64
+/// header bytes. Off the `tip-accept` thread that search uses up to four
+/// cores; on `tip-accept` it stays on one core so the lane cannot join
+/// workers that wait for the lane.
 pub fn grind_regtest_pow(header: &mut Header) {
     let target = Target::from_compact(header.bits);
-    for nonce in 0..u32::MAX {
+    const QUICK: u32 = 4096;
+    for nonce in 0..QUICK {
         header.nonce = nonce;
         if header.validate_pow(target).is_ok() {
             return;
         }
     }
-    panic!("regtest pow grind exhausted");
+    let nonce = grind_header_midstate(header, target, QUICK);
+    header.nonce = nonce;
+    debug_assert!(header.validate_pow(target).is_ok());
+}
+
+fn on_tip_accept_thread() -> bool {
+    std::thread::current().name() == Some("tip-accept")
+}
+
+/// SHA256 midstate after the first 64 header bytes. Nonce is the last 4
+/// bytes. No heap per nonce.
+fn grind_header_midstate(header: &Header, target: Target, start: u32) -> u32 {
+    use bitcoin::consensus::Encodable;
+
+    let mut raw = Vec::with_capacity(80);
+    header
+        .consensus_encode(&mut raw)
+        .expect("header encode into vec");
+    debug_assert_eq!(raw.len(), 80);
+    let workers = if on_tip_accept_thread() {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 4)
+    };
+    if workers == 1 {
+        return grind_header_midstate_one(&raw, target, start, 1, None)
+            .expect("regtest pow grind exhausted");
+    }
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let hit = std::sync::atomic::AtomicBool::new(false);
+    let found = std::sync::atomic::AtomicU32::new(u32::MAX);
+    std::thread::scope(|scope| {
+        for worker in 0..workers {
+            let raw = &raw;
+            let stop = &stop;
+            let hit = &hit;
+            let found = &found;
+            let begin = start.saturating_add(worker as u32);
+            scope.spawn(move || {
+                if let Some(nonce) =
+                    grind_header_midstate_one(raw, target, begin, workers as u32, Some(stop))
+                {
+                    found.fetch_min(nonce, std::sync::atomic::Ordering::Relaxed);
+                    hit.store(true, std::sync::atomic::Ordering::Relaxed);
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
+    if !hit.load(std::sync::atomic::Ordering::Relaxed) {
+        panic!("regtest pow grind exhausted");
+    }
+    found.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Search `start, start+step, …`. `step == 1` is the single-core scan.
+///
+/// `stop` lets sibling cores abandon the search once any stride has a hit.
+/// Any nonce that meets `target` is a valid block; the caller keeps the
+/// smallest one that was stored.
+fn grind_header_midstate_one(
+    raw: &[u8],
+    target: Target,
+    start: u32,
+    step: u32,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Option<u32> {
+    use bitcoin::hashes::{sha256, Hash, HashEngine};
+
+    debug_assert!(step >= 1);
+    let mut engine = sha256::Hash::engine();
+    engine.input(&raw[..64]);
+    let mid = engine.midstate();
+    let mut tail = [0u8; 16];
+    tail.copy_from_slice(&raw[64..80]);
+    let mut nonce = start;
+    let mut spins: u32 = 0;
+    loop {
+        if spins == 0 && stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed)) {
+            return None;
+        }
+        spins = spins.wrapping_add(1) % 1024;
+        tail[12..16].copy_from_slice(&nonce.to_le_bytes());
+        let mut second = sha256::HashEngine::from_midstate(mid, 64);
+        second.input(&tail);
+        let first = sha256::Hash::from_engine(second);
+        let pow = sha256::Hash::hash(first.as_byte_array());
+        let hash = bitcoin::BlockHash::from_byte_array(pow.to_byte_array());
+        if target.is_met_by(hash) {
+            return Some(nonce);
+        }
+        nonce = nonce.checked_add(step)?;
+    }
 }
 
 /// Fuzzer / tests keep txdata + version. Harness owns prev/bits/time/merkle/nonce.
@@ -91,7 +194,71 @@ pub fn mine_regtest_paying(
     block
 }
 
+/// One signet block whose challenge is `OP_TRUE`.
+///
+/// Bits come from the caller (the parent header at height 1). The coinbase
+/// witness commitment carries an empty scriptSig / empty witness solution,
+/// which is the only solution `OP_TRUE` accepts. PoW is a nonce grind against
+/// signet's genesis target (`0x1e0377ae`, about 5e6 hashes, not regtest's
+/// `0x207fffff`).
+pub fn mine_op_true_signet_paying(
+    params: &ChainParams,
+    prev: BlockHash,
+    time: u32,
+    height: u32,
+    bits: CompactTarget,
+    script_pubkey: ScriptBuf,
+    extra_txs: Vec<Transaction>,
+) -> Block {
+    let header = Header {
+        version: Version::from_consensus(4),
+        prev_blockhash: prev,
+        merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+        time,
+        bits,
+        nonce: 0,
+    };
+    let mut txdata = Vec::with_capacity(1 + extra_txs.len());
+    txdata.push(coinbase_paying_params(height, script_pubkey, params));
+    txdata.extend(extra_txs);
+    let mut block = Block { header, txdata };
+    block.txdata[0].input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
+    apply_witness_commitment(&mut block);
+    append_op_true_signet_push(&mut block);
+    grind_regtest_pow(&mut block.header);
+    block
+}
+
+/// BIP325: second push in the witness-commitment script is header `ecc7daa2`
+/// plus an empty scriptSig and an empty witness (`0x00 0x00`).
+fn append_op_true_signet_push(block: &mut Block) {
+    const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
+    let mut payload = Vec::with_capacity(6);
+    payload.extend_from_slice(&SIGNET_HEADER);
+    payload.extend_from_slice(&[0x00, 0x00]);
+    let spk = &mut block.txdata[0]
+        .output
+        .last_mut()
+        .expect("witness commitment output")
+        .script_pubkey;
+    let mut bytes = spk.as_bytes().to_vec();
+    bytes.push(u8::try_from(payload.len()).expect("signet solution push"));
+    bytes.extend_from_slice(&payload);
+    *spk = ScriptBuf::from_bytes(bytes);
+    if let Some(root) = block.compute_merkle_root() {
+        block.header.merkle_root = root;
+    }
+}
+
 fn coinbase_paying(height: u32, script_pubkey: ScriptBuf) -> Transaction {
+    coinbase_paying_params(height, script_pubkey, &ChainParams::regtest())
+}
+
+fn coinbase_paying_params(
+    height: u32,
+    script_pubkey: ScriptBuf,
+    params: &ChainParams,
+) -> Transaction {
     let mut ss = if height == 0 {
         vec![0x00]
     } else {
@@ -110,7 +277,7 @@ fn coinbase_paying(height: u32, script_pubkey: ScriptBuf) -> Transaction {
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(block_subsidy(height, &ChainParams::regtest()) as u64),
+            value: Amount::from_sat(block_subsidy(height, params) as u64),
             script_pubkey,
         }],
     }
@@ -187,6 +354,26 @@ mod tests {
         assert_eq!(b.header.prev_blockhash, genesis.block_hash());
         let target = Target::from_compact(b.header.bits);
         assert!(b.header.validate_pow(target).is_ok());
+    }
+
+    #[test]
+    fn op_true_signet_block_meets_pow_and_challenge() {
+        use bitcoin::script::Script;
+        let params =
+            ChainParams::custom_signet(ScriptBuf::from_bytes(vec![0x51]), 10 * 60).unwrap();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Signet);
+        let block = mine_op_true_signet_paying(
+            &params,
+            genesis.block_hash(),
+            genesis.header.time.saturating_add(1),
+            1,
+            genesis.header.bits,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+        );
+        let target = Target::from_compact(block.header.bits);
+        assert!(block.header.validate_pow(target).is_ok());
+        crate::signet::validate_signet_block_solution(&block, Script::from_bytes(&[0x51])).unwrap();
     }
 
     #[test]

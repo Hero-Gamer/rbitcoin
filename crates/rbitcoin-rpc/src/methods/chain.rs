@@ -98,6 +98,9 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         "pruned": ctx.query.prune_seqsigwit(),
         "warnings": rpc_warnings(ctx),
     });
+    if let Some(challenge) = signet_challenge_hex(ctx) {
+        info["signet_challenge"] = json!(challenge);
+    }
     if let Some(h) = ctx.query.pruneheight() {
         info["pruneheight"] = json!(h.0);
     }
@@ -108,6 +111,19 @@ pub(crate) fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
         }
     }
     Ok(info)
+}
+
+/// Bitcoin Core includes `signet_challenge` only on signet.
+pub(crate) fn signet_challenge_hex(ctx: &RpcContext) -> Option<String> {
+    if ctx.network != Network::Signet {
+        return None;
+    }
+    let script = ctx
+        .chain
+        .as_ref()
+        .and_then(|c| c.params.signet_challenge.clone())
+        .unwrap_or_else(rbitcoin_consensus::default_signet_challenge);
+    Some(hex_encode(script.as_bytes()))
 }
 
 pub(crate) fn rpc_warnings(ctx: &RpcContext) -> Vec<String> {
@@ -940,7 +956,7 @@ pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Val
     let filtertype = params.opt_str(1, "filtertype")?.unwrap_or("basic");
     if filtertype != "basic" {
         return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
+            ERR_INVALID_ADDRESS_OR_KEY,
             format!("Unknown filtertype {filtertype}"),
         ));
     }
@@ -951,21 +967,11 @@ pub(crate) fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Val
         ));
     }
     let hash = parse_hash32_display(hex)?;
-    let height = ctx
-        .query
-        .height_of_hash(&hash)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
     let (body, header) = ctx
         .query
-        .basic_filter_at(height.0)
+        .basic_filter_for_hash(&hash)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| {
-            rpc_error(
-                ERR_MISC,
-                "Filter not found. Block filters are still in the process of being indexed.",
-            )
-        })?;
+        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
     use bitcoin::hashes::Hash;
     Ok(json!({
         "filter": hex_encode(&body),

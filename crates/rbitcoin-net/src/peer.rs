@@ -1530,6 +1530,20 @@ fn tx_announce_peer_ok(
     })
 }
 
+fn announce_fee_rate_sat_kvb(
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) -> Option<u64> {
+    let (fee, weight) = mp.try_get_live_meta(txid)?;
+    // `prioritisetransaction` changes what we relay, not the base fee.
+    let modified = i128::from(fee)
+        .saturating_add(i128::from(mp.fee_delta(txid)))
+        .max(0) as u64;
+    Some(rbitcoin_consensus::policy::fee_rate_sat_per_kvb(
+        modified, weight,
+    ))
+}
+
 fn tx_announce_below_feefilter(
     session: Option<&crate::peers::LivePeer>,
     mp: &crate::tx_relay::MempoolHub,
@@ -1539,10 +1553,7 @@ fn tx_announce_below_feefilter(
     if peer_min == 0 {
         return false;
     }
-    let Some((fee, weight)) = mp.try_get_live_meta(txid) else {
-        return false;
-    };
-    rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, weight) < peer_min
+    announce_fee_rate_sat_kvb(mp, txid).is_some_and(|rate| rate < peer_min)
 }
 
 fn on_inv_flush(
@@ -2251,13 +2262,9 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
             continue;
         }
         let peer_min = s.minfeefilter_sat_kvb();
-        if peer_min > 0 {
-            if let Some((fee, weight)) = mp.try_get_live_meta(&txid) {
-                let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, weight);
-                if rate < peer_min {
-                    continue;
-                }
-            }
+        if peer_min > 0 && announce_fee_rate_sat_kvb(mp, &txid).is_some_and(|rate| rate < peer_min)
+        {
+            continue;
         }
         let Some(out) = s.writer() else {
             continue;
@@ -2343,13 +2350,8 @@ fn tx_inv_candidate_ok(
         return false;
     }
     let peer_min = session.minfeefilter_sat_kvb();
-    if peer_min > 0 {
-        if let Some((fee, weight)) = mp.try_get_live_meta(&txid) {
-            let rate = rbitcoin_consensus::policy::fee_rate_sat_per_kvb(fee, weight);
-            if rate < peer_min {
-                return false;
-            }
-        }
+    if peer_min > 0 && announce_fee_rate_sat_kvb(mp, &txid).is_some_and(|rate| rate < peer_min) {
+        return false;
     }
     let local = !mp.relay_enabled() && mp.is_unbroadcast(&txid);
     let age_due_this = mp.tx_inv_due(&w);

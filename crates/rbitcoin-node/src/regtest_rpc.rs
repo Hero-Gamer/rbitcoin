@@ -69,4 +69,28 @@ mod tests {
         assert_eq!(miner.0.tip_height(), Some(1));
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn hub_op_true_signet_generate_one() {
+        let n = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("rbitcoin-node-signet-gen-{n}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let params =
+            ChainParams::custom_signet(ScriptBuf::from_bytes(vec![0x51]), 10 * 60).unwrap();
+        let hub = Arc::new(ChainHub::new(
+            Query::open_or_create_tiny(dir.join("store")).unwrap(),
+            params,
+            Milestone::NONE,
+        ));
+        let miner = HubRegtest(hub);
+        let hashes = miner
+            .generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(miner.0.tip_height(), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -316,24 +317,52 @@ def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None
         result[i] = {"txid": row.get("txid"), "wtxid": row.get("wtxid")}
 
 
-def _rewrite_forwarded_testmempoolaccept(method: Any, body: bytes) -> bytes:
-    if method != "testmempoolaccept":
-        return body
+# Spending an unspendable scriptPubKey still resolves the coin and fails the
+# script. Core never stored the coin, so generateblock quotes CheckTxInputs.
+_UNSPENDABLE_SPEND = re.compile(
+    r"script verification failed: (?:script too large|OP_RETURN) txid=([0-9a-fA-F]{64})"
+)
+
+
+def rewrite_unspendable_spend(method: Any, parsed: dict[str, Any]) -> bool:
+    """Present Core's missing-input generateblock text.
+
+    The node still has the output. A scriptSig that fails the same way on
+    `generateblock` gets the same sentence; that is this shim, not consensus.
+    """
+    if method != "generateblock":
+        return False
+    err = parsed.get("error")
+    if not isinstance(err, dict):
+        return False
+    msg = err.get("message")
+    if not isinstance(msg, str):
+        return False
+    found = _UNSPENDABLE_SPEND.search(msg)
+    if found is None:
+        return False
+    txid = found.group(1)
+    err["message"] = (
+        "TestBlockValidity failed: bad-txns-inputs-missingorspent, "
+        f"CheckTxInputs: inputs missing/spent in transaction {txid}"
+    )
+    return True
+
+
+def _rewrite_forwarded_body(method: Any, body: bytes) -> bytes:
     try:
         parsed = json.loads(body.decode())
     except (UnicodeDecodeError, json.JSONDecodeError):
         return body
     if not isinstance(parsed, dict):
         return body
-    result = parsed.get("result")
-    if not isinstance(result, list) or len(result) < 2:
+    changed = rewrite_unspendable_spend(method, parsed)
+    if method == "testmempoolaccept":
+        before = json.dumps(parsed, sort_keys=True)
+        rewrite_testmempoolaccept_abort(method, parsed)
+        changed = changed or json.dumps(parsed, sort_keys=True) != before
+    if not changed:
         return body
-    if not any(
-        isinstance(row, dict) and row.get("reject-reason") in _TMA_ABORT
-        for row in result
-    ):
-        return body
-    rewrite_testmempoolaccept_abort(method, parsed)
     return json.dumps(parsed).encode()
 
 
@@ -443,7 +472,7 @@ class RpcProxy:
                 if isinstance(method, str) and method in self._handlers:
                     return 200, json.dumps(self._one(payload)).encode()
                 status, body = self.forward_raw(json.dumps(payload).encode())
-                return status, _rewrite_forwarded_testmempoolaccept(method, body)
+                return status, _rewrite_forwarded_body(method, body)
         except RpcError as e:
             req_id = payload.get("id") if isinstance(payload, dict) else None
             body = json.dumps(

@@ -607,7 +607,11 @@ impl ActiveMempool {
         );
         // One sat/kvB above the evicted chunk so that same-rate tx cannot re-enter.
         let raised = rate_sat_kvb.saturating_add(1);
-        self.rolling_min_sat_kvb = decayed.max(raised);
+        let next = decayed.max(raised);
+        if next > self.rolling_min_sat_kvb {
+            rbitcoin_log::info!("mempool: rolling minimum fee bumped");
+        }
+        self.rolling_min_sat_kvb = next;
         self.rolling_updated_ms = now;
     }
 
@@ -1018,6 +1022,25 @@ impl ActiveMempool {
         tx: &Transaction,
         prep: PreparedAdmit,
     ) -> Result<AcceptResult, AcceptError> {
+        self.finish_commit(tx, prep, true)
+    }
+
+    /// Insert without trimming. `submitpackage` trims once after every member
+    /// is in, so a parent is not dropped before its child can pay for it.
+    pub fn commit_after_script_defer_trim(
+        &mut self,
+        tx: &Transaction,
+        prep: PreparedAdmit,
+    ) -> Result<AcceptResult, AcceptError> {
+        self.finish_commit(tx, prep, false)
+    }
+
+    fn finish_commit(
+        &mut self,
+        tx: &Transaction,
+        prep: PreparedAdmit,
+        trim: bool,
+    ) -> Result<AcceptResult, AcceptError> {
         let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
         let txid = prep.txid;
         let weight = prep.weight;
@@ -1075,7 +1098,14 @@ impl ActiveMempool {
         self.bodies.insert(txid, Arc::clone(&body));
         self.vin_aux.insert(txid, aux);
 
-        self.evict_to_budget(Some(txid))?;
+        if trim {
+            let _ = self.evict_to_budget(Some(txid))?;
+            // A descendant of an evicted parent leaves with that tree.
+            // A lone protected tx stays.
+            if !self.graph.contains(&txid) {
+                return Err(AcceptError::Policy("mempool full"));
+            }
+        }
 
         Ok(AcceptResult {
             txid,
@@ -1236,8 +1266,8 @@ impl ActiveMempool {
 
     /// Remove lowest-feerate chunks until `total_weight <= max_weight`.
     ///
-    /// Prefer not to evict `protect` (the just-accepted tx). Returns how many removed.
-    pub fn evict_to_budget(&mut self, protect: Option<Txid>) -> Result<usize, AcceptError> {
+    /// Prefer not to evict `protect` (the just-accepted tx). Returns every txid dropped.
+    pub fn evict_to_budget(&mut self, protect: Option<Txid>) -> Result<Vec<Txid>, AcceptError> {
         self.evict_worst_chunks(protect, EvictUntil::WeightBudget)
     }
 
@@ -1245,8 +1275,8 @@ impl ActiveMempool {
         &mut self,
         protect: Option<Txid>,
         until: EvictUntil,
-    ) -> Result<usize, AcceptError> {
-        let mut removed = 0usize;
+    ) -> Result<Vec<Txid>, AcceptError> {
+        let mut gone = Vec::new();
         let mut guard = 0u32;
         loop {
             match until {
@@ -1263,35 +1293,34 @@ impl ActiveMempool {
                 }
             }
             let n = self.evict_worst_chunk_once(protect)?;
-            if n == 0 {
+            if n.is_empty() {
                 break;
             }
-            removed = removed.saturating_add(n);
+            gone.extend(n);
         }
-        Ok(removed)
+        Ok(gone)
     }
 
-    /// One worst-chunk pass. Returns how many txs this pass removed (0 = stop).
-    fn evict_worst_chunk_once(&mut self, protect: Option<Txid>) -> Result<usize, AcceptError> {
+    /// One worst-chunk pass. Empty means stop.
+    fn evict_worst_chunk_once(&mut self, protect: Option<Txid>) -> Result<Vec<Txid>, AcceptError> {
         let Some((_rep, chunk)) = self.graph.worst_chunk() else {
-            return Ok(0);
+            return Ok(Vec::new());
         };
         if chunk.txids.len() == 1 && protect == chunk.txids.first().copied() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let evicted_rate = chunk.fee_rate_sat_per_kvb();
         self.note_evicted_feerate(evicted_rate);
-        let mut removed = 0usize;
+        let mut gone = Vec::new();
         for t in &chunk.txids {
             if protect == Some(*t) {
                 continue;
             }
             if self.graph.contains(t) {
-                let gone = self.remove_txid_tree(t);
-                removed = removed.saturating_add(gone.len());
+                gone.extend(self.remove_txid_tree(t));
             }
         }
-        Ok(removed)
+        Ok(gone)
     }
 
     /// Count / weight / topo checks for an ancestor package (no graph lock).
@@ -1377,6 +1406,7 @@ impl ActiveMempool {
     /// Combined ancestor/CPFP package fee vs total sigop-adjusted weight
     /// against `sat_kvb`.
     pub fn package_meets_min_relay(
+        &self,
         txs: &[Transaction],
         utxos: &impl UtxoProvider,
         sat_kvb: u64,
@@ -1394,6 +1424,9 @@ impl ActiveMempool {
                 let op = inp.previous_output;
                 let prev = if let Some(outs) = created.get(&op.txid) {
                     outs.get(op.vout as usize).cloned()
+                } else if let Some(parent) = self.bodies.get(&op.txid) {
+                    // In-mempool parent outside this remainder (already admitted).
+                    parent.output.get(op.vout as usize).cloned()
                 } else {
                     utxos.get_coin(&op).map(|c| c.txout)
                 };
@@ -1424,7 +1457,7 @@ impl ActiveMempool {
         Self::check_package_shape(txs)?;
 
         self.last_accept_stages = AcceptStageUs::default();
-        let member_min = if Self::package_meets_min_relay(
+        let member_min = if self.package_meets_min_relay(
             txs,
             utxos,
             self.min_relay_sat_kvb,

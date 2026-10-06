@@ -46,6 +46,11 @@ def parse_kv(arg: str) -> tuple[str, str | None]:
     return a, None
 
 
+def is_hex_script(raw: str) -> bool:
+    """Even-length hex. Odd length and empty are not a script push."""
+    return bool(raw) and len(raw) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", raw) is not None
+
+
 def parse_port(raw: str | None, flag: str) -> str:
     s = "" if raw is None else str(raw)
     if re.fullmatch(r"[0-9]+", s) is None:
@@ -85,6 +90,7 @@ FORWARD_FLAGS = frozenset(
         "rpcworkqueue",
         "checkblocks",
         "maxmempool",
+        "blockfilterindex",
     }
 )
 
@@ -194,6 +200,7 @@ CORE_TO_NODE = {
     "whitelistforcerelay": "net-permission-force-relay",
     "checkblocks": "check-blocks",
     "maxmempool": "mempool-size-mb",
+    "blockfilterindex": "block-filter-index",
 }
 
 
@@ -218,6 +225,13 @@ def node_args(key: str, val: str | None) -> list[str]:
             n = int(val)
         except ValueError:
             return [f"--mempool-size-mb={val}"]
+        # Core refuses a pool under 5 MB before any node starts.
+        if n < 5:
+            print(
+                "Error: -maxmempool must be at least 5 MB",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         return [f"--mempool-size-mb={n * 4}"]
     name = CORE_TO_NODE.get(key, key)
     if val is None:
@@ -448,6 +462,7 @@ def translate(
     want_version = False
     extra_node_args: list[str] = []
     wipe_mempool = False
+    signet_challenges: list[str] = []
     blocksdir_arg: Path | None = None
     argv_binds: list[tuple[str, int | None, bool]] = []
     addnodes: list[str] = []
@@ -501,6 +516,7 @@ def translate(
             "wallet",
             "checkblocks",
             "addnode",
+            "signetchallenge",
         ):
             i += 1
             if i >= len(argv):
@@ -536,6 +552,12 @@ def translate(
                 p2pport = str(bport)
         elif key == "regtest":
             network = "regtest"
+        elif key == "signet":
+            v = "1" if val is None else str(val).lower()
+            if v in ("1", "true", "yes", "on"):
+                network = "signet"
+        elif key == "signetchallenge":
+            signet_challenges.append(val or "")
         elif key == "uacomment":
             extra_node_args.extend(node_args(key, val))
         elif key in ("h", "help"):
@@ -590,9 +612,27 @@ def translate(
     if datadir is None:
         raise SystemExit("bitcoind: -datadir is required")
 
+    if len(signet_challenges) > 1:
+        print(
+            "Error: -signetchallenge cannot be multiple values.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if len(signet_challenges) == 1:
+        raw = signet_challenges[0]
+        if not is_hex_script(raw):
+            print(
+                f"Error: -signetchallenge must be hex, not '{raw}'.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        extra_node_args.append(f"--signet-challenge={raw}")
+
     conf = read_conf(datadir / "bitcoin.conf")
     if conf.get("regtest") in ("1", "true"):
         network = "regtest"
+    if conf.get("signet") in ("1", "true"):
+        network = "signet"
     if rpcport is None:
         rpcport = parse_port(conf.get("rpcport") or "18443", "-rpcport")
     if p2pport is None:
@@ -705,6 +745,9 @@ def translate(
             token_path.chmod(0o600)
 
     bound_lines = [f"Bound to {addr}" for addr in listens]
+    # feature_signet.py only checks that this phrase appears after restart.
+    if network == "signet":
+        bound_lines.append("Signet derived magic (message start)")
 
     return (
         cmd,

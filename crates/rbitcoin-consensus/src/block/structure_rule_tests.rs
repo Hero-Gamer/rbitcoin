@@ -1871,6 +1871,84 @@ fn bip30_ignores_unspendable_outputs() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// An unspendable script is still a coin. Core drops it from the UTXO set;
+/// we do not, so the spend resolves and fails in the script.
+#[test]
+fn spending_an_unspendable_output_still_resolves() {
+    use super::resolve_prevout;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::BatchParents;
+    use rbitcoin_store::{OutputRecord, TxRecord};
+    let txid = [0x42u8; 32];
+    let fk = Fk(7);
+    let rec = TxRecord {
+        txid,
+        version: 1,
+        locktime: 0,
+        input_start_fk: Fk::NULL,
+        input_count: 0,
+        output_start_fk: Fk::NULL,
+        output_count: 1,
+    };
+    let op = OutPoint {
+        txid: bitcoin::Txid::from_byte_array(txid),
+        vout: 0,
+    };
+    let dummy_in = TxIn {
+        previous_output: op,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    let block = block_with(vec![coinbase(1)]);
+    let txid_index = super::TxidMap::<usize>::default();
+    let try_spend = |script: Vec<u8>| {
+        let mut parents = BatchParents::new();
+        parents.put_resolved(
+            fk,
+            rec.clone(),
+            &[(0, OutputRecord::unspent(1, script))],
+            &[0],
+            Some(true),
+        );
+        resolve_prevout(
+            &block,
+            op,
+            &dummy_in,
+            Some(fk),
+            &txid_index,
+            1,
+            &parents,
+            false,
+            true,
+            true,
+            &mut super::AsmPrevoutAcc::default(),
+        )
+    };
+    let show = |r: &Result<_, ConsensusError>| match r {
+        Ok(_) => "resolved as a coin".to_string(),
+        Err(e) => format!("{e:?}"),
+    };
+    let oversized = try_spend(vec![0x51; 10_001]);
+    assert!(
+        oversized.is_ok(),
+        "oversized scriptPubKey is still a coin, got {}",
+        show(&oversized)
+    );
+    let op_return = try_spend(vec![0x6a, 0x01, 0x42]);
+    assert!(
+        op_return.is_ok(),
+        "OP_RETURN is still a coin, got {}",
+        show(&op_return)
+    );
+    let max = try_spend(vec![0x51; 10_000]);
+    assert!(
+        max.is_ok(),
+        "MAX_SCRIPT_SIZE scriptPubKey is still a coin, got {}",
+        show(&max)
+    );
+}
+
 #[test]
 fn buried_rules_and_a_lying_header_path() {
     let (signet_path, signet_q, signet_tx) = plant_unspent_coinbase("buried-signet");

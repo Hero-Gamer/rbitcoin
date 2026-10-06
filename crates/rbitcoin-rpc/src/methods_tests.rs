@@ -179,6 +179,160 @@ fn getorphantxs_is_hidden_and_lists_parked() {
 }
 
 #[test]
+fn signet_reports_default_challenge_and_unknown_filtertype_is_minus_five() {
+    let (ctx, dir) = ctx_empty();
+    let info = dispatch(&ctx, "getblockchaininfo", vec![]).unwrap();
+    assert!(info.get("signet_challenge").is_none());
+    let mining = dispatch(&ctx, "getmininginfo", vec![]).unwrap();
+    assert!(mining.get("signet_challenge").is_none());
+
+    let (mut signet, dir_signet) = ctx_empty();
+    signet.network = Network::Signet;
+    let expect = "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae";
+    let info = dispatch(&signet, "getblockchaininfo", vec![]).unwrap();
+    assert_eq!(info["chain"], "signet");
+    assert_eq!(info["signet_challenge"], json!(expect));
+    let mining = dispatch(&signet, "getmininginfo", vec![]).unwrap();
+    assert_eq!(mining["signet_challenge"], json!(expect));
+    assert_eq!(mining["blocks"], 0);
+    assert!(mining.get("currentblocktx").is_none());
+    assert!(mining.get("currentblockweight").is_none());
+
+    let err = dispatch(
+        &ctx,
+        "getblockfilter",
+        vec![json!("00".repeat(32)), json!("unknown")],
+    )
+    .unwrap_err();
+    assert_eq!(err["code"], ERR_INVALID_ADDRESS_OR_KEY);
+    assert!(err["message"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown filtertype"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir_signet);
+}
+
+fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
+    use bitcoin::bip158::{BlockFilter, FilterHeader};
+    use bitcoin::hashes::Hash;
+    let parent = FilterHeader::from_byte_array(
+        rbitcoin_primitives::hex_decode(parent_header_hex)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let filter = BlockFilter::new(&rbitcoin_primitives::hex_decode(filter_hex).unwrap());
+    rbitcoin_primitives::hex_encode(filter.filter_header(&parent).as_byte_array())
+}
+
+#[test]
+fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
+    use bitcoin::bip158::BlockFilter;
+
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (hex, _spend) = spend_generated_coinbase(
+        &ctx,
+        1,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
+    ctx.query.set_block_filter_index(true).unwrap();
+    assert_eq!(ctx.query.filter_index_next(), Some(0));
+
+    let missing = dispatch(&ctx, "getblockfilter", vec![json!("11".repeat(32))]).unwrap_err();
+    assert_eq!(missing["code"], ERR_INVALID_ADDRESS_OR_KEY);
+    assert_eq!(missing["message"], "Block not found");
+
+    let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
+    let height1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
+    let g = dispatch(&ctx, "getblockfilter", vec![genesis.clone()]).unwrap();
+    let one_before = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap();
+    let two_before = dispatch(&ctx, "getblockfilter", vec![height2]).unwrap();
+    let tip_before = dispatch(&ctx, "getblockfilter", vec![tip.clone()]).unwrap();
+    assert!(
+        tip_before["filter"].as_str().unwrap().len() > 2,
+        "{tip_before}"
+    );
+    let zero = "00".repeat(32);
+    assert_eq!(
+        g["header"],
+        json!(filter_header_hex(g["filter"].as_str().unwrap(), &zero)),
+        "genesis filter header chains from the zero prev-header"
+    );
+    assert_eq!(
+        one_before["header"],
+        json!(filter_header_hex(
+            one_before["filter"].as_str().unwrap(),
+            g["header"].as_str().unwrap(),
+        )),
+        "height 1 chains from the genesis filter header before anything is sealed, got {one_before}"
+    );
+    assert_eq!(
+        two_before["header"],
+        json!(filter_header_hex(
+            two_before["filter"].as_str().unwrap(),
+            one_before["header"].as_str().unwrap(),
+        )),
+        "height 2 chains through an unsealed parent, got {two_before}"
+    );
+    let tip_block = dispatch(&ctx, "getblock", vec![tip.clone()]).unwrap();
+    let parent_before = dispatch(
+        &ctx,
+        "getblockfilter",
+        vec![tip_block["previousblockhash"].clone()],
+    )
+    .unwrap();
+    assert_eq!(
+        tip_before["header"],
+        json!(filter_header_hex(
+            tip_before["filter"].as_str().unwrap(),
+            parent_before["header"].as_str().unwrap(),
+        )),
+        "tip chains from its unsealed parent, got {tip_before}"
+    );
+
+    let body = rbitcoin_primitives::hex_decode(g["filter"].as_str().unwrap()).unwrap();
+    let fk = ctx
+        .query
+        .store()
+        .confirmed
+        .get(Height(0))
+        .unwrap()
+        .expect("genesis header");
+    assert_eq!(
+        ctx.query
+            .commit_window_filters(0, &[(BlockFilter::new(&body), fk)])
+            .unwrap(),
+        1
+    );
+    let g_sealed = dispatch(&ctx, "getblockfilter", vec![genesis]).unwrap();
+    assert_eq!(g_sealed, g, "sealed genesis filter must match the rebuild");
+
+    let one = dispatch(&ctx, "getblockfilter", vec![height1]).unwrap();
+    assert_eq!(one["filter"], one_before["filter"]);
+    assert_eq!(
+        one["header"], one_before["header"],
+        "sealing the parent must not change the child filter header"
+    );
+
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    let stale = dispatch(&ctx, "getblockfilter", vec![tip]).unwrap();
+    assert_eq!(
+        stale["filter"], tip_before["filter"],
+        "a stored block off the best chain still has a basic filter"
+    );
+    assert_eq!(
+        stale["header"], tip_before["header"],
+        "a stale block keeps the same BIP157 header, got {stale}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn blockchain_empty_store() {
     let (ctx, dir) = ctx_empty();
     let count = dispatch(&ctx, "getblockcount", vec![]).unwrap();
@@ -1227,12 +1381,60 @@ fn ctx_regtest_hub_on(
     max_wu: u64,
 ) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     let dir = TempDir::labeled("rpc-gen").expect("temp dir");
-    let hub = Arc::new(rbitcoin_net::ChainHub::new(
-        Query::open_or_create_tiny(dir.join("store")).unwrap(),
+    let hub = open_regtest_hub(dir.join("store"), params);
+    hub.ensure_genesis().unwrap();
+    regtest_ctx(dir, hub, max_wu)
+}
+
+/// One 101-block regtest chain for tests that only need a mature coinbase.
+/// Each caller copies the store and opens a fresh mempool.
+fn mature_regtest_pad() -> &'static MatureRegtestPad {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<MatureRegtestPad> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+        ctx.query.flush().expect("flush mature pad");
+        let store = dir.path().join("store");
+        MatureRegtestPad {
+            store,
+            _dir: dir,
+            _hub: hub,
+        }
+    })
+}
+
+struct MatureRegtestPad {
+    store: std::path::PathBuf,
+    _dir: TempDir,
+    _hub: Arc<rbitcoin_net::ChainHub>,
+}
+
+fn ctx_from_mature_pad(max_wu: u64) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    let dir = TempDir::labeled("rpc-gen").expect("temp dir");
+    let dest = dir.path().join("store");
+    copy_store_tree(&mature_regtest_pad().store, &dest);
+    let hub = open_regtest_hub(&dest, rbitcoin_consensus::ChainParams::regtest());
+    hub.ensure_genesis().unwrap();
+    regtest_ctx(dir, hub, max_wu)
+}
+
+fn open_regtest_hub(
+    store: impl AsRef<std::path::Path>,
+    params: rbitcoin_consensus::ChainParams,
+) -> Arc<rbitcoin_net::ChainHub> {
+    Arc::new(rbitcoin_net::ChainHub::new(
+        Query::open_or_create_tiny(store).unwrap(),
         params,
         rbitcoin_consensus::Milestone::NONE,
-    ));
-    hub.ensure_genesis().unwrap();
+    ))
+}
+
+fn regtest_ctx(
+    dir: TempDir,
+    hub: Arc<rbitcoin_net::ChainHub>,
+    max_wu: u64,
+) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     let mp = MempoolHub::open_with_weight(dir.join("mempool"), hub.query.clone(), max_wu).unwrap();
     mp.set_relay_enabled(true);
     let ctx = RpcContext {
@@ -1260,6 +1462,20 @@ fn ctx_regtest_hub_on(
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (ctx, dir, hub)
+}
+
+fn copy_store_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
 }
 
 fn p2wpkh_regtest() -> (String, ScriptBuf) {
@@ -2054,6 +2270,99 @@ fn submitpackage_child_fail_keeps_parent() {
 }
 
 #[test]
+fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (low_hex, low) = spend_generated_coinbase(
+        &ctx,
+        1,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    dispatch(&ctx, "sendrawtransaction", vec![json!(low_hex), json!(0)]).unwrap();
+    let parent = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: low.input[0].previous_output.txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 2_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let child = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000 - 12_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+        }],
+    };
+    let parent_vb = rbitcoin_consensus::policy::get_virtual_size(parent.weight().to_wu());
+    let child_vb = rbitcoin_consensus::policy::get_virtual_size(child.weight().to_wu());
+    let parent_fee = 2_000u64;
+    let child_fee = 10_000u64;
+    let max_feerate = parent_fee.div_ceil(parent_vb.max(1));
+    assert!(
+        parent_fee <= max_feerate.saturating_mul(parent_vb),
+        "parent fee must stay within maxfeerate {max_feerate}"
+    );
+    assert!(
+        child_fee > max_feerate.saturating_mul(child_vb),
+        "child fee must exceed maxfeerate {max_feerate} vsize {child_vb}"
+    );
+    let pkg = dispatch(
+        &ctx,
+        "submitpackage",
+        vec![
+            json!([
+                hex_encode(serialize(&parent)),
+                hex_encode(serialize(&child))
+            ]),
+            json!(max_feerate),
+        ],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    let child_w = hash_hex_display(&child.compute_wtxid().to_byte_array());
+    assert_eq!(
+        pkg["tx-results"][&child_w]["error"],
+        json!("max feerate exceeded"),
+        "{pkg}"
+    );
+    let low_txid = hash_hex_display(&low.compute_txid().to_byte_array());
+    assert_eq!(
+        pkg["replaced-transactions"],
+        json!([low_txid]),
+        "the replacement parent must name the tx it evicted, got {pkg}"
+    );
+    let mp = ctx.mempool.as_ref().unwrap();
+    assert!(mp.contains(&parent.compute_txid()));
+    assert!(!mp.contains(&child.compute_txid()));
+    assert!(!mp.contains(&low.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn rpc_submit_nonstandard_version_is_version() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
@@ -2245,18 +2554,18 @@ fn mempool_under_pressure() {
         assert_eq!(v["error"], json!("package-not-validated"), "{sub}");
     }
 
-    pressure_tiny_weight();
     pressure_admit_then_cluster(&ctx, &spk);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
 fn pressure_tiny_weight() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let (fee_ctx, fee_dir, _fee_hub) = ctx_regtest_hub_with_weight(1_000);
+    let (fee_ctx, fee_dir, _fee_hub) = ctx_from_mature_pad(1_000);
     let info = dispatch(&fee_ctx, "getmempoolinfo", vec![]).unwrap();
     let minrelay = info["minrelaytxfee"].as_f64().unwrap();
     let minfee = info["mempoolminfee"].as_f64().unwrap();
@@ -2264,12 +2573,14 @@ fn pressure_tiny_weight() {
         minfee > minrelay,
         "tiny weight cap must raise mempoolminfee: {info}"
     );
-    dispatch(&fee_ctx, "generate", vec![json!(101)]).unwrap();
     let cb = generated_coinbase_value(&fee_ctx, 1);
     let probe = spend_generated_coinbase(&fee_ctx, 1, cb - 1, spk.clone()).1;
     let vsize = rbitcoin_consensus::policy::get_virtual_size(probe.weight().to_wu());
     let minrelay_fee = vsize.div_ceil(10);
     let (low_hex, low) = spend_generated_coinbase(&fee_ctx, 1, cb - minrelay_fee, spk.clone());
+    // Child fee stays under the default 10_000 sat/vB `maxfeerate`. A 1 sat
+    // output would burn almost the whole coinbase and skip package eval.
+    let child_fee = 1_000u64;
     let low_child = Transaction {
         version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
@@ -2283,35 +2594,35 @@ fn pressure_tiny_weight() {
             witness: Witness::new(),
         }],
         output: vec![TxOut {
-            value: Amount::from_sat(1),
+            value: Amount::from_sat(cb - minrelay_fee - child_fee),
             script_pubkey: spk,
         }],
     };
+    let child_vb = rbitcoin_consensus::policy::get_virtual_size(low_child.weight().to_wu());
+    assert!(
+        child_fee <= 10_000u64.saturating_mul(child_vb),
+        "child fee {child_fee} must stay within default maxfeerate, vsize {child_vb}"
+    );
     let pkg = dispatch(
         &fee_ctx,
         "submitpackage",
         vec![json!([low_hex, hex_encode(serialize(&low_child))])],
     )
     .unwrap();
-    assert_eq!(pkg["package_msg"], "transaction failed", "{pkg}");
+    assert_eq!(pkg["package_msg"], "success", "{pkg}");
     let parent_w = hash_hex_display(&low.compute_wtxid().to_byte_array());
     let child_w = hash_hex_display(&low_child.compute_wtxid().to_byte_array());
-    let parent_err = pkg["tx-results"][&parent_w]["error"].as_str().unwrap_or("");
-    assert!(
-        parent_err.contains("mempool min fee not met"),
-        "parent must stay individual min-fee fail, got {pkg}"
-    );
     assert_eq!(
-        pkg["tx-results"][&child_w]["error"],
-        json!("bad-txns-inputs-missingorspent"),
-        "{pkg}"
+        pkg["tx-results"][&parent_w]["fees"]["effective-includes"].clone(),
+        json!([parent_w, child_w]),
+        "paying child must clear the dynamic floor with the parent, got {pkg}"
     );
-    assert!(!fee_ctx
+    assert!(fee_ctx
         .mempool
         .as_ref()
         .unwrap()
         .contains(&low.compute_txid()));
-    assert!(!fee_ctx
+    assert!(fee_ctx
         .mempool
         .as_ref()
         .unwrap()
@@ -3653,8 +3964,8 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
     let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(
         mem["maxmempool"].as_u64(),
-        Some(50_000_000),
-        "maxmempool must be the hub weight budget, not a hardcoded 300M"
+        Some(12_500_000),
+        "maxmempool is the virtual-size byte cap (weight/4), not the weight budget"
     );
     let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
     // Core 0.19 CLIENT_VERSION. Below this, bitcoincore-rpc requires the
