@@ -27,6 +27,14 @@ fn net_addr_unspecified(addr: NetAddr) -> bool {
 /// Skip a recently dialed addr while any other candidate remains.
 pub(crate) const DIAL_ATTEMPT_RECENT: Duration = Duration::from_secs(10 * 60);
 
+fn attempt_is_recent(when: Instant, now: Instant) -> bool {
+    matches!(
+        now.saturating_duration_since(when)
+            .cmp(&DIAL_ATTEMPT_RECENT),
+        std::cmp::Ordering::Less
+    )
+}
+
 /// Service bits we advertise and ask DNS seeds for (`NETWORK|WITNESS|P2P_V2` = `0x809`).
 pub fn required_seed_services() -> ServiceFlags {
     ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
@@ -419,7 +427,7 @@ impl AddrMan {
     fn recently_attempted_addr(&self, addr: NetAddr, now: Instant) -> bool {
         self.last_attempt
             .get(&addr)
-            .is_some_and(|&t| now.saturating_duration_since(t) < DIAL_ATTEMPT_RECENT)
+            .is_some_and(|&t| attempt_is_recent(t, now))
     }
 
     pub fn add(&mut self, addr: SocketAddr) {
@@ -644,9 +652,7 @@ impl AddrMan {
     }
 
     fn recently_attempted(&self, addr: SocketAddr, now: Instant) -> bool {
-        self.last_attempt
-            .get(&NetAddr::from_socket(addr))
-            .is_some_and(|&t| now.saturating_duration_since(t) < DIAL_ATTEMPT_RECENT)
+        self.recently_attempted_addr(NetAddr::from_socket(addr), now)
     }
 
     /// Dial failed. `incompatible` = no v2 / protocol reject; else network/timeout.
@@ -1177,6 +1183,26 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got.contains(&addr(1)));
         assert!(got.contains(&addr(2)));
+
+        let now = Instant::now();
+        let mut edge = AddrMan::new();
+        edge.add(addr(1));
+        edge.note_attempt_at(
+            addr(1),
+            now.checked_sub(DIAL_ATTEMPT_RECENT).expect("clock"),
+        );
+        assert!(
+            !edge.recently_attempted(addr(1), now),
+            "an attempt exactly ten minutes old is not recent"
+        );
+        edge.note_attempt_at(
+            addr(1),
+            now.checked_sub(DIAL_ATTEMPT_RECENT)
+                .expect("clock")
+                .checked_add(Duration::from_secs(1))
+                .expect("clock"),
+        );
+        assert!(edge.recently_attempted(addr(1), now));
     }
 
     #[test]
