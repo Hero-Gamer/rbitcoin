@@ -126,7 +126,7 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 | **L12** | Coinbase scriptSig length `2..=100` | `rpc_regtest_from_genesis` (padded height push and 100 bytes) | same (under 2 and 101 → `bad-cb-length`) |
 | **L13** | Non-coinbase inputs non-null | `rpc_regtest_from_genesis` (non-null inputs connect) | same (null among two inputs → `bad-txns-prevout-null`) |
 | **C01** | All txs final at height / locktime | journey: `locktime=100` at height 101 | journey: `locktime==height` |
-| **C02** | Pre-SegWit block has no witness | `s8_mainnet_rejects_witness_before_segwit` (no-witness accepts) | same (witness before segwit) |
+| **C02** | Pre-SegWit block has no witness | `s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce` | `consensus_rules::header_and_spending_boundaries` (`unexpected witness before segwit`) |
 | **C03** | Weight `<= 4_000_000` WU | `s4_weight_4_000_000_accepts_4_000_001_rejects` (no-witness 4 M and witness 4 M) | same (`4_000_001` via +1 witness byte); `s4_rejects_overweight_block` |
 | **C04** | BIP34 coinbase height push | `s7_rejects_bip34_missing_after_activation_signet` (height push at activation) | same; `s7_*` activation / pre-activation |
 | **C05** | Witness data ⇒ commitment | `rpc_regtest_from_genesis` (no witness, no commitment) | same (witness, no commitment → `missing witness commitment`) |
