@@ -67,9 +67,9 @@ impl IbdLoopCadence {
     }
 
     /// Header poll every [`HEADERS_PERIOD`], or immediately when the work path
-    /// is empty (continuation of a live path stays event-driven in apply).
-    pub(crate) fn headers_due(&self, now: Instant, path_empty: bool) -> bool {
-        path_empty || Self::due(self.last_headers, now, HEADERS_PERIOD)
+    /// is empty or a block inv is waiting on headers.
+    pub(crate) fn headers_due(&self, now: Instant, path_empty: bool, challenge_due: bool) -> bool {
+        path_empty || challenge_due || Self::due(self.last_headers, now, HEADERS_PERIOD)
     }
 
     pub(crate) fn mark_headers(&mut self, now: Instant) {
@@ -127,16 +127,21 @@ mod tests {
     fn headers_period_or_empty_path() {
         let mut c = IbdLoopCadence::new();
         let t0 = Instant::now();
-        assert!(c.headers_due(t0, false));
+        assert!(c.headers_due(t0, false, false));
         c.mark_headers(t0);
         assert!(
-            !c.headers_due(t0 + Duration::from_millis(50), false),
+            !c.headers_due(t0 + Duration::from_millis(50), false, false),
             "locator_hashes must not run on every frame"
         );
         assert!(
-            c.headers_due(t0 + Duration::from_millis(1), true),
+            c.headers_due(t0 + Duration::from_millis(1), true, false),
             "empty path header fan is immediate"
         );
-        assert!(c.headers_due(t0 + HEADERS_PERIOD, false));
+        assert!(
+            c.headers_due(t0 + Duration::from_millis(1), false, true),
+            "a block inv asks for headers on this turn"
+        );
+        assert!(!c.headers_due(t0 + Duration::from_millis(1), false, false));
+        assert!(c.headers_due(t0 + HEADERS_PERIOD, false, false));
     }
 }

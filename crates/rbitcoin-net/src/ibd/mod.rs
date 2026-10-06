@@ -36,7 +36,7 @@ pub use dial::connect_timeout_for;
 pub use perf_log::{format_tip_perf_sizes, read_platform_rss, ProcessRss, TipPerfSizes};
 
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};
-use assign_plan::want_headers_beyond_soft_cap;
+use assign_plan::{need_ready_headroom, want_headers_beyond_soft_cap};
 use confirm::{offer_confirm_ready, spawn_confirm_engine, ConfirmEvent, ConfirmFeed};
 
 use assign::{assign_work_ordered, bq_pipeline_saturated, AssignDepth};
@@ -593,16 +593,19 @@ pub async fn ibd_cancellable(
         // after the 500 ms header period, or the announced header waits
         // behind a full queue.
         let challenge_due = header_walk::inv_challenge_due(&st);
-        if cadence.headers_due(now_cadence, path_empty || challenge_due) {
+        if cadence.headers_due(now_cadence, path_empty, challenge_due) {
             let live = st.ordered_set.len();
             let known_ready = st.body.known_len();
             let ready_gap = st.max_ordered_height.saturating_sub(st.max_ready_height);
-            let need_ready_headroom = want_headers_beyond_soft_cap(
-                live,
-                known_ready,
-                ready_gap,
-                (window as u32).saturating_mul(4).max(2048),
-            ) && !st.header_walk.has_checkpoints();
+            let need_ready_headroom = need_ready_headroom(
+                want_headers_beyond_soft_cap(
+                    live,
+                    known_ready,
+                    ready_gap,
+                    (window as u32).saturating_mul(4).max(2048),
+                ),
+                st.header_walk.has_checkpoints(),
+            );
             if should_unlatch_headers_done(&st, hub.tip_height().unwrap_or(0)) {
                 st.headers_done = false;
             }

@@ -100,6 +100,12 @@ pub(crate) fn densify_slots_for_peer(
 /// separate cadence (main loop / empty-headers lag). Treating empty as
 /// headroom made every already-known 1-header announce re-issue getheaders
 /// (mainnet tip: ~1k INFO lines/s).
+/// Soft-cap headroom only when headers are wanted and this walk has no
+/// checkpoints yet. A checkpointed walk does not ask past the soft cap.
+pub(crate) fn need_ready_headroom(want: bool, have_checkpoints: bool) -> bool {
+    want && !have_checkpoints
+}
+
 pub(crate) fn want_headers_beyond_soft_cap(
     live: usize,
     known_ready: usize,
@@ -160,6 +166,10 @@ mod tests {
         assert!(!want_headers_beyond_soft_cap(64_000, 50_000, 10_000, 2048));
         // Empty path is not soft-cap headroom (tip 1-header storm).
         assert!(!want_headers_beyond_soft_cap(0, 0, 0, 2048));
+        let dense = want_headers_beyond_soft_cap(64_000, 50_000, 100, 2048);
+        assert!(need_ready_headroom(dense, false));
+        assert!(!need_ready_headroom(dense, true));
+        assert!(!need_ready_headroom(false, false));
     }
 
     #[test]
