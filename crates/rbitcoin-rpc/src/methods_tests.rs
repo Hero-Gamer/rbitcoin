@@ -230,8 +230,13 @@ fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
 fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (hex, _spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (hex, _spend) = spend_generated_coinbase(
+        &ctx,
+        1,
+        50_0000_0000 - 1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
     let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
     ctx.query.set_block_filter_index(true).unwrap();
@@ -1376,12 +1381,60 @@ fn ctx_regtest_hub_on(
     max_wu: u64,
 ) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     let dir = TempDir::labeled("rpc-gen").expect("temp dir");
-    let hub = Arc::new(rbitcoin_net::ChainHub::new(
-        Query::open_or_create_tiny(dir.join("store")).unwrap(),
+    let hub = open_regtest_hub(dir.join("store"), params);
+    hub.ensure_genesis().unwrap();
+    regtest_ctx(dir, hub, max_wu)
+}
+
+/// One 101-block regtest chain for tests that only need a mature coinbase.
+/// Each caller copies the store and opens a fresh mempool.
+fn mature_regtest_pad() -> &'static MatureRegtestPad {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<MatureRegtestPad> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let (ctx, dir, hub) = ctx_regtest_hub();
+        dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+        ctx.query.flush().expect("flush mature pad");
+        let store = dir.path().join("store");
+        MatureRegtestPad {
+            store,
+            _dir: dir,
+            _hub: hub,
+        }
+    })
+}
+
+struct MatureRegtestPad {
+    store: std::path::PathBuf,
+    _dir: TempDir,
+    _hub: Arc<rbitcoin_net::ChainHub>,
+}
+
+fn ctx_from_mature_pad(max_wu: u64) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    let dir = TempDir::labeled("rpc-gen").expect("temp dir");
+    let dest = dir.path().join("store");
+    copy_store_tree(&mature_regtest_pad().store, &dest);
+    let hub = open_regtest_hub(&dest, rbitcoin_consensus::ChainParams::regtest());
+    hub.ensure_genesis().unwrap();
+    regtest_ctx(dir, hub, max_wu)
+}
+
+fn open_regtest_hub(
+    store: impl AsRef<std::path::Path>,
+    params: rbitcoin_consensus::ChainParams,
+) -> Arc<rbitcoin_net::ChainHub> {
+    Arc::new(rbitcoin_net::ChainHub::new(
+        Query::open_or_create_tiny(store).unwrap(),
         params,
         rbitcoin_consensus::Milestone::NONE,
-    ));
-    hub.ensure_genesis().unwrap();
+    ))
+}
+
+fn regtest_ctx(
+    dir: TempDir,
+    hub: Arc<rbitcoin_net::ChainHub>,
+    max_wu: u64,
+) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     let mp = MempoolHub::open_with_weight(dir.join("mempool"), hub.query.clone(), max_wu).unwrap();
     mp.set_relay_enabled(true);
     let ctx = RpcContext {
@@ -1409,6 +1462,20 @@ fn ctx_regtest_hub_on(
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     (ctx, dir, hub)
+}
+
+fn copy_store_tree(src: &std::path::Path, dst: &std::path::Path) {
+    std::fs::create_dir_all(dst).unwrap();
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
 }
 
 fn p2wpkh_regtest() -> (String, ScriptBuf) {
@@ -2208,9 +2275,10 @@ fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    let (low_hex, low) = mature_coinbase_spend(
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (low_hex, low) = spend_generated_coinbase(
         &ctx,
+        1,
         50_0000_0000 - 1_000,
         ScriptBuf::from_bytes(vec![0x51]),
     );
@@ -2486,18 +2554,18 @@ fn mempool_under_pressure() {
         assert_eq!(v["error"], json!("package-not-validated"), "{sub}");
     }
 
-    pressure_tiny_weight();
     pressure_admit_then_cluster(&ctx, &spk);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
 fn pressure_tiny_weight() {
     use bitcoin::absolute::LockTime;
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let (fee_ctx, fee_dir, _fee_hub) = ctx_regtest_hub_with_weight(1_000);
+    let (fee_ctx, fee_dir, _fee_hub) = ctx_from_mature_pad(1_000);
     let info = dispatch(&fee_ctx, "getmempoolinfo", vec![]).unwrap();
     let minrelay = info["minrelaytxfee"].as_f64().unwrap();
     let minfee = info["mempoolminfee"].as_f64().unwrap();
@@ -2505,7 +2573,6 @@ fn pressure_tiny_weight() {
         minfee > minrelay,
         "tiny weight cap must raise mempoolminfee: {info}"
     );
-    dispatch(&fee_ctx, "generate", vec![json!(101)]).unwrap();
     let cb = generated_coinbase_value(&fee_ctx, 1);
     let probe = spend_generated_coinbase(&fee_ctx, 1, cb - 1, spk.clone()).1;
     let vsize = rbitcoin_consensus::policy::get_virtual_size(probe.weight().to_wu());
