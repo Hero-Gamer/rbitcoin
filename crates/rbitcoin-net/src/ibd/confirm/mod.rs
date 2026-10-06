@@ -621,8 +621,9 @@ fn rearm_after_reject(
 /// plan, or a consensus reject against a parent that is not the tip) goes
 /// back for a retry. A batched reject names the first hash but may be any
 /// block's fault, so every block goes back and the retry runs one block at
-/// a time. Same order as [`rearm_after_reject`]: serialize, isolate,
-/// re-arm, insert.
+/// a time. An engine fault is no block's fault: every block goes back and
+/// the retry is not isolated. Same order as [`rearm_after_reject`]:
+/// serialize, isolate, re-arm, insert.
 fn load_fail_rewind_wave(
     feed: &ConfirmFeed,
     hub: &ChainHub,
@@ -631,8 +632,11 @@ fn load_fail_rewind_wave(
     class: ConfirmRejectClass,
     wave: &[OfferBack<'_>],
 ) {
+    let fault = class == ConfirmRejectClass::EngineFault;
     let drop_head = match wave {
-        [(_, hash, _, _)] => class.trust_consensus(hub, *hash) != ConfirmRejectClass::Cascade,
+        [(_, hash, _, _)] => {
+            !fault && class.trust_consensus(hub, *hash) != ConfirmRejectClass::Cascade
+        }
         _ => false,
     };
     let prepared = prepare_offer_back(hub, wave[usize::from(drop_head)..].iter().copied());
@@ -641,7 +645,7 @@ fn load_fail_rewind_wave(
     feed.clear();
     // After `clear` (which drops isolation) and before the re-offer, so
     // lookup cannot rebuild the same wave.
-    if wave.len() > 1 {
+    if wave.len() > 1 && !fault {
         feed.request_single_block(first_h.saturating_add(wave.len() as u32 - 1));
     }
     hub.query.set_lookup_taken_hi(hub.tip_height());
@@ -2122,27 +2126,19 @@ pub(crate) fn spawn_confirm_engine(
                         let first_hash = wire_batch[0].1;
                         let sender = wire_sender(&wire_batch[0].2);
                         let class = ConfirmRejectClass::from_consensus(&e);
-                        if class == ConfirmRejectClass::EngineFault {
-                            reoffer_blocks_to_body_queue(
-                                &hub_load,
-                                wire_batch.iter().filter_map(|(h, ha, w)| {
-                                    (!hub_load.has_block(ha))
-                                        .then_some((*h, *ha, w.block.as_ref(), w.sender))
-                                }),
-                            );
-                        } else {
-                            load_fail_rewind_wave(
-                                &feed_load,
-                                &hub_load,
-                                &mut lookup_ahead,
-                                expect_h,
-                                class,
-                                &wire_batch
-                                    .iter()
-                                    .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
-                                    .collect::<Vec<_>>(),
-                            );
-                        }
+                        let t_rewind = Instant::now();
+                        load_fail_rewind_wave(
+                            &feed_load,
+                            &hub_load,
+                            &mut lookup_ahead,
+                            expect_h,
+                            class,
+                            &wire_batch
+                                .iter()
+                                .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
+                                .collect::<Vec<_>>(),
+                        );
+                        confirm_thr_stats::add_load_prune(&stats, t_rewind.elapsed());
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
@@ -2293,17 +2289,27 @@ pub(crate) fn spawn_confirm_engine(
                         }
                         let class = ConfirmRejectClass::from_net(&e);
                         let sender = wire_sender(&wire_batch[0].2);
+                        // A pin-stage invariant miss can be a stale-fk plan
+                        // race, not a store fault: retry it one block at a
+                        // time, as a cascade.
+                        let rewind = if class == ConfirmRejectClass::EngineFault {
+                            ConfirmRejectClass::Cascade
+                        } else {
+                            class
+                        };
+                        let t_rewind = Instant::now();
                         load_fail_rewind_wave(
                             &feed_load,
                             &hub_load,
                             &mut lookup_ahead,
                             expect_h,
-                            class,
+                            rewind,
                             &wire_batch
                                 .iter()
                                 .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
                                 .collect::<Vec<_>>(),
                         );
+                        confirm_thr_stats::add_load_prune(&stats, t_rewind.elapsed());
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);

@@ -1783,8 +1783,8 @@ fn ibd_confirm_pin_fault() {
 /// A two-block load wave fails, named by tip+1: pins clear, the epoch drops
 /// same-wave loads, lookup rewinds to the tip, the retry is one block at a
 /// time, and both bodies go back on the body queue, not feed.ready. A
-/// one-block verdict drops the block that failed; a one-block cascade goes
-/// back for a retry.
+/// one-block verdict drops the block that failed; a one-block cascade or
+/// engine fault goes back for a retry. An engine fault is not isolated.
 fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHash, tip_time: u32) {
     use super::{load_fail_rewind_wave, ConfirmRejectClass, LoadAheadState};
     use bitcoin::consensus::encode::serialize;
@@ -1852,7 +1852,7 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
     for (class, kept) in [
         (ConfirmRejectClass::ConsensusInvalid, false),
         (ConfirmRejectClass::SoftWire, false),
-        (ConfirmRejectClass::EngineFault, false),
+        (ConfirmRejectClass::EngineFault, true),
         (ConfirmRejectClass::Cascade, true),
     ] {
         let solo = ConfirmFeed::new();
@@ -1870,6 +1870,30 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
             hub.query.block_queue_dequeue_height(t + 1).unwrap();
         }
     }
+
+    let fault = ConfirmFeed::new();
+    hub.query.set_lookup_taken_hi(Some(t + 2));
+    load_fail_rewind_wave(
+        &fault,
+        hub,
+        &mut st,
+        t + 1,
+        ConfirmRejectClass::EngineFault,
+        &[
+            (t + 1, head.block_hash(), &head, None),
+            (t + 2, tail.block_hash(), &tail, None),
+        ],
+    );
+    assert_eq!(hub.query.lookup_taken_hi(), Some(t));
+    assert!(!fault.single_block(), "an engine fault is not isolated");
+    assert_eq!(
+        hub.query
+            .block_queue_unresolved_heights(t + 1, &HashSet::new(), 4),
+        vec![t + 1, t + 2],
+        "the faulted wave is claimable again"
+    );
+    hub.query.block_queue_dequeue_height(t + 1).unwrap();
+    hub.query.block_queue_dequeue_height(t + 2).unwrap();
 }
 
 /// A write or scripts reject re-arms lookup at the tip. A retried batched

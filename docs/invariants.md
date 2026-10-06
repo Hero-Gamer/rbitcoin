@@ -179,4 +179,5 @@ packs at/above the leaving **pack** height **before** the next bind.
 | `direct_write_skips_create_pin_map_idx_without_recent` | Direct skips `write_create_pins`; Class A idx holds body range |
 | `pin_takes_stamp_parent_vouts` / `plan_batch_same_header_vouts_skipped_cross_height_pinned` | pin takes stamp vouts; same-header creates not pinned |
 | `ibd_confirm_pin_fault` | IBD load: child spend of just-written pack (187); same-wave intervening writes (496); later-wave intervening write still has InFlight so TipOnly loc must ride the stamp (905); lookup-ahead child wave (133433) |
+| `load_engine_fault_near_the_tip_retakes_the_wave` | load stamp store fault on the last path block: the wave goes back to lookup under a re-arm and connects with no later wave to re-arm it |
 | `ibd_bad_prev_fork` | fk mismatch / connect height not tip+1 cascade requeue; store invariant engine-fault (requeue once then halt); only consensus-invalid blacklisted |
