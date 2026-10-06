@@ -204,18 +204,15 @@ impl std::fmt::Display for DialTarget {
 
 /// An outbound dial counted in [`PeerHub::dial_in_flight`]; dropping it
 /// ends the count.
+#[derive(Debug)]
 pub(crate) struct DialInFlight {
-    peers: Arc<PeerHub>,
+    counts: Arc<Mutex<HashMap<String, usize>>>,
     key: String,
 }
 
 impl Drop for DialInFlight {
     fn drop(&mut self) {
-        let mut g = self
-            .peers
-            .dials_in_flight
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut g = self.counts.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(n) = g.get_mut(&self.key) {
             *n -= 1;
             if *n == 0 {
@@ -226,10 +223,14 @@ impl Drop for DialInFlight {
 }
 
 /// Request that the node dial `addr` as `typ`.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DialRequest {
     pub target: DialTarget,
     pub typ: PeerConnType,
+    /// Counts the dial from the moment it is queued, so a redial or
+    /// `addnode` that runs before the dial task picks it up sees it. `None`
+    /// for a feeler, which registers no session and is never counted.
+    pub(crate) in_flight: Option<DialInFlight>,
 }
 
 #[derive(Clone, Debug)]
@@ -1296,7 +1297,7 @@ pub struct PeerHub {
     connect_addrs: Mutex<Vec<crate::NetAddr>>,
     /// Outbound dials still before session registration, by target. The
     /// redial pass skips these, so a slow connect is not stacked every 2 s.
-    dials_in_flight: Mutex<HashMap<String, usize>>,
+    dials_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Network P2P port used when a remembered host omits `:port`. `0` = unset.
     connect_default_port: AtomicU16,
     dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
@@ -1413,7 +1414,7 @@ impl PeerHub {
             manual_hosts: Mutex::new(HashSet::new()),
             connect_hosts: Mutex::new(Vec::new()),
             connect_addrs: Mutex::new(Vec::new()),
-            dials_in_flight: Mutex::new(HashMap::new()),
+            dials_in_flight: Arc::new(Mutex::new(HashMap::new())),
             connect_default_port: AtomicU16::new(0),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
@@ -2358,10 +2359,22 @@ impl PeerHub {
     }
 
     fn dial_manual_net(&self, addr: &crate::NetAddr) -> Result<(), String> {
-        match addr.socket_addr() {
-            Some(ip) => self.dial(ip, PeerConnType::Manual),
-            None => self.dial_domain(addr.host_str(), addr.port(), PeerConnType::Manual),
+        self.dial_manual_target(DialTarget::from_net(*addr))
+    }
+
+    /// Core `AlreadyConnectedToHost` / `AlreadyConnectedToAddressPort`:
+    /// `addnode` and the redial pass open no second session to an endpoint
+    /// that is connected or still dialling, and the RPC still succeeds.
+    fn dial_manual_target(&self, target: DialTarget) -> Result<(), String> {
+        // Claim before the live check: a dial registers its session before
+        // it drops its claim, so no window shows the endpoint as neither.
+        let Some(claim) = self.claim_dial(&target) else {
+            return Ok(());
+        };
+        if self.is_target_live(&target) {
+            return Ok(());
         }
+        self.send_dial(target, PeerConnType::Manual, Some(claim))
     }
 
     pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
@@ -2394,13 +2407,13 @@ impl PeerHub {
     pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
         self.note_default_port(default_port);
         match cmd {
-            "onetry" => self.dial_resolved(node, PeerConnType::Manual),
+            "onetry" => self.dial_resolved(node),
             "add" => {
                 self.manual_hosts
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(node.to_string());
-                let _ = self.dial_resolved(node, PeerConnType::Manual);
+                let _ = self.dial_resolved(node);
                 Ok(())
             }
             "remove" => {
@@ -2451,7 +2464,7 @@ impl PeerHub {
         Ok(DialTarget::Socket(addr))
     }
 
-    fn dial_resolved(&self, node: &str, typ: PeerConnType) -> Result<(), String> {
+    fn dial_resolved(&self, node: &str) -> Result<(), String> {
         let target = self.host_dial_target(node)?;
         match &target {
             DialTarget::Socket(addr) => {
@@ -2467,14 +2480,7 @@ impl PeerHub {
                     .insert(target.net_addr());
             }
         }
-        self.dial_target(target, typ)
-    }
-
-    fn dial_target(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
-        match target {
-            DialTarget::Socket(addr) => self.dial(addr, typ),
-            DialTarget::Domain { host, port } => self.dial_domain(host, port, typ),
-        }
+        self.dial_manual_target(target)
     }
 
     fn disconnect_target(&self, target: &DialTarget) -> bool {
@@ -2497,10 +2503,11 @@ impl PeerHub {
         }
     }
 
-    /// Count an outbound dial to `target` until the guard drops. Held from
-    /// before the TCP / SOCKS connect until the session is registered or the
-    /// dial fails, whichever path ends it.
-    pub(crate) fn dial_in_flight(self: &Arc<Self>, target: &DialTarget) -> DialInFlight {
+    /// Count an outbound dial to `target` until the guard drops. Taken when
+    /// the dial is queued (a direct follow dial takes it before the TCP /
+    /// SOCKS connect) and held until the session is registered or the dial
+    /// fails, whichever path ends it.
+    pub(crate) fn dial_in_flight(&self, target: &DialTarget) -> DialInFlight {
         let key = target.to_string();
         *self
             .dials_in_flight
@@ -2509,16 +2516,27 @@ impl PeerHub {
             .entry(key.clone())
             .or_insert(0) += 1;
         DialInFlight {
-            peers: Arc::clone(self),
+            counts: Arc::clone(&self.dials_in_flight),
             key,
         }
     }
 
-    fn is_target_dialing(&self, target: &DialTarget) -> bool {
-        self.dials_in_flight
+    /// [`Self::dial_in_flight`], or `None` when `target` already has a dial
+    /// queued or connecting. Check and count are one step.
+    fn claim_dial(&self, target: &DialTarget) -> Option<DialInFlight> {
+        let key = target.to_string();
+        let mut g = self
+            .dials_in_flight
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&target.to_string())
+            .unwrap_or_else(|e| e.into_inner());
+        if g.contains_key(&key) {
+            return None;
+        }
+        g.insert(key.clone(), 1);
+        Some(DialInFlight {
+            counts: Arc::clone(&self.dials_in_flight),
+            key,
+        })
     }
 
     fn is_target_live(&self, target: &DialTarget) -> bool {
@@ -2571,10 +2589,7 @@ impl PeerHub {
             if !seen.insert(target.to_string()) {
                 continue;
             }
-            if self.is_target_live(&target) || self.is_target_dialing(&target) {
-                continue;
-            }
-            let _ = self.dial_target(target, PeerConnType::Manual);
+            let _ = self.dial_manual_target(target);
         }
     }
 
@@ -2663,11 +2678,31 @@ impl PeerHub {
     }
 
     pub fn dial_net(&self, addr: crate::NetAddr, typ: PeerConnType) -> Result<(), String> {
+        self.queue_dial(DialTarget::from_net(addr), typ)
+    }
+
+    /// Queue a dial, counted in flight from now on. A feeler is not counted:
+    /// it registers no session, and its probe has no connect deadline, so a
+    /// stuck one would block the redial pass for that endpoint.
+    fn queue_dial(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
+        let in_flight = (typ != PeerConnType::Feeler).then(|| self.dial_in_flight(&target));
+        self.send_dial(target, typ, in_flight)
+    }
+
+    /// Queue a dial. The request carries `in_flight` to the dial task; if it
+    /// is never sent, dropping it ends the count.
+    fn send_dial(
+        &self,
+        target: DialTarget,
+        typ: PeerConnType,
+        in_flight: Option<DialInFlight>,
+    ) -> Result<(), String> {
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = g.as_ref().ok_or("no dialer attached")?;
         tx.send(DialRequest {
-            target: DialTarget::from_net(addr),
+            target,
             typ,
+            in_flight,
         })
         .map_err(|_| "dialer closed".to_string())
     }
@@ -2795,13 +2830,7 @@ impl PeerHub {
     }
 
     pub fn dial(&self, addr: SocketAddr, typ: PeerConnType) -> Result<(), String> {
-        let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = g.as_ref().ok_or("no dialer attached")?;
-        tx.send(DialRequest {
-            target: DialTarget::from_net(crate::NetAddr::Ip(addr)),
-            typ,
-        })
-        .map_err(|_| "dialer closed".to_string())
+        self.dial_net(crate::NetAddr::Ip(addr), typ)
     }
 
     pub fn dial_domain(
@@ -2810,16 +2839,11 @@ impl PeerHub {
         port: u16,
         typ: PeerConnType,
     ) -> Result<(), String> {
-        let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
-        let tx = g.as_ref().ok_or("no dialer attached")?;
-        tx.send(DialRequest {
-            target: DialTarget::Domain {
-                host: host.into(),
-                port,
-            },
-            typ,
-        })
-        .map_err(|_| "dialer closed".to_string())
+        let target = DialTarget::Domain {
+            host: host.into(),
+            port,
+        };
+        self.queue_dial(target, typ)
     }
 }
 
@@ -3525,6 +3549,8 @@ mod tests {
         let got = take_dials(&mut rx);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(matches!(got[0].typ, PeerConnType::Manual), "{got:?}");
+        // A queued request counts as in flight; dropping it ends that dial.
+        drop(got);
 
         // A --connect address (IP or overlay) redials in the same pass. One
         // that meets a hostname at an endpoint shares its dial, and a live
@@ -3541,6 +3567,7 @@ mod tests {
         assert!(got.iter().all(|d| d.typ == PeerConnType::Manual), "{got:?}");
         assert_eq!(got[0].target, DialTarget::Socket(ip), "{got:?}");
         assert_eq!(got[1].target, DialTarget::from_net(onion), "{got:?}");
+        drop(got);
         let _live = hub.register(
             ip,
             ip,
@@ -3552,6 +3579,84 @@ mod tests {
         let got = take_dials(&mut rx);
         assert_eq!(got.len(), 1, "only the onion has no live session: {got:?}");
         assert_eq!(got[0].target, DialTarget::from_net(onion), "{got:?}");
+    }
+
+    #[test]
+    fn addnode_skips_an_endpoint_that_is_connected_or_dialling() {
+        let hub = PeerHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.set_dialer(tx);
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18446);
+        let live = hub.register(
+            ip,
+            ip,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        );
+        // Core `AlreadyConnectedToHost` / `AlreadyConnectedToAddressPort`.
+        hub.addnode_host("127.0.0.1:18446", "onetry", 18444)
+            .unwrap();
+        hub.addnode_host("127.0.0.1:18446", "add", 18444).unwrap();
+        hub.addnode(ip, "onetry").unwrap();
+        let got = take_dials(&mut rx);
+        assert!(
+            got.is_empty(),
+            "a connected endpoint is not dialled again: {got:?}"
+        );
+
+        let onion: crate::NetAddr =
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+                .parse()
+                .unwrap();
+        let dialing = hub.dial_in_flight(&DialTarget::from_net(onion));
+        hub.addnode_host(&onion.to_string(), "onetry", 18444)
+            .unwrap();
+        let got = take_dials(&mut rx);
+        assert!(got.is_empty(), "nor is one still dialling: {got:?}");
+        drop(dialing);
+        // A dial counts from the moment it is queued, before the dial task
+        // picks it up: `onetry`, `add` and a redial pass right behind it
+        // queue nothing more.
+        hub.addnode_host(&onion.to_string(), "onetry", 18444)
+            .unwrap();
+        hub.addnode_host(&onion.to_string(), "add", 18444).unwrap();
+        hub.redial_remembered();
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 1, "a queued dial is not queued again: {got:?}");
+        assert_eq!(got[0].target, DialTarget::from_net(onion), "{got:?}");
+
+        live.request_disconnect();
+        hub.addnode_host("127.0.0.1:18446", "onetry", 18444)
+            .unwrap();
+        let got = take_dials(&mut rx);
+        assert_eq!(got.len(), 1, "once the session ends, onetry dials: {got:?}");
+        assert_eq!(got[0].target, DialTarget::Socket(ip), "{got:?}");
+        assert_eq!(got[0].typ, PeerConnType::Manual, "{got:?}");
+    }
+
+    #[test]
+    fn a_queued_feeler_does_not_hold_off_a_manual_dial() {
+        let hub = PeerHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.set_dialer(tx);
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+        // A feeler's probe has no connect deadline. Counted in flight, a
+        // stuck one would keep `addnode` and the redial pass off this
+        // endpoint until it ended.
+        hub.addconnection(ip, PeerConnType::Feeler).unwrap();
+        let feeler = take_dials(&mut rx);
+        assert_eq!(feeler.len(), 1, "{feeler:?}");
+        assert_eq!(feeler[0].typ, PeerConnType::Feeler, "{feeler:?}");
+        hub.addnode(ip, "onetry").unwrap();
+        let got = take_dials(&mut rx);
+        assert_eq!(
+            got.len(),
+            1,
+            "a queued feeler does not block addnode: {got:?}"
+        );
+        assert_eq!(got[0].typ, PeerConnType::Manual, "{got:?}");
+        drop(feeler);
     }
 
     #[tokio::test]

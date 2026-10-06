@@ -3002,6 +3002,22 @@ async fn node_run_p2p_short() {
             )
             .await;
 
+            // Core `AlreadyConnectedToHost`: `addnode` to a connected
+            // endpoint succeeds and opens no second session.
+            for cmd in ["onetry", "add"] {
+                let r = jsonrpc(rpc_addr, "addnode", json!([addr.clone(), cmd])).await;
+                assert!(r["error"].is_null(), "addnode {cmd}: {r}");
+            }
+            let quiet = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < quiet {
+                let peers = jsonrpc(rpc_addr, "getpeerinfo", json!([])).await;
+                let n = peers["result"].as_array().map_or(0, |rows| {
+                    rows.iter().filter(|p| p["addr"] == addr.as_str()).count()
+                });
+                assert_eq!(n, 1, "addnode opened a second session to {addr}: {peers}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
             pin_blocksonly_seeder_tx_disconnects(rpc_addr, &seed_peers).await;
             let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
         });

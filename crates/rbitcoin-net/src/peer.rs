@@ -140,11 +140,11 @@ async fn accept_received_from_peer(
     })
 }
 
-/// One-day in-memory refusal. Noban peers are not recorded.
+/// One-day in-memory refusal. Noban and manual peers are not recorded.
 /// A loopback address is every local connection, so Core disconnects that
 /// peer and does not discourage the address.
 fn note_threshold_refusal(session: Option<&crate::peers::LivePeer>) {
-    let Some(s) = session.filter(|s| !s.session_noban()) else {
+    let Some(s) = session.filter(|s| !misbehavior_exempt(s)) else {
         return;
     };
     if local_addr_skips_discourage(s.addr.ip()) {
@@ -169,6 +169,27 @@ fn threshold_disconnect(session: Option<&crate::peers::LivePeer>) -> NetError {
     NetError::Protocol("peer misbehavior threshold")
 }
 
+/// Core `MaybeDiscourageAndDisconnect`: misbehavior never disconnects or
+/// discourages a noban peer or a manual one (`--connect`, `addnode`).
+fn misbehavior_exempt(s: &crate::peers::LivePeer) -> bool {
+    s.session_noban() || s.conn_type == crate::peers::PeerConnType::Manual
+}
+
+/// Core `Misbehaving`. Unlike [`punish_disconnect`], it also keeps a manual
+/// peer connected.
+fn misbehaving(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
+    if let Some(s) =
+        session.filter(|s| s.conn_type == crate::peers::PeerConnType::Manual && !s.session_noban())
+    {
+        rbitcoin_log::info!("Warning: not punishing manually connected peer {}!", s.id);
+        return;
+    }
+    punish_disconnect(ban_score, session);
+}
+
+/// Disconnects and refuses the address; a noban peer is kept. Used where Core
+/// sets `fDisconnect`, which drops a manual peer too. Core `Misbehaving`
+/// sites call [`misbehaving`].
 fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePeer>) {
     if let Some(s) = session.filter(|s| s.session_noban()) {
         rbitcoin_log::info!("Warning: not punishing noban peer {}!", s.id);
@@ -181,9 +202,10 @@ fn punish_disconnect(ban_score: &mut u32, session: Option<&crate::peers::LivePee
     }
 }
 
-/// Core `MaybeDiscourageAndDisconnect`: misbehavior never drops a noban peer.
+/// Core `MaybeDiscourageAndDisconnect`: misbehavior never drops a noban or
+/// manual peer.
 fn misbehavior_disconnects(ban_score: u32, session: Option<&crate::peers::LivePeer>) -> bool {
-    ban_score >= BAN_SCORE_THRESHOLD && !session.is_some_and(|s| s.session_noban())
+    ban_score >= BAN_SCORE_THRESHOLD && !session.is_some_and(misbehavior_exempt)
 }
 /// Cap on incomplete compact blocks awaiting `blocktxn` (DoS).
 const MAX_PENDING_CMPCT: usize = 1;
@@ -2891,7 +2913,7 @@ fn on_addrv2(
     rbitcoin_log::info!("{}", received_addrv2_log(nbytes, id));
     if n > MAX_ADDR_TO_SEND {
         rbitcoin_log::info!("{}", addrv2_message_size_log(n));
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     if session.is_some_and(|s| s.conn_type == crate::peers::PeerConnType::AddrFetch && n > 1) {
@@ -3028,7 +3050,7 @@ async fn serve_getdata(
     inv: &[Inventory],
 ) -> Result<(), NetError> {
     if inv.len() > MAX_INV_SIZE {
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     let inflight = session.map(|s| &s.serve_inflight);
@@ -3204,11 +3226,8 @@ fn on_getblocktxn(
         }
         if bad {
             rbitcoin_log::info!("p2p: getblocktxn with out-of-bounds tx indices");
-            // Out-of-range indexes: disconnect.
-            follow.ban_score = follow.ban_score.saturating_add(BAN_SCORE_THRESHOLD);
-            if let Some(s) = session {
-                s.request_disconnect();
-            }
+            // Core `Misbehaving`: noban and manual peers stay connected.
+            misbehaving(&mut follow.ban_score, session);
         } else {
             // Core: past `MAX_GETBLOCKTXN_DEPTH` (10) send the full block.
             const MAX_GETBLOCKTXN_DEPTH: u32 = 10;
@@ -3246,7 +3265,7 @@ fn on_inv(
     items: &[Inventory],
 ) -> Result<(), NetError> {
     if items.len() > MAX_INV_SIZE {
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     let mut want = Vec::new();
@@ -3436,7 +3455,7 @@ fn on_headers(
         {
             // Headers on a cached-invalid chain: disconnect
             // (`p2p_unrequested_blocks` step 8 follow-up header).
-            punish_disconnect(&mut follow.ban_score, session);
+            misbehaving(&mut follow.ban_score, session);
             return Ok(());
         }
         let connecting = header_announcement_connects(hub, &follow.pending_headers, prev);
@@ -3522,19 +3541,19 @@ async fn on_block(
     if !block.check_merkle_root() {
         rbitcoin_log::info!("Block mutated: bad-txnmrklroot, hashMerkleRoot mismatch");
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     if crate::compact::merkle_body_mutated(&block.txdata) {
         rbitcoin_log::info!("Block mutated: bad-txns-duplicate");
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     if rbitcoin_consensus::block_mutated_without_coinbase(block) {
         rbitcoin_log::info!("Block mutated: 64-byte transaction without a coinbase");
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     if let Some(s) = session {
@@ -3563,7 +3582,7 @@ async fn on_block(
     }
     if let Err(e) = hub.ensure_header(&block.header) {
         if !crate::chain::accept_err_is_temporary_time(&e) {
-            punish_disconnect(&mut follow.ban_score, session);
+            misbehaving(&mut follow.ban_score, session);
         }
         return Ok(());
     }
@@ -3594,12 +3613,12 @@ fn on_block_unrequested_skip(
         && !follow.pending_headers.contains_key(&prev)
     {
         rbitcoin_log::info!("{}", accept_prev_not_found_log(hash));
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
     if let Err(e) = hub.ensure_header(&block.header) {
         if !crate::chain::accept_err_is_temporary_time(&e) {
-            punish_disconnect(&mut follow.ban_score, session);
+            misbehaving(&mut follow.ban_score, session);
         }
         return Ok(true);
     }
@@ -3749,7 +3768,7 @@ fn on_cmpctblock_reject_early(
 ) -> Result<bool, NetError> {
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
         rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
     if let Some(s) = session {
@@ -3759,13 +3778,13 @@ fn on_cmpctblock_reject_early(
     }
     if !crate::compact::prefilled_indexes_ok(hsi) {
         rbitcoin_log::info!("p2p: invalid index in cmpctblock message");
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
     // Child of a cached-invalid block: disconnect. Same-hash cached invalid
     // via compact stays connected.
     if hub.is_block_invalid(&hsi.header.prev_blockhash) {
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
     if hub.is_block_invalid(&hash) {
@@ -3958,7 +3977,7 @@ async fn on_blocktxn(
     }
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
         rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
-        punish_disconnect(&mut follow.ban_score, session);
+        misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
     let Some(pc) = follow.pending_cmpct.remove(&hash) else {

@@ -206,7 +206,17 @@ impl P2PNode {
                 let (ah_tx, ah_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
                 let h = tokio::spawn(async move {
                     let _ = run_outbound_session_with_abort(
-                        req.target, magic, local_addr, hub, peers, ua, live, req.typ, ah_rx, d,
+                        req.target,
+                        req.in_flight,
+                        magic,
+                        local_addr,
+                        hub,
+                        peers,
+                        ua,
+                        live,
+                        req.typ,
+                        ah_rx,
+                        d,
                     )
                     .await;
                 });
@@ -365,6 +375,7 @@ impl P2PNode {
         let target = DialTarget::from_net(peer);
         let prepared = prepare_outbound_session(
             target,
+            None,
             self.magic,
             self.local_addr,
             self.hub.clone(),
@@ -610,6 +621,7 @@ const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn prepare_outbound_session(
     peer: DialTarget,
+    in_flight: Option<crate::peers::DialInFlight>,
     magic: Magic,
     local: SocketAddr,
     hub: Arc<ChainHub>,
@@ -620,8 +632,9 @@ async fn prepare_outbound_session(
     dialer: crate::socks::Dialer,
 ) -> Result<PreparedOutbound, NetError> {
     rbitcoin_log::debug!("{}", crate::peers::trying_connection_log(typ, &peer));
-    // Until this returns, the redial pass treats `peer` as already dialling.
-    let _dialing = peers.dial_in_flight(&peer);
+    // Until this returns, the redial pass and `addnode` treat `peer` as
+    // already dialling. A queued dial was counted when it was queued.
+    let _dialing = in_flight.unwrap_or_else(|| peers.dial_in_flight(&peer));
     let peer_net = peer.net_addr();
     let stream = tokio::time::timeout(
         crate::connect_timeout_for(peer_net, OUTBOUND_CONNECT_TIMEOUT),
@@ -726,6 +739,7 @@ async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetErro
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn run_outbound_session_with_abort(
     peer: DialTarget,
+    in_flight: Option<crate::peers::DialInFlight>,
     magic: Magic,
     local: SocketAddr,
     hub: Arc<ChainHub>,
@@ -749,6 +763,7 @@ async fn run_outbound_session_with_abort(
     }
     let prepared = prepare_outbound_session(
         peer,
+        in_flight,
         magic,
         local,
         hub,

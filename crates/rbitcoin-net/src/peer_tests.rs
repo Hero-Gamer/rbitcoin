@@ -3117,6 +3117,28 @@ fn threshold_exit_refuses_the_address_without_punish_disconnect() {
         !peers.inbound_discouraged(std::net::SocketAddr::from(([1, 2, 3, 4], 1))),
         "noban is not recorded"
     );
+    peers.set_noban(false);
+
+    // Core never discourages a manual peer.
+    let manual_addr = std::net::SocketAddr::from(([5, 6, 7, 8], 8333));
+    let manual = peers.register(
+        manual_addr,
+        manual_addr,
+        &ver,
+        false,
+        crate::peers::PeerConnType::Manual,
+    );
+    let _ = threshold_disconnect(Some(manual.as_ref()));
+    let mut score = 0u32;
+    punish_disconnect(&mut score, Some(manual.as_ref()));
+    assert!(
+        manual.stop.load(std::sync::atomic::Ordering::SeqCst),
+        "a protocol violation drops a manual peer"
+    );
+    assert!(
+        !peers.inbound_discouraged(std::net::SocketAddr::from(([5, 6, 7, 8], 1))),
+        "a manual peer is not recorded"
+    );
 }
 
 #[test]
