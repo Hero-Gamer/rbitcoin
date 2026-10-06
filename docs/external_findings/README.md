@@ -91,6 +91,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [084](./084-findanddelete-empty-sig.md) | critical | Empty sig in legacy CHECKMULTISIG did not delete OP_0 from scriptCode | fixed | `legacy_multisig_empty_sig_deletes_op_0_from_script_code` |
 | [085](./085-64-byte-tx-mutation.md) | high | Coinbase-less 64-byte body cached as an invalid block hash | partial (IBD confirm path: `consensus/ibd-mutated-body-reject`) | `hostile_peer_session`, `peer_header_dos_and_self_announce`, `prefilled_64_byte_body_without_coinbase_is_not_a_block`, `rpc_regtest_from_genesis` |
 | [086](./086-p2sh-spk-stack-size.md) | high | P2SH spend skipped the scriptPubKey `MAX_STACK_SIZE` check | fixed | `p2sh_script_pubkey_push_counts_against_max_stack_size` |
+| [087](./087-forward-spend-in-batch.md) | critical | Spend of a later block in one confirm batch accepted | fixed | `same_batch_spend_of_a_later_block_is_missing`, `batched_spend_of_a_later_block_is_rejected_alone`, `spender_below_its_create_height_is_corrupt` |
 | [088](./088-tip-chain-selection.md) | high | Tip-follow chain selection: total-work ranking, failed-branch prefix, sibling header check, reorg depth | partial (F3 reorg depth open) | `held_branch_with_more_total_work_beats_an_earlier_local_tie`, `failed_branch_tip_keeps_the_heavier_valid_prefix`, `sibling_claiming_more_work_with_wrong_bits_keeps_the_tip` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline

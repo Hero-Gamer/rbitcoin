@@ -146,6 +146,7 @@ version floors and exact +2h).
 | C38 | An input's prevout exists and is still unspent | height-1 coinbase spend accepts | missing txid → `MissingPrevout`; child-before-parent; a second spend of the same outpoint; two spends in one block. `header_and_spending_boundaries` |
 | C40 | A tx's output sum ≤ its input sum | `in==out` accepts | `in+1` rejects. `header_and_spending_boundaries` |
 | C41 | BIP68 relative finality | `nSequence=10` at height 101 accepts; time-type after MTP | `nSequence=200` at 101 rejects; `finality_tests` 109/110 |
+| C42 | An input binds only to an output from an earlier block or an earlier tx in its own block, also inside one multi-block confirm batch (Core connects one block at a time) | `MissingPrevout` (`bad-txns-inputs-missingorspent`) | `consensus_rules::same_batch_spend_of_a_later_block_is_missing`; IBD isolation `batched_spend_of_a_later_block_is_rejected_alone` ([087](./external_findings/087-forward-spend-in-batch.md)); same block: `header_and_spending_boundaries` ([005](./external_findings/005-non-topological-block-accepted.md)) |
 
 ## Adding a new rule
 
