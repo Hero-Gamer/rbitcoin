@@ -2740,23 +2740,18 @@ impl ChainHub {
         None
     }
 
-    /// Activate the most-work held branch. When `offered` is the block that
-    /// failed, its error is the result even if a kept prefix became the tip.
-    fn try_apply_held(
-        &self,
-        offered: Option<BlockHash>,
-    ) -> Result<Option<AcceptOutcome>, NetError> {
+    /// The held (or archived) branch with the most total chain work, as in
+    /// Core's `CBlockIndexWorkComparator`. Equal work prefers the precious
+    /// tip, then the first-seen held tip.
+    fn best_held_branch(&self) -> Option<Vec<Block>> {
         let mut starts: Vec<BlockHash> = self.held_bodies.read().unwrap().keys().collect();
-        if let Some(p) = *self.precious.read().unwrap() {
+        let precious = *self.precious.read().unwrap();
+        if let Some(p) = precious {
             if !starts.contains(&p) {
                 starts.push(p);
             }
         }
-        if starts.is_empty() {
-            return Ok(None);
-        }
-        let precious = *self.precious.read().unwrap();
-        let mut best: Option<(Work, u64, Vec<Block>, bool)> = None;
+        let mut best: Option<(Work, bool, u64, Vec<Block>)> = None;
         for start in starts {
             if self.is_block_invalid(&start) {
                 continue;
@@ -2770,48 +2765,76 @@ impl ChainHub {
             {
                 continue;
             }
-            let Ok(w) = self.branch_header_work(&branch) else {
+            let Ok(w) = self.branch_chain_work(&branch) else {
                 continue;
             };
-            let tip = branch.last().map(Block::block_hash);
-            let is_p = tip == precious;
-            let seq = match tip {
-                Some(t) => self.held_bodies.read().unwrap().seq(t),
-                None => u64::MAX,
-            };
+            let tip = branch[branch.len() - 1].block_hash();
+            let is_p = Some(tip) == precious;
+            let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, bseq, _, was_p)) => {
-                    work_better(w, *bw)
-                        || (!work_better(*bw, w) && is_p && !*was_p)
-                        || (w.to_be_bytes() == bw.to_be_bytes() && !is_p && !*was_p && seq < *bseq)
+                Some((bw, was_p, bseq, _)) => {
+                    let tie = !work_better(*bw, w);
+                    work_better(w, *bw) || (tie && !*was_p && (is_p || seq < *bseq))
                 }
             };
             if take {
-                best = Some((w, seq, branch, is_p));
+                best = Some((w, is_p, seq, branch));
             }
         }
-        let Some((_, _, branch, _)) = best else {
-            return Ok(None);
-        };
-        let attempt = {
-            let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
-            self.accept_branch_prefix(&branch)
-        };
-        match attempt {
-            Ok((AcceptOutcome::Accepted { .. }, Some(e)))
-                if offered.is_some_and(|h| e.failing_block_hash() == Some(h.to_byte_array())) =>
-            {
-                Err(e)
+        best.map(|(_, _, _, branch)| branch)
+    }
+
+    /// Activate the most-work held branch. A branch that fails connect is
+    /// remembered as invalid and the next best is tried, so a failed heavier
+    /// branch does not hide a valid one. When `offered` is the block that
+    /// failed, its error is the result even if a kept prefix or another
+    /// branch became the tip. A local fault stops at once.
+    fn try_apply_held(
+        &self,
+        offered: Option<BlockHash>,
+    ) -> Result<Option<AcceptOutcome>, NetError> {
+        let mut applied = None;
+        let mut failed = None;
+        let mut offered_failed = None;
+        for _ in 0..=self.held_body_count() {
+            let Some(branch) = self.best_held_branch() else {
+                break;
+            };
+            let branch_tip = branch[branch.len() - 1].block_hash();
+            let attempt = {
+                let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.accept_branch_prefix(&branch)
+            };
+            let e = match attempt {
+                Ok((o @ AcceptOutcome::Accepted { .. }, None)) => {
+                    applied = Some(o);
+                    break;
+                }
+                Ok((o @ AcceptOutcome::Accepted { .. }, Some(e))) => {
+                    applied = Some(o);
+                    e
+                }
+                Ok((AcceptOutcome::IgnoredWeaker, _)) => break,
+                Ok((other, _)) => return Ok(Some(other)),
+                Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => break,
+                Err(e) if e.is_local_fault() => return Err(e),
+                Err(e) => {
+                    self.remember_failed_accept(branch_tip, &e);
+                    e
+                }
+            };
+            if offered.is_some_and(|h| e.failing_block_hash() == Some(h.to_byte_array())) {
+                offered_failed.get_or_insert(e);
+            } else {
+                failed.get_or_insert(e);
             }
-            Ok((AcceptOutcome::IgnoredWeaker, _)) => Ok(None),
-            Ok((other, _)) => Ok(Some(other)),
-            Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => Ok(None),
-            Err(e) => {
-                let branch_tip = branch[branch.len() - 1].block_hash();
-                self.remember_failed_accept(branch_tip, &e);
-                Err(e)
-            }
+        }
+        match (offered_failed, applied, failed) {
+            (Some(e), _, _) => Err(e),
+            (None, Some(o), _) => Ok(Some(o)),
+            (None, None, Some(e)) => Err(e),
+            (None, None, None) => Ok(None),
         }
     }
 
@@ -5663,6 +5686,66 @@ mod tests {
         assert_eq!(hub.tip_hash(), Some(main[2].block_hash()));
         assert!(hub.is_block_invalid(&w4.block_hash()));
         assert!(!hub.is_block_invalid(&w3.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two held branches score the same work from their own fork points.
+    /// The later one forks higher, so it has more total chain work.
+    #[test]
+    fn held_branch_with_more_total_work_beats_an_earlier_local_tie() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 3, 1_300_072_000);
+        let [x1, x2, x3] = [&main[0], &main[1], &main[2]];
+        let y2 = mine_distinct(x1.block_hash(), x1.header.time + 1, 2, &[x2.block_hash()]);
+        let y3 = mine(y2.block_hash(), y2.header.time + 600, 3);
+        let z3 = mine_distinct(x2.block_hash(), x2.header.time + 1, 3, &[x3.block_hash()]);
+        let z4 = mine(z3.block_hash(), z3.header.time + 600, 4);
+        for b in [&y2, &y3, &z3] {
+            assert!(matches!(
+                hub.accept_received_block(b.clone()).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ));
+        }
+        let out = hub.accept_received_block(z4.clone()).unwrap();
+        assert!(
+            matches!(out, AcceptOutcome::Accepted { height: 4 }),
+            "z4 has the most total work: {out:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(z4.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `p2` completes two held branches. The heavier one fails at `m3`; the
+    /// lighter `n3` is still heavier than the tip and must win.
+    #[test]
+    fn failed_heavier_held_branch_does_not_hide_a_valid_one() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 2, 1_300_073_000);
+        let x1 = &main[0];
+        let p2 = mine_distinct(
+            x1.block_hash(),
+            x1.header.time + 1,
+            2,
+            &[main[1].block_hash()],
+        );
+        let m3 = mine(p2.block_hash(), p2.header.time + 600, 9);
+        let m4 = mine(m3.block_hash(), m3.header.time + 600, 4);
+        let n3 = mine_distinct(p2.block_hash(), p2.header.time + 601, 3, &[m3.block_hash()]);
+        for b in [&m3, &m4, &n3] {
+            assert!(matches!(
+                hub.accept_received_block(b.clone()).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ));
+        }
+        let out = hub.accept_received_block(p2.clone()).unwrap();
+        assert!(
+            matches!(out, AcceptOutcome::Accepted { height: 3 }),
+            "n3 is the most-work valid tip: {out:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(n3.block_hash()));
+        assert!(hub.is_block_invalid(&m3.block_hash()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
