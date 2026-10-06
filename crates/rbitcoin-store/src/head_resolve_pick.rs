@@ -1,13 +1,14 @@
 //! Newest-first identity pick for head resolve (BIP30 / fence).
 //!
 //! A wave fills identities in at most two page-grouped `txid.body` shots
-//! (first [`ID_FILL_CHUNK`] cands, then the rest). Walk the filled prefix
-//! deepest-first and take the first `body==want` that is fence-connected
-//! (or the first body match when no fence).
+//! (first [`ID_FILL_CHUNK`] cands, then the rest). One walk of the filled
+//! prefix returns the fence-connected winner (or the newest body match when
+//! no fence), whether any body matched, and the miss count. Entries after
+//! the winner still count as misses.
 
 use crate::height_fence::HeightFence;
+use crate::int_map::{U64Map, U64Set};
 use rbitcoin_primitives::Fk;
-use std::collections::HashMap;
 
 /// First identity shot size. Later cands wait for shot B only if the key is
 /// still unfinished (no connected win; unconnected body match is not enough).
@@ -21,7 +22,7 @@ pub(crate) fn next_id_shot(
     take: usize,
 ) -> Vec<Fk> {
     let mut need = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = U64Set::default();
     for (ki, cands) in cands_by_key.iter().enumerate() {
         if skip.get(ki).copied().unwrap_or(false) {
             continue;
@@ -39,47 +40,65 @@ pub(crate) fn next_id_shot(
     need
 }
 
-/// First txid match that is fence-connected, or first txid match if `heights` is None.
+/// One pass over `cands[..filled]`: winner, any body match, and miss count.
 ///
-/// Walks only `cands[..filled]`. Newer unconnected matches do not win when a
-/// fence is present — walk continues. After the first connected hit, older
-/// cands are irrelevant.
-pub(crate) fn pick_winner(
+/// `winner` is the fence-connected body match. With no fence it is the newest
+/// body match. `unconnected_fallback` is the end-of-list TipThenAny case: no
+/// connected hit, so the newest body match wins. Newer unconnected matches do
+/// not win while a fence is present and this flag is clear.
+///
+/// `miss` counts prefix entries that are not `want`, including entries after
+/// the winner.
+pub(crate) struct PrefixWalk {
+    pub winner: Option<(Fk, u64)>,
+    pub had_body: bool,
+    pub miss: u64,
+}
+
+pub(crate) fn walk_id_prefix(
     cands: &[Fk],
     filled: usize,
     want: &[u8; 32],
-    id_of: &HashMap<u64, [u8; 32]>,
+    id_of: &U64Map<[u8; 32]>,
     heights: Option<&HeightFence>,
-) -> Option<(Fk, u64)> {
+    unconnected_fallback: bool,
+) -> PrefixWalk {
     let n = filled.min(cands.len());
     let mut first_match: Option<(Fk, u64)> = None;
+    let mut connected: Option<(Fk, u64)> = None;
+    let mut miss = 0u64;
     for (i, &fk) in cands.iter().take(n).enumerate() {
         let rank = (i + 1) as u64;
-        let Some(id) = fk.get() else {
-            continue;
+        let body_hit = match fk.get() {
+            Some(id) => id_of.get(&id).is_some_and(|got| got.as_slice() == want),
+            None => false,
         };
-        let Some(got) = id_of.get(&id) else {
-            continue;
-        };
-        if got.as_slice() != want {
+        if !body_hit {
+            // The stat covers the whole filled prefix, not only the prefix
+            // before the winner.
+            miss = miss.saturating_add(1);
             continue;
         }
         if first_match.is_none() {
             first_match = Some((fk, rank));
         }
-        if let Some(ht) = heights {
-            if ht.height_of(fk).is_some() {
-                return Some((fk, rank));
-            }
-            continue;
+        if connected.is_none() && heights.is_some_and(|ht| ht.height_of(fk).is_some()) {
+            connected = Some((fk, rank));
         }
-        return Some((fk, rank));
     }
-    if heights.is_some() {
-        // TipThenAny fallback is applied by the caller when no connected hit.
-        None
+    let winner = if heights.is_some() {
+        connected.or(if unconnected_fallback {
+            first_match
+        } else {
+            None
+        })
     } else {
         first_match
+    };
+    PrefixWalk {
+        winner,
+        had_body: first_match.is_some(),
+        miss,
     }
 }
 
@@ -129,28 +148,6 @@ pub fn classify_leftover_miss(
     }
 }
 
-/// How many of the filled prefix peeks missed the wanted txid (for `miss_peeks`).
-pub(crate) fn miss_peeks_in_prefix(
-    cands: &[Fk],
-    filled: usize,
-    want: &[u8; 32],
-    id_of: &HashMap<u64, [u8; 32]>,
-) -> u64 {
-    let n = filled.min(cands.len());
-    let mut nmiss = 0u64;
-    for &fk in cands.iter().take(n) {
-        let Some(id) = fk.get() else {
-            nmiss = nmiss.saturating_add(1);
-            continue;
-        };
-        match id_of.get(&id) {
-            Some(got) if got.as_slice() == want => {}
-            _ => nmiss = nmiss.saturating_add(1),
-        }
-    }
-    nmiss
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,8 +165,18 @@ mod tests {
         HeightFence::from_runs(runs)
     }
 
-    fn ids(pairs: &[(u64, [u8; 32])]) -> HashMap<u64, [u8; 32]> {
+    fn ids(pairs: &[(u64, [u8; 32])]) -> U64Map<[u8; 32]> {
         pairs.iter().copied().collect()
+    }
+
+    fn walked(
+        cands: &[Fk],
+        filled: usize,
+        want: &[u8; 32],
+        id_of: &U64Map<[u8; 32]>,
+        heights: Option<&HeightFence>,
+    ) -> PrefixWalk {
+        walk_id_prefix(cands, filled, want, id_of, heights, false)
     }
 
     #[test]
@@ -180,10 +187,10 @@ mod tests {
         let ht = fence_on(&[20]);
         // Newest unconnected match is not a fence winner.
         let map1 = ids(&[(10, want)]);
-        assert!(pick_winner(&cands, 1, &want, &map1, Some(&ht)).is_none());
+        assert!(walked(&cands, 1, &want, &map1, Some(&ht)).winner.is_none());
         // Connected match at rank 2 wins; older Fk(30) is irrelevant.
         let map2 = ids(&[(10, want), (20, want)]);
-        let (fk, rank) = pick_winner(&cands, 2, &want, &map2, Some(&ht)).unwrap();
+        let (fk, rank) = walked(&cands, 2, &want, &map2, Some(&ht)).winner.unwrap();
         assert_eq!(fk, Fk(20));
         assert_eq!(rank, 2);
         let _ = other;
@@ -195,8 +202,13 @@ mod tests {
         let cands = [Fk(10), Fk(20)];
         let ht = fence_on(&[99]);
         let map = ids(&[(10, want), (20, want)]);
-        assert!(pick_winner(&cands, 2, &want, &map, Some(&ht)).is_none());
-        assert_eq!(miss_peeks_in_prefix(&cands, 2, &want, &map), 0);
+        let w = walked(&cands, 2, &want, &map, Some(&ht));
+        assert!(w.winner.is_none());
+        assert!(w.had_body);
+        assert_eq!(w.miss, 0);
+        let fb = walk_id_prefix(&cands, 2, &want, &map, Some(&ht), true);
+        assert_eq!(fb.winner, Some((Fk(10), 1)));
+        assert_eq!(fb.miss, 0);
     }
 
     #[test]
@@ -204,7 +216,7 @@ mod tests {
         let want = [0xAAu8; 32];
         let cands = [Fk(1), Fk(2)];
         let map = ids(&[(1, want)]);
-        let (fk, rank) = pick_winner(&cands, 1, &want, &map, None).unwrap();
+        let (fk, rank) = walked(&cands, 1, &want, &map, None).winner.unwrap();
         assert_eq!((fk, rank), (Fk(1), 1));
     }
 
@@ -216,7 +228,9 @@ mod tests {
         let cands = [Fk(10), Fk(20)];
         let ht = fence_on(&[20]);
         let map = ids(&[(10, want), (20, want)]);
-        let (fk, rank) = pick_winner(&cands, cands.len(), &want, &map, Some(&ht)).unwrap();
+        let (fk, rank) = walked(&cands, cands.len(), &want, &map, Some(&ht))
+            .winner
+            .unwrap();
         assert_eq!(fk, Fk(20));
         assert_eq!(rank, 2);
     }
@@ -228,11 +242,15 @@ mod tests {
         let cands = [Fk(10), Fk(20)];
         let ht = fence_on(&[10, 20]);
         let map = ids(&[(20, want)]);
-        let (fk, rank) = pick_winner(&cands, cands.len(), &want, &map, Some(&ht)).unwrap();
+        let (fk, rank) = walked(&cands, cands.len(), &want, &map, Some(&ht))
+            .winner
+            .unwrap();
         assert_eq!(fk, Fk(20));
         assert_eq!(rank, 2);
         let empty = ids(&[]);
-        assert!(pick_winner(&cands, cands.len(), &want, &empty, Some(&ht)).is_none());
+        assert!(walked(&cands, cands.len(), &want, &empty, Some(&ht))
+            .winner
+            .is_none());
     }
 
     #[test]
@@ -261,7 +279,14 @@ mod tests {
         let want = [0xAAu8; 32];
         let cands = [Fk(1), Fk(2)];
         let map = ids(&[(1, [0x00; 32]), (2, want)]);
-        assert_eq!(miss_peeks_in_prefix(&cands, 2, &want, &map), 1);
+        let w = walked(&cands, 2, &want, &map, None);
+        assert_eq!(w.miss, 1);
+        assert_eq!(w.winner, Some((Fk(2), 2)));
+        let after = [Fk(1), Fk(2), Fk(3)];
+        let map_after = ids(&[(1, want), (2, [0x00; 32]), (3, [0x11; 32])]);
+        let w_after = walked(&after, 3, &want, &map_after, None);
+        assert_eq!(w_after.winner, Some((Fk(1), 1)));
+        assert_eq!(w_after.miss, 2, "entries after the winner still miss");
     }
 
     #[test]
@@ -287,7 +312,9 @@ mod tests {
         filled[0] = ID_FILL_CHUNK;
         let map = ids(&[(10, want), (20, want)]);
         let ht = fence_on(&[20]);
-        assert!(pick_winner(&cands[0], filled[0], &want, &map, Some(&ht)).is_some());
+        assert!(walked(&cands[0], filled[0], &want, &map, Some(&ht))
+            .winner
+            .is_some());
         skip[0] = true;
         let shot_b = next_id_shot(&cands, &filled, &skip, usize::MAX);
         assert!(
@@ -307,7 +334,9 @@ mod tests {
         let map = ids(&[(10, want)]);
         let ht = fence_on(&[50]);
         assert!(
-            pick_winner(&cands[0], filled[0], &want, &map, Some(&ht)).is_none(),
+            walked(&cands[0], filled[0], &want, &map, Some(&ht))
+                .winner
+                .is_none(),
             "unconnected match in the chunk is not a fence win"
         );
         let shot_b = next_id_shot(&cands, &filled, &skip, usize::MAX);

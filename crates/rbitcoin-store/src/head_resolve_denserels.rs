@@ -1,16 +1,16 @@
 //! Plan Shape A head resolve: **txids in → denserels out** (or fk+range short-circuit).
 //!
-//! Three probe+identity waves (uring when available):
-//! 1. **Open** — every unsealed OA (insert tail + in-flight seal)
-//! 2. **Sealed-hot** — sealed ages 1..=3 (only keys still unfinished)
-//! 3. **Cold** — sealed ages ≥4 (only keys still unfinished)
+//! Probe+identity (uring when available):
+//! 1. **Open** — every unsealed OA (insert tail + in-flight seal), one batch
+//! 2. **Sealed** — newest segment first. Fuse + one MPHF (or sealed OA), then
+//!    identity, then retire fence-connected keys before the next segment.
 //!
-//! Each wave: probe that slice → at most two page-grouped `txid.body` shots
-//! (first four cands, then the rest if still unfinished) → newest-first walk
-//! (`body==want`, fence-connected if a fence is on). Unconnected identity does
-//! **not** skip later waves or shot B. TipOnly strips unconnected winners at
-//! the end. **One** `create.loc` batch runs **after** all three waves, on
-//! FdOnly / standalone bulk — not on the held probe ring.
+//! Each identity: at most two page-grouped `txid.body` shots (first four cands,
+//! then the rest if still unfinished) → newest-first walk (`body==want`,
+//! fence-connected if a fence is on). Unconnected identity does **not** skip
+//! later segments or shot B. TipOnly strips unconnected winners at the end.
+//! **One** `create.loc` batch runs **after** the sealed walk, on FdOnly /
+//! standalone bulk — not on the held probe ring.
 //!
 //! [`resolve_fk_and_range_batch`] is the **stamp short-circuit**: stops after
 //! loc, returns `(fk, body_range)` so prep denserels-loads by offset.
@@ -43,7 +43,7 @@ pub fn resolve_fk_and_range_batch(
 }
 
 /// Like [`resolve_fk_and_range_batch`], but prefer a **connected** Class A row
-/// (height fence hit). Unconnected hot hits do **not** skip the cold wave.
+/// (height fence hit). An unconnected hit does **not** skip older segments.
 ///
 /// `tip_only`: result is connected-or-None (confirm). Otherwise connected else
 /// newest unconnected (RPC).
@@ -303,59 +303,40 @@ fn resolve_identity_core(
     )?;
 
     if any_unfinished(&picked, &connected, heights) {
-        let active = unfinished_mask(&picked, &connected, heights);
-        let t_probe = Instant::now();
-        let mid = table.head.probe_candidates_batch_wave(
-            &mixed,
-            HeadProbeWave::SealedHot,
-            Some(&active),
-            &mut ctx,
-        )?;
-        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-        cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &mid));
-        id_idx_wave(
-            txids,
-            &mid,
-            side,
-            &mut picked,
-            &mut connected,
-            heights,
-            &mut body_lookups,
-            &mut miss_peeks,
-            &mut id_ns,
-            &first_fks,
-            &mut local_age,
-            &mut ctx,
-            &mut had_id,
-        )?;
-    }
-
-    if any_unfinished(&picked, &connected, heights) {
-        let active = unfinished_mask(&picked, &connected, heights);
-        let t_probe = Instant::now();
-        let cold = table.head.probe_candidates_batch_wave(
-            &mixed,
-            HeadProbeWave::Cold,
-            Some(&active),
-            &mut ctx,
-        )?;
-        probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
-        cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &cold));
-        id_idx_wave(
-            txids,
-            &cold,
-            side,
-            &mut picked,
-            &mut connected,
-            heights,
-            &mut body_lookups,
-            &mut miss_peeks,
-            &mut id_ns,
-            &first_fks,
-            &mut local_age,
-            &mut ctx,
-            &mut had_id,
-        )?;
+        let n_segs = table.head.segment_count();
+        let mut active = unfinished_mask(&picked, &connected, heights);
+        for si in (0..n_segs).rev() {
+            if !active.iter().any(|on| *on) {
+                break;
+            }
+            let t_probe = Instant::now();
+            let cands = table
+                .head
+                .probe_sealed_segment(&mixed, si, Some(&active), &mut ctx)?;
+            probe_ns = probe_ns.saturating_add(t_probe.elapsed().as_nanos() as u64);
+            if cands.iter().all(|c| c.is_empty()) {
+                continue;
+            }
+            cands_total = cands_total.saturating_add(add_wave_cands(&mut n_cands, &cands));
+            id_idx_wave(
+                txids,
+                &cands,
+                side,
+                &mut picked,
+                &mut connected,
+                heights,
+                &mut body_lookups,
+                &mut miss_peeks,
+                &mut id_ns,
+                &first_fks,
+                &mut local_age,
+                &mut ctx,
+                &mut had_id,
+            )?;
+            for (i, on) in active.iter_mut().enumerate() {
+                *on = !key_finished(i, &picked, &connected, heights);
+            }
+        }
     }
 
     if tip_only && heights.is_some() {
@@ -462,8 +443,8 @@ fn unfinished_mask(
 ///
 /// Shot A is the first four cands of unfinished keys; shot B is the rest only
 /// when the key is still unfinished. A fence-connected win skips shot B; an
-/// unconnected body match does not. Loc fill is **one** batch after all
-/// probe waves (`attach_loc_to_identity`), never on this held probe ring.
+/// unconnected body match does not. Loc fill is **one** batch after the
+/// sealed walk (`attach_loc_to_identity`), never on this held probe ring.
 ///
 /// When `ctx` is held, identity preads ride that **already-held** plan ring.
 /// When none, libc pread for ID.
@@ -482,27 +463,26 @@ fn id_idx_wave(
     ctx: &mut crate::IoCtx<'_>,
     had_id: &mut [bool],
 ) -> Result<(), StoreError> {
-    use crate::head_resolve_pick::{
-        miss_peeks_in_prefix, next_id_shot, pick_winner, ID_FILL_CHUNK,
-    };
-    use std::collections::HashMap;
+    use crate::head_resolve_pick::{next_id_shot, walk_id_prefix, ID_FILL_CHUNK};
+    use crate::int_map::{U64Map, U64Set};
 
     let n = cands_by_key.len();
     let mut filled = vec![0usize; n];
     let mut skip = vec![false; n];
     let mut started = vec![false; n];
+    let mut key_miss = vec![0u64; n];
     for ki in 0..n {
         let done = key_finished(ki, picked, connected, heights);
         skip[ki] = done;
         started[ki] = !done;
     }
-    let mut id_map: HashMap<u64, [u8; 32]> = HashMap::new();
+    let mut id_map: U64Map<[u8; 32]> = U64Map::default();
 
     for take in [ID_FILL_CHUNK, usize::MAX] {
         let shot = next_id_shot(cands_by_key, &filled, &skip, take);
         let mut need: Vec<Fk> = Vec::new();
         {
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = U64Set::default();
             for fk in shot {
                 let Some(id) = fk.get() else {
                     continue;
@@ -534,19 +514,16 @@ fn id_idx_wave(
             }
             let cands = &cands_by_key[ki];
             let nfill = filled[ki];
-            if pick_winner(cands, nfill, &txids[ki], &id_map, None).is_some() {
+            // A prior segment may already hold an unconnected body. Do not
+            // replace it unless this prefix connects, or this is the last
+            // cand and nothing is picked yet.
+            let fallback = heights.is_some() && nfill >= cands.len() && picked[ki].is_none();
+            let walked = walk_id_prefix(cands, nfill, &txids[ki], &id_map, heights, fallback);
+            if walked.had_body {
                 had_id[ki] = true;
             }
-            if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, heights) {
-                crate::head_resolve_stats::add_hit_rank(rank);
-                note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
-                skip[ki] = true;
-                continue;
-            }
-            if heights.is_none() || nfill < cands.len() || picked[ki].is_some() {
-                continue;
-            }
-            if let Some((fk, rank)) = pick_winner(cands, nfill, &txids[ki], &id_map, None) {
+            key_miss[ki] = walked.miss;
+            if let Some((fk, rank)) = walked.winner {
                 crate::head_resolve_stats::add_hit_rank(rank);
                 note_identity_pick(ki, fk, picked, connected, heights, first_fks, local_age);
                 skip[ki] = true;
@@ -558,12 +535,7 @@ fn id_idx_wave(
         if !started[ki] {
             continue;
         }
-        *miss_peeks = miss_peeks.saturating_add(miss_peeks_in_prefix(
-            &cands_by_key[ki],
-            filled[ki],
-            &txids[ki],
-            &id_map,
-        ));
+        *miss_peeks = miss_peeks.saturating_add(key_miss[ki]);
     }
     Ok(())
 }
@@ -982,6 +954,102 @@ mod tests {
             let serial = t.create_loc.range_batch(&[fk]).unwrap()[0].unwrap();
             assert_eq!(pair, serial, "fk={}", fk.0);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Older fence-connected create wins over a newer unconnected duplicate,
+    /// including when they sit in different sealed segments. TipOnly must not
+    /// return None after seeing only the newer body.
+    #[test]
+    fn tip_fence_keeps_older_connected_across_sealed_segments() {
+        use crate::address_head::HeadLayout;
+        use crate::height_fence::FenceRun;
+        use crate::segmented_head::HEAD_PROBE_HOT_MAX_AGE;
+        let dir = tmp("fence-across-segs");
+        let layout = HeadLayout::with_entry_bytes(8, 4).unwrap();
+        let t = TxTable::create_with_head_layout(&dir, layout).unwrap();
+        let n = 204u32.saturating_mul(6);
+        let mut items = Vec::new();
+        let mut txids = Vec::new();
+        for i in 0..n {
+            let mut tid = [0u8; 32];
+            tid[0..4].copy_from_slice(&i.to_le_bytes());
+            tid[8] = 0xa5;
+            txids.push(tid);
+            items.push((
+                TxRecord {
+                    txid: tid,
+                    version: 1,
+                    locktime: 0,
+                    input_start_fk: Fk::NULL,
+                    input_count: 1,
+                    output_start_fk: Fk::NULL,
+                    output_count: 1,
+                },
+                vec![InputRecord::coinbase(u32::MAX, vec![], vec![])],
+                vec![OutputRecord::unspent(1, vec![0x51])],
+            ));
+        }
+        t.put_full_batch_indexed(&items, true).unwrap();
+        let dup_tid = txids[0];
+        let dup_fk = t
+            .put_full_batch_indexed(
+                &[(
+                    TxRecord {
+                        txid: dup_tid,
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    vec![InputRecord::coinbase(u32::MAX, vec![0x22], vec![])],
+                    vec![OutputRecord::unspent(1, vec![0x52])],
+                )],
+                true,
+            )
+            .unwrap()[0];
+        t.flush_head().unwrap();
+        let first = t.head.first_fks_snapshot();
+        let oldest = crate::head_resolve_stats::sealed_age_for_fk(&first, 1).unwrap();
+        assert!(oldest > HEAD_PROBE_HOT_MAX_AGE, "oldest age={oldest}");
+        let newest_fk = Fk(u64::from(n));
+        let age_new = crate::head_resolve_stats::sealed_age_for_fk(&first, newest_fk.0).unwrap();
+        assert!(
+            (1..=HEAD_PROBE_HOT_MAX_AGE).contains(&age_new),
+            "newest sealed fk={} age={age_new} first={first:?}",
+            newest_fk.0
+        );
+        let age_dup = crate::head_resolve_stats::sealed_age_for_fk(&first, dup_fk.0).unwrap();
+        assert_eq!(
+            age_dup, 0,
+            "duplicate must land in the open tail, fk={}",
+            dup_fk.0
+        );
+        assert!(dup_fk.0 > newest_fk.0);
+        let fence = HeightFence::from_runs(vec![
+            FenceRun {
+                first_fk: 1,
+                count: 1,
+                height: 1,
+            },
+            FenceRun {
+                first_fk: newest_fk.0,
+                count: 1,
+                height: 2,
+            },
+        ]);
+        assert_eq!(fence.height_of(Fk(1)), Some(1));
+        assert_eq!(fence.height_of(newest_fk), Some(2));
+        assert_eq!(fence.height_of(dup_fk), None);
+        let newest_tid = txids[(n as usize) - 1];
+        let tip =
+            resolve_fk_and_range_batch_with_tip(&t, &fence, &[dup_tid, newest_tid], true).unwrap();
+        assert_eq!(tip[0].1.map(|(f, _)| f), Some(Fk(1)));
+        assert_eq!(tip[1].1.map(|(f, _)| f), Some(newest_fk));
+        let any = resolve_fk_and_range_batch_with_tip(&t, &fence, &[dup_tid], false).unwrap();
+        assert_eq!(any[0].1.map(|(f, _)| f), Some(Fk(1)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -37,7 +37,9 @@ pub use soft_densify::{
     TIP_HOLE_MIN_AHEAD_BLOCKS,
 };
 pub use sp_tweaks::{ThinTweakRangeLimits, ThinTweakRow};
-pub use tx_precompute::{decode_block_precomputes, pres_for_tip, TxPrecompute};
+pub use tx_precompute::{
+    block_wire_len_from_pres, decode_block_precomputes, pres_for_tip, TxPrecompute,
+};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -1668,7 +1670,10 @@ impl Query {
     }
 
     /// Raw frame only. `None` when missing or already promoted.
-    pub fn block_queue_raw_payload(&self, height: u32) -> Result<Option<Vec<u8>>, QueryError> {
+    pub fn block_queue_raw_payload(
+        &self,
+        height: u32,
+    ) -> Result<Option<std::sync::Arc<Vec<u8>>>, QueryError> {
         let g = self.block_queue.lock().unwrap();
         Ok(g.raw_payload(height))
     }

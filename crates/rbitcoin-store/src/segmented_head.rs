@@ -466,7 +466,9 @@ impl SegmentedTxHead {
     }
 }
 
-/// Sealed-hot wave: ages `1..=` this. Open is its own wave (age 0).
+/// Sealed-hot probe-coverage split: ages `1..=` this. Lookup does not union
+/// this band; open is its own wave (age 0).
+#[cfg(test)]
 pub(crate) const HEAD_PROBE_HOT_MAX_AGE: u32 = 3;
 
 /// Which head segments to probe (three-wave resolve vs full baseline).
@@ -477,8 +479,13 @@ pub(crate) enum HeadProbeWave {
     /// All unsealed OAs (insert tail + in-flight seal), newest first.
     Open,
     /// Sealed ages `1..=` [`HEAD_PROBE_HOT_MAX_AGE`] (sealed age 0 if tail sealed).
+    ///
+    /// Probe-coverage tests only. Lookup retires per segment and does not
+    /// construct this band.
+    #[cfg(test)]
     SealedHot,
-    /// Sealed ages > [`HEAD_PROBE_HOT_MAX_AGE`].
+    /// Sealed ages > [`HEAD_PROBE_HOT_MAX_AGE`]. Probe-coverage tests only.
+    #[cfg(test)]
     Cold,
 }
 
@@ -491,6 +498,18 @@ impl HeadProbeWave {
     /// `age` = [`crate::head_resolve_stats::sealed_age_from_index`] for the seg.
     #[inline]
     fn includes_sealed_age(self, age: u32) -> bool {
+        self.sealed_age_included(age)
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn sealed_age_included(self, _age: u32) -> bool {
+        matches!(self, HeadProbeWave::All)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn sealed_age_included(self, age: u32) -> bool {
         match self {
             HeadProbeWave::All => true,
             HeadProbeWave::Open => false,
@@ -596,6 +615,33 @@ impl SegmentedTxHead {
         Ok(out)
     }
 
+    /// One sealed segment, newest-first caller order. Unsealed `si` returns
+    /// empty lists (the open wave already probed those OAs).
+    pub(crate) fn probe_sealed_segment(
+        &self,
+        mixed: &[[u8; 32]],
+        si: usize,
+        active: Option<&[bool]>,
+        ctx: &mut crate::IoCtx<'_>,
+    ) -> Result<Vec<Vec<Fk>>, StoreError> {
+        let n = mixed.len();
+        let mut out = vec![Vec::new(); n];
+        if n == 0 {
+            return Ok(out);
+        }
+        if let Some(a) = active {
+            if a.len() != n {
+                return Err(StoreError::Corrupt("probe active mask len"));
+            }
+        }
+        let segs = self.segments_snapshot();
+        if si >= segs.len() {
+            return Ok(out);
+        }
+        self.fill_sealed_segment(&segs, si, mixed, active, ctx, &mut out)?;
+        Ok(out)
+    }
+
     fn probe_unsealed_wave(
         &self,
         mixed: &[[u8; 32]],
@@ -646,58 +692,75 @@ impl SegmentedTxHead {
     ) -> Result<(), StoreError> {
         let segs = self.segments_snapshot();
         let n_segs = segs.len();
-        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
         for si in (0..n_segs).rev() {
-            let seg = &segs[si];
-            if !seg.sealed {
+            if !segs[si].sealed {
                 continue;
             }
             let age = crate::head_resolve_stats::sealed_age_from_index(si, n_segs);
             if !wave.includes_sealed_age(age) {
                 continue;
             }
-            let Some(fuse) = seg.fuse.as_ref() else {
-                return Err(StoreError::Corrupt("sealed segment missing fuse"));
-            };
+            self.fill_sealed_segment(&segs, si, mixed, active, ctx, out)?;
+        }
+        Ok(())
+    }
 
-            let mut pass_i: Vec<usize> = Vec::new();
-            let mut pass_keys: Vec<[u8; 32]> = Vec::new();
-            for (i, m) in mixed.iter().enumerate() {
-                if !key_on(i) {
-                    continue;
-                }
-                let fuse_key = fuse_key_from_mixed(m);
-                if !fuse.contains(fuse_key) {
-                    continue;
-                }
-                pass_i.push(i);
-                pass_keys.push(*m);
-            }
-            if pass_keys.is_empty() {
+    /// Fuse-filter `active` keys, then one MPHF batch (or the sealed OA).
+    fn fill_sealed_segment(
+        &self,
+        segs: &[Arc<Segment>],
+        si: usize,
+        mixed: &[[u8; 32]],
+        active: Option<&[bool]>,
+        ctx: &mut crate::IoCtx<'_>,
+        out: &mut [Vec<Fk>],
+    ) -> Result<(), StoreError> {
+        let seg = &segs[si];
+        if !seg.sealed {
+            return Ok(());
+        }
+        let Some(fuse) = seg.fuse.as_ref() else {
+            return Err(StoreError::Corrupt("sealed segment missing fuse"));
+        };
+        let key_on = |i: usize| active.map(|a| a[i]).unwrap_or(true);
+
+        let mut pass_i: Vec<usize> = Vec::new();
+        let mut pass_keys: Vec<[u8; 32]> = Vec::new();
+        for (i, m) in mixed.iter().enumerate() {
+            if !key_on(i) {
                 continue;
             }
-            if let Some(pack) = seg.pack.as_ref() {
-                let mixed_u: Vec<u64> = pass_keys.iter().map(fuse_key_from_mixed).collect();
-                let slots = pack.slots_for_ctx(&mixed_u, ctx)?;
-                let rel_lists = pack.read_rels_batch(&slots, ctx)?;
-                for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
-                    for r in rels {
-                        if let Some(fk) = rel_to_abs(seg.first_fk, u64::from(r)) {
-                            out[orig_i].push(fk);
-                        }
+            let fuse_key = fuse_key_from_mixed(m);
+            if !fuse.contains(fuse_key) {
+                continue;
+            }
+            pass_i.push(i);
+            pass_keys.push(*m);
+        }
+        if pass_keys.is_empty() {
+            return Ok(());
+        }
+        if let Some(pack) = seg.pack.as_ref() {
+            let mixed_u: Vec<u64> = pass_keys.iter().map(fuse_key_from_mixed).collect();
+            let slots = pack.slots_for_ctx(&mixed_u, ctx)?;
+            let rel_lists = pack.read_rels_batch(&slots, ctx)?;
+            for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                for r in rels {
+                    if let Some(fk) = rel_to_abs(seg.first_fk, u64::from(r)) {
+                        out[orig_i].push(fk);
                     }
                 }
-            } else {
-                let rel_lists = seg
-                    .head
-                    .as_ref()
-                    .ok_or(StoreError::Corrupt("tx.head sealed probe: missing pack"))?
-                    .probe_fks_batch_ctx(&pass_keys, ctx)?;
-                for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
-                    for r in rels.into_iter().rev() {
-                        if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
-                            out[orig_i].push(fk);
-                        }
+            }
+        } else {
+            let rel_lists = seg
+                .head
+                .as_ref()
+                .ok_or(StoreError::Corrupt("tx.head sealed probe: missing pack"))?
+                .probe_fks_batch_ctx(&pass_keys, ctx)?;
+            for (orig_i, rels) in pass_i.into_iter().zip(rel_lists) {
+                for r in rels.into_iter().rev() {
+                    if let Some(fk) = rel_to_abs(seg.first_fk, r.0) {
+                        out[orig_i].push(fk);
                     }
                 }
             }
