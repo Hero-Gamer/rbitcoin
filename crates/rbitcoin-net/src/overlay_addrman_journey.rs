@@ -255,6 +255,14 @@ fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [c
         got.contains(&good_onion) && !got.contains(&bad_onion),
         "without a fresh clearnet, incompatible overlays lose to a compatible one: {got:?}"
     );
+    let mut sole_recent = crate::seeds::AddrMan::new();
+    sole_recent.add_addr(good_onion);
+    sole_recent.note_attempt_addr(good_onion);
+    let got = sole_recent.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    assert!(
+        got.contains(&good_onion),
+        "a sole recent overlay is still dialed: {got:?}"
+    );
 
     let dir = rbitcoin_query::testutil::TempDir::labeled("overlay-peers").unwrap();
     let path = dir.join("peers");
