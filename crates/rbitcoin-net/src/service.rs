@@ -739,7 +739,7 @@ async fn run_prepared_outbound(prepared: PreparedOutbound) -> Result<(), NetErro
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 async fn run_outbound_session_with_abort(
     peer: DialTarget,
-    in_flight: crate::peers::DialInFlight,
+    in_flight: Option<crate::peers::DialInFlight>,
     magic: Magic,
     local: SocketAddr,
     hub: Arc<ChainHub>,
@@ -763,7 +763,7 @@ async fn run_outbound_session_with_abort(
     }
     let prepared = prepare_outbound_session(
         peer,
-        Some(in_flight),
+        in_flight,
         magic,
         local,
         hub,

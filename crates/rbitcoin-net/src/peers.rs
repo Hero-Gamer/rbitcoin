@@ -228,8 +228,9 @@ pub struct DialRequest {
     pub target: DialTarget,
     pub typ: PeerConnType,
     /// Counts the dial from the moment it is queued, so a redial or
-    /// `addnode` that runs before the dial task picks it up sees it.
-    pub(crate) in_flight: DialInFlight,
+    /// `addnode` that runs before the dial task picks it up sees it. `None`
+    /// for a feeler, which registers no session and is never counted.
+    pub(crate) in_flight: Option<DialInFlight>,
 }
 
 #[derive(Clone, Debug)]
@@ -2373,7 +2374,7 @@ impl PeerHub {
         if self.is_target_live(&target) {
             return Ok(());
         }
-        self.send_dial(target, PeerConnType::Manual, claim)
+        self.send_dial(target, PeerConnType::Manual, Some(claim))
     }
 
     pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
@@ -2677,8 +2678,14 @@ impl PeerHub {
     }
 
     pub fn dial_net(&self, addr: crate::NetAddr, typ: PeerConnType) -> Result<(), String> {
-        let target = DialTarget::from_net(addr);
-        let in_flight = self.dial_in_flight(&target);
+        self.queue_dial(DialTarget::from_net(addr), typ)
+    }
+
+    /// Queue a dial, counted in flight from now on. A feeler is not counted:
+    /// it registers no session, and its probe has no connect deadline, so a
+    /// stuck one would block the redial pass for that endpoint.
+    fn queue_dial(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
+        let in_flight = (typ != PeerConnType::Feeler).then(|| self.dial_in_flight(&target));
         self.send_dial(target, typ, in_flight)
     }
 
@@ -2688,7 +2695,7 @@ impl PeerHub {
         &self,
         target: DialTarget,
         typ: PeerConnType,
-        in_flight: DialInFlight,
+        in_flight: Option<DialInFlight>,
     ) -> Result<(), String> {
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = g.as_ref().ok_or("no dialer attached")?;
@@ -2836,8 +2843,7 @@ impl PeerHub {
             host: host.into(),
             port,
         };
-        let in_flight = self.dial_in_flight(&target);
-        self.send_dial(target, typ, in_flight)
+        self.queue_dial(target, typ)
     }
 }
 
@@ -3627,6 +3633,30 @@ mod tests {
         assert_eq!(got.len(), 1, "once the session ends, onetry dials: {got:?}");
         assert_eq!(got[0].target, DialTarget::Socket(ip), "{got:?}");
         assert_eq!(got[0].typ, PeerConnType::Manual, "{got:?}");
+    }
+
+    #[test]
+    fn a_queued_feeler_does_not_hold_off_a_manual_dial() {
+        let hub = PeerHub::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        hub.set_dialer(tx);
+        let ip = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18447);
+        // A feeler's probe has no connect deadline. Counted in flight, a
+        // stuck one would keep `addnode` and the redial pass off this
+        // endpoint until it ended.
+        hub.addconnection(ip, PeerConnType::Feeler).unwrap();
+        let feeler = take_dials(&mut rx);
+        assert_eq!(feeler.len(), 1, "{feeler:?}");
+        assert_eq!(feeler[0].typ, PeerConnType::Feeler, "{feeler:?}");
+        hub.addnode(ip, "onetry").unwrap();
+        let got = take_dials(&mut rx);
+        assert_eq!(
+            got.len(),
+            1,
+            "a queued feeler does not block addnode: {got:?}"
+        );
+        assert_eq!(got[0].typ, PeerConnType::Manual, "{got:?}");
+        drop(feeler);
     }
 
     #[tokio::test]
