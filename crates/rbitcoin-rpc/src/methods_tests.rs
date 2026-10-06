@@ -5330,15 +5330,20 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         "{stats_hash}"
     );
     ctx.query.set_block_filter_index(true).unwrap();
-    let indexing = dispatch(
+    let tip_filter = dispatch(
         &ctx,
         "getblockfilter",
         vec![json!(hub.tip_hash().unwrap().to_string())],
     )
-    .unwrap_err();
+    .unwrap();
     assert!(
-        rpc_message(&indexing).contains("still in the process of being indexed"),
-        "{indexing}"
+        tip_filter["filter"].as_str().unwrap_or("").len() > 2,
+        "an unsealed tip is built on demand: {tip_filter}"
+    );
+    assert_eq!(
+        tip_filter["header"].as_str().unwrap_or("").len(),
+        64,
+        "{tip_filter}"
     );
     let unknown_filter = dispatch(
         &ctx,
