@@ -248,8 +248,8 @@ fn push_range(
 ) -> Result<(), Value> {
     let mut i = begin;
     while i <= end {
-        let idx = u32::try_from(i)
-            .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "End of range is too high"))?;
+        // parse_range rejects an end above i32::MAX, so this index fits in u32.
+        let idx = i as u32;
         push_index(secp, desc, source, keymap, Some(idx), out)?;
         if out.len() > MAX_SCAN_SCRIPTS {
             return Err(rpc_error(

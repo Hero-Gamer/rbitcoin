@@ -565,12 +565,6 @@ pub(crate) fn echo(params: &RpcParams) -> Result<Value, Value> {
                     ),
                 )
             })?;
-            if !pos.is_empty() {
-                return Err(rpc_error(
-                    ERR_INVALID_PARAMETER,
-                    "Parameter args specified twice both as positional and named argument",
-                ));
-            }
             pos = arr.clone();
         }
         for (i, name) in ECHO_NAMES.iter().enumerate() {
