@@ -1704,23 +1704,42 @@ mod tests {
             .expect("batch json");
         assert_eq!(arr.len(), 2, "{body:?}");
 
-        let mut hits = Vec::new();
-        let mut set = tokio::task::JoinSet::new();
-        for _ in 0..16 {
+        // One POST holds the only permit for every call in the batch.
+        let mut calls = Vec::new();
+        for i in 0..256 {
+            calls.push(serde_json::json!({
+                "jsonrpc": "1.0",
+                "id": i,
+                "method": "getblockcount"
+            }));
+        }
+        let hold = serde_json::Value::Array(calls).to_string();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
             let addr = tcp_addr(&handle);
             let auth = handle.auth.clone();
-            set.spawn(async move {
-                post_raw(
-                    addr,
-                    &auth,
-                    br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
-                )
-                .await
-            });
+            let done = std::sync::Arc::clone(&done);
+            tokio::spawn(async move {
+                let result = post_raw(addr, &auth, hold.as_bytes()).await;
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+        };
+        let mut hits = Vec::new();
+        while !done.load(std::sync::atomic::Ordering::SeqCst) {
+            let (st, _) = post_raw(
+                tcp_addr(&handle),
+                &handle.auth,
+                br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+            )
+            .await;
+            hits.push(st);
+            if hits.len() > 32 {
+                break;
+            }
         }
-        while let Some(r) = set.join_next().await {
-            hits.push(r.unwrap().0);
-        }
+        let (hold_st, _) = holder.await.unwrap();
+        hits.push(hold_st);
         assert!(
             hits.contains(&503),
             "full permit must HTTP 503, got {hits:?}"
