@@ -127,7 +127,9 @@ fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [c
 
     let clear = book.take_dial_candidates(8, &HashSet::new(), &[]);
     assert!(
-        clear.iter().any(|a| a.ip() == IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+        clear
+            .iter()
+            .any(|a| a.ip() == IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
         "{clear:?}"
     );
     assert!(
@@ -137,8 +139,13 @@ fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [c
 
     let mut only = book.clone();
     only.set_only_net(vec![OnlyNet::Onion]);
-    assert_eq!(only.take_dial_candidates_net(8, &HashSet::new(), &[]), vec![onion]);
-    assert!(only.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+    assert_eq!(
+        only.take_dial_candidates_net(8, &HashSet::new(), &[]),
+        vec![onion]
+    );
+    assert!(only
+        .take_dial_candidates(8, &HashSet::new(), &[])
+        .is_empty());
 
     let mut only = book.clone();
     only.set_only_net(vec![OnlyNet::I2p]);
@@ -148,12 +155,17 @@ fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [c
         got.iter().all(|a| matches!(a, crate::NetAddr::I2p { .. })),
         "{got:?}"
     );
-    assert!(only.take_dial_candidates(8, &HashSet::new(), &[]).is_empty());
+    assert!(only
+        .take_dial_candidates(8, &HashSet::new(), &[])
+        .is_empty());
 
     let mut only = book.clone();
     only.set_cjdns_reachable(true);
     only.set_only_net(vec![OnlyNet::Cjdns]);
-    assert_eq!(only.take_dial_candidates(8, &HashSet::new(), &[]), vec![cjdns_sock]);
+    assert_eq!(
+        only.take_dial_candidates(8, &HashSet::new(), &[]),
+        vec![cjdns_sock]
+    );
 
     let mut mixed = crate::seeds::AddrMan::new();
     for i in 0..8u8 {
@@ -188,12 +200,71 @@ fn only_net_dials_and_peers_file(am: &Mutex<crate::seeds::AddrMan>, overlays: [c
         "a version-message placeholder is not a peer"
     );
 
+    let clear = SocketAddr::from((Ipv4Addr::new(1, 2, 3, 4), 8333));
+    let tired_onion = crate::NetAddr::Onion {
+        pk: [0x55; 32],
+        port: 8333,
+    };
+    let bad_onion = crate::NetAddr::Onion {
+        pk: [0x66; 32],
+        port: 8333,
+    };
+    let mut fresh_ip = crate::seeds::AddrMan::new();
+    fresh_ip.add(clear);
+    fresh_ip.add_addr(tired_onion);
+    fresh_ip.note_connect_failed_addr(tired_onion, false);
+    fresh_ip.add_addr(bad_onion);
+    fresh_ip.note_connect_failed_addr(bad_onion, true);
+    let got = fresh_ip.take_dial_candidates_net(8, &HashSet::new(), &[]);
+    assert!(
+        !got.contains(&tired_onion) && !got.contains(&bad_onion),
+        "a fresh clearnet drops last-resort and incompatible overlays: {got:?}"
+    );
+
+    let mut tired_ip = crate::seeds::AddrMan::new();
+    let tired_clear = SocketAddr::from((Ipv4Addr::new(9, 9, 9, 9), 8333));
+    tired_ip.add(tired_clear);
+    tired_ip.note_connect_failed(tired_clear, false);
+    tired_ip.add_addr(tired_onion);
+    tired_ip.note_connect_failed_addr(tired_onion, false);
+    let got = tired_ip.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    assert!(
+        got.contains(&tired_onion),
+        "a last-resort clearnet is not a fresh batch: {got:?}"
+    );
+
+    let mut only_bad = crate::seeds::AddrMan::new();
+    only_bad.add_addr(bad_onion);
+    only_bad.note_connect_failed_addr(bad_onion, true);
+    let got = only_bad.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    assert!(
+        got.contains(&bad_onion),
+        "an incompatible overlay is still dialed when nothing else is: {got:?}"
+    );
+
+    let good_onion = crate::NetAddr::Onion {
+        pk: [0x77; 32],
+        port: 8333,
+    };
+    let mut mix = crate::seeds::AddrMan::new();
+    mix.add_addr(good_onion);
+    mix.add_addr(bad_onion);
+    mix.note_connect_failed_addr(bad_onion, true);
+    let got = mix.take_dial_candidates_net(4, &HashSet::new(), &[]);
+    assert!(
+        got.contains(&good_onion) && !got.contains(&bad_onion),
+        "without a fresh clearnet, incompatible overlays lose to a compatible one: {got:?}"
+    );
+
     let dir = rbitcoin_query::testutil::TempDir::labeled("overlay-peers").unwrap();
     let path = dir.join("peers");
     book.save(&path).unwrap();
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.starts_with("rbitcoin-peers-v2"), "{body}");
-    assert!(body.contains(".b32.i2p:8333") && body.contains("fc00:"), "{body}");
+    assert!(
+        body.contains(".b32.i2p:8333") && body.contains("fc00:"),
+        "{body}"
+    );
     let loaded = crate::seeds::AddrMan::load(&path).unwrap();
     for want in [onion, i2p, cjdns] {
         assert!(
@@ -216,12 +287,7 @@ fn overlay_config() {
         0x2f, 0x1f,
     ];
     learn_overlay(&hub, AddrV2::TorV3(pk), 8333, 1);
-    learn_overlay(
-        &hub,
-        AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)),
-        18444,
-        1,
-    );
+    learn_overlay(&hub, AddrV2::Ipv4(Ipv4Addr::new(1, 2, 3, 4)), 18444, 1);
     let onion = onion_addr();
     assert!(book_has(&am, onion));
     let i2p_early = crate::NetAddr::I2p {
