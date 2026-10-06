@@ -230,8 +230,6 @@ fn admit_pending_header(
 const MAX_PENDING_BLOCKS: usize = 128;
 /// Honest maximum block serialization. One larger body is not parked.
 const MAX_BLOCK_SERIALIZED: usize = 4_000_000;
-/// Byte ceiling for the tip-session map: the count cap times one max block.
-const MAX_PENDING_BLOCK_BYTES: usize = MAX_PENDING_BLOCKS * MAX_BLOCK_SERIALIZED;
 /// Max reconstructed full bodies queued on one session writer, and the
 /// matching catch-up `getdata` window (extra hashes stick in `requested`).
 pub const MAX_SERVE_BLOCKS: usize = 16;
@@ -255,7 +253,6 @@ pub(crate) const MAX_PENDING_BLOCKS_FOR_TEST: usize = MAX_PENDING_BLOCKS;
 pub struct PendingBlocks {
     map: HashMap<BlockHash, bitcoin::Block>,
     fifo: VecDeque<BlockHash>,
-    bytes: usize,
 }
 
 impl PendingBlocks {
@@ -283,7 +280,6 @@ impl PendingBlocks {
 
     pub(crate) fn remove(&mut self, hash: &BlockHash) -> Option<bitcoin::Block> {
         let b = self.map.remove(hash)?;
-        self.bytes = self.bytes.saturating_sub(block_wire_len(&b));
         if let Some(i) = self.fifo.iter().position(|h| h == hash) {
             self.fifo.remove(i);
         }
@@ -300,35 +296,20 @@ fn stash_pending_block(pending: &mut PendingBlocks, hash: BlockHash, block: bitc
     if nbytes > MAX_BLOCK_SERIALIZED {
         return;
     }
-    if let Some(old) = pending.map.get(&hash) {
-        let next = pending
-            .bytes
-            .saturating_sub(block_wire_len(old))
-            .saturating_add(nbytes);
-        if next > MAX_PENDING_BLOCK_BYTES {
-            return;
-        }
-        pending.bytes = next;
+    if pending.map.contains_key(&hash) {
         pending.map.insert(hash, block);
         return;
     }
-    while pending.map.len() >= MAX_PENDING_BLOCKS
-        || pending.bytes.saturating_add(nbytes) > MAX_PENDING_BLOCK_BYTES
-    {
+    while pending.map.len() >= MAX_PENDING_BLOCKS {
         let Some(k) = pending.fifo.pop_front() else {
             break;
         };
-        if let Some(old) = pending.map.remove(&k) {
-            pending.bytes = pending.bytes.saturating_sub(block_wire_len(&old));
-        }
+        pending.map.remove(&k);
     }
-    if pending.map.len() >= MAX_PENDING_BLOCKS
-        || pending.bytes.saturating_add(nbytes) > MAX_PENDING_BLOCK_BYTES
-    {
+    if pending.map.len() >= MAX_PENDING_BLOCKS {
         return;
     }
     pending.fifo.push_back(hash);
-    pending.bytes = pending.bytes.saturating_add(nbytes);
     pending.map.insert(hash, block);
 }
 
@@ -350,13 +331,13 @@ pub fn set_compact_filters_service(on: bool) {
 
 /// BIP159: a pruned node offers `NETWORK_LIMITED`, not `NETWORK`.
 pub fn local_service_flags_pruned(pruned: bool) -> ServiceFlags {
-    let base = if pruned {
+    let mut base = if pruned {
         ServiceFlags::NETWORK_LIMITED | ServiceFlags::WITNESS | ServiceFlags::P2P_V2
     } else {
         crate::seeds::required_seed_services()
     };
     if COMPACT_FILTERS_ADVERTISED.load(Ordering::Acquire) {
-        base | ServiceFlags::COMPACT_FILTERS
+        base.add(ServiceFlags::COMPACT_FILTERS)
     } else {
         base
     }

@@ -3383,10 +3383,6 @@ fn getpeerinfo_lists_registered_session() {
     assert_eq!(arr[0]["last_transaction"], 0);
     assert!(arr[0].get("minfeefilter").is_some());
     assert!(arr[0]["bytesrecv_per_msg"]["pong"].as_u64().unwrap() >= 29);
-    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
-    assert_eq!(net["connections_in"], 0);
-    assert_eq!(net["connections_out"], 1);
-    assert_eq!(net["connections"], 1);
     let totals = dispatch(&ctx, "getnettotals", vec![]).unwrap();
     assert!(totals["totalbytesrecv"].as_u64().unwrap() >= 29);
     assert_eq!(totals["totalbytessent"].as_u64().unwrap(), 0);
@@ -3417,6 +3413,10 @@ fn getpeerinfo_lists_registered_session() {
         dispatch(&ctx, "getconnectioncount", vec![]).unwrap(),
         json!(2)
     );
+    let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
+    assert_eq!(net["connections_in"], 1);
+    assert_eq!(net["connections_out"], 1);
+    assert_eq!(net["connections"], 2);
     drop(inbound);
     let _ = std::fs::remove_dir_all(&dir);
 }
