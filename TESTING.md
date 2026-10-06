@@ -6,11 +6,11 @@
 |--------|--------|
 | **Journey scenarios**: one setup a peer, client, or operator could use, then a **sequence** of asserts on what they would observe | Many skinny scenarios that each remine maturity and re-open the store |
 | The socket, RPC, HTTP route, operator config, or scripted peer | An in-process helper the product never calls, or a thread-local the client does not share |
-| **Pure units** whose return **is** the consensus or schema result, when a real session cannot reach that result without an absurd chain | Units whose job is to execute a private branch, or that re-implement confirm and only paint lines a journey already hits |
+| **A shrinking set of pure results.** One stays only when its return is the consensus or schema result and no peer, client, operator, or reopened store can show it without an absurd chain | A new pure unit for a result a session or the on-disk store can already show. Also units whose job is to execute a private branch, or that re-implement confirm and only paint lines a journey already hits |
 | **One entry** per production path (the journey owns the asserts) | A `#[test]` that only calls other tests, or those tests kept as private bodies |
 | Core JSON corpora for **script engine** breadth | A second parallel script suite |
 
-**Fewer scenario functions / store opens, not less coverage** — put more asserts on one story.
+**Fewer scenario functions, fewer store opens, and fewer pure results, not less coverage** — put more asserts on one story. The pure-result set shrinks as a surface learns to show the result. Do not add to it.
 
 ### True journeys
 
@@ -20,7 +20,7 @@ Distinct cases that only share a costly chain are separate `#[test]`s. Build tha
 
 A `#[test]` whose body only calls other tests is neither shape. If each callee still opens its own store, the suite gains one name and the same N boots. If the callees are independent, give each its own name on the shared fixture. Do not keep the old functions as private bodies the new test calls.
 
-If no peer, client, or operator can cause the behavior, delete the behavior in the same change. A small test stays only when the function's return is the consensus or schema result and a session cannot reach it without an absurd chain: pure arithmetic, a codec with no socket, two networks that cannot be the same chain. Say which of those it is, next to the test. A small unit is not a cheaper substitute for a journey the session can already run. A tall chain the rest of the story never builds is a named second chapter on a second setup. Two setups only when the objects cannot be the same.
+If no peer, client, or operator can cause the behavior, delete the behavior in the same change. A small test stays only when the function's return is the consensus or schema result and a session cannot reach it without an absurd chain: pure arithmetic, a codec with no socket, two networks that cannot be the same chain. Say which of those it is, next to the test. Store state is a surface: a tip after reopen, and bytes a later open reads back, are observed results, not pure ones. When a story shows a result a pure unit used to own, delete the pure unit in that commit. The set of pure results gets smaller over time. Do not add one because it is faster to land. A small unit is not a cheaper substitute for a journey the session can already run. A tall chain the rest of the story never builds is a named second chapter on a second setup. Two setups only when the objects cannot be the same.
 
 Push the entry up. Prefer the surface a real session uses over an in-process dispatch the product never calls. In-process is for a fact that surface cannot show. Do not assert a thread-local, a counter on a worker the client does not share, or a helper's name. If the only proof lives there, it is not the contract yet.
 
@@ -183,7 +183,7 @@ test bytes are RAM.
 | Package / binary (warm, order-of-magnitude) | Budget | Notes |
 |---------------------------------------------|-------:|-------|
 | `rbitcoin-store --lib` | **&lt;45 s** | Catalog-run fixtures stay tens of tiny files, not thousands |
-| `rbitcoin-consensus --lib` | **&lt;30 s** | Prefer pure unit over full-store loops. Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
+| `rbitcoin-consensus --lib` | **&lt;30 s** | Do not add a pure unit a session or a reopened store can show. Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
 | `rbitcoin-query --lib` | **&lt;20 s** | |
 | `rbitcoin-test --test scenarios` | **&lt;15 s** | Prefer `pad_empty_from` / shared mature helpers |
 | **Full** `cargo test --workspace` | **≤3 min** warm | Stretch **&lt;2 min** |
@@ -282,9 +282,10 @@ counts that line.
    ([`CONTRIBUTING.md`](./CONTRIBUTING.md) principle 11).
 4. A small unit only when the function's return is the consensus or schema
    result and a real session cannot reach it without an absurd chain — say
-   why in the test file. Any other behavior no session can trigger is
-   deleted, not unit-tested. Drive the shipped function, not a
-   `#[cfg(test)]` wrapper around it.
+   why in the test file. On-disk store state counts as a session result.
+   That set of pure results shrinks; do not add to it. Any other behavior
+   no session can trigger is deleted, not unit-tested. Drive the shipped
+   function, not a `#[cfg(test)]` wrapper around it.
 
 ### Closing a red region
 
@@ -297,7 +298,8 @@ counts that line.
    holds because `LF` fell.
 5. The function is pure consensus or schema math and the journey would need
    an absurd chain: one unit on that shipped function, reason in the test.
-   Drive that function, not a `#[cfg(test)]` wrapper.
+   Drive that function, not a `#[cfg(test)]` wrapper. If a reopened store
+   can show the result, it is case 3, not a new pure unit.
 6. Stop when the ratio is **≥ 92%**. Do not add a private-helper test to
    get there.
 
