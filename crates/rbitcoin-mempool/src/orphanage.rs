@@ -509,10 +509,17 @@ mod tests {
         let mut miss = BTreeSet::new();
         miss.insert(parent);
         assert!(o.insert_from(tx2.clone(), miss.clone(), Some(2)));
+        let mut first_peer = None;
+        let mut last_peer = None;
         for i in 0..80u8 {
             let mut tx = make_orphan(parent, i.wrapping_add(3));
             tx.input[0].witness = Witness::from_slice(&[vec![i.wrapping_add(3); 20_000]]);
             tx.lock_time = LockTime::from_height(i as u32).unwrap();
+            let tid = tx.compute_txid();
+            if first_peer.is_none() {
+                first_peer = Some(tid);
+            }
+            last_peer = Some(tid);
             o.insert_from(tx, miss.clone(), Some(1));
         }
         assert!(
@@ -520,6 +527,28 @@ mod tests {
             "peer weight {}",
             o.peer_orphan_weight(1)
         );
+        assert!(o.contains(&last_peer.expect("inserted")));
+        assert!(!o.contains(&first_peer.expect("inserted")));
+        let mut exact = make_orphan(txid_n(4), 1);
+        let base = exact.weight().to_wu();
+        let mut pad = ORPHAN_RESERVED_WEIGHT_PER_PEER.saturating_sub(base) as usize;
+        for _ in 0..6 {
+            exact.input[0].witness = Witness::from_slice(&[vec![1u8; pad]]);
+            let got = exact.weight().to_wu();
+            if got == ORPHAN_RESERVED_WEIGHT_PER_PEER {
+                break;
+            }
+            if got > ORPHAN_RESERVED_WEIGHT_PER_PEER {
+                pad = pad.saturating_sub((got - ORPHAN_RESERVED_WEIGHT_PER_PEER) as usize);
+            } else {
+                pad = pad.saturating_add((ORPHAN_RESERVED_WEIGHT_PER_PEER - got) as usize);
+            }
+        }
+        assert_eq!(exact.weight().to_wu(), ORPHAN_RESERVED_WEIGHT_PER_PEER);
+        let mut alone = Orphanage::new();
+        let mut exact_miss = BTreeSet::new();
+        exact_miss.insert(txid_n(4));
+        assert!(alone.insert_from(exact, exact_miss, Some(9)));
         let peer2_kept = o.announcers_of(&tx2.compute_txid()).contains(&2);
         assert!(peer2_kept, "peer 2 must keep its orphan");
     }
