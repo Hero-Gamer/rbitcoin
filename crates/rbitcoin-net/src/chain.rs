@@ -2200,30 +2200,20 @@ impl ChainHub {
                 };
 
                 let new_height = parent_h.0.saturating_add(1);
-                if new_height > tip_h {
-                    if hold_unconnected {
-                        self.hold_body(block);
-                    }
-                    return Err(NetError::Protocol("gap above tip"));
-                }
+                validate_header(
+                    self.query.as_ref(),
+                    &self.params,
+                    Height(new_height),
+                    &block.header,
+                )
+                .map_err(|e| header_reject(&block.header, &e))?;
 
                 if new_height == tip_h {
-                    let cur_work = self
-                        .query
-                        .wire_header_at_height(Height(tip_h))
-                        .map_err(NetError::store)?
-                        .work();
-                    let new_work = block.header.work();
-                    let precious = *self.precious.read().unwrap() == Some(hash);
-                    if new_work > cur_work || (new_work == cur_work && precious) {
-                        self.disconnect_to(parent_h.0)?;
-                        self.connect_at(new_height, block)?;
-                        return Ok(AcceptOutcome::Accepted { height: new_height });
-                    }
-                    if hold_unconnected {
+                    let out = self.accept_branch_locked(std::slice::from_ref(block.as_ref()))?;
+                    if matches!(out, AcceptOutcome::IgnoredWeaker) && hold_unconnected {
                         self.hold_body(block);
                     }
-                    return Ok(AcceptOutcome::IgnoredWeaker);
+                    return Ok(out);
                 }
 
                 if hold_unconnected {
@@ -2242,6 +2232,10 @@ impl ChainHub {
 
     fn accept_branch_inner(&self, blocks: &[Block]) -> Result<AcceptOutcome, NetError> {
         let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.accept_branch_locked(blocks)
+    }
+
+    fn accept_branch_locked(&self, blocks: &[Block]) -> Result<AcceptOutcome, NetError> {
         self.accept_branch_precheck(blocks)?;
         if let Some(out) = self.accept_branch_genesis_fill(blocks)? {
             return Ok(out);
@@ -2509,8 +2503,7 @@ impl ChainHub {
                 Some(o) => Ok(o),
                 None => Ok(AcceptOutcome::IgnoredWeaker),
             },
-            Err(NetError::SideBlock | NetError::UnknownParent)
-            | Err(NetError::Protocol("gap above tip")) => match self.try_apply_held()? {
+            Err(NetError::SideBlock | NetError::UnknownParent) => match self.try_apply_held()? {
                 Some(o) => Ok(o),
                 None => Ok(AcceptOutcome::IgnoredWeaker),
             },
@@ -5491,6 +5484,42 @@ mod tests {
             other => panic!("expected invalidated refuse, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn mine_chain(hub: &ChainHub, len: u32, time: u32) -> Vec<Block> {
+        let mut prev = hub.tip_hash().unwrap();
+        let base = hub.tip_height().unwrap();
+        let mut out = Vec::new();
+        for h in base + 1..=base + len {
+            let b = mine(prev, time + h * 600, h);
+            prev = b.block_hash();
+            hub.accept_block(b.clone()).unwrap();
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn sibling_claiming_more_work_with_wrong_bits_keeps_the_tip() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 5, 1_300_060_000);
+        let tip = main[4].block_hash();
+        for h in (2..=5u32).rev() {
+            let parent = &main[h as usize - 2];
+            let mut bogus = mine(parent.block_hash(), parent.header.time + 1, h);
+            bogus.header.bits = CompactTarget::from_consensus(0x1700_ffff);
+            let err = hub
+                .accept_received_block(bogus)
+                .expect_err("a sibling with wrong nBits must be rejected");
+            assert!(err.to_string().contains("bits"), "height {h}: {err}");
+            assert_eq!(
+                hub.tip_hash(),
+                Some(tip),
+                "a rejected sibling at height {h} must not move the tip"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

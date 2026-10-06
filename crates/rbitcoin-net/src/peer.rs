@@ -2158,10 +2158,7 @@ fn take_requested_block(hub: &ChainHub, requested: &mut HashSet<BlockHash>, hash
 }
 
 fn net_error_needs_parent(e: &NetError) -> bool {
-    matches!(
-        e,
-        NetError::UnknownParent | NetError::Protocol("gap above tip")
-    )
+    matches!(e, NetError::UnknownParent)
 }
 
 /// Incomplete compact block waiting for `blocktxn`.
