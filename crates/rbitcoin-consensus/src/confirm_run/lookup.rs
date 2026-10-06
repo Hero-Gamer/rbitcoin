@@ -172,6 +172,9 @@ pub fn confirm_wire_lookup_stamp(
 
 /// plan=None rehydrate: stamp external parent create_fk + body_range + txid
 /// via the shared query helper so load never probes those tables.
+///
+/// A wire input whose parent is neither in this batch nor connected is
+/// [`ConsensusError::MissingPrevout`], as on the plan path.
 pub(super) fn stamp_parent_pin_archived(
     query: &Query,
     params: &ChainParams,
@@ -189,14 +192,15 @@ pub(super) fn stamp_parent_pin_archived(
             }
         }
     }
-    let mut need_external: rbitcoin_query::TxidMap<()> = rbitcoin_query::TxidMap::default();
+    // Value: a wire input spends this txid (BIP30 probes are `false`).
+    let mut need_external: rbitcoin_query::TxidMap<bool> = rbitcoin_query::TxidMap::default();
     if skeleton.is_some() {
         for &prev in carried_need.unwrap_or(&[]) {
             if same_batch.contains_key(&prev) {
                 continue;
             }
             if prev != [0u8; 32] {
-                need_external.insert(prev, ());
+                need_external.insert(prev, true);
             }
         }
     } else {
@@ -211,7 +215,7 @@ pub(super) fn stamp_parent_pin_archived(
                         continue;
                     }
                     if prev != [0u8; 32] {
-                        need_external.insert(prev, ());
+                        need_external.insert(prev, true);
                     }
                 }
             }
@@ -220,13 +224,13 @@ pub(super) fn stamp_parent_pin_archived(
     for m in metas {
         if !params.bip34_active_at(m.height.0) {
             for p in m.pres.iter() {
-                need_external.insert(p.txid, ());
+                need_external.entry(p.txid).or_insert(false);
             }
         }
     }
     let empty = rbitcoin_query::InFlight::new();
     let ifo = in_flight.unwrap_or(&empty);
-    let need_vec: Vec<[u8; 32]> = need_external.into_keys().collect();
+    let need_vec: Vec<[u8; 32]> = need_external.keys().copied().collect();
     let ext = rbitcoin_query::stamp_external_parents(
         query.store(),
         &need_vec,
@@ -235,6 +239,12 @@ pub(super) fn stamp_parent_pin_archived(
         query.confirm_stats(),
     )
     .map_err(ConsensusError::from)?;
+    if need_external
+        .iter()
+        .any(|(txid, &spent)| spent && !ext.resolved.contains_key(txid))
+    {
+        return Err(ConsensusError::MissingPrevout);
+    }
     let mut stamp = ParentPinStamp {
         resolved: rbitcoin_query::TxidMap::with_capacity_and_hasher(
             ext.resolved.len().saturating_add(same_batch.len()),

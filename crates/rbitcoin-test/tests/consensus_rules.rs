@@ -295,11 +295,22 @@ fn same_batch_spend_of_a_later_block_is_missing() {
         &q,
         &params,
         Milestone::NONE,
-        &[(Height(101), child_first), (Height(102), parent_second)],
+        &[
+            (Height(101), child_first.clone()),
+            (Height(102), parent_second),
+        ],
     );
     assert!(
         matches!(err, Err(ConsensusError::MissingPrevout)),
         "spend of an output created one block later in the batch: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(100)));
+
+    // Both bodies are archived now, and the parent is not connected.
+    let err = confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(101), child_first)]);
+    assert!(
+        matches!(err, Err(ConsensusError::MissingPrevout)),
+        "the spending block retried alone: {err:?}"
     );
     assert_eq!(q.tip_height(), Some(Height(100)));
 
