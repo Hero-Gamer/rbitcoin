@@ -602,6 +602,9 @@ fn plan_reorg_respend() -> Result<Vec<PlannedSubmit>, String> {
 fn core_fate(reply: OracleReply) -> Result<Fate, String> {
     match reply {
         OracleReply::NullAccept => Ok(Fate::Accept),
+        // Already stored and valid. `invalidateblock` on rewind makes the next
+        // submit of that block `duplicate-invalid` until `reconsiderblock`.
+        OracleReply::Reason(reason) if reason == "duplicate" => Ok(Fate::Accept),
         OracleReply::Reason(reason) => {
             if mutated_reason(&reason) {
                 Ok(Fate::Mutated)
@@ -611,6 +614,50 @@ fn core_fate(reply: OracleReply) -> Result<Fate, String> {
         }
         OracleReply::RpcError => Err("oracle rpc".into()),
         OracleReply::Dead => Err("oracle dead".into()),
+    }
+}
+
+fn block_hash_from_hex(hex: &str) -> Result<String, String> {
+    fn nybble(b: u8) -> Result<u8, String> {
+        match b {
+            b'0'..=b'9' => Ok(b - b'0'),
+            b'a'..=b'f' => Ok(b - b'a' + 10),
+            b'A'..=b'F' => Ok(b - b'A' + 10),
+            _ => Err("block hex".into()),
+        }
+    }
+    if !hex.len().is_multiple_of(2) {
+        return Err("block hex".into());
+    }
+    let bytes = hex.as_bytes();
+    let mut raw = Vec::with_capacity(hex.len() / 2);
+    let mut i = 0;
+    while i < bytes.len() {
+        raw.push((nybble(bytes[i])? << 4) | nybble(bytes[i + 1])?);
+        i += 2;
+    }
+    let block: Block =
+        bitcoin::consensus::encode::deserialize(&raw).map_err(|_| "block hex".to_string())?;
+    Ok(block.block_hash().to_string())
+}
+
+/// `invalidateblock` sticks. A later submit of a block this process already
+/// gave Core is `duplicate-invalid` until `reconsiderblock` clears the flag.
+/// Setup blocks (no compared fate) still need that clear, or the child is
+/// `bad-prevblk`.
+fn submit_fate(oracle: &dyn BlockOracle, hex: &str) -> Result<Fate, String> {
+    let reply = oracle.submitblock_hex(hex);
+    match reply {
+        OracleReply::Reason(ref reason)
+            if reason == "duplicate-invalid" || reason == "duplicate-inconclusive" =>
+        {
+            let hash = block_hash_from_hex(hex)?;
+            oracle
+                .core_reconsider_block(&hash)
+                .map_err(|_| "oracle rpc".to_string())?;
+            core_fate(oracle.submitblock_hex(hex))
+        }
+        other => core_fate(other),
     }
 }
 
@@ -637,8 +684,7 @@ pub fn compare_chain_plan(
     let mut all_accept = true;
     let mut mismatch: Option<(bool, bool)> = None;
     for step in plan {
-        let reply = oracle.submitblock_hex(&step.hex);
-        let core = core_fate(reply)?;
+        let core = submit_fate(oracle, &step.hex)?;
         let Some(ours) = step.fate else {
             continue;
         };
@@ -766,6 +812,103 @@ mod tests {
                 matches!(flipped, ChainReview::Disagree { .. }),
                 "shape {shape} did not disagree with the opposite reply: {flipped:?}"
             );
+        }
+    }
+
+    /// After `invalidateblock`, Core answers `duplicate-invalid` for a block it
+    /// already accepted. The checked block is a child: without
+    /// `reconsiderblock` on the setup parent, Core reports `bad-prevblk`.
+    #[test]
+    fn invalidated_replay_is_not_a_consensus_split() {
+        let params = params_bip34_off();
+        let genesis = genesis_block(&params);
+        let parent = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let child = mine_empty_regtest(parent.block_hash(), parent.header.time + 600, 2);
+        let parent_hash = parent.block_hash().to_string();
+        let plan = vec![
+            PlannedSubmit {
+                hex: hex_block(&parent),
+                fate: None,
+            },
+            PlannedSubmit {
+                hex: hex_block(&child),
+                fate: Some(Fate::Accept),
+            },
+        ];
+        let oracle = ReplayOracle {
+            setup_hex: plan[0].hex.clone(),
+            setup_hash: parent_hash,
+            reconsidered: Cell::new(false),
+            stay_invalid: false,
+        };
+        let got = compare_chain_plan(&plan, &oracle).expect("compare");
+        assert_eq!(got, ChainReview::Agree { accept: true });
+        assert!(oracle.reconsidered.get(), "parent was not reconsidered");
+    }
+
+    #[test]
+    fn sticky_invalid_block_stays_a_reject() {
+        let params = params_bip34_off();
+        let genesis = genesis_block(&params);
+        let parent = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let plan = vec![PlannedSubmit {
+            hex: hex_block(&parent),
+            fate: Some(Fate::Accept),
+        }];
+        let oracle = ReplayOracle {
+            setup_hex: plan[0].hex.clone(),
+            setup_hash: parent.block_hash().to_string(),
+            reconsidered: Cell::new(false),
+            stay_invalid: true,
+        };
+        let got = compare_chain_plan(&plan, &oracle).expect("compare");
+        assert_eq!(
+            got,
+            ChainReview::Disagree {
+                ours: true,
+                core: false
+            }
+        );
+    }
+
+    struct ReplayOracle {
+        setup_hex: String,
+        setup_hash: String,
+        reconsidered: Cell<bool>,
+        stay_invalid: bool,
+    }
+
+    impl BlockOracle for ReplayOracle {
+        fn submitblock_hex(&self, hex: &str) -> OracleReply {
+            if hex == self.setup_hex {
+                if !self.reconsidered.get() || self.stay_invalid {
+                    return OracleReply::Reason("duplicate-invalid".into());
+                }
+                return OracleReply::Reason("duplicate".into());
+            }
+            if self.reconsidered.get() {
+                OracleReply::NullAccept
+            } else {
+                OracleReply::Reason("bad-prevblk".into())
+            }
+        }
+        fn liveness_ok(&self) -> bool {
+            true
+        }
+        fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_reconsider_block(&self, hash: &str) -> Result<(), &'static str> {
+            if hash == self.setup_hash {
+                self.reconsidered.set(true);
+            }
+            Ok(())
+        }
+        fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
         }
     }
 }
