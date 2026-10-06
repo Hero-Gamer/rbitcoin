@@ -39,9 +39,9 @@
 //!   + `pins=` / `head_sub=` / `drain_join=` / `dequeue=` / `idx_put=`.
 //!     `other=` is write-thread work minus that inventory.
 //!
-//! **Inventory rule:** new work on lookup / load / scripts / write (or a sidecar
-//! the write thread joins) must add a named token here in the **same commit**.
-//! Same-commit rule: `AGENTS.md`. `write=` must equal `write_stage_ms`.
+//! **Inventory:** token names for lookup, load, scripts, and write live here.
+//! Adding one is the same-commit rule in `docs/concurrency.md`.
+//! `write=` must equal `write_stage_ms`.
 //!
 //! **Long-pole diagnosis:** do **not** rank stages by work-sum alone when
 //! `scriptq` can stay empty. Prefer `lookup_thr busy=` / `thr load=busy/wait=` /

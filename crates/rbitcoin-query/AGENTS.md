@@ -22,12 +22,6 @@ Open the row that matches the change. Leave the other owners closed.
 - Archive: `src/archive.rs`
 - Fixtures: `src/testutil.rs`
 
-## Rules here
-
-- Pins are plan/batch only. No process-resident FIFO, LRU, or sticky pin cache.
-- Test-only adapters stay in `testutil`. Do not grow production `Query` around fixture shapes.
-- A missed fact the pipeline promised is `StoreError::Corrupt("invariant: …")`, not a silent colder walk.
-
 ## Verify
 
 `cargo test -p rbitcoin-query --lib`

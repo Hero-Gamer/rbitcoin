@@ -7,7 +7,8 @@ Open the one row that matches the change. Leave the other owners closed.
 ## Crate graph
 
 For workspace crate roles, see [`CRATES.md`](./CRATES.md). Crate-specific
-read-first links and local rules are in `crates/<name>/AGENTS.md` when present.
+read-first links are in `crates/<name>/AGENTS.md` when present. Those files
+own no facts.
 
 Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file exists.
 

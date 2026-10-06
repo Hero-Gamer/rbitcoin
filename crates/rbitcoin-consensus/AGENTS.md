@@ -1,8 +1,8 @@
 # rbitcoin-consensus
 
 Header, block, and script validation. Depends on primitives, query, and store.
-Peer and RPC script checks use the detached worker (`verify_tx_scripts_detached`).
-Do not run the interpreter on an I/O thread.
+Peer and RPC script checks use the detached worker. The thread rule is
+[`docs/concurrency.md`](../../docs/concurrency.md).
 
 ## Read first
 
@@ -20,11 +20,6 @@ Open the row that matches the change. Leave the other owners closed.
 - Confirm: `src/confirm_run.rs`
 - Headers and blocks: `src/header.rs`, `src/block.rs`
 - Worker pool: `src/script_pool.rs`
-
-## Rules here
-
-- One production implementation. No silent consensus fallback.
-- Do not split a Core-faithful opcode `match` to chase a line count.
 
 ## Verify
 

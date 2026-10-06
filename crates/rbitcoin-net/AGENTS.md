@@ -21,11 +21,6 @@ Open the row that matches the change. Leave the other owners closed.
 - Tip: `src/chain.rs`, `src/tip_accept.rs`
 - Relay: `src/tx_relay.rs`, `src/peers.rs`
 
-## Rules here
-
-- IBD intake is body queue → lookup → load. No large process-resident body cache with FIFO, LRU, or sticky residency.
-- A change on lookup, load, scripts, or write (or a sidecar the write thread joins) gets a named `ibd: perf` timer in the same commit. Inventory: `src/ibd/perf_log.rs`.
-
 ## Verify
 
 `cargo test -p rbitcoin-net --lib`
