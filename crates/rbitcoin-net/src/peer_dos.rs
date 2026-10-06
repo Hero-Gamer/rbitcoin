@@ -184,6 +184,21 @@ mod tests {
             !rolled.note_at(510, roll_t0 + RATE_WINDOW + Duration::from_millis(500)),
             "rolled: 100 + half of 800 + 510 exceeds 1000"
         );
+
+        // `new` stamps its own start. Jump far enough that this note sets
+        // the window start to `anchor`, then hit that start plus one second.
+        let mut edge = PeerRateLimiter::new(10_000, 1_000);
+        let anchor = Instant::now() + RATE_WINDOW + RATE_WINDOW + Duration::from_secs(5);
+        assert!(edge.note_at(800, anchor));
+        let boundary = anchor + RATE_WINDOW;
+        assert!(
+            edge.note_at(200, boundary),
+            "the exact boundary still has the rest of a 1000-byte budget"
+        );
+        assert!(
+            !edge.note_at(401, boundary + Duration::from_millis(500)),
+            "half a second later the previous 800 bytes still count"
+        );
     }
 
     #[test]
