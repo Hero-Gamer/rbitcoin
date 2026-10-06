@@ -158,12 +158,6 @@ impl LoadAheadState {
         self.last_loaded = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
-
-    /// Drop speculative FKs after load uring recover (`requeue_on_uring_recover`
-    /// already ran on this thread). `sync_body_hwm` uses `max` and will not roll down.
-    fn on_uring_recover(&mut self, hub: &ChainHub) {
-        self.clear_all(hub);
-    }
 }
 
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
@@ -299,11 +293,6 @@ impl ConfirmFeed {
             }
         }
         self.cv.notify_one();
-    }
-
-    pub(crate) fn requeue_hashes(&self, items: impl IntoIterator<Item = (u32, BlockHash)>) {
-        let batch: Vec<_> = items.into_iter().map(|(h, ha)| (h, ha, None)).collect();
-        self.requeue_wire(&batch);
     }
 
     /// Write (or permanent reject) finished — height may be re-offered only after
@@ -500,19 +489,18 @@ fn finish_connected_write_after_session_fault(
     }
 }
 
+/// A scripts or write session fault: take recover credit, then requeue
+/// the wave as an engine fault. Lookup took its bodies off the body queue,
+/// so the wave goes back there under a re-arm.
 fn requeue_on_uring_recover(
-    query: &rbitcoin_query::Query,
+    hub: &ChainHub,
     feed: &ConfirmFeed,
-    session_fault: bool,
     reason: &'static str,
-    heights: impl IntoIterator<Item = (u32, BlockHash)>,
-) -> bool {
-    if !session_fault {
-        return false;
-    }
-    query.uring_recover_or_abort(reason);
-    feed.requeue_hashes(heights);
-    true
+    wave: &[(u32, BlockHash, &bitcoin::Block)],
+) {
+    hub.query.uring_recover_or_abort(reason);
+    feed.finish(wave.iter().map(|&(h, _, _)| h));
+    rearm_after_reject(hub, feed, ConfirmRejectClass::EngineFault, wave);
 }
 
 /// A body to offer back, with the BQ sender id it was enqueued with.
@@ -574,9 +562,10 @@ fn reoffer_blocks_to_body_queue<'a>(
 /// drops its look-ahead plan before the next wave. When the wave is retried
 /// (a cascade, or a batched reject being isolated), turn on isolation
 /// before the re-arm and offer its bodies back after it, so lookup cannot
-/// rebuild the same wave from them. Write and scripts re-offer without a
-/// sender: load already checked these bodies for mutation. Returns false
-/// when the class does not re-arm (cancel, engine fault).
+/// rebuild the same wave from them. An engine fault's wave goes back the
+/// same way without isolation: the fault is no block's. Write and scripts
+/// re-offer without a sender: load already checked these bodies for
+/// mutation. Returns false when the class does not re-arm (cancel).
 ///
 /// Order: serialize, isolate, re-arm, insert. The insert must follow the
 /// re-arm: a body queued first could be selected by a lookup pass that read
@@ -590,14 +579,12 @@ fn rearm_after_reject(
     class: ConfirmRejectClass,
     wave: &[(u32, BlockHash, &bitcoin::Block)],
 ) -> bool {
-    if matches!(
-        class,
-        ConfirmRejectClass::Cancelled | ConfirmRejectClass::EngineFault
-    ) {
+    if class == ConfirmRejectClass::Cancelled {
         return false;
     }
     let retried = class.isolate_if_batched(wave.len()) == ConfirmRejectClass::Cascade;
-    let prepared = if retried {
+    let requeue = retried || class == ConfirmRejectClass::EngineFault;
+    let prepared = if requeue {
         prepare_offer_back(hub, wave.iter().map(|&(h, ha, b)| (h, ha, b, None)))
     } else {
         Vec::new()
@@ -609,7 +596,7 @@ fn rearm_after_reject(
     }
     hub.query.set_lookup_taken_hi(hub.tip_height());
     hub.query.set_lookup_started_hi(hub.tip_height());
-    if retried {
+    if requeue {
         offer_back(hub, prepared);
         feed.notify();
     }
@@ -621,8 +608,9 @@ fn rearm_after_reject(
 /// plan, or a consensus reject against a parent that is not the tip) goes
 /// back for a retry. A batched reject names the first hash but may be any
 /// block's fault, so every block goes back and the retry runs one block at
-/// a time. Same order as [`rearm_after_reject`]: serialize, isolate,
-/// re-arm, insert.
+/// a time. An engine fault is no block's fault: every block goes back and
+/// the retry is not isolated. Same order as [`rearm_after_reject`]:
+/// serialize, isolate, re-arm, insert.
 fn load_fail_rewind_wave(
     feed: &ConfirmFeed,
     hub: &ChainHub,
@@ -631,8 +619,11 @@ fn load_fail_rewind_wave(
     class: ConfirmRejectClass,
     wave: &[OfferBack<'_>],
 ) {
+    let fault = class == ConfirmRejectClass::EngineFault;
     let drop_head = match wave {
-        [(_, hash, _, _)] => class.trust_consensus(hub, *hash) != ConfirmRejectClass::Cascade,
+        [(_, hash, _, _)] => {
+            !fault && class.trust_consensus(hub, *hash) != ConfirmRejectClass::Cascade
+        }
         _ => false,
     };
     let prepared = prepare_offer_back(hub, wave[usize::from(drop_head)..].iter().copied());
@@ -641,7 +632,7 @@ fn load_fail_rewind_wave(
     feed.clear();
     // After `clear` (which drops isolation) and before the re-offer, so
     // lookup cannot rebuild the same wave.
-    if wave.len() > 1 {
+    if wave.len() > 1 && !fault {
         feed.request_single_block(first_h.saturating_add(wave.len() as u32 - 1));
     }
     hub.query.set_lookup_taken_hi(hub.tip_height());
@@ -1713,14 +1704,20 @@ pub(crate) fn spawn_confirm_engine(
                                         skip_stale = true;
                                     }
                                 }
-                            } else if requeue_on_uring_recover(
-                                &hub_wb.query,
-                                &feed_wb,
-                                true,
-                                "ibd-confirm-write",
-                                meta.iter().copied(),
-                            ) {
-                                load_ahead_reset_wb.store(true, Ordering::Release);
+                            } else {
+                                let t_rearm = Instant::now();
+                                let wave: Vec<(u32, BlockHash, &bitcoin::Block)> = meta
+                                    .iter()
+                                    .zip(failed.wire_blocks())
+                                    .map(|(&(h, ha), b)| (h, ha, b.as_ref()))
+                                    .collect();
+                                requeue_on_uring_recover(
+                                    &hub_wb,
+                                    &feed_wb,
+                                    "ibd-confirm-write",
+                                    &wave,
+                                );
+                                confirm_thr_stats::add_write_work(&stats, t_rearm.elapsed());
                                 warn!(
                                     "ibd: confirm write uring recover @ {height} batch_parts={parts}: {err}"
                                 );
@@ -1855,15 +1852,29 @@ pub(crate) fn spawn_confirm_engine(
                         info!("ibd: confirm scripts aborted: {msg}");
                         return false;
                     }
-                    if requeue_on_uring_recover(
-                        &hub_sc.query,
-                        &feed_sc,
-                        e.is_uring_session_fault(),
-                        "ibd-confirm-scripts",
-                        meta.heights_hashes.iter().map(|(h, raw)| {
-                            (*h, BlockHash::from_byte_array(*raw))
-                        }),
-                    ) {
+                    let session_fault = e.is_uring_session_fault();
+                    let class = ConfirmRejectClass::from_consensus(&e);
+                    // A retried, engine-faulted, or session-faulted wave goes
+                    // back with the batches dropped behind it; a one-block
+                    // verdict drops its block.
+                    let retried = class.isolate_if_batched(meta.heights_hashes.len())
+                        == ConfirmRejectClass::Cascade;
+                    let t_rearm = Instant::now();
+                    let wave: Vec<(u32, BlockHash, &bitcoin::Block)> = if retried
+                        || session_fault
+                        || class == ConfirmRejectClass::EngineFault
+                    {
+                        std::iter::once(&meta)
+                            .chain(dropped)
+                            .flat_map(|m| m.heights_hashes.iter().zip(&m.wire_blocks))
+                            .map(|(&(h, raw), b)| (h, BlockHash::from_byte_array(raw), b.as_ref()))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    if session_fault {
+                        requeue_on_uring_recover(&hub_sc, &feed_sc, "ibd-confirm-scripts", &wave);
+                        confirm_thr_stats::add_script_work(&stats, t_rearm.elapsed());
                         warn!("ibd: confirm scripts uring recover @ {}: {e}", meta.first_h);
                         return true;
                     }
@@ -1880,21 +1891,6 @@ pub(crate) fn spawn_confirm_engine(
                         .confirm_reject_stops
                         .fetch_add(1, Ordering::Relaxed);
                     warn!("ibd: confirm scripts reject @ {height} (batch first {hash}): {e}");
-                    let class = ConfirmRejectClass::from_consensus(&e);
-                    // A retried wave goes back with the batches dropped behind
-                    // it; a one-block verdict drops its block.
-                    let retried = class.isolate_if_batched(meta.heights_hashes.len())
-                        == ConfirmRejectClass::Cascade;
-                    let t_rearm = Instant::now();
-                    let wave: Vec<(u32, BlockHash, &bitcoin::Block)> = if retried {
-                        std::iter::once(&meta)
-                            .chain(dropped)
-                            .flat_map(|m| m.heights_hashes.iter().zip(&m.wire_blocks))
-                            .map(|(&(h, raw), b)| (h, BlockHash::from_byte_array(raw), b.as_ref()))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
                     let rearm = if retried {
                         ConfirmRejectClass::Cascade
                     } else {
@@ -2106,42 +2102,35 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = scripts.join();
                             return;
                         }
-                        if requeue_on_uring_recover(
-                            &hub_load.query,
-                            &feed_load,
-                            e.is_uring_session_fault(),
-                            "ibd-confirm-load",
-                            wire_batch.iter().map(|(h, ha, _)| (*h, *ha)),
-                        ) {
-                            warn!(
-                                "ibd: confirm load stamp uring recover {first} @ {expect_h}: {e}",
-                                first = wire_batch[0].1
-                            );
-                            continue;
+                        let session_fault = e.is_uring_session_fault();
+                        let t_rewind = Instant::now();
+                        if session_fault {
+                            hub_load.query.uring_recover_or_abort("ibd-confirm-load");
                         }
                         let first_hash = wire_batch[0].1;
                         let sender = wire_sender(&wire_batch[0].2);
-                        let class = ConfirmRejectClass::from_consensus(&e);
-                        if class == ConfirmRejectClass::EngineFault {
-                            reoffer_blocks_to_body_queue(
-                                &hub_load,
-                                wire_batch.iter().filter_map(|(h, ha, w)| {
-                                    (!hub_load.has_block(ha))
-                                        .then_some((*h, *ha, w.block.as_ref(), w.sender))
-                                }),
-                            );
+                        let class = if session_fault {
+                            ConfirmRejectClass::EngineFault
                         } else {
-                            load_fail_rewind_wave(
-                                &feed_load,
-                                &hub_load,
-                                &mut lookup_ahead,
-                                expect_h,
-                                class,
-                                &wire_batch
-                                    .iter()
-                                    .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
-                                    .collect::<Vec<_>>(),
+                            ConfirmRejectClass::from_consensus(&e)
+                        };
+                        load_fail_rewind_wave(
+                            &feed_load,
+                            &hub_load,
+                            &mut lookup_ahead,
+                            expect_h,
+                            class,
+                            &wire_batch
+                                .iter()
+                                .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
+                                .collect::<Vec<_>>(),
+                        );
+                        confirm_thr_stats::add_load_prune(&stats, t_rewind.elapsed());
+                        if session_fault {
+                            warn!(
+                                "ibd: confirm load stamp uring recover {first_hash} @ {expect_h}: {e}"
                             );
+                            continue;
                         }
                         loop_stats_load
                             .confirm_reject_stops
@@ -2278,32 +2267,44 @@ pub(crate) fn spawn_confirm_engine(
                             let _ = scripts.join();
                             return;
                         }
-                        if requeue_on_uring_recover(
-                            &hub_load.query,
-                            &feed_load,
-                            rbitcoin_store::StoreError::is_uring_session_fault_msg(&msg),
-                            "ibd-confirm-load",
-                            heights_hashes.iter().copied(),
-                        ) {
-                            lookup_ahead.on_uring_recover(&hub_load);
-                            warn!(
-                                "ibd: confirm load uring recover {first_hash} @ {expect_h}: {e}"
-                            );
-                            continue;
+                        let session_fault =
+                            rbitcoin_store::StoreError::is_uring_session_fault_msg(&msg);
+                        let t_rewind = Instant::now();
+                        if session_fault {
+                            hub_load.query.uring_recover_or_abort("ibd-confirm-load");
                         }
-                        let class = ConfirmRejectClass::from_net(&e);
+                        let class = if session_fault {
+                            ConfirmRejectClass::EngineFault
+                        } else {
+                            ConfirmRejectClass::from_net(&e)
+                        };
                         let sender = wire_sender(&wire_batch[0].2);
+                        // A pin-stage invariant miss can be a stale-fk plan
+                        // race, not a store fault: retry it one block at a
+                        // time, as a cascade. A session fault is not a race.
+                        let rewind = if class == ConfirmRejectClass::EngineFault && !session_fault {
+                            ConfirmRejectClass::Cascade
+                        } else {
+                            class
+                        };
                         load_fail_rewind_wave(
                             &feed_load,
                             &hub_load,
                             &mut lookup_ahead,
                             expect_h,
-                            class,
+                            rewind,
                             &wire_batch
                                 .iter()
                                 .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
                                 .collect::<Vec<_>>(),
                         );
+                        confirm_thr_stats::add_load_prune(&stats, t_rewind.elapsed());
+                        if session_fault {
+                            warn!(
+                                "ibd: confirm load uring recover {first_hash} @ {expect_h}: {e}"
+                            );
+                            continue;
+                        }
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);

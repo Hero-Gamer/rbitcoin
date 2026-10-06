@@ -92,8 +92,10 @@ restart after a drain abort).
 IBD write / lookup / load / scripts and post-IBD tip connect: a session fault
 after a successful drain recovers once per 1000-height window (credit CAS;
 **no** in-process Class C repair — leftover strong is the open-repair case).
-The next wave opens a new TLS ring. A second stall in that window aborts and
-names `RBITCOIN_IO=pread`.
+The next wave opens a new TLS ring. Load, scripts, and write then requeue the
+faulted wave as an engine fault with no reject event: lookup re-arms at the
+tip and the wave's bodies go back on the body queue. A second stall in that
+window aborts and names `RBITCOIN_IO=pread`.
 
 ### Do not flatten custom machines
 

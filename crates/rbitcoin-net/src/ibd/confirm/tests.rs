@@ -1308,7 +1308,7 @@ fn plan_epoch_stale_after_clear() {
 }
 
 #[test]
-fn write_session_fault_is_engine_fault_and_requeue_puts_ready() {
+fn write_session_fault_is_engine_fault() {
     use rbitcoin_consensus::ConsensusError;
     use rbitcoin_store::StoreError;
 
@@ -1327,17 +1327,6 @@ fn write_session_fault_is_engine_fault_and_requeue_puts_ready() {
         super::ConfirmRejectClass::from_consensus(&io),
         super::ConfirmRejectClass::EngineFault
     );
-
-    let feed = ConfirmFeed::new();
-    let hash = bitcoin::BlockHash::from_byte_array([1u8; 32]);
-    {
-        let mut g = feed.inner.lock().unwrap();
-        g.inflight.insert(10);
-    }
-    feed.requeue_hashes(std::iter::once((10, hash)));
-    let g = feed.inner.lock().unwrap();
-    assert!(g.ready.contains_key(&10));
-    assert!(!g.inflight.contains(&10));
 }
 
 #[test]
@@ -1374,38 +1363,46 @@ fn from_net_maps_wire_and_string_classes() {
     );
 }
 
+/// A scripts or write session fault takes recover credit, re-arms lookup
+/// at the tip, and offers the wave back to the body queue: lookup took
+/// those bodies, so a hash on feed.ready alone is never confirmed again.
 #[test]
-fn requeue_on_uring_recover_credits_then_skips_non_fault() {
-    let (_d, q) = rbitcoin_query::testutil::tiny_query_labeled("requeue-uring");
+fn requeue_on_uring_recover_rearms_lookup_and_offers_the_wave_back() {
+    use rbitcoin_consensus::mine_empty_regtest;
+    use std::collections::HashSet;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("requeue-uring");
+    hub.ensure_genesis().unwrap();
+    let time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+        .header
+        .time;
+    let b1 = mine_empty_regtest(hub.tip_hash().unwrap(), time + 600, 1);
+    let b2 = mine_empty_regtest(b1.block_hash(), time + 1200, 2);
+    let wave = [(1, b1.block_hash(), &b1), (2, b2.block_hash(), &b2)];
     let feed = ConfirmFeed::new();
-    let hash = bitcoin::BlockHash::from_byte_array([3u8; 32]);
     {
         let mut g = feed.inner.lock().unwrap();
-        g.inflight.insert(7);
+        g.inflight.insert(1);
+        g.inflight.insert(2);
     }
-    assert!(super::requeue_on_uring_recover(
-        &q,
-        &feed,
-        true,
-        "test",
-        std::iter::once((7, hash)),
-    ));
-    {
-        let g = feed.inner.lock().unwrap();
-        assert!(g.ready.contains_key(&7));
-        assert!(!g.inflight.contains(&7));
-    }
-    assert!(!super::requeue_on_uring_recover(
-        &q,
-        &feed,
-        false,
-        "test",
-        std::iter::empty(),
-    ));
+    hub.query.set_lookup_taken_hi(Some(2));
+    let gen = hub.query.lookup_taken_gen();
+    super::requeue_on_uring_recover(&hub, &feed, "test", &wave);
+    assert_ne!(hub.query.lookup_taken_gen(), gen, "load resets");
+    assert_eq!(hub.query.lookup_taken_hi(), Some(0));
+    assert!(!feed.single_block());
+    assert_eq!(feed.size_snap(), (0, 0), "not feed.ready, not inflight");
     assert_eq!(
-        q.uring_recover("again"),
+        hub.query
+            .block_queue_unresolved_heights(1, &HashSet::new(), 4),
+        vec![1, 2],
+        "lookup takes the wave again"
+    );
+    assert_eq!(
+        hub.query.uring_recover("again"),
         rbitcoin_query::UringRecover::Exhausted
     );
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -1472,9 +1469,9 @@ fn next_reject(
 #[test]
 fn ibd_confirm_pin_fault() {
     use super::{
-        finish_connected_write_after_session_fault, reoffer_blocks_to_body_queue,
-        spawn_confirm_engine, write_batch_is_stale, ConfirmEvent, ConfirmRejectClass,
-        LoadAheadState,
+        finish_connected_write_after_session_fault, load_fail_rewind_wave,
+        reoffer_blocks_to_body_queue, spawn_confirm_engine, write_batch_is_stale, ConfirmEvent,
+        ConfirmRejectClass, LoadAheadState,
     };
     use crate::ibd::status::LoopStats;
     use bitcoin::absolute::LockTime;
@@ -1682,8 +1679,8 @@ fn ibd_confirm_pin_fault() {
     hub.query.block_queue_dequeue_height(t + 3).unwrap();
     hub.query.set_lookup_taken_hi(None);
 
-    // A load session fault after lookup noted speculative fks resets the
-    // next fk to the one after the durable bodies.
+    // A load session fault rewinds as an engine fault. After lookup noted
+    // speculative fks, the next fk is the one after the durable bodies.
     let mut st = LoadAheadState::new(&hub);
     let durable = hub.query.tx_body_count() + 1;
     let mut plan = ArchiveWritePlan::empty();
@@ -1693,7 +1690,14 @@ fn ibd_confirm_pin_fault() {
     st.in_flight
         .note_pins(std::iter::once((plan.planned_fks[0], &pin)), Some(t + 1));
     assert!(st.next_tx_start > durable && st.in_flight.entry_count() > 0);
-    st.on_uring_recover(&hub);
+    load_fail_rewind_wave(
+        &ConfirmFeed::new(),
+        &hub,
+        &mut st,
+        t + 1,
+        ConfirmRejectClass::EngineFault,
+        &[],
+    );
     assert_eq!(st.next_tx_start, durable);
     assert_eq!(st.in_flight.entry_count(), 0);
 
@@ -1783,8 +1787,8 @@ fn ibd_confirm_pin_fault() {
 /// A two-block load wave fails, named by tip+1: pins clear, the epoch drops
 /// same-wave loads, lookup rewinds to the tip, the retry is one block at a
 /// time, and both bodies go back on the body queue, not feed.ready. A
-/// one-block verdict drops the block that failed; a one-block cascade goes
-/// back for a retry.
+/// one-block verdict drops the block that failed; a one-block cascade or
+/// engine fault goes back for a retry. An engine fault is not isolated.
 fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHash, tip_time: u32) {
     use super::{load_fail_rewind_wave, ConfirmRejectClass, LoadAheadState};
     use bitcoin::consensus::encode::serialize;
@@ -1852,7 +1856,7 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
     for (class, kept) in [
         (ConfirmRejectClass::ConsensusInvalid, false),
         (ConfirmRejectClass::SoftWire, false),
-        (ConfirmRejectClass::EngineFault, false),
+        (ConfirmRejectClass::EngineFault, true),
         (ConfirmRejectClass::Cascade, true),
     ] {
         let solo = ConfirmFeed::new();
@@ -1870,11 +1874,37 @@ fn load_fail_rewind_requeues_the_wave(hub: &crate::chain::ChainHub, tip: BlockHa
             hub.query.block_queue_dequeue_height(t + 1).unwrap();
         }
     }
+
+    let fault = ConfirmFeed::new();
+    hub.query.set_lookup_taken_hi(Some(t + 2));
+    load_fail_rewind_wave(
+        &fault,
+        hub,
+        &mut st,
+        t + 1,
+        ConfirmRejectClass::EngineFault,
+        &[
+            (t + 1, head.block_hash(), &head, None),
+            (t + 2, tail.block_hash(), &tail, None),
+        ],
+    );
+    assert_eq!(hub.query.lookup_taken_hi(), Some(t));
+    assert!(!fault.single_block(), "an engine fault is not isolated");
+    assert_eq!(
+        hub.query
+            .block_queue_unresolved_heights(t + 1, &HashSet::new(), 4),
+        vec![t + 1, t + 2],
+        "the faulted wave is claimable again"
+    );
+    hub.query.block_queue_dequeue_height(t + 1).unwrap();
+    hub.query.block_queue_dequeue_height(t + 2).unwrap();
 }
 
 /// A write or scripts reject re-arms lookup at the tip. A retried batched
 /// wave turns on isolation and goes back on the body queue; a one-block
-/// consensus reject does not.
+/// consensus reject does not. An engine fault's wave goes back without
+/// isolation. A torn store file faults lookup or load before write, so
+/// this is a unit check.
 #[test]
 fn reject_rearms_lookup_and_requeues_a_retried_wave() {
     use super::{rearm_after_reject, ConfirmRejectClass};
@@ -1926,17 +1956,25 @@ fn reject_rearms_lookup_and_requeues_a_retried_wave() {
         }
     }
 
+    let feed = ConfirmFeed::new();
     hub.query.set_lookup_taken_hi(Some(2));
-    assert!(!rearm_after_reject(
+    let gen = hub.query.lookup_taken_gen();
+    assert!(rearm_after_reject(
         &hub,
         &feed,
         ConfirmRejectClass::EngineFault,
         &wave
     ));
-    assert_eq!(
-        hub.query.lookup_taken_hi(),
-        Some(2),
-        "engine fault keeps lookup"
+    assert_ne!(
+        hub.query.lookup_taken_gen(),
+        gen,
+        "engine fault: load resets"
+    );
+    assert_eq!(hub.query.lookup_taken_hi(), Some(0), "engine fault");
+    assert!(!feed.single_block(), "an engine fault is not isolated");
+    assert!(
+        hub.query.block_queue_has_height(1) && hub.query.block_queue_has_height(2),
+        "engine fault: the wave is back on the queue"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -27,8 +27,9 @@
 //!   `head=(probe= io= preads=)` / `loc=`)
 //! - **load=** = pin (`LOAD_NS`) + assemble (`CONNECT_NS`) only — **not** the
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp
-//!   (plan=None / S0 only), clone, and post-stamp prune on a marked last load
-//!   batch (`load_thr pack/stamp/pin/asm/prune`).
+//!   (plan=None / S0 only), clone, post-stamp prune on a marked last load
+//!   batch, and a stamp or pin reject's rewind of the wave
+//!   (`load_thr pack/stamp/pin/asm/prune`).
 //! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
 //!   `ibd-confirm`; excludes head-of-line wait for write handoff and `idx_asm=`).
 //!   `idx_asm=` is filter and tweak assemble after that verify. `thr script work`

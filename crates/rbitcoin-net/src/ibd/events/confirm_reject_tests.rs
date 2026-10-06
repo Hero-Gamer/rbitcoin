@@ -1970,6 +1970,83 @@ impl WireRig {
         }
     }
 
+    /// Cut the store file `name` to zero bytes, so a read of any row in it
+    /// is a local IO fault. Returns what [`Self::mend`] writes back.
+    fn tear(&self, name: &str) -> (std::path::PathBuf, Vec<u8>) {
+        fn find(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+            std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+                let p = e.path();
+                if p.is_dir() {
+                    find(&p, name)
+                } else {
+                    (p.file_name()? == name).then_some(p)
+                }
+            })
+        }
+        let path = find(self.dir.path(), name).expect(name);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        (path, bytes)
+    }
+
+    fn mend((path, bytes): (std::path::PathBuf, Vec<u8>)) {
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Run the engine without IBD until its first reject, then hand back
+    /// that reject and every event seen, unapplied.
+    fn first_reject(
+        &self,
+    ) -> (
+        Reject,
+        std::sync::mpsc::Receiver<super::super::confirm::ConfirmEvent>,
+    ) {
+        use super::super::confirm::ConfirmEvent;
+        use std::time::{Duration, Instant};
+        let rx = &self.engine.as_ref().expect("engine").1;
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(Instant::now() < deadline, "no confirm reject");
+            let Ok(ev) = rx.recv_timeout(Duration::from_millis(5)) else {
+                continue;
+            };
+            let reject = match &ev {
+                ConfirmEvent::Reject {
+                    hash,
+                    class,
+                    batch_len,
+                    ..
+                } => Some((*hash, *class, *batch_len)),
+                _ => None,
+            };
+            held_tx.send(ev).unwrap();
+            if let Some(r) = reject {
+                return (r, held);
+            }
+        }
+    }
+
+    fn apply_held(
+        &mut self,
+        held: &std::sync::mpsc::Receiver<super::super::confirm::ConfirmEvent>,
+    ) {
+        super::apply_confirm_events(
+            &mut self.st,
+            &self.hub,
+            held,
+            &self.write_next,
+            &std::sync::atomic::AtomicU32::new(0),
+            &mut self.progress,
+            Some(&self.feed),
+        );
+    }
+
     fn finish(mut self) {
         self.feed.request_stop();
         self.feed.notify();
@@ -2305,6 +2382,109 @@ fn batched_write_reject_offers_the_wave_back() {
         Some(&(h2, ConfirmRejectClass::ConsensusInvalid, 1))
     );
     assert_eq!(rig.hub.tip_hash(), Some(h1));
+    rig.finish();
+}
+
+/// tip+1 is the last block on the path, and load cannot read its header
+/// row when it stamps the wave: a local store fault, not a block verdict.
+/// The wave goes back to lookup, so once the row reads again tip+1
+/// connects with no later wave, disconnect, or reorg to re-arm lookup.
+#[test]
+fn load_engine_fault_near_the_tip_retakes_the_wave() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::state::InflightReq;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("load-engine-fault", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let b1 = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![WireRig::spend(cbs[0])],
+    );
+    let h1 = b1.block_hash();
+    rig.plant(&[&b1]);
+    rig.st.slots[0].in_flight.insert(h1);
+    rig.st.inflight.insert(h1, InflightReq::new(1));
+    rig.deliver(1, &b1);
+    let torn = rig.tear("header.body");
+    rig.start_engine();
+
+    let (reject, held) = rig.first_reject();
+    WireRig::mend(torn);
+    assert_eq!(reject, (h1, ConfirmRejectClass::EngineFault, 1));
+    rig.apply_held(&held);
+    rig.pump(|_, _| b1.clone(), |_, hub, _| hub.tip_hash() == Some(h1));
+    assert!(!rig.st.body.is_rejected(&h1));
+    rig.finish();
+}
+
+/// tip+1 and tip+2 load in one wave, and pin cannot read the coinbase
+/// outputs they spend. A pin-stage engine fault can be a stale-plan race,
+/// so the retry runs one block at a time and names tip+1 alone. Once the
+/// outputs read again, both blocks connect.
+#[test]
+fn batched_pin_engine_fault_retries_one_block_at_a_time() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::state::InflightReq;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+    use std::time::{Duration, Instant};
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("pin-engine-fault", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let b1 = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        spk.clone(),
+        vec![WireRig::spend(cbs[0])],
+    );
+    let b2 = mine_regtest_paying(
+        b1.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk,
+        vec![WireRig::spend(cbs[1])],
+    );
+    let (h1, h2) = (b1.block_hash(), b2.block_hash());
+    rig.plant(&[&b1, &b2]);
+    // Both bodies are queued before the engine starts, so one wave holds them.
+    for body in [&b1, &b2] {
+        let hash = body.block_hash();
+        rig.st.slots[0].in_flight.insert(hash);
+        rig.st.inflight.insert(hash, InflightReq::new(1));
+        rig.deliver(1, body);
+    }
+    let torn = rig.tear("txout.body");
+    rig.start_engine();
+
+    let (wave, _) = rig.first_reject();
+    let (retry, _) = rig.first_reject();
+    WireRig::mend(torn);
+    assert_eq!(
+        [wave, retry],
+        [
+            (h1, ConfirmRejectClass::EngineFault, 2),
+            (h1, ConfirmRejectClass::EngineFault, 1)
+        ]
+    );
+    let rx = &rig.engine.as_ref().unwrap().1;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rig.hub.tip_hash() != Some(h2) {
+        assert!(
+            Instant::now() < deadline,
+            "stall at {:?}",
+            rig.hub.tip_height()
+        );
+        let _ = rx.recv_timeout(Duration::from_millis(5));
+    }
     rig.finish();
 }
 
