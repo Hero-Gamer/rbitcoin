@@ -183,7 +183,7 @@ mod tests {
             min_ping: Some(1.0),
             last_block: 0,
             last_tx: 0,
-            netgroup: 7,
+            netgroup: 50_000,
             noban: false,
         });
         cands.push(InboundEvictCandidate {
@@ -192,7 +192,7 @@ mod tests {
             min_ping: Some(1.0),
             last_block: 0,
             last_tx: 0,
-            netgroup: 7,
+            netgroup: 50_000,
             noban: false,
         });
         cands.push(InboundEvictCandidate {
@@ -201,7 +201,7 @@ mod tests {
             min_ping: Some(1.0),
             last_block: 0,
             last_tx: 0,
-            netgroup: 7,
+            netgroup: 50_000,
             noban: false,
         });
         cands.push(InboundEvictCandidate {
