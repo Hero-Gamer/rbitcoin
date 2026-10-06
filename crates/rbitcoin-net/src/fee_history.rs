@@ -88,14 +88,14 @@ impl FeeHistory {
         let first = self.blocks.first_key_value().map(|(&h, _)| h);
         let last = self.blocks.last_key_value().map(|(&h, _)| h);
         if let (Some(rate), false) = (block.p10_sat_kvb, self.analog_stale) {
-            match (first, last) {
-                (_, None) => self.analog.push_back(rate),
-                (Some(first), Some(last)) => match (height.cmp(&first), height.cmp(&last)) {
+            if let (Some(first), Some(last)) = (first, last) {
+                match (height.cmp(&first), height.cmp(&last)) {
                     (_, Ordering::Greater) => self.analog.push_back(rate),
                     (Ordering::Less, _) => self.analog.push_front(rate),
                     _ => self.analog_stale = true,
-                },
-                _ => self.analog_stale = true,
+                }
+            } else {
+                self.analog.push_back(rate);
             }
         }
         self.blocks.insert(height, block);
