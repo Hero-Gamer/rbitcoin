@@ -1035,18 +1035,20 @@ pub fn submit_received_block(hub: &rbitcoin_net::ChainHub, block: Block) -> Subm
     if !known {
         return SubmitBlockOutcome::Rejected("prev-blk-not-found".into());
     }
-    match cheap_submit_tx_reject(hub.query.as_ref(), &block, hub.params.coinbase_maturity()) {
+    match cheap_submit_tx_reject(
+        hub.query.as_ref(),
+        &block,
+        hub.params.coinbase_maturity(),
+        &hub.params,
+        hub.milestone,
+    ) {
         Err(e) => return SubmitBlockOutcome::Error(format!("store: {e}")),
         Ok(Some(reason)) => {
-            // `bad-txns-duplicate` and `bad-txnmrklroot` are mutated-block needles.
-            // A coinbase-less 64-byte body is too: it can be the header's inner
-            // nodes, so `bad-cb-missing` must not stick to the hash. Cache
-            // every other cheap consensus reason so a second submit is
-            // `duplicate-invalid`.
-            if reason != "bad-txns-duplicate"
-                && reason != "bad-txnmrklroot"
-                && !rbitcoin_consensus::block_mutated_without_coinbase(&block)
-            {
+            // Merkle and witness bytes are not the block hash. A coinbase-less
+            // 64-byte body can be the header's inner nodes. Those reasons must
+            // not stick, so a second submit of the honest body is not
+            // `duplicate-invalid`. Every other cheap consensus reason is.
+            if !submit_reason_is_mutated(&block, &reason) {
                 hub.note_invalid_block(hash);
                 let _ = hub.ensure_header(&block.header);
             }
@@ -1183,10 +1185,21 @@ fn read_confirmed_prevout(
     )))
 }
 
+/// Witness and merkle bytes are not the block hash. Caching them drops the
+/// honest body for the rest of the process.
+fn submit_reason_is_mutated(block: &Block, reason: &str) -> bool {
+    reason == "bad-txns-duplicate"
+        || reason == "bad-txnmrklroot"
+        || reason.contains("witness")
+        || rbitcoin_consensus::block_mutated_without_coinbase(block)
+}
+
 fn cheap_submit_tx_reject(
     query: &rbitcoin_query::Query,
     block: &Block,
     maturity: u32,
+    params: &rbitcoin_consensus::ChainParams,
+    milestone: rbitcoin_consensus::Milestone,
 ) -> Result<Option<String>, rbitcoin_store::StoreError> {
     use bitcoin::{OutPoint, TxOut};
     let spend_height = cheap_spend_height(query, block)?;
@@ -1203,14 +1216,10 @@ fn cheap_submit_tx_reject(
     if mutated {
         return Ok(Some("bad-txns-duplicate".into()));
     }
-    let Some((first, rest)) = block.txdata.split_first() else {
-        return Ok(Some("bad-blk-length".into()));
-    };
-    if !first.is_coinbase() {
-        return Ok(Some("bad-cb-missing".into()));
-    }
-    if rest.iter().any(Transaction::is_coinbase) {
-        return Ok(Some("bad-cb-multiple".into()));
+    // CheckBlock before inputs. connect_at is the other caller, and an
+    // equal-work sibling never reaches it.
+    if let Some(reason) = submit_checkblock_reason(block, spend_height, params, milestone)? {
+        return Ok(Some(reason));
     }
     let mut spent = std::collections::HashSet::new();
     let mut created: std::collections::HashMap<OutPoint, TxOut> = std::collections::HashMap::new();
@@ -1276,6 +1285,26 @@ fn cheap_submit_tx_reject(
         }
     }
     Ok(None)
+}
+
+/// Context-free CheckBlock for a known parent. A best-chain parent has a
+/// height, so BIP34 applies. A held-only parent has no height yet.
+fn submit_checkblock_reason(
+    block: &Block,
+    spend_height: Option<u32>,
+    params: &rbitcoin_consensus::ChainParams,
+    milestone: rbitcoin_consensus::Milestone,
+) -> Result<Option<String>, rbitcoin_store::StoreError> {
+    use rbitcoin_consensus::ConsensusError;
+    let vctx = match spend_height {
+        Some(h) => rbitcoin_consensus::ValidationContext::at(params, Height(h), milestone),
+        None => rbitcoin_consensus::ValidationContext::archive_structure(params),
+    };
+    match rbitcoin_consensus::validate_block_structure(block, &vctx) {
+        Ok(()) => Ok(None),
+        Err(ConsensusError::Store(e)) => Err(e),
+        Err(e) => Ok(Some(rbitcoin_consensus::block_reject_reason(&e))),
+    }
 }
 
 fn submit_reject_reason(e: &rbitcoin_net::NetError) -> String {

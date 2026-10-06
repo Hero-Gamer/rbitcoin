@@ -517,37 +517,6 @@ fn mainnet_ancestor_skip_then_miss(q: &rbitcoin_query::Query, first: &Transactio
 }
 
 #[test]
-fn s1_rejects_empty_txdata() {
-    validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();
-    let b = block_with(vec![]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "no transactions");
-}
-
-#[test]
-fn s2_rejects_non_coinbase_first() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
-    let b = block_with(vec![non_coinbase_spend(1)]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "first tx not coinbase");
-}
-
-#[test]
-fn s3_rejects_second_coinbase() {
-    let b = block_with(vec![coinbase(1), coinbase(2)]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "coinbase not first");
-    // The same coinbase twice is a mutated tree (Core `bad-txns-duplicate`).
-    let b = block_with(vec![coinbase(1), coinbase(1)]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "bad-txns-duplicate");
-}
-
-#[test]
 fn s4_rejects_overweight_block() {
     // ~1MB of script data per tx ≈ 4M weight; a few large outputs exceed the limit.
     let mut txs = vec![coinbase(1)];
@@ -1047,73 +1016,6 @@ fn p3_default_milestone_heights() {
     );
     assert!(crate::default_milestone_anchor(Network::Signet).is_none());
     assert!(crate::default_milestone_anchor(Network::Regtest).is_none());
-}
-
-#[test]
-fn s9_rejects_bad_cb_length_short() {
-    let mut two = coinbase(0);
-    two.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x00]);
-    validate_block_structure(&block_with(vec![two]), &ctx_h(0)).unwrap();
-    let mut cb = coinbase(0);
-    cb.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01]); // len 1
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "bad-cb-length");
-}
-
-#[test]
-fn s9_rejects_bad_cb_length_long() {
-    let mut hundred = coinbase(0);
-    hundred.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01; 100]);
-    validate_block_structure(&block_with(vec![hundred]), &ctx_h(0)).unwrap();
-    let mut cb = coinbase(0);
-    cb.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01; 101]);
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "bad-cb-length");
-}
-
-#[test]
-fn s10_rejects_vout_toolarge() {
-    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
-    let mut zero = coinbase(0);
-    zero.output[0].value = Amount::ZERO;
-    validate_block_structure(&block_with(vec![zero]), &ctx_h(0)).unwrap();
-    let mut ok = coinbase(0);
-    ok.output[0].value = Amount::from_sat(MAX_MONEY);
-    validate_block_structure(&block_with(vec![ok]), &ctx_h(0)).expect("exactly MAX_MONEY");
-    let mut cb = coinbase(0);
-    cb.output[0].value = Amount::from_sat(MAX_MONEY + 1);
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "toolarge");
-}
-
-#[test]
-fn s13_rejects_coinbase_empty_vout() {
-    validate_block_structure(&block_with(vec![coinbase(0)]), &ctx_h(0)).unwrap();
-    let mut cb = coinbase(0);
-    cb.output.clear();
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("no outputs") || msg.contains("vout-empty"),
-        "expected empty vout reject, got {msg}"
-    );
-}
-
-#[test]
-fn s11_rejects_excessive_legacy_sigops() {
-    let mut ok = coinbase(0);
-    ok.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_000]);
-    validate_block_structure(&block_with(vec![ok]), &ctx_h(0)).expect("20_000 legacy sigops");
-    let mut cb = coinbase(0);
-    // 20_001 × OP_CHECKSIG × WITNESS_SCALE(4) = 80_004 > MAX 80_000.
-    cb.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_001]);
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "sigops");
 }
 
 #[test]

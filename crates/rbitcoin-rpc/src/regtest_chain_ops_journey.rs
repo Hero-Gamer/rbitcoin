@@ -83,6 +83,8 @@ fn rpc_regtest_from_genesis() {
     chain_ops_empty_template_and_proposals(&ctx);
     chain_ops_header_rejects(&ctx, &hub, &p2wpkh);
     chain_ops_submit_rejects(&ctx, &hub, &p2wpkh);
+    chain_ops_equal_work_sibling_checkblock(&ctx, &hub);
+    chain_ops_coinbase_script_and_sigops(&ctx, &hub, &p2wpkh);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -584,7 +586,10 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     };
     let mut below = mine(4);
     let cb = below.txdata[0].compute_txid();
-    below.txdata.push(spend(OutPoint { txid: cb, vout: 0 }, u64::MAX));
+    // Inside the money range. CheckBlock would report `bad-txns-vout-toolarge`
+    // before this same-block coinbase is immature.
+    let over_in = Amount::MAX_MONEY.to_sat();
+    below.txdata.push(spend(OutPoint { txid: cb, vout: 0 }, over_in));
     let mut miss = mine(5);
     let ghost = OutPoint {
         txid: Txid::from_byte_array([0x22; 32]),
@@ -615,7 +620,7 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     let mut young_prev = mine(9);
     young_prev
         .txdata
-        .push(spend(OutPoint { txid: prev_cb, vout: 0 }, u64::MAX));
+        .push(spend(OutPoint { txid: prev_cb, vout: 0 }, over_in));
     let no_vin = commit(no_vin);
     for (block, want) in [
         (commit(empty), "bad-blk-length"),
@@ -674,6 +679,143 @@ fn chain_ops_submit_rejects(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wp
     let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&honest))]).unwrap();
     assert!(r.is_null(), "the honest body still connects: {r}");
     assert_eq!(tip_count(ctx), before + 2);
+
+    // CheckBlock money range. MAX_MONEY is not `toolarge` (subsidy rejects
+    // it later). One satoshi over is.
+    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    let mut at_max = mine(10);
+    at_max.txdata[0].output[0].value = Amount::from_sat(MAX_MONEY);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(at_max)))]).unwrap();
+    assert_eq!(r, "bad-cb-amount", "MAX_MONEY is not toolarge: {r}");
+    let mut over = mine(11);
+    over.txdata[0].output[0].value = Amount::from_sat(MAX_MONEY + 1);
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(over)))]).unwrap();
+    assert_eq!(r, "bad-txns-vout-toolarge");
+
+    // Coinbase with no outputs is CheckTransaction, not the spend-loop reject.
+    let mut no_cb_out = mine(12);
+    no_cb_out.txdata[0].output.clear();
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&commit(no_cb_out)))]).unwrap();
+    assert_eq!(r, "bad-txns-vout-empty");
+}
+
+/// An equal-work sibling never connects, so `submitblock` is the CheckBlock
+/// that body gets. Layout rejects are cached; a valid sibling is held.
+fn chain_ops_equal_work_sibling_checkblock(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub) {
+    use bitcoin::{OutPoint, Txid};
+    let tip = hub.tip_header().unwrap();
+    let parent = tip.prev_blockhash;
+    let height = hub.tip_height().unwrap();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let mine_on = |time: u32, h: u32| {
+        rbitcoin_consensus::mine_regtest_paying(parent, time, h, op_true.clone(), vec![])
+    };
+    let commit = |mut block: Block| {
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .unwrap_or_else(|| bitcoin::TxMerkleNode::from_byte_array([0; 32]));
+        regrind(&mut block);
+        block
+    };
+    let mut empty = mine_on(tip.time + 10, height);
+    empty.txdata.clear();
+    let mut no_cb = mine_on(tip.time + 11, height);
+    no_cb.txdata[0].input[0].previous_output = OutPoint {
+        txid: Txid::from_byte_array([0x11; 32]),
+        vout: 0,
+    };
+    assert_ne!(
+        no_cb.txdata[0].base_size(),
+        64,
+        "this body is a real non-coinbase, not a 64-byte merkle node"
+    );
+    let other_cb = mine_on(tip.time + 12, height + 1).txdata.remove(0);
+    let mut two_cb = mine_on(tip.time + 13, height);
+    two_cb.txdata.push(other_cb);
+    let valid = mine_on(tip.time + 14, height);
+    for (block, want) in [
+        (commit(empty), "bad-blk-length"),
+        (commit(no_cb), "bad-cb-missing"),
+        (commit(two_cb), "bad-cb-multiple"),
+    ] {
+        let hash = block.block_hash();
+        let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert_eq!(r, want, "{hash}");
+        assert!(hub.is_block_invalid(&hash), "{want} is cached on {hash}");
+        let again = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert_eq!(again, "duplicate-invalid", "{want} resubmit");
+    }
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&valid))]).unwrap();
+    assert_eq!(r, "inconclusive", "a valid equal-work sibling is held");
+    assert!(!hub.is_block_invalid(&valid.block_hash()));
+    assert_eq!(hub.tip_hash(), Some(tip.block_hash()));
+}
+
+/// Coinbase scriptSig length, BIP34 height, and the legacy sigop cap on the
+/// live tip. Regtest activates BIP34 at height 1.
+fn chain_ops_coinbase_script_and_sigops(
+    ctx: &RpcContext,
+    hub: &rbitcoin_net::ChainHub,
+    spk: &ScriptBuf,
+) {
+    let mine_claiming = |claimed: u32| {
+        rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            hub.tip_header().unwrap().time + 1,
+            claimed,
+            spk.clone(),
+            vec![],
+        )
+    };
+    let submit = |b: &Block| dispatch(ctx, "submitblock", vec![json!(block_hex(b))]).unwrap();
+    let h = tip_count(ctx) as u32 + 1;
+    let wrong = mine_claiming(h + 1);
+    assert_eq!(submit(&wrong), "bad-cb-height");
+    assert_eq!(
+        submit(&wrong),
+        "duplicate-invalid",
+        "bad-cb-height is a consensus reject, not a mutated body"
+    );
+    for script_sig in [vec![0x52], vec![]] {
+        let mut short = mine_claiming(h);
+        short.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(script_sig);
+        short.header.merkle_root = short.compute_merkle_root().unwrap();
+        regrind(&mut short);
+        assert_eq!(submit(&short), "bad-cb-length");
+    }
+    let r = submit(&mine_claiming(h));
+    assert!(r.is_null(), "the right height push connects: {r}");
+
+    // CheckTransaction length is 2..=100, after the merkle check and before BIP34.
+    let mut wide = mine_claiming(h + 1);
+    let mut ss = rbitcoin_consensus::bip34_height_script(h + 1);
+    ss.resize(100, 0x00);
+    wide.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(ss);
+    wide.header.merkle_root = wide.compute_merkle_root().unwrap();
+    regrind(&mut wide);
+    let r = submit(&wide);
+    assert!(r.is_null(), "a 100-byte coinbase scriptSig connects: {r}");
+    let mut too_long = mine_claiming(h + 2);
+    let mut ss = rbitcoin_consensus::bip34_height_script(h + 2);
+    ss.resize(101, 0x00);
+    too_long.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(ss);
+    too_long.header.merkle_root = too_long.compute_merkle_root().unwrap();
+    regrind(&mut too_long);
+    assert_eq!(submit(&too_long), "bad-cb-length");
+
+    // The 101-byte script did not connect, so the next height is still h + 2.
+    // Legacy sigops cost is 20_000 × 4. The next CHECKSIG is over the cap.
+    let mut sig_ok = mine_claiming(h + 2);
+    sig_ok.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_000]);
+    sig_ok.header.merkle_root = sig_ok.compute_merkle_root().unwrap();
+    regrind(&mut sig_ok);
+    let r = submit(&sig_ok);
+    assert!(r.is_null(), "20_000 legacy sigops connects: {r}");
+    let mut sig_bad = mine_claiming(h + 3);
+    sig_bad.txdata[0].output[0].script_pubkey = ScriptBuf::from_bytes(vec![0xac; 20_001]);
+    sig_bad.header.merkle_root = sig_bad.compute_merkle_root().unwrap();
+    regrind(&mut sig_bad);
+    assert_eq!(submit(&sig_bad), "bad-blk-sigops");
 }
 
 /// Past 120 blocks and short of the 144 retarget window.
