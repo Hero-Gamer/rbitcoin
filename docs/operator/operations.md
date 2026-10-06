@@ -215,7 +215,7 @@ error. `--listen [fc00:…]:port` binds that address when the OS has it; no
 cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
 `After`/`Wants` `cjdns.service`. Do not start a cjdns router from this module.
 
-`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`).
+`--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`). After a listener binds, `{datadir}/run/{health,electrum,esplora,rpc}.addr` is that socket (the kernel port when the configured port is 0).
 Omit `--datadir-cold` and cold files live there too. Set it to put the large
 rarely-read Class A **seqsigwit** stem (`seqsigwit.body` + `seqsigwit.loc`, ~486 GiB + loc
 on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not

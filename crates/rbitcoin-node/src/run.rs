@@ -221,11 +221,13 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
 pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let status = NodeStatus::new(config.network, config.shindex);
     let _health = match config.listen.health {
-        Some(addr) => Some(
-            run_health(addr, Arc::clone(&status), config.metrics)
+        Some(addr) => {
+            let health = run_health(addr, Arc::clone(&status), config.metrics)
                 .await
-                .map_err(|e| NodeError::Config(format!("health listen {addr}: {e}")))?,
-        ),
+                .map_err(|e| NodeError::Config(format!("health listen {addr}: {e}")))?;
+            publish_listener_addr(config.datadir.path(), "health", health.local_addr);
+            Some(health)
+        }
         None => None,
     };
     let handle = run_node(config.clone())?;
@@ -819,6 +821,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers
             .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
     }
+    let mut electrum_gave_up =
+        sh_tip_ready && config.listen.electrum.is_some() && electrum_handles.is_empty();
+    if let Some(h) = electrum_handles.first() {
+        publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
+    }
     let mut esplora_handles = start_esplora_if_ready(
         sh_tip_ready,
         config.listen.esplora.clone(),
@@ -842,6 +849,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             node.peers
                 .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
         }
+    }
+    let mut esplora_gave_up =
+        sh_tip_ready && config.listen.esplora.is_some() && esplora_handles.is_empty();
+    if let Some(h) = esplora_handles.first() {
+        publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
     }
     let sv2_tp = start_sv2_tp(&config, &node.hub).await;
     let mut i2p_wallet = Vec::new();
@@ -932,6 +944,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     h.socket_path,
                     h.token_path.display()
                 );
+                if let Some(addr) = h.local_addr {
+                    publish_listener_addr(config.datadir.path(), "rpc", addr);
+                }
                 rpc_handle = Some(h);
             }
             Err(e) => warn!("rpc start warning: {e}"),
@@ -1006,11 +1021,18 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
             // A durable head can lag `include_hwm` at tip entry. Electrum stays
             // down until write-behind covers the tip, then this same process binds.
-            let electrum_due =
-                config.shindex && config.listen.electrum.is_some() && electrum_handles.is_empty();
-            let esplora_due =
-                config.shindex && config.listen.esplora.is_some() && esplora_handles.is_empty();
+            // A bind that already failed stays down: retrying on the RPC stop
+            // tick takes a port another process released and spams the warning.
+            let electrum_due = config.shindex
+                && config.listen.electrum.is_some()
+                && electrum_handles.is_empty()
+                && !electrum_gave_up;
+            let esplora_due = config.shindex
+                && config.listen.esplora.is_some()
+                && esplora_handles.is_empty()
+                && !esplora_gave_up;
             if (electrum_due || esplora_due) && node.hub.query.sh_is_tip_ready() {
+                let mut bound_now = false;
                 if electrum_due {
                     let (handles, bridge, onion) = start_electrum_if_ready(
                         true,
@@ -1053,6 +1075,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                                 );
                             }
                         }
+                    }
+                    if handles.is_empty() {
+                        electrum_gave_up = true;
+                    } else if let Some(h) = handles.first() {
+                        bound_now = true;
+                        publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
                     }
                     electrum_bridge = bridge;
                     electrum_handles = handles;
@@ -1099,9 +1127,17 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             }
                         }
                     }
+                    if handles.is_empty() {
+                        esplora_gave_up = true;
+                    } else if let Some(h) = handles.first() {
+                        bound_now = true;
+                        publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
+                    }
                     esplora_handles = handles;
                 }
-                info!("node: scripthash inclusion reached the tip — wallet services bound");
+                if bound_now {
+                    info!("node: scripthash inclusion reached the tip — wallet services bound");
+                }
             }
 
             // Prefer shutdown, then the 5s perf tick when both ready. Do **not**
@@ -1692,6 +1728,28 @@ where
             }
         }
     })
+}
+
+// Bound TCP address, including the kernel port when the configured port was 0.
+// Unix Esplora's placeholder `127.0.0.1:0` is not a listener and is skipped.
+fn publish_listener_addr(datadir: &Path, name: &str, addr: SocketAddr) {
+    if addr.port() == 0 {
+        return;
+    }
+    let dir = datadir.join("run");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!("listener address {}: {e}", dir.display());
+        return;
+    }
+    let path = dir.join(format!("{name}.addr"));
+    let tmp = dir.join(format!("{name}.addr.tmp"));
+    if let Err(e) = std::fs::write(&tmp, format!("{addr}\n")) {
+        warn!("listener address {}: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        warn!("listener address {}: {e}", path.display());
+    }
 }
 
 fn electrum_tip_notify(ev: TipEvent) -> Option<TipNotify> {
