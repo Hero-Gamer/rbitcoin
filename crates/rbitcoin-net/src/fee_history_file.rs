@@ -326,6 +326,34 @@ mod tests {
 
         std::fs::write(&path, b"not a snapshot at all, but long enough").unwrap();
         assert!(load(&d).unwrap_err().contains("not a fee history"));
+
+        std::fs::write(&path, &good[..16]).unwrap();
+        assert!(
+            load(&d).unwrap_err().contains("not a fee history"),
+            "a header without the checksum trailer is not a snapshot"
+        );
+        write_snapshot(&d, &[], &[]).unwrap();
+        let empty = load(&d).unwrap().unwrap();
+        assert!(empty.rows.is_empty() && empty.hashes.is_empty());
+
+        let generation = write_snapshot(&d, &[(1, block(Some(500)))], &[]).unwrap();
+        drop(start_journal(&d, generation).unwrap());
+        let exact = load(&d).unwrap().unwrap();
+        assert!(exact.journal.is_empty());
+        assert_eq!(exact.journal_note, None);
+        let mut j = start_journal(&d, generation).unwrap();
+        append(&mut j, 2, &block(Some(600)), &hash(2)).unwrap();
+        drop(j);
+        let jpath = d.join(JOURNAL_FILE);
+        let mut raw = std::fs::read(&jpath).unwrap();
+        raw[0] = b'X';
+        std::fs::write(&jpath, &raw).unwrap();
+        let foreign = load(&d).unwrap().unwrap();
+        assert!(foreign.journal.is_empty(), "{foreign:?}");
+        assert!(
+            foreign.journal_note.unwrap().contains("bad header"),
+            "a long journal with a bad magic is not replayed"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }
