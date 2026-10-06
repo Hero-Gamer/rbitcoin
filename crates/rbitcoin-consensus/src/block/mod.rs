@@ -2036,7 +2036,9 @@ fn structural_apply_one_meta(
         .and_then(|fid| scratch.field_h_by_id.get(&fid).copied());
     if let (Some(ch), Some(sh)) = (create_h, spend_h) {
         if sh < ch {
-            return Ok(0);
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: confirmed spender below its create height",
+            )));
         }
     }
     scratch.durable_spent.insert((id, vout));

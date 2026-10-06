@@ -232,6 +232,79 @@ fn missing_marker_replays_a_spend_below_the_tip_window() {
     let _ = dir;
 }
 
+/// No valid chain has a confirmed spender below its create's height. A
+/// spend slot that names one is a store fault, not an unspent output.
+#[test]
+fn spender_below_its_create_height_is_corrupt() {
+    use std::io::Read;
+
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-below-create");
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let mut cbs = Vec::new();
+    for h in 1..=maturity + 2 {
+        let b = mine(tip, tip_time + 600, h, Vec::new());
+        cbs.push(b.txdata[0].compute_txid());
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    let early_spender = spend_one(cbs[0], Amount::from_sat(49_0000_0000));
+    let later_create = spend_one(cbs[1], Amount::from_sat(49_0000_0000));
+    let later_txid = later_create.compute_txid();
+    for (h, tx) in [(maturity + 3, early_spender), (maturity + 4, later_create)] {
+        let b = mine(tip, tip_time + 600, h, vec![tx]);
+        accept_and_connect_block(&q, &params, Height(h), &b, ms).unwrap();
+        tip = b.block_hash();
+        tip_time = b.header.time;
+    }
+    let slot_abs = |txid: Txid| {
+        let fk = q.tx_fk_by_txid(txid.as_byte_array()).unwrap().unwrap();
+        spent_abs(q.store().tx_spent_range(fk).unwrap().0, 0)
+    };
+    let (from, to) = (slot_abs(cbs[0]), slot_abs(later_txid));
+    let store = q.store().path().to_path_buf();
+    drop(q);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.join("spent.body"))
+            .unwrap();
+        let mut slot = [0u8; 8];
+        f.seek(SeekFrom::Start(from)).unwrap();
+        f.read_exact(&mut slot).unwrap();
+        f.seek(SeekFrom::Start(to)).unwrap();
+        f.write_all(&slot).unwrap();
+    }
+
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    let tip_h = q.tip_height().unwrap();
+    let spend = mine(
+        tip,
+        tip_time + 600,
+        tip_h.0 + 1,
+        vec![spend_one(later_txid, Amount::from_sat(48_0000_0000))],
+    );
+    let err = accept_and_connect_block(&q, &params, Height(tip_h.0 + 1), &spend, ms)
+        .expect_err("a slot naming a spender below the create must not read as unspent");
+    assert!(
+        matches!(
+            &err,
+            ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(m))
+                if m.starts_with("invariant:")
+        ),
+        "got {err}"
+    );
+    assert_eq!(q.tip_height(), Some(tip_h));
+    let _ = dir;
+}
+
 #[test]
 fn confirms_past_eight_batches_wait_for_an_explicit_checkpoint() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-checkpoint");
