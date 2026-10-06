@@ -1016,7 +1016,7 @@ pub(crate) fn network_hash_ps(ctx: &RpcContext, nblocks: i64, height: i64) -> Re
     if lookup > end {
         lookup = end;
     }
-    // `nblocks` above `u32::MAX` truncates to 0. That is not a window.
+    // A positive `nblocks` whose low 32 bits are 0 is not a window.
     if lookup == 0 {
         return Ok(0.0);
     }
