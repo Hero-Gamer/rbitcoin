@@ -20,7 +20,7 @@ use rbitcoin_consensus::{
 use rbitcoin_net::{AcceptOutcome, ChainHub, NetError};
 use rbitcoin_primitives::Height;
 
-use crate::block_diff::{BlockOracle, OracleReply};
+use crate::block_diff::{BlockOracle, BlockStanding, OracleReply};
 
 const SHAPE_MILESTONE: u8 = 0;
 const SHAPE_GENESIS: u8 = 1;
@@ -51,10 +51,17 @@ pub struct PlannedSubmit {
     pub(crate) fate: Option<Fate>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainReview {
-    Agree { accept: bool },
-    Disagree { ours: bool, core: bool },
+    Agree {
+        accept: bool,
+    },
+    Disagree {
+        ours: bool,
+        core: bool,
+        /// Raw `submitblock` reason and, for `"duplicate"`, the chain standing.
+        detail: String,
+    },
 }
 
 fn params_bip34_off() -> ChainParams {
@@ -599,12 +606,22 @@ fn plan_reorg_respend() -> Result<Vec<PlannedSubmit>, String> {
     Ok(out)
 }
 
-fn core_fate(reply: OracleReply) -> Result<Fate, String> {
+/// One `submitblock` result.
+///
+/// JSON `null` means Core connected the block. The exact string `duplicate`
+/// means the body is already stored and `ProcessNewBlock` returned true.
+/// Core returns that string for a block that is merely `valid-headers` while
+/// a heavier tip stays active, so `duplicate` is an accept only when
+/// `standing` is [`BlockStanding::Active`] or [`BlockStanding::ValidFork`].
+/// `duplicate-invalid` stays a reject.
+fn core_fate(reply: OracleReply, standing: Option<BlockStanding>) -> Result<Fate, String> {
     match reply {
         OracleReply::NullAccept => Ok(Fate::Accept),
-        // Already stored and valid. `invalidateblock` on rewind makes the next
-        // submit of that block `duplicate-invalid` until `reconsiderblock`.
-        OracleReply::Reason(reason) if reason == "duplicate" => Ok(Fate::Accept),
+        OracleReply::Reason(reason) if reason == "duplicate" => match standing {
+            Some(BlockStanding::Active | BlockStanding::ValidFork) => Ok(Fate::Accept),
+            Some(BlockStanding::NotConnected | BlockStanding::Invalid) => Ok(Fate::Reject),
+            None => Err("oracle rpc".into()),
+        },
         OracleReply::Reason(reason) => {
             if mutated_reason(&reason) {
                 Ok(Fate::Mutated)
@@ -614,6 +631,28 @@ fn core_fate(reply: OracleReply) -> Result<Fate, String> {
         }
         OracleReply::RpcError => Err("oracle rpc".into()),
         OracleReply::Dead => Err("oracle dead".into()),
+    }
+}
+
+fn standing_label(standing: BlockStanding) -> &'static str {
+    match standing {
+        BlockStanding::Active => "active",
+        BlockStanding::ValidFork => "valid-fork",
+        BlockStanding::NotConnected => "not-connected",
+        BlockStanding::Invalid => "invalid",
+    }
+}
+
+fn reply_note(reply: &OracleReply, standing: Option<BlockStanding>) -> String {
+    let base = match reply {
+        OracleReply::NullAccept => "submitblock=null".to_string(),
+        OracleReply::Reason(reason) => format!("submitblock={reason}"),
+        OracleReply::RpcError => "submitblock=rpc-error".to_string(),
+        OracleReply::Dead => "submitblock=dead".to_string(),
+    };
+    match standing {
+        Some(standing) => format!("{base} standing={}", standing_label(standing)),
+        None => base,
     }
 }
 
@@ -645,19 +684,63 @@ fn block_hash_from_hex(hex: &str) -> Result<String, String> {
 /// gave Core is `duplicate-invalid` until `reconsiderblock` clears the flag.
 /// Setup blocks (no compared fate) still need that clear, or the child is
 /// `bad-prevblk`.
-fn submit_fate(oracle: &dyn BlockOracle, hex: &str) -> Result<Fate, String> {
-    let reply = oracle.submitblock_hex(hex);
-    match reply {
-        OracleReply::Reason(ref reason)
+fn submit_fate(oracle: &dyn BlockOracle, hex: &str) -> Result<(Fate, String), String> {
+    let reply = match oracle.submitblock_hex(hex) {
+        OracleReply::Reason(reason)
             if reason == "duplicate-invalid" || reason == "duplicate-inconclusive" =>
         {
             let hash = block_hash_from_hex(hex)?;
             oracle
                 .core_reconsider_block(&hash)
                 .map_err(|_| "oracle rpc".to_string())?;
-            core_fate(oracle.submitblock_hex(hex))
+            oracle.submitblock_hex(hex)
         }
-        other => core_fate(other),
+        other => other,
+    };
+    let standing = match &reply {
+        OracleReply::Reason(reason) if reason == "duplicate" => {
+            let hash = block_hash_from_hex(hex)?;
+            Some(
+                oracle
+                    .block_standing(&hash)
+                    .map_err(|_| "oracle rpc".to_string())?,
+            )
+        }
+        _ => None,
+    };
+    let note = reply_note(&reply, standing);
+    let fate = core_fate(reply, standing)?;
+    Ok((fate, note))
+}
+
+/// `reconsiderblock` activates the most-work descendant of that block,
+/// including a chain this plan did not submit. When `hash` lies on the
+/// active chain, invalidate the tip until `hash` itself is the tip so the
+/// next child is most-work and Core connects it.
+fn park_active_tip_at(oracle: &dyn BlockOracle, hash: &str) -> Result<(), String> {
+    loop {
+        let best = match oracle.best_block_hash() {
+            Ok(best) => best,
+            Err("no chain") => return Ok(()),
+            Err(_) => return Err("oracle rpc".into()),
+        };
+        if best == hash {
+            return Ok(());
+        }
+        match oracle.block_standing(hash) {
+            Ok(BlockStanding::Active) => {
+                oracle
+                    .core_invalidate_hash(&best)
+                    .map_err(|_| "oracle rpc".to_string())?;
+                let next = oracle.best_block_hash().map_err(|_| "oracle rpc")?;
+                if next == best {
+                    return Err("invalidate no progress".into());
+                }
+            }
+            Ok(_) => return Ok(()),
+            Err("no chain") => return Ok(()),
+            Err(_) => return Err("oracle rpc".into()),
+        }
     }
 }
 
@@ -682,9 +765,13 @@ pub fn compare_chain_plan(
     oracle.core_rewind_to_height(0)?;
     let mut saw = false;
     let mut all_accept = true;
-    let mut mismatch: Option<(bool, bool)> = None;
+    let mut mismatch: Option<(bool, bool, String)> = None;
     for step in plan {
-        let core = submit_fate(oracle, &step.hex)?;
+        let (core, note) = submit_fate(oracle, &step.hex)?;
+        if step.fate.is_none() {
+            let hash = block_hash_from_hex(&step.hex)?;
+            park_active_tip_at(oracle, &hash)?;
+        }
         let Some(ours) = step.fate else {
             continue;
         };
@@ -693,14 +780,14 @@ pub fn compare_chain_plan(
             all_accept = false;
         }
         if mismatch.is_none() && ours != core {
-            mismatch = Some((ours == Fate::Accept, core == Fate::Accept));
+            mismatch = Some((ours == Fate::Accept, core == Fate::Accept, note));
         }
     }
     if !saw {
         return Err("shape produced no comparison".into());
     }
-    if let Some((ours, core)) = mismatch {
-        Ok(ChainReview::Disagree { ours, core })
+    if let Some((ours, core, detail)) = mismatch {
+        Ok(ChainReview::Disagree { ours, core, detail })
     } else {
         Ok(ChainReview::Agree { accept: all_accept })
     }
@@ -866,9 +953,175 @@ mod tests {
             got,
             ChainReview::Disagree {
                 ours: true,
-                core: false
+                core: false,
+                detail: "submitblock=duplicate-invalid".into(),
             }
         );
+    }
+
+    /// BIP22 `duplicate` on a body Core has only stored (`valid-headers`) is
+    /// the immature-spend failure: the hub rejects, and the block is not on a
+    /// chain Core treats as valid.
+    #[test]
+    fn duplicate_of_an_unconnected_block_is_a_reject() {
+        let block = one_block();
+        let plan = vec![PlannedSubmit {
+            hex: hex_block(&block),
+            fate: Some(Fate::Reject),
+        }];
+        let oracle = FixedStanding {
+            reply: OracleReply::Reason("duplicate".into()),
+            standing: BlockStanding::NotConnected,
+        };
+        let got = compare_chain_plan(&plan, &oracle).expect("compare");
+        assert_eq!(got, ChainReview::Agree { accept: false });
+    }
+
+    /// The same string on the active chain is still an accept. A reconsidered
+    /// valid block comes back `duplicate` and must not become a split.
+    #[test]
+    fn duplicate_of_the_active_chain_is_an_accept() {
+        let block = one_block();
+        let plan = vec![PlannedSubmit {
+            hex: hex_block(&block),
+            fate: Some(Fate::Accept),
+        }];
+        let oracle = FixedStanding {
+            reply: OracleReply::Reason("duplicate".into()),
+            standing: BlockStanding::Active,
+        };
+        let got = compare_chain_plan(&plan, &oracle).expect("compare");
+        assert_eq!(got, ChainReview::Agree { accept: true });
+    }
+
+    /// `reconsiderblock` on a shared parent revives heavier descendants.
+    /// The child is judged only after those descendants are invalidated and
+    /// the parent is the tip.
+    #[test]
+    fn reconsidered_parent_is_parked_before_the_child() {
+        let params = params_bip34_off();
+        let genesis = genesis_block(&params);
+        let parent = mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1);
+        let child = mine_empty_regtest(parent.block_hash(), parent.header.time + 600, 2);
+        let parent_hash = parent.block_hash().to_string();
+        let heavy = "11".repeat(32);
+        let plan = vec![
+            PlannedSubmit {
+                hex: hex_block(&parent),
+                fate: None,
+            },
+            PlannedSubmit {
+                hex: hex_block(&child),
+                fate: Some(Fate::Reject),
+            },
+        ];
+        let oracle = HeavyTipOracle {
+            parent_hex: plan[0].hex.clone(),
+            parent_hash: parent_hash.clone(),
+            heavy: heavy.clone(),
+            tip: std::cell::RefCell::new("00".repeat(32)),
+            parent_n: Cell::new(0),
+            invalidated: std::cell::RefCell::new(Vec::new()),
+        };
+        let got = compare_chain_plan(&plan, &oracle).expect("compare");
+        assert_eq!(got, ChainReview::Agree { accept: false });
+        assert_eq!(oracle.invalidated.borrow().as_slice(), &[heavy]);
+        assert_eq!(oracle.tip.borrow().as_str(), parent_hash);
+    }
+
+    fn one_block() -> Block {
+        let params = params_bip34_off();
+        let genesis = genesis_block(&params);
+        mine_empty_regtest(genesis.block_hash(), genesis.header.time + 600, 1)
+    }
+
+    struct FixedStanding {
+        reply: OracleReply,
+        standing: BlockStanding,
+    }
+
+    impl BlockOracle for FixedStanding {
+        fn submitblock_hex(&self, _hex: &str) -> OracleReply {
+            self.reply.clone()
+        }
+        fn liveness_ok(&self) -> bool {
+            true
+        }
+        fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_reconsider_block(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn block_standing(&self, _hash: &str) -> Result<BlockStanding, &'static str> {
+            Ok(self.standing)
+        }
+    }
+
+    struct HeavyTipOracle {
+        parent_hex: String,
+        parent_hash: String,
+        heavy: String,
+        tip: std::cell::RefCell<String>,
+        parent_n: Cell<u32>,
+        invalidated: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl BlockOracle for HeavyTipOracle {
+        fn submitblock_hex(&self, hex: &str) -> OracleReply {
+            if hex == self.parent_hex {
+                let n = self.parent_n.get();
+                self.parent_n.set(n + 1);
+                if n == 0 {
+                    return OracleReply::Reason("duplicate-invalid".into());
+                }
+                return OracleReply::Reason("duplicate".into());
+            }
+            if self.tip.borrow().as_str() == self.parent_hash {
+                OracleReply::Reason("bad-txns-premature-spend-of-coinbase".into())
+            } else {
+                OracleReply::Reason("duplicate".into())
+            }
+        }
+        fn liveness_ok(&self) -> bool {
+            true
+        }
+        fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_reconsider_block(&self, hash: &str) -> Result<(), &'static str> {
+            if hash == self.parent_hash {
+                *self.tip.borrow_mut() = self.heavy.clone();
+            }
+            Ok(())
+        }
+        fn core_invalidate_hash(&self, hash: &str) -> Result<(), &'static str> {
+            self.invalidated.borrow_mut().push(hash.to_string());
+            if hash == self.heavy {
+                *self.tip.borrow_mut() = self.parent_hash.clone();
+            }
+            Ok(())
+        }
+        fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn best_block_hash(&self) -> Result<String, &'static str> {
+            Ok(self.tip.borrow().clone())
+        }
+        fn block_standing(&self, hash: &str) -> Result<BlockStanding, &'static str> {
+            let tip = self.tip.borrow().clone();
+            if hash == self.parent_hash && (tip == self.parent_hash || tip == self.heavy) {
+                Ok(BlockStanding::Active)
+            } else {
+                Ok(BlockStanding::NotConnected)
+            }
+        }
     }
 
     struct ReplayOracle {
@@ -909,6 +1162,20 @@ mod tests {
         }
         fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
             Ok(())
+        }
+        fn block_standing(&self, hash: &str) -> Result<BlockStanding, &'static str> {
+            if hash == self.setup_hash && self.reconsidered.get() && !self.stay_invalid {
+                Ok(BlockStanding::Active)
+            } else {
+                Ok(BlockStanding::NotConnected)
+            }
+        }
+        fn best_block_hash(&self) -> Result<String, &'static str> {
+            if self.reconsidered.get() && !self.stay_invalid {
+                Ok(self.setup_hash.clone())
+            } else {
+                Ok("00".repeat(32))
+            }
         }
     }
 }

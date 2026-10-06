@@ -53,6 +53,21 @@ pub enum OracleReply {
     Dead,
 }
 
+/// Where a block sits after `submitblock`, from `getblockheader` confirmations
+/// and `getchaintips` when it is not on the active chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockStanding {
+    /// `confirmations > 0`, or chaintips `active`.
+    Active,
+    /// Chaintips `valid-fork`: connected on a side chain.
+    ValidFork,
+    /// Stored headers or body that Core has not connected (`valid-headers`,
+    /// `headers-only`, or absent from the tip list).
+    NotConnected,
+    /// Chaintips `invalid`.
+    Invalid,
+}
+
 pub trait BlockOracle {
     fn submitblock_hex(&self, hex: &str) -> OracleReply;
     fn liveness_ok(&self) -> bool;
@@ -61,6 +76,14 @@ pub trait BlockOracle {
     fn core_reconsider_block(&self, hash: &str) -> Result<(), &'static str>;
     fn core_invalidate_hash(&self, hash: &str) -> Result<(), &'static str>;
     fn core_precious_block(&self, hash: &str) -> Result<(), &'static str>;
+    /// Active-chain tip hash. `"no chain"` means this oracle has no tip to park.
+    fn best_block_hash(&self) -> Result<String, &'static str> {
+        Err("no chain")
+    }
+    /// `getblockheader` / `getchaintips` standing. `"no chain"` means unset.
+    fn block_standing(&self, _hash: &str) -> Result<BlockStanding, &'static str> {
+        Err("no chain")
+    }
     /// Core `testmempoolaccept` on one hex tx. Default unused.
     fn testmempoolaccept_hex(&self, hex: &str) -> OracleReply {
         let _ = hex;
