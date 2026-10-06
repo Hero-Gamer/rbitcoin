@@ -2385,6 +2385,61 @@ fn batched_write_reject_offers_the_wave_back() {
     rig.finish();
 }
 
+/// tip+1 spends an output that tip+2 creates, and both write in one
+/// batch. Core connects one block at a time, so tip+1's input is missing.
+/// The batch reject is isolated, and tip+1 alone is rejected again: the
+/// parent is not on the chain, and tip+1 never connects.
+#[test]
+fn batched_spend_of_a_later_block_is_rejected_alone() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::state::InflightReq;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("forward-spend", 2);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let child = WireRig::spend(parent.compute_txid());
+    let b1 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![child]);
+    let b2 = mine_regtest_paying(
+        b1.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk,
+        vec![parent],
+    );
+    let h1 = b1.block_hash();
+    rig.plant(&[&b1, &b2]);
+    for (peer, body) in [(1, &b1), (2, &b2)] {
+        let hash = body.block_hash();
+        rig.st.slots[peer - 1].in_flight.insert(hash);
+        rig.st.inflight.insert(hash, InflightReq::new(peer));
+        rig.deliver(peer, body);
+    }
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, hash| if hash == h1 { b1.clone() } else { b2.clone() },
+        |_, _, seen| seen.len() == 2,
+    );
+    assert_eq!(
+        rejects,
+        [
+            (h1, ConfirmRejectClass::Cascade, 2),
+            (h1, ConfirmRejectClass::ConsensusInvalid, 1)
+        ],
+        "one batch, named by tip+1, is isolated; then tip+1 alone is rejected"
+    );
+    // Known gap (087): apply reads the load-stamp miss as an engine fault,
+    // so tip+1 is not blacklisted; a repeat halts IBD.
+    assert!(rig.st.engine_fault_seen.contains(&h1));
+    assert!(!rig.st.body.is_rejected(&h1));
+    assert_eq!(rig.hub.tip_height(), Some(t));
+    rig.finish();
+}
+
 /// tip+1 is the last block on the path, and load cannot read its header
 /// row when it stamps the wave: a local store fault, not a block verdict.
 /// The wave goes back to lookup, so once the row reads again tip+1

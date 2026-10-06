@@ -2102,6 +2102,11 @@ fn structural_create_heights(
         let Some(&durable_h) = scratch.height_by_id.get(&id) else {
             return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
         };
+        // Core connects a run one block at a time: a create from a later
+        // block of this batch is not yet a coin when this block spends it.
+        if durable_h > spend_height {
+            return Err(ConsensusError::MissingPrevout);
+        }
         let pin_cb = batch_parents.get_parent_coinbase(create_fk);
         let is_cb = match (pin_cb, run_create_height.create(create_fk)) {
             (Some(cb), _) => cb,
