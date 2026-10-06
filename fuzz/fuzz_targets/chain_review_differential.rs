@@ -65,10 +65,10 @@ fuzz_target!(|data: &[u8]| {
     };
     match compare_chain_plan(&plan, &core().rpc) {
         Ok(ChainReview::Agree { .. }) => note_comparison(),
-        Ok(ChainReview::Disagree { ours, core }) => {
+        Ok(ChainReview::Disagree { ours, core, detail }) => {
             eprintln!("=== CHAIN-REVIEW FUZZ CONSENSUS DIVERGENCE ===");
-            eprintln!("ours_accept={ours} core_accept={core} shape={shape}");
-            panic!("chain-review: ours={ours} core={core} shape={shape}");
+            eprintln!("ours_accept={ours} core_accept={core} shape={shape} {detail}");
+            panic!("chain-review: ours={ours} core={core} shape={shape} {detail}");
         }
         Err(msg) if msg == "oracle dead" || msg == "oracle rpc" => {
             let n = ORACLE_DOWN_STREAK.fetch_add(1, Ordering::Relaxed) + 1;

@@ -177,6 +177,30 @@ impl BlockOracle for CoreRpc {
         }
     }
 
+    fn best_block_hash(&self) -> Result<String, &'static str> {
+        let body = self
+            .call("getbestblockhash", "[]")
+            .map_err(|_| "best hash")?;
+        parse_submitblock_json(&body)
+            .ok()
+            .flatten()
+            .ok_or("best hash")
+    }
+
+    fn block_standing(&self, hash: &str) -> Result<block_diff::BlockStanding, &'static str> {
+        let params = format!(r#"["{hash}"]"#);
+        let header = self.call("getblockheader", &params).map_err(|_| "header")?;
+        if json_error_object(&header) {
+            return Ok(block_diff::BlockStanding::NotConnected);
+        }
+        let confirmations = json_confirmations(&header).ok_or("header")?;
+        if confirmations > 0 {
+            return Ok(block_diff::BlockStanding::Active);
+        }
+        let tips = self.call("getchaintips", "[]").map_err(|_| "chaintips")?;
+        standing_from_header_and_tips(&header, &tips, hash)
+    }
+
     fn core_rewind_to_height(&self, keep: u32) -> Result<(), &'static str> {
         rewind_oracle_until(
             keep,
@@ -202,6 +226,85 @@ impl BlockOracle for CoreRpc {
             },
         )
     }
+}
+
+fn json_error_object(body: &str) -> bool {
+    body.contains("\"error\":{") || body.contains("\"error\": {")
+}
+
+fn json_confirmations(body: &str) -> Option<i64> {
+    let key = "\"confirmations\"";
+    let i = body.find(key)?;
+    let rest = body[i + key.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let (neg, rest) = if let Some(rest) = rest.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, rest)
+    };
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let n: i64 = digits.parse().ok()?;
+    Some(if neg { -n } else { n })
+}
+
+/// Object in `getchaintips` that contains this hash. Status is read from that
+/// object only, so a later tip cannot supply it.
+pub(crate) fn standing_from_chaintips(body: &str, hash: &str) -> block_diff::BlockStanding {
+    let Some(object) = json_object_containing_hash(body, hash) else {
+        return block_diff::BlockStanding::NotConnected;
+    };
+    let Some(status) = json_string_field(object, "status") else {
+        return block_diff::BlockStanding::NotConnected;
+    };
+    match status.as_str() {
+        "active" => block_diff::BlockStanding::Active,
+        "valid-fork" => block_diff::BlockStanding::ValidFork,
+        "invalid" => block_diff::BlockStanding::Invalid,
+        _ => block_diff::BlockStanding::NotConnected,
+    }
+}
+
+pub(crate) fn standing_from_header_and_tips(
+    header: &str,
+    tips: &str,
+    hash: &str,
+) -> Result<block_diff::BlockStanding, &'static str> {
+    if json_error_object(header) {
+        return Ok(block_diff::BlockStanding::NotConnected);
+    }
+    let confirmations = json_confirmations(header).ok_or("header")?;
+    if confirmations > 0 {
+        return Ok(block_diff::BlockStanding::Active);
+    }
+    if json_error_object(tips) {
+        return Err("chaintips");
+    }
+    Ok(standing_from_chaintips(tips, hash))
+}
+
+fn json_object_containing_hash<'a>(body: &'a str, hash: &str) -> Option<&'a str> {
+    let needle = format!("\"{hash}\"");
+    let idx = body.find(&needle)?;
+    let start = body[..idx].rfind('{')?;
+    let end = body[idx..].find('}')? + idx;
+    Some(&body[start..=end])
+}
+
+fn json_string_field(object: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let i = object.find(&needle)?;
+    let rest = object[i + needle.len()..]
+        .trim_start()
+        .strip_prefix(':')?
+        .trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 fn json_result_u64(body: &str) -> Option<u64> {
@@ -425,6 +528,38 @@ mod tests {
         assert!(
             args.iter().any(|a| a == "-maxtipage=999999999"),
             "P2P bitcoind must leave IBD at genesis so fill txs reach extra-txn"
+        );
+    }
+
+    #[test]
+    fn duplicate_standing_reads_header_confirmations_then_chaintips() {
+        let header_active = r#"{"result":{"hash":"aa","confirmations":2,"height":1},"error":null}"#;
+        let header_side = r#"{"result":{"hash":"0ab9","confirmations":-1},"error":null}"#;
+        let tips = r#"{"result":[{"height":2,"hash":"0ab9","branchlen":2,"status":"valid-headers"},{"height":6,"hash":"0122","branchlen":0,"status":"active"},{"height":3,"hash":"fork","branchlen":1,"status":"valid-fork"},{"height":4,"hash":"dead","branchlen":1,"status":"invalid"}],"error":null}"#;
+        assert_eq!(
+            standing_from_header_and_tips(header_active, tips, "aa").unwrap(),
+            block_diff::BlockStanding::Active
+        );
+        assert_eq!(
+            standing_from_header_and_tips(header_side, tips, "0ab9").unwrap(),
+            block_diff::BlockStanding::NotConnected
+        );
+        assert_eq!(
+            standing_from_chaintips(tips, "fork"),
+            block_diff::BlockStanding::ValidFork
+        );
+        assert_eq!(
+            standing_from_chaintips(tips, "dead"),
+            block_diff::BlockStanding::Invalid
+        );
+        assert_eq!(
+            standing_from_chaintips(tips, "missing"),
+            block_diff::BlockStanding::NotConnected
+        );
+        let missing = r#"{"result":null,"error":{"code":-5,"message":"Block not found"}}"#;
+        assert_eq!(
+            standing_from_header_and_tips(missing, tips, "nope").unwrap(),
+            block_diff::BlockStanding::NotConnected
         );
     }
 
