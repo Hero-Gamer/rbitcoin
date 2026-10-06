@@ -128,7 +128,11 @@ a LevelDB bag.
 
 The node follows the **fully valid** chain with **strictly most cumulative
 work** (Bitcoin rule). Header work only **ranks candidates**; full block
-connect decides the tip. IBD reorg depth is **any** (DoS/RAM caps only).
+connect decides the tip. IBD rewinds at most 1,024 blocks
+(`REWIND_MAX_DEPTH`). Tip-follow cannot assemble a side branch that forks
+more than 288 blocks below the tip (held-body window) and does not hand
+off to the IBD rewind. Deeper reorgs are open
+([088](./external_findings/088-tip-chain-selection.md)).
 Tip-follow pending cap is **128** (`MAX_PENDING_BLOCKS`) so a ≥99-block
 divergence can still be assembled. Catch-up `getdata` is windowed to
 **16** (`MAX_SERVE_BLOCKS`) so it matches per-session reconstruct serve;
@@ -156,16 +160,19 @@ Two layers:
 
 ```text
 # Layer 1 — candidate ranking (headers only)
-prefer A over B iff sum(header.work() along A) > sum(header.work() along B)
-  and no apply-path hash is invalid-marked
+prefer A over B iff chain work at A's tip > chain work at B's tip
+  (fork-point chain work + header work along the branch)
+  and no apply-path hash is invalid-marked; equal work keeps the first seen
 
 # Layer 2 — most-work *valid* (full blocks)
-apply only if every block connects. On fail: restore tip; mark path invalid; re-rank.
+connect block by block. On fail: mark the block invalid; keep the connected
+prefix if it has strictly more work than the old tip, else restore the old
+tip; re-rank.
 ```
 
 | Path | Behavior |
 |------|----------|
-| **IBD** | Any depth. When headers prove a **strictly heavier** branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant that branch as the linear work path. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
+| **IBD** | Up to 1,024 blocks (`REWIND_MAX_DEPTH`). When headers prove a **strictly heavier** branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant that branch as the linear work path. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
 | **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
 | **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. A greater-work sibling **rewinds to the LCA** and becomes the linear path. Body preference alone must never re-elect an archived losing fork. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |
@@ -174,7 +181,10 @@ apply only if every block connects. On fail: restore tip; mark path invalid; re-
 L = current tip, valid, work 100
 M = peer header chain, work 150, connect fails mid-path
 N = other peer chain, work 120, all blocks valid
-Attempt M → fail → tip restored to L; M invalid-marked → re-rank → tip = N
+Attempt M → fail; the failed block is invalid-marked. Then:
+  M's valid prefix at 130 > L → keep the prefix → re-rank → tip stays (130 > N)
+  M's valid prefix at 110 > L → keep the prefix → re-rank → tip = N
+  M's valid prefix at 100 ≤ L → restore L → re-rank → tip = N
 ```
 
 IBD may disconnect on **header work** (losing bodies stay in Class A; the
