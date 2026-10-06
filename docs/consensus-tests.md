@@ -141,6 +141,7 @@ version floors and exact +2h).
 | C32 | P2PKH fast path: scriptSig push > 520 falls back to the interpreter | `PUSH_SIZE` | `p2pkh_signature_push_over_520_rejected_pre_bip66` |
 | C33 | P2WPKH fast path (native + nested): strict DER only with DERSIG; witness element ≤ 520 | `PUSH_SIZE` / DER reject | `p2wpkh_der_follows_bip66_flag_and_push_size` |
 | C34 | Base CHECKMULTISIG FindAndDelete of an empty sig removes every OP_0 opcode before the other sigs hash scriptCode | accept / `SIG_DER` | `legacy_multisig_empty_sig_deletes_op_0_from_script_code` |
+| C35 | P2SH scriptPubKey `HASH160 <20> EQUAL` runs on the scriptSig stack: 1000 items fail `MAX_STACK_SIZE` at the `<20>` push, with or without BIP16 | `stack size` | `p2sh_script_pubkey_push_counts_against_max_stack_size` ([086](./external_findings/086-p2sh-spk-stack-size.md)) |
 
 ## Adding a new rule
 
