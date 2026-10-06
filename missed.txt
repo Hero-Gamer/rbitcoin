@@ -1,0 +1,27 @@
+# 37426335315 1 a2b2258f83c0ac10273d4e01fb219c0f15ca6803
+MISSED   crates/rbitcoin-mempool/src/fee_analog.rs:27:24: replace / with % in analog_lookback in 100s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/fee_analog.rs:53:29: replace / with % in lower_median in 12s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/fee_analog.rs:53:24: replace - with + in lower_median in 11s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/fee_analog.rs:53:24: replace - with / in lower_median in 11s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:364:15: replace || with && in fee_at_target_sat_kvb in 11s build + 80s test
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:367:15: replace > with == in fee_at_target_sat_kvb in 11s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:367:15: replace > with >= in fee_at_target_sat_kvb in 12s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:152:17: replace > with >= in Orphanage::insert_from_at in 11s build + 81s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:154:20: delete ! in Orphanage::insert_from_at in 11s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:272:16: delete ! in Orphanage::evict_one_from_peer in 11s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:585:36: replace < with == in Mempool::load_live_txs in 11s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:585:36: replace < with <= in Mempool::load_live_txs in 12s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:605:9: replace Mempool::drop_slots_past_body -> Result<(), MempoolError> with Ok(()) in 11s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:609:32: replace != with == in Mempool::drop_slots_past_body in 12s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:825:9: replace Mempool::sync_meta -> Result<(), MempoolError> with Ok(()) in 11s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:58:39: replace * with + in 119s build + 83s test
+MISSED   crates/rbitcoin-net/src/chain.rs:106:19: replace > with == in HeldBodies::insert in 11s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:106:19: replace > with >= in HeldBodies::insert in 11s build + 81s test
+MISSED   crates/rbitcoin-net/src/chain.rs:109:84: replace > with == in HeldBodies::insert in 11s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:109:84: replace > with >= in HeldBodies::insert in 11s build + 81s test
+MISSED   crates/rbitcoin-net/src/chain.rs:131:44: replace || with && in HeldBodies::insert in 11s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:131:81: replace > with == in HeldBodies::insert in 11s build + 81s test
+MISSED   crates/rbitcoin-net/src/chain.rs:131:81: replace > with >= in HeldBodies::insert in 11s build + 81s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1034:25: replace && with || in ChainHub::best_header_height in 15s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:1034:18: replace > with >= in ChainHub::best_header_height in 11s build + 83s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3112:30: replace / with * in format_tip_accept_sh_line in 11s build + 82s test
