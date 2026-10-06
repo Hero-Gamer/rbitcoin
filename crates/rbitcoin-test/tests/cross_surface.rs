@@ -288,7 +288,10 @@ async fn pin_metrics_equal_rpc(
         ),
         ("rbitcoin_difficulty", num(&chain["difficulty"])),
         ("rbitcoin_peer_time_offset_seconds", num(&net["timeoffset"])),
-        ("rbitcoin_mempool_max_weight", num(&mempool["maxmempool"])),
+        (
+            "rbitcoin_mempool_max_weight",
+            num(&mempool["maxmempool"]) * 4.0,
+        ),
         (
             "rbitcoin_mempool_orphan_transactions",
             num(&mempool["orphanage"]["size"]),

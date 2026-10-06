@@ -496,7 +496,7 @@ lock on the progress registry. NixOS:
 | `rbitcoin_mempool_transactions` | gauge | `getmempoolinfo.size` |
 | `rbitcoin_mempool_bytes` | gauge | `getmempoolinfo.bytes` (virtual size) |
 | `rbitcoin_mempool_min_fee_sat_per_vb` | gauge | Minimum mempool feerate in sat/vB. `getmempoolinfo.mempoolminfee` is BTC/kvB |
-| `rbitcoin_mempool_max_weight` | gauge | `getmempoolinfo.maxmempool` (weight units) |
+| `rbitcoin_mempool_max_weight` | gauge | Mempool weight cap. `getmempoolinfo.maxmempool` is that cap in virtual-size bytes (weight/4) |
 | `rbitcoin_mempool_orphan_transactions` | gauge | `getmempoolinfo.orphanage.size` |
 | `rbitcoin_mempool_unbroadcast_transactions` | gauge | `getmempoolinfo.unbroadcastcount` |
 | `rbitcoin_scripthash_lag_blocks` | gauge | `tip: accept sh_lag=` (with `--sh-index`) |

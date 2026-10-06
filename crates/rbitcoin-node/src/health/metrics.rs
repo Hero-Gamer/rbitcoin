@@ -126,7 +126,7 @@ pub(super) fn render(status: &NodeStatus) -> String {
         );
         out.gauge(
             "rbitcoin_mempool_max_weight",
-            "Mempool weight cap in weight units (getmempoolinfo.maxmempool).",
+            "Mempool weight cap in weight units. getmempoolinfo.maxmempool is this divided by 4.",
             mempool.max_weight(),
         );
         let (orphans, _orphan_wu) = mempool.orphan_stats();

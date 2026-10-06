@@ -3857,8 +3857,8 @@ fn rpc_honesty_mempool_budget_and_network_identity() {
     let mem = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(
         mem["maxmempool"].as_u64(),
-        Some(50_000_000),
-        "maxmempool must be the hub weight budget, not a hardcoded 300M"
+        Some(12_500_000),
+        "maxmempool is the virtual-size byte cap (weight/4), not the weight budget"
     );
     let net = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
     // Core 0.19 CLIENT_VERSION. Below this, bitcoincore-rpc requires the

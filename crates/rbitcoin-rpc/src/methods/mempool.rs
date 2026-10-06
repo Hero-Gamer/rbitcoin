@@ -48,7 +48,9 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         "bytes": bytes,
         "usage": bytes,
         "total_fee": sat_btc_json(total_fee as i64),
-        "maxmempool": mp.max_weight(),
+        // Core's field is the virtual-size byte cap, same unit as `bytes`.
+        // The hub budget stays weight; the metric reports that weight.
+        "maxmempool": mp.max_weight() / 4,
         "mempoolminfee": sat_btc_json(mp.mempool_min_fee_sat_kvb() as i64),
         "minrelaytxfee": relay_fee_json(),
         "incrementalrelayfee": relay_fee_json(),

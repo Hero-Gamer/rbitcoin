@@ -21,6 +21,7 @@ Fixed
   feerate announced to peers. A member whose own feerate is above
   `maxfeerate` is rejected and does not rescue the rest of the package.
   An individual admit still reports the transactions it replaced.
-- **Spending an unspendable output is a missing input.** A script that
-  starts with `OP_RETURN`, or is longer than 10_000 bytes, is not a coin.
-  Spending it fails `bad-txns-inputs-missingorspent`.
+- **`getmempoolinfo.maxmempool` is the virtual-size byte cap.** The hub
+  budget stays weight (`--mempool-size-mb` × 1_000_000). The Core field is
+  that budget divided by 4, the same unit as `bytes`.
+  `rbitcoin_mempool_max_weight` still reports weight.

@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -316,54 +317,52 @@ def rewrite_testmempoolaccept_abort(method: Any, parsed: dict[str, Any]) -> None
         result[i] = {"txid": row.get("txid"), "wtxid": row.get("wtxid")}
 
 
-def rewrite_getmempoolinfo_budget(method: Any, parsed: dict[str, Any]) -> None:
-    """Core `maxmempool` is the byte cap. The node field is the weight budget.
+# Spending an unspendable scriptPubKey still resolves the coin and fails the
+# script. Core never stored the coin, so generateblock quotes CheckTxInputs.
+_UNSPENDABLE_SPEND = re.compile(
+    r"script verification failed: (?:script too large|OP_RETURN) txid=([0-9a-fA-F]{64})"
+)
 
-    The bitcoind shim maps `-maxmempool=N` to a 4× weight budget so vsize
-    capacity matches Core. `bytes` stays virtual size, so the reported cap
-    is weight/4 (`mempool_limit.py` compares `maxmempool - bytes`).
+
+def rewrite_unspendable_spend(method: Any, parsed: dict[str, Any]) -> bool:
+    """Present Core's missing-input generateblock text.
+
+    The node still has the output. A scriptSig that fails the same way on
+    `generateblock` gets the same sentence; that is this shim, not consensus.
     """
-    if method != "getmempoolinfo":
-        return
-    result = parsed.get("result")
-    if not isinstance(result, dict):
-        return
-    cap = result.get("maxmempool")
-    if isinstance(cap, int) and not isinstance(cap, bool):
-        result["maxmempool"] = cap // 4
+    if method != "generateblock":
+        return False
+    err = parsed.get("error")
+    if not isinstance(err, dict):
+        return False
+    msg = err.get("message")
+    if not isinstance(msg, str):
+        return False
+    found = _UNSPENDABLE_SPEND.search(msg)
+    if found is None:
+        return False
+    txid = found.group(1)
+    err["message"] = (
+        "TestBlockValidity failed: bad-txns-inputs-missingorspent, "
+        f"CheckTxInputs: inputs missing/spent in transaction {txid}"
+    )
+    return True
 
 
 def _rewrite_forwarded_body(method: Any, body: bytes) -> bytes:
-    if method == "getmempoolinfo":
-        try:
-            parsed = json.loads(body.decode())
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return body
-        if not isinstance(parsed, dict) or not isinstance(parsed.get("result"), dict):
-            return body
-        rewrite_getmempoolinfo_budget(method, parsed)
-        return json.dumps(parsed).encode()
-    return _rewrite_forwarded_testmempoolaccept(method, body)
-
-
-def _rewrite_forwarded_testmempoolaccept(method: Any, body: bytes) -> bytes:
-    if method != "testmempoolaccept":
-        return body
     try:
         parsed = json.loads(body.decode())
     except (UnicodeDecodeError, json.JSONDecodeError):
         return body
     if not isinstance(parsed, dict):
         return body
-    result = parsed.get("result")
-    if not isinstance(result, list) or len(result) < 2:
+    changed = rewrite_unspendable_spend(method, parsed)
+    if method == "testmempoolaccept":
+        before = json.dumps(parsed, sort_keys=True)
+        rewrite_testmempoolaccept_abort(method, parsed)
+        changed = changed or json.dumps(parsed, sort_keys=True) != before
+    if not changed:
         return body
-    if not any(
-        isinstance(row, dict) and row.get("reject-reason") in _TMA_ABORT
-        for row in result
-    ):
-        return body
-    rewrite_testmempoolaccept_abort(method, parsed)
     return json.dumps(parsed).encode()
 
 

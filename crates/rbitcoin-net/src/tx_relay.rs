@@ -2858,7 +2858,8 @@ impl MempoolHub {
             .collect()
     }
 
-    /// Weight budget used for chunk eviction (WU). RPC `maxmempool`.
+    /// Weight budget used for chunk eviction (WU).
+    /// `getmempoolinfo.maxmempool` is this divided by 4 (virtual-size bytes).
     pub fn max_weight(&self) -> u64 {
         self.lock_read().max_weight
     }

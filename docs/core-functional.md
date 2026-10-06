@@ -58,12 +58,12 @@ arrived. The same child env sets `RBITCOIN_RPC_PACKAGE_DIALECT=1` so
 `submitpackage` matches Core `IsChildWithParents` (`-25`). A member above
 `maxfeerate` is rejected either way and does not rescue the package.
 Production (unset) still package-evaluates a child-with-parents remainder
-that failed min relay, the dynamic mempool floor, or missing inputs. The RPC proxy rewrites multi-tx
-`testmempoolaccept` abort-class rows (`missing-inputs` /
-`max-fee-exceeded` / `bip125-replacement-disallowed`) to `{txid,wtxid}`; the
-node keeps earlier `allowed: true`. `getmempoolinfo.maxmempool` on the
-proxy is the node weight budget divided by 4, so it lines up with `bytes`
-(virtual size) after the shim's 4× `-maxmempool` map. The proxy answers `gettxoutsetinfo`
+that failed min relay, the dynamic mempool floor, or missing inputs. The RPC
+proxy rewrites multi-tx `testmempoolaccept` abort-class rows
+(`missing-inputs` / `max-fee-exceeded` / `bip125-replacement-disallowed`) to
+`{txid,wtxid}`; the node keeps earlier `allowed: true`.
+`getmempoolinfo.maxmempool` is already the virtual-size byte cap. The shim's
+4× `-maxmempool` map makes that number match Core. The proxy answers `gettxoutsetinfo`
 with `getblockcount`, `getbestblockhash`, and `txouts: -1` so
 `rpc_scantxoutset.py` can compare an empty scan. The node does not
 implement that method. `rpc_packages.py` `run` includes that named shim
