@@ -26,7 +26,7 @@ use crate::error::ConsensusError;
 use rbitcoin_primitives::{scriptnum_decode, scriptnum_decode_width, scriptnum_encode};
 
 /// Stack element cap (main + alt).
-const MAX_STACK_SIZE: usize = 1000;
+pub(crate) const MAX_STACK_SIZE: usize = 1000;
 /// Push / witness stack item cap.
 pub(crate) const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 /// BIP342 `VALIDATION_WEIGHT_OFFSET` / `VALIDATION_WEIGHT_PER_SIGOP_PASSED`.

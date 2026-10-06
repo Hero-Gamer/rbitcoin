@@ -138,10 +138,26 @@ pub(crate) fn p2sh_script_sig_stack(
     let ctx = EvalContext::from_job(job, tx, input_index, script_sig, SigVersion::Base);
     let mut stack = Vec::new();
     let _ = interpreter::eval_script(script_sig, &mut stack, &ctx)?;
+    require_room_for_p2sh_hash_push(&stack)?;
     if !script_is_push_only(script_sig) {
         return Err(ConsensusError::Script("p2sh scriptSig op".into()));
     }
     Ok(stack)
+}
+
+/// Core `VerifyScript` runs the scriptPubKey `HASH160 <20> EQUAL` on the
+/// scriptSig stack before the push-only check and the redeemScript. The
+/// `<20>` push is the one step that grows the stack, so a scriptSig that
+/// leaves `MAX_STACK_SIZE` items fails there with `stack size`.
+///
+/// CPU/RAM trade: this depth check stands in for running the scriptPubKey,
+/// which would clone the stack and hash the redeemScript a second time on
+/// every P2SH input. The hash match itself is [`check_p2sh_redeem_hash`].
+fn require_room_for_p2sh_hash_push(stack: &[Vec<u8>]) -> Result<(), ConsensusError> {
+    if stack.len() >= interpreter::MAX_STACK_SIZE {
+        return Err(ConsensusError::Script("stack size".into()));
+    }
+    Ok(())
 }
 
 /// P2SH spk shape + HASH160(redeem) match (shared by nested and legacy paths).

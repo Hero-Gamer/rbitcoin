@@ -1420,3 +1420,51 @@ fn legacy_multisig_empty_sig_deletes_op_0_from_script_code() {
         .expect_err("CONST_SCRIPTCODE: the empty sig deletes an OP_0");
     assert!(format!("{err}").contains("SIG_FINDANDDELETE"), "{err}");
 }
+
+/// Core `VerifyScript` runs the P2SH scriptPubKey `HASH160 <20> EQUAL` on
+/// the scriptSig stack before it evaluates the redeemScript. The `<20>` push
+/// is one more item, so a scriptSig that leaves 1000 items fails
+/// `MAX_STACK_SIZE` there, with or without BIP16. 999 items fit.
+/// Cross-checked against libbitcoinconsensus (external finding 086).
+#[test]
+fn p2sh_script_pubkey_push_counts_against_max_stack_size() {
+    let redeem = [0x51u8];
+    let mut spk = vec![0xa9, 0x14];
+    spk.extend_from_slice(hash160::Hash::hash(&redeem).as_byte_array());
+    spk.push(0x87);
+    let job = |stack_items: usize, bip16_active: bool| {
+        let mut script_sig = vec![0x00; stack_items - 1];
+        script_sig.extend_from_slice(&[0x01, redeem[0]]);
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(script_sig),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let flags = crate::block::ScriptVerifyFlags::buried(true, true, true, bip16_active, true);
+        let prevout = TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: ScriptBuf::from_bytes(spk.clone()),
+        };
+        ScriptCheckJob::new(vec![prevout], tx, flags)
+    };
+
+    for bip16_active in [true, false] {
+        script::verify_job_all_inputs(&job(999, bip16_active))
+            .unwrap_or_else(|e| panic!("bip16={bip16_active}: 999 items fit: {e}"));
+        let err = script::verify_job_all_inputs(&job(1000, bip16_active))
+            .expect_err("the spk push is item 1001");
+        assert!(
+            format!("{err}").contains("stack size"),
+            "bip16={bip16_active}: {err}"
+        );
+    }
+}
