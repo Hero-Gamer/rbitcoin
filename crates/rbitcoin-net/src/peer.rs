@@ -296,8 +296,8 @@ fn stash_pending_block(pending: &mut PendingBlocks, hash: BlockHash, block: bitc
     if nbytes > MAX_BLOCK_SERIALIZED {
         return;
     }
-    if pending.map.contains_key(&hash) {
-        pending.map.insert(hash, block);
+    if let std::collections::hash_map::Entry::Occupied(mut e) = pending.map.entry(hash) {
+        e.insert(block);
         return;
     }
     while pending.map.len() >= MAX_PENDING_BLOCKS {
