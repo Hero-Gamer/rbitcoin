@@ -135,4 +135,6 @@ Playbooks:
   `qc` is fmt, ast-grep, deny, the script self-tests, clippy, then
   nixos-module-eval. Mutants are a nightly workspace oracle
   ([`mutants.yml`](.github/workflows/mutants.yml)), not a PR check.
-  Owner: [`TESTING.md`](TESTING.md).
+  Do not run `cargo mutants` locally. Apply the missed operator by hand
+  and run the journey. `rearden-grok[bot]`: never run it on this VM.
+  Owner: [`TESTING.md`](TESTING.md). VM: [`rearden-vm-HOST.md`](rearden-vm-HOST.md).

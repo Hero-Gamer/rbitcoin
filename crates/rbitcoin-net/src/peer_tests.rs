@@ -20,6 +20,7 @@ fn p2p_serve_line_names_tx_bytes_wall() {
     let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("serve-line");
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
+    let (served_n, served_bytes) = crate::serve_perf::serve_perf_totals();
     let _ = crate::serve_perf::sample_reset_serve_perf();
     let encoded = encode_served_witness_block(&hub.cache, &hub.query, &gen)
         .unwrap()
@@ -27,8 +28,13 @@ fn p2p_serve_line_names_tx_bytes_wall() {
     assert_eq!(encoded.first().copied(), Some(2), "v2 block short id");
     let s = crate::serve_perf::sample_reset_serve_perf();
     assert!(s.n >= 1, "{s:?}");
-    assert!(s.bytes > 0, "{s:?}");
+    assert!(s.bytes > 1, "{s:?}");
     assert!(s.tx_count >= 1, "{s:?}");
+    let (served_n_after, served_bytes_after) = crate::serve_perf::serve_perf_totals();
+    assert!(
+        served_n_after > served_n && served_bytes_after > served_bytes.max(1),
+        "running serve totals move with the window: before=({served_n},{served_bytes}) after=({served_n_after},{served_bytes_after}) window={s:?}"
+    );
     let line = crate::serve_perf::format_serve_perf(&s);
     assert!(
         !line.contains("p2p: serve"),
@@ -2150,11 +2156,39 @@ fn pending_blocks_insert_evicts_at_cap() {
 #[test]
 fn pending_block_over_four_megabytes_is_not_parked() {
     let mut pending = PendingBlocks::new();
-    let mut b = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0u8; 4_000_001]);
-    let h = b.block_hash();
-    pending.insert(h, b);
+    let mut exact = block_with_wire_len(4_000_000);
+    exact.header.nonce = 1;
+    let exact_h = exact.block_hash();
+    pending.insert(exact_h, exact);
+    assert!(
+        pending.contains_key(&exact_h),
+        "a 4_000_000-byte body is parked"
+    );
+    let mut over = block_with_wire_len(4_000_000);
+    over.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0u8; 4_000_001]);
+    over.header.nonce = 2;
+    let h = over.block_hash();
+    pending.insert(h, over);
     assert!(!pending.contains_key(&h));
+    assert!(pending.contains_key(&exact_h));
+}
+
+fn block_with_wire_len(n: usize) -> bitcoin::Block {
+    let mut b = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let mut len = n;
+    for _ in 0..6 {
+        b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0u8; len]);
+        let got = b.total_size();
+        if got == n {
+            return b;
+        }
+        if got > n {
+            len = len.saturating_sub(got - n);
+        } else {
+            len = len.saturating_add(n - got);
+        }
+    }
+    panic!("wire len {n} landed on {}", b.total_size());
 }
 
 #[test]
@@ -3038,7 +3072,9 @@ fn misbehavior_disconnect_refuses_the_same_address() {
         peers.inbound_discouraged(other_port),
         "a misbehavior disconnect refuses that address"
     );
-    peers.set_mock_now(now + crate::peers::PeerHub::DISCOURAGE_TTL_SECS);
+    peers.set_mock_now(now + 86_400 - 1);
+    assert!(peers.inbound_discouraged(addr), "the refusal lasts a day");
+    peers.set_mock_now(now + 86_400);
     assert!(
         !peers.inbound_discouraged(addr),
         "the refusal ends after a day"
@@ -3153,10 +3189,36 @@ fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
         peers.inbound_discouraged(same),
         "a netgroup that just lost a slot is refused"
     );
-    peers.set_mock_now(now + crate::peers::PeerHub::NETGROUP_SLOT_WAIT_SECS);
+    peers.set_mock_now(now + 600 - 1);
+    assert!(
+        peers.inbound_discouraged(same),
+        "the netgroup wait holds until ten minutes"
+    );
+    peers.set_mock_now(now + 600);
     assert!(
         !peers.inbound_discouraged(same),
-        "the netgroup wait is shorter than a day"
+        "the netgroup wait is ten minutes"
+    );
+    peers.set_mock_now(now);
+    for i in 0..crate::peers::PeerHub::DISCOURAGE_CAP {
+        let a = (i / 256) as u8;
+        let b = (i % 256) as u8;
+        let slot = std::net::SocketAddr::from(([a, b, 1, 1], 1));
+        peers.note_slot_evict(crate::eviction::eviction_netgroup(slot));
+    }
+    let overflow = std::net::SocketAddr::from(([255, 255, 1, 1], 1));
+    peers.note_slot_evict(crate::eviction::eviction_netgroup(overflow));
+    assert!(
+        !peers.inbound_discouraged(overflow),
+        "a new netgroup past the cap is not stored"
+    );
+    peers.set_mock_now(now + 100);
+    let refreshed = std::net::SocketAddr::from(([0, 0, 1, 1], 1));
+    peers.note_slot_evict(crate::eviction::eviction_netgroup(refreshed));
+    peers.set_mock_now(now + 600);
+    assert!(
+        peers.inbound_discouraged(refreshed),
+        "a netgroup already stored is refreshed at the cap"
     );
     peers.set_mock_now(now);
     for i in 0..crate::peers::PeerHub::DISCOURAGE_CAP {
@@ -3535,4 +3597,49 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
     assert!(compact_filter_range(0, 1000, MAX_GETCFILTERS).is_err());
     assert!(compact_filter_range(1, 2000, MAX_GETCFHEADERS).is_ok());
     assert!(compact_filter_range(0, 2000, MAX_GETCFHEADERS).is_err());
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cf-stop");
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    let heights = hub.query.index_heights(0, 0, None).unwrap();
+    let window = hub.query.read_index_window(&heights).unwrap();
+    let filter = hub.query.basic_filter_from_window(&window, 0).unwrap();
+    assert_eq!(
+        hub.query
+            .commit_window_filters(0, &[(filter, heights[0].header_fk)])
+            .unwrap(),
+        1,
+        "genesis basic filter must be sealed before a peer can read it"
+    );
+    let tip = hub.tip_hash().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let headers = bitcoin::p2p::message_filter::GetCFHeaders {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: tip,
+    };
+    on_getcfheaders(&hub, &tx, None, &headers).unwrap();
+    match rx.try_recv().expect("cfheaders") {
+        crate::peers::PeerOut::Msg(NetworkMessage::CFHeaders(m)) => {
+            assert_eq!(m.previous_filter_header.as_byte_array(), &[0u8; 32]);
+            assert_eq!(m.filter_hashes.len(), 1, "{m:?}");
+        }
+        other => panic!("expected cfheaders, got {other:?}"),
+    }
+    let typed = bitcoin::p2p::message_filter::GetCFilters {
+        filter_type: 1,
+        start_height: 0,
+        stop_hash: tip,
+    };
+    on_getcfilters(&hub, &tx, None, &typed).unwrap();
+    assert!(rx.try_recv().is_err(), "a non-basic filter is silence");
+    hub.query.set_block_filter_index(false).unwrap();
+    let basic = bitcoin::p2p::message_filter::GetCFilters {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: tip,
+    };
+    on_getcfilters(&hub, &tx, None, &basic).unwrap();
+    assert!(rx.try_recv().is_err(), "filters off is silence");
+    let _ = std::fs::remove_dir_all(dir);
 }

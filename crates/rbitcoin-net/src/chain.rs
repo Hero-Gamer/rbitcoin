@@ -46,7 +46,6 @@ struct HeaderSyncNode {
 struct HeldBodies {
     by_hash: HashMap<BlockHash, (Arc<Block>, u64)>,
     next_seq: u64,
-    bytes: usize,
 }
 
 impl HeldBodies {
@@ -54,14 +53,11 @@ impl HeldBodies {
     const STALE_BELOW: u32 = 288;
     /// One honest max block. A larger body is not held.
     const MAX_BLOCK_SERIALIZED: usize = 4_000_000;
-    /// Count cap times one max block. Honest fills are not evicted early.
-    const BYTE_CAP: usize = Self::CAP * Self::MAX_BLOCK_SERIALIZED;
 
     fn new() -> Self {
         Self {
             by_hash: HashMap::new(),
             next_seq: 1,
-            bytes: 0,
         }
     }
 
@@ -106,8 +102,7 @@ impl HeldBodies {
         if nbytes > Self::MAX_BLOCK_SERIALIZED {
             return;
         }
-        while self.by_hash.len() >= Self::CAP || self.bytes.saturating_add(nbytes) > Self::BYTE_CAP
-        {
+        while self.by_hash.len() >= Self::CAP {
             let victim = self
                 .by_hash
                 .iter()
@@ -121,26 +116,18 @@ impl HeldBodies {
                         .map(|(h, _)| *h)
                 });
             if let Some(k) = victim {
-                if let Some((old, _)) = self.by_hash.remove(&k) {
-                    self.bytes = self.bytes.saturating_sub(Self::wire_len(&old));
-                }
+                self.by_hash.remove(&k);
             } else {
                 break;
             }
         }
-        if self.by_hash.len() >= Self::CAP || self.bytes.saturating_add(nbytes) > Self::BYTE_CAP {
-            return;
-        }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(nbytes);
         self.by_hash.insert(hash, (block, seq));
     }
 
     fn remove(&mut self, hash: &BlockHash) {
-        if let Some((old, _)) = self.by_hash.remove(hash) {
-            self.bytes = self.bytes.saturating_sub(Self::wire_len(&old));
-        }
+        self.by_hash.remove(hash);
     }
 }
 
@@ -1030,9 +1017,8 @@ impl ChainHub {
         let mut best = self.tip_height().unwrap_or(0);
         let tips: Vec<(BlockHash, u32)> = self.header_tips.read().unwrap().entries().collect();
         for (hash, h) in tips {
-            // Only a taller tip can raise `best`; the walk is for those alone.
-            if h > best && !self.header_ancestry_invalid(hash) {
-                best = h;
+            if !self.header_ancestry_invalid(hash) {
+                best = best.max(h);
             }
         }
         best
@@ -3695,10 +3681,40 @@ mod tests {
         }
         panic!("no distinct pow sibling");
     }
+    fn block_with_wire_len(n: usize) -> Block {
+        let mut b = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        let mut len = n;
+        for _ in 0..6 {
+            b.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0u8; len]);
+            let got = b.total_size();
+            if got == n {
+                return b;
+            }
+            if got > n {
+                len = len.saturating_sub(got - n);
+            } else {
+                len = len.saturating_add(n - got);
+            }
+        }
+        panic!("wire len {n} landed on {}", b.total_size());
+    }
+
     #[test]
     fn hold_body_caps_fifo() {
         let (dir, hub) = tmp_hub();
         hub.ensure_genesis().unwrap();
+        let mut exact = block_with_wire_len(HeldBodies::MAX_BLOCK_SERIALIZED);
+        exact.header.nonce = 1;
+        let exact_h = exact.block_hash();
+        hub.hold_unconnected_body(exact);
+        assert!(hub.held_body(&exact_h).is_some());
+        let mut over = block_with_wire_len(HeldBodies::MAX_BLOCK_SERIALIZED);
+        over.txdata[0].input[0].script_sig = bitcoin::ScriptBuf::from_bytes(vec![0u8; 4_000_001]);
+        over.header.nonce = 2;
+        let over_h = over.block_hash();
+        hub.hold_unconnected_body(over);
+        assert!(hub.held_body(&over_h).is_none());
+        hub.drop_held(exact_h);
         let gen = hub.tip_hash().unwrap();
         let n = HeldBodies::CAP.saturating_add(1);
         let mut hashes = Vec::with_capacity(n);
@@ -4342,7 +4358,7 @@ mod tests {
             // Substep ms are unitless inside the paren (outer fields carry `ms`).
             "seed=800",
             "body=600",
-            "head=300 sync=50",
+            "head=300 sync=50 ",
             "creates=12000",
             "unique=9500",
             "written=9400",
@@ -4649,6 +4665,19 @@ mod tests {
         assert_eq!(ho.branchlen, 1);
         assert_eq!(hub.best_header_height(), 2);
         assert_eq!(hub.tip_height(), Some(1));
+        let shorter = mine(gen, 1_300_020_200, 9);
+        hub.ensure_header(&shorter.header).unwrap();
+        assert_eq!(
+            hub.best_header_height(),
+            2,
+            "a shorter valid header cannot lower the best header height"
+        );
+        hub.invalidate_block(child.block_hash()).unwrap();
+        assert_eq!(
+            hub.best_header_height(),
+            1,
+            "an invalidated taller header does not count"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

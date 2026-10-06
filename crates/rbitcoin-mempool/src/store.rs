@@ -197,7 +197,6 @@ impl Mempool {
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_body_then_slots()?;
-        self.sync_meta()?;
         Ok(())
     }
 
@@ -218,7 +217,6 @@ impl Mempool {
         self.persist_body_tail()?;
         self.pwrite_live_slots_since(old_persisted)?;
         self.persist_meta()?;
-        self.sync_meta()?;
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
         Ok(())
@@ -621,7 +619,6 @@ impl Mempool {
         }
         if changed {
             self.persist_slots_and_meta()?;
-            self.sync_meta()?;
         }
         Ok(())
     }
@@ -818,14 +815,9 @@ impl Mempool {
         self.meta_file
             .write_all(&meta)
             .map_err(|e| MempoolError::io(&meta_path, e))?;
-        Ok(())
-    }
-
-    fn sync_meta(&mut self) -> Result<(), MempoolError> {
-        let path = self.dir.join("meta");
         self.meta_file
             .sync_data()
-            .map_err(|e| MempoolError::io(&path, e))?;
+            .map_err(|e| MempoolError::io(&meta_path, e))?;
         Ok(())
     }
 
@@ -1359,6 +1351,42 @@ pub(crate) mod tests {
             live.is_empty(),
             "LIVE must not be written past body_persisted_len={persisted}"
         );
+        assert_eq!(
+            mp.slots[SLOTS_HEADER], SLOT_FREE,
+            "a torn LIVE slot past the body is free after open"
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        // Slots can reach disk ahead of the published body length. Demoted
+        // writes do not create that image; a crash between the two files does.
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let raw = tiny_tx();
+        let torn = Txid::from_byte_array([0x11; 32]);
+        mp.append_live_tx(&raw, &torn, &raw.compute_wtxid(), 1, 400, 0, &[])
+            .unwrap();
+        mp.flush().unwrap();
+        drop(mp);
+        let mut body = fs::read(dir.join("tx.body")).unwrap();
+        let published = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        assert!(published > BODY_HEADER as u64);
+        body[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
+        fs::write(dir.join("tx.body"), &body).unwrap();
+        assert_eq!(
+            fs::read(dir.join("slots")).unwrap()[SLOTS_HEADER],
+            SLOT_LIVE,
+            "the slots file still names the row live"
+        );
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert!(
+            mp.load_live_txs().unwrap().is_empty(),
+            "a row past the published body is not a live tx"
+        );
+        assert_eq!(
+            mp.slots[SLOTS_HEADER], SLOT_FREE,
+            "open frees a live row whose body was not published"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1608,6 +1636,22 @@ pub(crate) mod tests {
         let mp = Mempool::open_or_create(&dir).unwrap();
         let live = mp.load_live_txs().expect("new body + old slots must load");
         assert!(live.len() <= 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, 0, &[])
+            .unwrap();
+        let off = SLOTS_HEADER;
+        mp.slots[off + 12..off + 16].copy_from_slice(&88u32.to_le_bytes());
+        let short = mp.load_live_txs().unwrap_err().to_string();
+        assert!(
+            !short.contains("live slot body range"),
+            "an 88-byte live record is past the prefix check: {short}"
+        );
+        mp.slots[off + 12..off + 16].copy_from_slice(&87u32.to_le_bytes());
+        let shorter = mp.load_live_txs().unwrap_err().to_string();
+        assert!(shorter.contains("live slot body range"), "{shorter}");
         let _ = fs::remove_dir_all(&dir);
     }
 

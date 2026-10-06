@@ -148,6 +148,15 @@ mod tests {
         let mut r = PeerRateLimiter::new(1000, 100);
         assert!(r.note(100));
         assert!(!r.note(1));
+
+        let mut blended = PeerRateLimiter::new(10_000, 2_000);
+        let t0 = Instant::now();
+        assert!(blended.note_at(1_000, t0));
+        assert!(blended.note_at(1, t0 + RATE_WINDOW));
+        assert!(
+            !blended.note_at(1_600, t0 + RATE_WINDOW + Duration::from_millis(500)),
+            "500ms later half of the previous 1000 bytes plus this frame exceeds 2000"
+        );
     }
 
     #[test]
@@ -166,6 +175,30 @@ mod tests {
         assert!(r.note_at(1, cleared));
         assert!(r.note_at(1, cleared));
         assert!(!r.note_at(1, cleared));
+
+        let mut rolled = PeerRateLimiter::new(10_000, 1_000);
+        let roll_t0 = Instant::now();
+        assert!(rolled.note_at(800, roll_t0));
+        assert!(rolled.note_at(100, roll_t0 + RATE_WINDOW));
+        assert!(
+            !rolled.note_at(510, roll_t0 + RATE_WINDOW + Duration::from_millis(500)),
+            "rolled: 100 + half of 800 + 510 exceeds 1000"
+        );
+
+        // `new` stamps its own start. Jump far enough that this note sets
+        // the window start to `anchor`, then hit that start plus one second.
+        let mut edge = PeerRateLimiter::new(10_000, 1_000);
+        let anchor = Instant::now() + RATE_WINDOW + RATE_WINDOW + Duration::from_secs(5);
+        assert!(edge.note_at(800, anchor));
+        let boundary = anchor + RATE_WINDOW;
+        assert!(
+            edge.note_at(200, boundary),
+            "the exact boundary still has the rest of a 1000-byte budget"
+        );
+        assert!(
+            !edge.note_at(401, boundary + Duration::from_millis(500)),
+            "half a second later the previous 800 bytes still count"
+        );
     }
 
     #[test]

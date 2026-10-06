@@ -628,10 +628,19 @@ python3 scripts/core-functional/check_inventory.py
 
 ## What a mutant kill looks like
 
-Mutants are a nightly oracle, not a pull-request check. The command is
-`./scripts/mutants-nightly.sh` ([`mutants.yml`](.github/workflows/mutants.yml)).
-Do not treat a package-only `cargo mutants` run as the gate: a journey
-outside the mutated crate must be able to catch the mutant.
+Mutants are a nightly oracle, not a pull-request check, and not a local
+command. Do not run `cargo mutants` on a developer machine. The nightly
+script is `./scripts/mutants-nightly.sh`
+([`mutants.yml`](.github/workflows/mutants.yml)). A local run copies a
+workspace build and then reruns the suite once per mutant.
+
+Check a kill by hand. Edit the expression to the missed operator, run the
+catalog journey that should catch it, then restore the expression. The
+journey fails while the mutant is applied and passes once the expression
+is restored. That is the local proof. A package-only `cargo mutants` run
+is not the gate: a journey outside the mutated crate must be able to catch
+the mutant. The operator VM never runs `cargo mutants`; that host rule is
+[`rearden-vm-HOST.md`](rearden-vm-HOST.md).
 
 A new production behavior still needs a test that fails when that behavior
 is removed or inverted. Put that assert on a catalog journey. A `MISSED`

@@ -1965,12 +1965,13 @@ impl PeerHub {
     pub(crate) fn inbound_discouraged(&self, addr: SocketAddr) -> bool {
         let now = self.now_secs();
         self.sweep_discouraged(now);
+        // `sweep_discouraged` already dropped rows with `until <= now`.
         if self
             .discouraged_addrs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&addr.ip())
-            .is_some_and(|until| *until > now)
+            .is_some()
         {
             return true;
         }
@@ -1979,7 +1980,7 @@ impl PeerHub {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&group)
-            .is_some_and(|until| *until > now)
+            .is_some()
     }
 
     pub fn now_secs(&self) -> u64 {
@@ -3706,8 +3707,38 @@ mod tests {
             "inside the peer timeout the ping does not time out"
         );
         hub.set_peer_timeout_secs(60);
+        assert!(
+            !matches!(
+                p.take_ping_action(now + 20 * 60),
+                Some(PingAction::Timeout { .. })
+            ),
+            "the ping timeout starts the second after twenty minutes"
+        );
         assert!(matches!(
-            p.take_ping_action(now + 6_000),
+            p.take_ping_action(now + 20 * 60 + 1),
+            Some(PingAction::Timeout { .. })
+        ));
+
+        let late = hub.register(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+            &ver("/rbitcoin:0.1.0/"),
+            true,
+            PeerConnType::Inbound,
+        );
+        let Some(PingAction::Send { .. }) = late.take_ping_action(now) else {
+            panic!("expected send");
+        };
+        hub.set_peer_timeout_secs(2_000);
+        assert!(
+            !matches!(
+                late.take_ping_action(now + 2_000),
+                Some(PingAction::Timeout { .. })
+            ),
+            "inactivity checks start the second after the peer timeout"
+        );
+        assert!(matches!(
+            late.take_ping_action(now + 2_001),
             Some(PingAction::Timeout { .. })
         ));
     }

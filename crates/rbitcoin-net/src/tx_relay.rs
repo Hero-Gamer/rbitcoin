@@ -4436,6 +4436,7 @@ mod tests {
             spends.push(tx.compute_txid());
         }
         let n = 3u64;
+        assert_eq!(hub.accept_totals(), (n, 0));
         let s = hub.sample_reset_perf();
         assert_eq!(s.accepts, n);
         assert_eq!(s.tip_mtp, 1, "same tip must compute MTP once");

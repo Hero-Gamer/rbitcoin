@@ -6,6 +6,7 @@
 //! and reorg bookkeeping but is not an observation.
 
 use rbitcoin_mempool::{AnalogHistory, CONFIDENCE_FAR, CONFIDENCE_NEAR};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 /// Newest heights whose block hash is kept to validate the history file.
@@ -87,11 +88,14 @@ impl FeeHistory {
         let first = self.blocks.first_key_value().map(|(&h, _)| h);
         let last = self.blocks.last_key_value().map(|(&h, _)| h);
         if let (Some(rate), false) = (block.p10_sat_kvb, self.analog_stale) {
-            match (first, last) {
-                (_, None) => self.analog.push_back(rate),
-                (_, Some(last)) if height > last => self.analog.push_back(rate),
-                (Some(first), _) if height < first => self.analog.push_front(rate),
-                _ => self.analog_stale = true,
+            if let (Some(first), Some(last)) = (first, last) {
+                match (height.cmp(&first), height.cmp(&last)) {
+                    (_, Ordering::Greater) => self.analog.push_back(rate),
+                    (Ordering::Less, _) => self.analog.push_front(rate),
+                    _ => self.analog_stale = true,
+                }
+            } else {
+                self.analog.push_back(rate);
             }
         }
         self.blocks.insert(height, block);
@@ -250,6 +254,13 @@ mod tests {
         }
         assert_eq!(history.analog.pairs(2), hurdles_only.analog.pairs(2));
         assert_eq!(history.rates(), hurdles_only.rates());
+        let near = history.analog.rate_sat_kvb(1, CONFIDENCE_NEAR);
+        let far = history.analog.rate_sat_kvb(1, CONFIDENCE_FAR);
+        assert_eq!(history.rates()[&1], near);
+        assert_ne!(
+            near, far,
+            "one-block confidence is nearer than a farther target"
+        );
         assert!(history.rates()[&1].is_some());
         assert!(history.rates()[&2].is_some());
         assert!(history.rates.is_some(), "cached");
@@ -265,6 +276,51 @@ mod tests {
 
     #[test]
     fn every_update_path_matches_a_fresh_history() {
+        let mut book = FeeHistory::new(u64::MAX, &[1]);
+        book.insert_if_absent(10, block(Some(100), 1), None);
+        for h in 11..14u32 {
+            book.insert_if_absent(h, block(Some(100 + u64::from(h)), 1), None);
+        }
+        let after_back = book.analog.pairs(1);
+        assert!(
+            after_back >= 1,
+            "an empty history and heights above the last extend the analog"
+        );
+        assert!(!book.analog_stale);
+        book.insert_if_absent(1, block(Some(50), 1), None);
+        assert!(
+            book.analog.pairs(1) > after_back,
+            "a height below the first extends the analog"
+        );
+        assert!(!book.analog_stale);
+
+        let mut replaced = FeeHistory::new(u64::MAX, &[1]);
+        for h in 1..=4u32 {
+            replaced.insert(h, block(Some(100), 1), None);
+        }
+        let before_replace = replaced.analog.pairs(1);
+        replaced.insert(5, block(None, 1), None);
+        replaced.insert(5, block(Some(200), 1), None);
+        assert_eq!(replaced.analog.pairs(1), before_replace + 1);
+        assert!(!replaced.analog_stale);
+
+        let mut evicted = FeeHistory::new(10, &[1]);
+        evicted.insert(1, block(None, 10), None);
+        for h in 2..=6u32 {
+            evicted.insert(h, block(Some(100 + u64::from(h)), 1), None);
+        }
+        assert!(!evicted.analog_stale);
+        assert_eq!(
+            evicted.analog.pairs(1),
+            2,
+            "evicting a hurdle-less height keeps the five later observations"
+        );
+        evicted.insert(7, block(Some(300), 10), None);
+        assert!(
+            evicted.analog.pairs(1) < 2,
+            "evicting a hurdle drops it from the analog"
+        );
+
         let targets = [1, 2, 6];
         let mut history = FeeHistory::new(20_000, &targets);
         // preload walks down from 3000; connects arrive above it
