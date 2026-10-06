@@ -197,7 +197,6 @@ impl Mempool {
     pub fn flush(&mut self) -> Result<(), MempoolError> {
         self.generation = self.generation.saturating_add(1);
         self.persist_body_then_slots()?;
-        self.sync_meta()?;
         Ok(())
     }
 
@@ -218,7 +217,6 @@ impl Mempool {
         self.persist_body_tail()?;
         self.pwrite_live_slots_since(old_persisted)?;
         self.persist_meta()?;
-        self.sync_meta()?;
         self.clear_dirty();
         self.last_persist_ms = self.now_ms();
         Ok(())
@@ -621,7 +619,6 @@ impl Mempool {
         }
         if changed {
             self.persist_slots_and_meta()?;
-            self.sync_meta()?;
         }
         Ok(())
     }
@@ -818,14 +815,9 @@ impl Mempool {
         self.meta_file
             .write_all(&meta)
             .map_err(|e| MempoolError::io(&meta_path, e))?;
-        Ok(())
-    }
-
-    fn sync_meta(&mut self) -> Result<(), MempoolError> {
-        let path = self.dir.join("meta");
         self.meta_file
             .sync_data()
-            .map_err(|e| MempoolError::io(&path, e))?;
+            .map_err(|e| MempoolError::io(&meta_path, e))?;
         Ok(())
     }
 
@@ -1359,6 +1351,10 @@ pub(crate) mod tests {
             live.is_empty(),
             "LIVE must not be written past body_persisted_len={persisted}"
         );
+        assert_eq!(
+            mp.slots[SLOTS_HEADER], SLOT_FREE,
+            "a torn LIVE slot past the body is free after open"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1608,6 +1604,22 @@ pub(crate) mod tests {
         let mp = Mempool::open_or_create(&dir).unwrap();
         let live = mp.load_live_txs().expect("new body + old slots must load");
         assert!(live.len() <= 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.append_live_tx(&raw, &t1, &raw.compute_wtxid(), 1, 400, 0, &[])
+            .unwrap();
+        let off = SLOTS_HEADER;
+        mp.slots[off + 12..off + 16].copy_from_slice(&88u32.to_le_bytes());
+        let short = mp.load_live_txs().unwrap_err().to_string();
+        assert!(
+            !short.contains("live slot body range"),
+            "an 88-byte live record is past the prefix check: {short}"
+        );
+        mp.slots[off + 12..off + 16].copy_from_slice(&87u32.to_le_bytes());
+        let shorter = mp.load_live_txs().unwrap_err().to_string();
+        assert!(shorter.contains("live slot body range"), "{shorter}");
         let _ = fs::remove_dir_all(&dir);
     }
 
