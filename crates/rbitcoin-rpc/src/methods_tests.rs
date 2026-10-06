@@ -5528,12 +5528,8 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     assert!(body.contains("\"bitmap\":\"1\""), "{body}");
     assert!(body.contains("2147483647"), "{body}");
     let (status, body) = rest_text(&ctx, &format!("/rest/getutxos/{coinbase_txid}-1.json"), "");
-    assert_eq!(
-        status,
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        "{body}"
-    );
-    assert!(body.contains("spent slot"), "{body}");
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert!(body.contains("\"bitmap\":\"0\""), "{body}");
     let (status, body) = rest_text(
         &ctx,
         &format!("/rest/getutxos/{}-0.json", "00".repeat(32)),

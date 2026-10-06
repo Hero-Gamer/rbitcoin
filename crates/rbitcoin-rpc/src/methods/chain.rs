@@ -1020,6 +1020,10 @@ pub(crate) fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
         .query
         .get_tx(fk)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    // Spender read treats a slot past `output_count` as corrupt. The vout is absent.
+    if n >= rec.output_count {
+        return Ok(Value::Null);
+    }
     if ctx
         .query
         .is_outpoint_spent(&want, n)
