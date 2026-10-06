@@ -1356,6 +1356,38 @@ pub(crate) mod tests {
             "a torn LIVE slot past the body is free after open"
         );
         let _ = fs::remove_dir_all(&dir);
+
+        // Slots can reach disk ahead of the published body length. Demoted
+        // writes do not create that image; a crash between the two files does.
+        let dir = tmp_dir();
+        let mut mp = Mempool::open_or_create(&dir).unwrap();
+        mp.set_now_ms(0);
+        let raw = tiny_tx();
+        let torn = Txid::from_byte_array([0x11; 32]);
+        mp.append_live_tx(&raw, &torn, &raw.compute_wtxid(), 1, 400, 0, &[])
+            .unwrap();
+        mp.flush().unwrap();
+        drop(mp);
+        let mut body = fs::read(dir.join("tx.body")).unwrap();
+        let published = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        assert!(published > BODY_HEADER as u64);
+        body[8..16].copy_from_slice(&(BODY_HEADER as u64).to_le_bytes());
+        fs::write(dir.join("tx.body"), &body).unwrap();
+        assert_eq!(
+            fs::read(dir.join("slots")).unwrap()[SLOTS_HEADER],
+            SLOT_LIVE,
+            "the slots file still names the row live"
+        );
+        let mp = Mempool::open_or_create(&dir).unwrap();
+        assert!(
+            mp.load_live_txs().unwrap().is_empty(),
+            "a row past the published body is not a live tx"
+        );
+        assert_eq!(
+            mp.slots[SLOTS_HEADER], SLOT_FREE,
+            "open frees a live row whose body was not published"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
