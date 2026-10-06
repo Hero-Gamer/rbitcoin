@@ -793,6 +793,11 @@ mod tests {
         sam.stream_forward(18444).await.unwrap();
         let got = stream_lines(&log, "STREAM FORWARD");
         assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(
+            stream_lines(&log, "SESSION CREATE").len(),
+            1,
+            "early eof retries the forward on the same session"
+        );
     }
 
     #[cfg(unix)]
@@ -1029,6 +1034,11 @@ mod tests {
             .expect("SAM reset must recreate the session and retry");
         let creates = stream_lines(&log, "SESSION CREATE");
         assert_eq!(creates.len(), 2, "{creates:?}");
+        assert_eq!(
+            stream_lines(&log, "STREAM CONNECT").len(),
+            3,
+            "a reset returns without another connect on the dead session"
+        );
         clear_installed();
     }
 
