@@ -86,19 +86,19 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 | S5 | Unique txids | `BadBlock("duplicate txid")` (`bad-txns-inputs-missingorspent`, as Core rejects the second copy at connect) | `structure_rule_tests::s5_rejects_duplicate_txid`; tip cache `chain::tests::hostile_peer_session` |
 | S6 | Merkle root matches txids, checked before every other body rule; a repeated tail (CVE-2012-2459) is mutated | `BadBlock("merkle root mismatch")`, `BadBlock("bad-txns-duplicate")` | `structure_rule_tests::s6_rejects_merkle_root_mismatch`, `body_rules_run_after_the_header_merkle_check` (+ `merkle_root_bytes_single_and_odd`; store `merkle_mutation_flags_a_repeated_tail_at_any_level`) |
 | S7 | BIP34 height in coinbase (h≥1) | `BadBlock("bip34…")` | `s7_rejects_bip34_missing_at_height_1`, `s7_bip34_not_required_at_height_0`, `s7_regtest_rejects_bip34_missing_at_height_1`, `s7_regtest_bip34_activation_height_override` |
-| S8 | Witness commitment when any witness; reject witness before SegWit activation | missing / mismatch / `BadBlock("unexpected witness before segwit")` | `s8_rejects_missing_witness_commitment`, `s8_rejects_wrong_witness_commitment`; `consensus_rules::header_and_spending_boundaries` (connect-path pre-activation reject) |
+| S8 | Witness commitment when any witness; reject witness before SegWit activation | missing / mismatch / `BadBlock("unexpected witness before segwit")` | `rpc_regtest_from_genesis` (`missing witness commitment`, `witness commitment mismatch`); `s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce` (pre-segwit `aa21a9ed` is data); `consensus_rules::header_and_spending_boundaries` (connect-path `unexpected witness before segwit`) |
 | S9 | Coinbase scriptSig length 2..=100, after the merkle check | `bad-cb-length` | `rpc_regtest_from_genesis` (under 2 and 101 reject; a padded height push and 100 bytes connect); `short_coinbase_under_a_real_header_is_merkle_mismatch` |
-| S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `rpc_regtest_from_genesis` submit (`bad-txns-vout-toolarge` above MAX_MONEY; MAX_MONEY is `bad-cb-amount`); sum of two under-max outputs: `s10_rejects_txouttotal_toolarge` |
+| S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `rpc_regtest_from_genesis` submit (`bad-txns-vout-toolarge` above MAX_MONEY; MAX_MONEY is `bad-cb-amount`; two under-max outputs sum to `bad-txns-txouttotal-toolarge`) |
 | S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `rpc_regtest_from_genesis` (20_000 connect / 20_001 reject) |
 | S12 | Connect: P2SH + witness sigops (BIP16/BIP141); P2SH scriptSig opcode `> OP_16` → 0; witness sigops whenever the WITNESS script flag is set (every block except the BIP16 exception, as in Core) | `bad-blk-sigops` | `sigop_cost_tests::*` + `p2sh_sigops_non_push_scriptsig_is_zero` + `witness_sigops_gated_on_witness_flag` + `script_flags_follow_core_exception_table` |
 | S13 | Every tx including coinbase has ≥1 output | `no outputs` | `rpc_regtest_from_genesis` submit of a coinbase with no outputs (`bad-txns-vout-empty`); `header_and_spending_boundaries` (non-coinbase empty `vout`) |
 | S14 | Stripped size ≤ 1_000_000 | `block stripped size too large` | `s14_stripped_size_1_000_000_accepts_1_000_001_rejects` |
 | S15 | Every tx has ≥1 input | `no inputs` | `s15_rejects_empty_vin` |
 | S16 | Tx stripped size ≤ 1_000_000 | `bad-txns-oversize` | `s16_tx_stripped_size_1_000_000_accepts_1_000_001_rejects` |
-| S17 | No duplicate outpoints in a tx | `bad-txns-inputs-duplicate` | `s17_rejects_duplicate_outpoints` |
-| S18 | Non-coinbase inputs non-null | `bad-txns-prevout-null` | `s18_rejects_non_coinbase_null_prevout` |
+| S17 | No duplicate outpoints in a tx | `bad-txns-inputs-duplicate` | `rpc_regtest_from_genesis` |
+| S18 | Non-coinbase inputs non-null | `bad-txns-prevout-null` | `rpc_regtest_from_genesis` |
 
-Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs` for the rows that still name a unit there. S1, S2, S9, S10, S11, and S13 are `submitblock` on `rpc_regtest_from_genesis`, including S1–S3 on an equal-work sibling. S3 on a tip extend is `rpc_regtest_mature_chain_ops`.
+Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs` for the rows that still name a unit there. S1, S2, S8's missing and mismatched witness commitment, S9, S10, S11, S13, S17, and S18 are `submitblock` on `rpc_regtest_from_genesis`, including S1–S3 on an equal-work sibling. S3 on a tip extend is `rpc_regtest_mature_chain_ops`.
 
 ## B. Header — `validate_header` / helpers
 
