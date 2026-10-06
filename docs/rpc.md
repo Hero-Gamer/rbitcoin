@@ -5,6 +5,7 @@ keys such as `blockhash`, `verbosity`, `txid`, `hexstring`). Missing
 required keys are `-32602`; unknown named keys are `-8`.
 
 rbitcoin serves a **documented subset** of Bitcoin Core JSON-RPC over plain HTTP.
+A new method is documented in this file in the same change.
 This is **not** full Core parity: no wallet, no `createrawtransaction` /
 `signrawtransactionwithkey` / `createmultisig` / `sendtoaddress` (those
 live only on the Core-functional test proxy, backed by Esplora).

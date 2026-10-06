@@ -151,6 +151,11 @@ to it. Darwin operator binaries come from the `macos-14` release job, not Nix.
 
 ## Principles
 
+Write clear, concrete technical English. Keep Core-aligned terms where we
+match Bitcoin Core. Do not inject moralizing or political framing, or soften
+consensus and security language. Keep a name unless a new one is clearer
+engineering.
+
 1. **One owner per fact.** The map is [`docs/README.md`](./docs/README.md).
    Update the owner file; do not add a parallel spec. Prefer
    [`docs/architecture.md`](./docs/architecture.md), [`SCHEMA.md`](./SCHEMA.md),

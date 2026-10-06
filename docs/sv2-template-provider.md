@@ -67,6 +67,12 @@ three unused subprotocol crates) if it adds nothing.
 
 ## Constraints (all plans)
 
+Operator-visible limits (session cap, setup and write deadlines, constraint
+rebuild rate, retained templates, no client authentication, no templates
+during IBD) live in
+[`operator/interfaces.md`](./operator/interfaces.md#stratum-v2-template-provider).
+Do not copy them here.
+
 - New crate `crates/rbitcoin-sv2` (Plan B), service pattern of
   electrum/esplora: depends on `rbitcoin-net` (`ChainHub`, `MempoolHub`) /
   `rbitcoin-consensus` / `rbitcoin-store` (merkle); wired in `rbitcoin-node`
@@ -83,22 +89,9 @@ three unused subprotocol crates) if it adds nothing.
   Retention is required: the mempool may evict a tx
   before `RequestTransactionData` or `SubmitSolution` arrives. Stale grace
   (default 10 s) after a tip change, then drop (mirrors sv2-tp).
-- Session cap (always on): the listener accepts at most 8 concurrent
-  sessions and closes the next one after accept, like Electrum's
-  `max_connections` semaphore. Per-IP metering stays out of scope.
-- Setup deadline: a session holds its slot from TCP accept, so the Noise
-  handshake, `SetupConnection`, and the first `CoinbaseOutputConstraints`
-  must all arrive within 10 s (`SETUP_TIMEOUT`) or the socket is closed.
-  The client sends constraints right after setup (sv2-spec 07); without
-  them the session never gets a template, never writes, and the write
-  deadline cannot free the slot. Other frames before the first constraints
-  are handled but do not extend the deadline. There is no read deadline
-  after that: TDP has no keepalive and a client may stay silent while the
-  TP pushes.
-- Write deadline: a socket write that makes no progress for 30 s
-  (`WRITE_TIMEOUT`) closes the session, so a client that stops reading
-  cannot stall it. The deadline is per write call, not per frame, so a
-  slow reader still receives a multi-MB `RequestTransactionData.Success`.
+- Write deadline is per write call, not per frame, so a slow reader still
+  receives a multi-MB `RequestTransactionData.Success`. The 30 s close is
+  the operator page above.
 - Client frame cap: a client→TP payload over `MAX_CLIENT_PAYLOAD`
   (65557 bytes: `SubmitSolution`'s 20 fixed bytes plus a full `B064K`
   coinbase, the largest TDP client message) closes the session. codec_sv2
@@ -128,8 +121,7 @@ three unused subprotocol crates) if it adds nothing.
   the merkle root, does not cover it); a coinbase without a commitment
   or with a non-empty witness is submitted as sent.
 - `SetNewPrevHash.target` == nBits target here (no weak blocks).
-- No templates before sync: same refusal gate as `getblocktemplate` during
-  IBD.
+- No templates during IBD: the same refusal gate as `getblocktemplate`.
 - `SubmitSolution` has no error message in TDP: undecodable or
   unknown-template solutions are logged and dropped; decodable ones that
   meet the target are always attempted through `ChainHub::accept_block` (the TP MUST try to

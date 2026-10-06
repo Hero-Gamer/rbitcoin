@@ -358,9 +358,8 @@ Test moves ([`TESTING.md`](../TESTING.md) owns the budget):
 - Lift guts asserts up to the journey once the journey hits the same shipped
   path, then delete the twin unit.
 - If the journey cannot hit the line, delete the production branch in this
-  refactor and delete the test that only painted it. The 92% floor still
-  applies. It passes because the dead lines left both `LH` and `LF`, or
-  because the journey hits them.
+  refactor and delete the test that only painted it.
+  [`TESTING.md`](../TESTING.md) owns that fold and the coverage floor.
 - A CRAP failure on a function this step made more branched is a simplify,
   not a new test and not a new allowlist row.
 - Delete tests that pin implementation shape rather than behavior.
@@ -378,7 +377,7 @@ Test moves ([`TESTING.md`](../TESTING.md) owns the budget):
 | After Green | Refactor move |
 |-------------|---------------|
 | A unit drove a private helper; the journey now covers that path | Move the assert to the journey, delete the unit, inline or `pub(crate)` the helper |
-| The journey cannot execute the line | Delete that production branch and the test that only painted it. The 92% floor still applies |
+| The journey cannot execute the line | Delete that production branch and the test that only painted it ([`TESTING.md`](../TESTING.md)) |
 | Green added a second branch beside the old one | Collapse to one path and delete the old; the same test still passes |
 | Green needed a test-only hook on production | Assert the session/table stat or file state instead; delete the hook |
 | A new scenario re-mines a pad the journey already has | Reuse that journey’s pad; one open per binary |
@@ -474,6 +473,6 @@ Before closing a **plan**:
 - Extreme Programming: planning game, stories, small releases, TDD, refactoring
 - Bill Wake — **INVEST** user stories
 - Vertical story slicing (value through the stack, not layer-by-layer)
-- Project: [AGENTS.md](../AGENTS.md) (change discipline) and
+- Project: [AGENTS.md](../AGENTS.md) (hard stops) and
   [`.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md)
   (worktree + PR)

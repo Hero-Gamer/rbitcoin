@@ -85,8 +85,9 @@ into `AGENTS.md`.
 
 **Owner:** [`invariants.md`](./invariants.md) (“Direct IBD stage table”).
 
-`concurrency.md`, `heads.md`, `architecture.md`, and `AGENTS.md` **link** that
-table. Do not paste a second Allowed/Forbidden IO copy.
+`concurrency.md`, `heads.md`, `architecture.md`, and `ORIENT.md` **link** that
+table. Do not paste a second Allowed/Forbidden IO copy, including into
+`AGENTS.md`.
 
 `crash-recovery.md` owns write-order / tip-as-commit (different fact).
 `ibd-memory.md` owns RAM caps (different fact).

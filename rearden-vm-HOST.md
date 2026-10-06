@@ -37,7 +37,7 @@ what fill the disk.
 | Clean this target | On one branch, dep rlibs and incremental are the warm cache. On each `git switch -C`, `rm -rf target/dev/debug/incremental`. Do that mid-branch too when `debug/incremental` is multiple GiB: those files grow with every edit, and the old CGUs are not reused. `cargo clean` this session's target when the dep graph or `RUSTFLAGS` changed, or when `debug/deps` still holds hashed bins from the previous branch. That clean hits only this worktree. |
 | Other sessions | Do not `cargo clean` or delete another session's `target/`. A live session is a `/tmp/rbtc-*` worktree with a cargo or rustc whose cwd is that tree, or a held `target/.cargo-lock`. |
 | ENOSPC | Before the first cargo of a session, `df /`. Clean this session's incremental and stale dep bins first. Skip production-scale body tests (`sp_tweaks` and similar multi‑GiB `/tmp` files). Skip `cargo test --workspace` when free space is a few GiB. Never `./scripts/coverage.sh` here (`target/cov` is another silo). Targeted `-p` tests plus clippy are enough to push. |
-| No `cargo mutants` | Never run `cargo mutants` on this VM. A copy of the workspace build fills the root disk. Apply the missed operator by hand and `cargo test` the journey that should catch it ([`TESTING.md`](TESTING.md)). |
+| No `cargo mutants` | Never run `cargo mutants` on this VM. A copy of the workspace build fills the root disk. How to check a miss: [`TESTING.md`](TESTING.md). |
 | Session end | `git worktree remove` this session's `/tmp/rbtc-<session>` (that removes its `target/dev`). `rm -rf` the `/tmp/rbitcoin-*` test dirs this session created. |
 
 Do not change `shell.nix` / `flake.nix` defaults. Those stay

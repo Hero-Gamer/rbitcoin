@@ -119,11 +119,8 @@ checklist.
   “fix” flakes with `RUST_TEST_THREADS=1`.
   [`TESTING.md`](../TESTING.md).
 - **Default CI is the pin.** Unlabeled PRs: `cargo test`, not Core
-  functional. Coverage: production LCOV **≥ 92%** floor. Journey tests run
-  and already count the production lines they hit; their own lines stay out
-  of the ratio. CRAP `--fail-above 30`
-  with `.cargo-crap.toml` allowlist. Tests assert shipped behavior, not repo
-  text.
+  functional. Floor, CRAP, and what a test may assert:
+  [`TESTING.md`](../TESTING.md).
 - **Operator honesty:** experimental 0.x; milestone skip is loud; CLI/conf
   share `apply_kv`; dummy RPC numbers labeled or gone; COMPAT matches
   shipped surface (including Esplora `/txs/summary` as a dialect).

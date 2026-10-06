@@ -6,11 +6,11 @@
 |--------|--------|
 | **Journey scenarios**: one setup a peer, client, or operator could use, then a **sequence** of asserts on what they would observe | Many skinny scenarios that each remine maturity and re-open the store |
 | The socket, RPC, HTTP route, operator config, or scripted peer | An in-process helper the product never calls, or a thread-local the client does not share |
-| **A shrinking set of pure results.** One stays only when its return is the consensus or schema result and no peer, client, operator, or reopened store can show it without an absurd chain | A new pure unit for a result a session or the on-disk store can already show. Also units whose job is to execute a private branch, or that re-implement confirm and only paint lines a journey already hits |
+| A pure result only in the narrow case under [True journeys](#true-journeys) | A new pure unit a session or a reopened store can already show, or a unit whose job is a private branch |
 | **One entry** per production path (the journey owns the asserts) | A `#[test]` that only calls other tests, or those tests kept as private bodies |
 | Core JSON corpora for **script engine** breadth | A second parallel script suite |
 
-**Fewer scenario functions, fewer store opens, and fewer pure results, not less coverage** — put more asserts on one story. The pure-result set shrinks as a surface learns to show the result. Do not add to it.
+**Fewer scenario functions, fewer store opens, and fewer pure results, not less coverage** — put more asserts on one story. The pure-result rule is [True journeys](#true-journeys).
 
 ### True journeys
 
@@ -48,35 +48,21 @@ When adding or folding a pin:
 | Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
 | New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` |
 
-The coverage job stays at `LH*100 >= LF*92`. CRAP stays `--fail-above 30`.
-Delete a lower test only in a commit where a surface journey already hits
-those lines, so the ratio holds. When no surface can hit the lines, delete
-the production branch and the test that only painted it in that commit. The
-ratio holds because those lines leave `LF`.
-
-Do not add a test of a private helper to turn a coverage or CRAP failure
-green. Extend the catalog journey, or remove the branch and tighten the
-invariant ([`docs/invariants.md`](docs/invariants.md): a missing promised
-fact is `StoreError::Corrupt("invariant: …")`, no silent fallback).
+A coverage or CRAP miss is the catalog journey, or a deleted branch. The
+floor and the CRAP gate are under [Coverage](#coverage). A missing promised
+fact is `StoreError::Corrupt("invariant: …")`
+([`docs/invariants.md`](docs/invariants.md)).
 
 Internal witnesses still exist for store packed / v17 / fuse / scripthash
 machines, unsorted pack/lag, the IBD wave fence / 8×8000, scripthash
 write-behind / uring CAS, handshake format needles, `getaddr_cache_*`,
 sole-preferred stall, `stamp_reject_names_*`, `multi_hop_bad_prev_*`,
-structure s4–s7, s8's pre-segwit and nonce-size units, s12, and s14–s16,
-the rate-limiter,
-netgroup, and the subsidy table. Empty body, coinbase position, coinbase
-scriptSig length, a single output over `MAX_MONEY`, a coinbase with no
-outputs, and the legacy sigop cap are `submitblock` on
-`rpc_regtest_from_genesis` or `rpc_regtest_mature_chain_ops`. An equal-work
-sibling that never connects still reports `bad-blk-length`, `bad-cb-missing`,
-and `bad-cb-multiple` from `rpc_regtest_from_genesis`, and a resubmit is
-`duplicate-invalid`. A duplicate outpoint, a null non-coinbase prevout, two
-outputs that sum over `MAX_MONEY`, a missing witness commitment, and a
-mismatched witness commitment are `submitblock` on `rpc_regtest_from_genesis`.
-The next change that touches one of them applies the
-two rules above. It does not add another witness, and the list is not a
-permanent exception.
+the rate-limiter, netgroup, and the subsidy table. Which structure check
+already runs on `submitblock` is
+[`docs/consensus-tests.md`](docs/consensus-tests.md). Do not copy that
+matrix here. The next change that touches one of these witnesses applies
+the two rules above. It does not add another witness, and the list is not
+a permanent exception.
 Optional leftovers (more HTTP methods on `cross_surface`, a tiny
 legacy-head `Store::open` fixture, testnet 20-minute min-diff header walk)
 are not a backlog.
@@ -187,7 +173,7 @@ test bytes are RAM.
 | Package / binary (warm, order-of-magnitude) | Budget | Notes |
 |---------------------------------------------|-------:|-------|
 | `rbitcoin-store --lib` | **&lt;45 s** | Catalog-run fixtures stay tens of tiny files, not thousands |
-| `rbitcoin-consensus --lib` | **&lt;30 s** | Do not add a pure unit a session or a reopened store can show. Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
+| `rbitcoin-consensus --lib` | **&lt;30 s** | Pure-result rule: [True journeys](#true-journeys). Mainnet 866342 (~1.6 s) is the historical prevout pin — one zstd decode, overweight on a clone. |
 | `rbitcoin-query --lib` | **&lt;20 s** | |
 | `rbitcoin-test --test scenarios` | **&lt;15 s** | Prefer `pad_empty_from` / shared mature helpers |
 | **Full** `cargo test --workspace` | **≤3 min** warm | Stretch **&lt;2 min** |
@@ -284,12 +270,8 @@ counts that line.
    through a **shipped** config / error / CLI path. Do not add a `pub` or
    `*_for_test` injector so a unit can see it
    ([`CONTRIBUTING.md`](./CONTRIBUTING.md) principle 11).
-4. A small unit only when the function's return is the consensus or schema
-   result and a real session cannot reach it without an absurd chain — say
-   why in the test file. On-disk store state counts as a session result.
-   That set of pure results shrinks; do not add to it. Any other behavior
-   no session can trigger is deleted, not unit-tested. Drive the shipped
-   function, not a `#[cfg(test)]` wrapper around it.
+4. A small unit only for the narrow case in [True journeys](#true-journeys).
+   Drive the shipped function, not a `#[cfg(test)]` wrapper around it.
 
 ### Closing a red region
 
@@ -300,10 +282,9 @@ counts that line.
    are hit.
 4. A session cannot cause it: delete the branch. Re-run. The ratio rises or
    holds because `LF` fell.
-5. The function is pure consensus or schema math and the journey would need
-   an absurd chain: one unit on that shipped function, reason in the test.
-   Drive that function, not a `#[cfg(test)]` wrapper. If a reopened store
-   can show the result, it is case 3, not a new pure unit.
+5. The narrow pure-result case in [True journeys](#true-journeys): one unit
+   on that shipped function, reason in the test. A reopened store that can
+   show the result is case 3.
 6. Stop when the ratio is **≥ 92%**. Do not add a private-helper test to
    get there.
 
@@ -358,7 +339,7 @@ A cell that names a crate-local test describes the witness that exists today. It
 | `mempool_under_pressure` | Mempool + RPC (crate) | One entry in `orphanage`, `accept`, `tx_relay`, and `methods_tests`: orphan reserve and expiry, sigops before script, rolling fee floor, cluster cap, parked min-relay orphan, and the package RPC rejects (unsorted, missing inputs, conflict, min-relay parent with maxfeerate child). |
 | `sigop_adjusted_size_budget_and_reopen` | Mempool (crate) | One empty `ActiveMempool`: sigop-adjusted vsize (boundary, min relay, full-pool floor, RBF, package and 1p1c), the raw-weight cluster limit, the shared block sigop budget, and sigop cost plus bytes-per-sigop and reserve overlays across reopen and compact. Each beat restores an empty pool. |
 | `mempool_accept_life` | Mempool (crate) | One `ActiveMempool` against one chain view that blocks move. Orphan parks and re-announce, dry run not parked, parent promotes the child; missing vout, invalid parent, and block-spent coin reject without parking. Full RBF and no return, the staged commit failing closed on a conflict that landed after prepare, pure RBFR unpinning a child, replaced txs out of the cluster count; a ~30 kvB single tx under the vsize cap and the ten-way merge over it. Package order, CPFP, child fail restoring the RBF victim. A block evicts double-spent txs with descendants; a reorg readmits the parent and evicts the BIP68 and coinbase-maturity spends. Raised `-minrelaytxfee`: 1p1c needs a paying child, an unrelated tx does not ride the waiver, child fail takes a promoted spender down. Full pool: a protected lone worst chunk evicts nothing and leaves the floor, the next arrival evicts the CPFP pair together. |
-| `rpc_regtest_from_genesis` | RPC (crate) | One regtest hub from genesis through the first submits. At genesis: `size_on_disk` is the store walk, IBD comes from the hub and not the stale atomic, buried deployments, `generateblock submit=false` connects nothing, and the priority, mocktime, mockscheduler, submitheader decode, and not-found refuses. The first block pays a p2wpkh address: display-order hashes and txids, raw `getblock` and header, a headers-only child at progress 0.5. Mocktime stamps `generate` and makes a far block `time-too-new`. Coinbase-only blocks: verbosity 1 without a seqsigwit zip, `getnetworkhashps` over chainwork, the empty template and proposal needles, a `time-too-old` header, an invalid parent body that marks its branch, and the `submitblock` merkle, length, coinbase, duplicate, value, missing-input, `MAX_MONEY`, and coinbase-without-outputs rejects. Equal-work siblings of the tip report `bad-blk-length`, `bad-cb-missing`, and `bad-cb-multiple` (cached; resubmit is `duplicate-invalid`); a valid sibling stays `inconclusive`. The same hub checks coinbase scriptSig length, a wrong BIP34 height, and the 20_000 / 20_001 legacy sigop boundary. Duplicate outpoints (`bad-txns-inputs-duplicate`), a null non-coinbase prevout (`bad-txns-prevout-null`), two outputs summing over `MAX_MONEY` (`bad-txns-txouttotal-toolarge`), a witness with no commitment (`missing witness commitment`), and a commitment that does not match the witness merkle (`witness commitment mismatch`). |
+| `rpc_regtest_from_genesis` | RPC (crate) | One regtest hub from genesis through the first submits. At genesis: `size_on_disk` is the store walk, IBD comes from the hub and not the stale atomic, buried deployments, `generateblock submit=false` connects nothing, and the priority, mocktime, mockscheduler, submitheader decode, and not-found refuses. The first block pays a p2wpkh address: display-order hashes and txids, raw `getblock` and header, a headers-only child at progress 0.5. Mocktime stamps `generate` and makes a far block `time-too-new`. Coinbase-only blocks: verbosity 1 without a seqsigwit zip, `getnetworkhashps` over chainwork, the empty template and proposal needles, a `time-too-old` header, an invalid parent body that marks its branch, and the structure rejects named on this hub in [`docs/consensus-tests.md`](docs/consensus-tests.md) (S1–S3, S6's RPC `bad-txnmrklroot`, S8's missing and mismatched witness commitment, S9–S11, S13, S17, S18), including S1–S3 on an equal-work sibling. A resubmit of a rejected sibling is `duplicate-invalid`; a valid sibling stays `inconclusive`. |
 | `rpc_regtest_mature_chain_ops` | RPC (crate) | One regtest hub mined to height 130. The `nblocks=0` window, GBT fee and sigops (bare, P2SH, P2WSH), sigop-adjusted mempool vsize (`getmempoolentry`, package retry, `blockmintxfee`; weight and the Esplora/Electrum histogram stay raw) and a big-sigops cluster under the block budget, a non-DER spend with Core `reject-details`, deprioritise, `generateblock` reject shapes then parent-first mining, a premature coinbase, proposal spend/value/final needles against the chain, a repeated txid and a second coinbase, default and explicit `maxfeerate`, `testmempoolaccept` known vs mempool vs archived, invalidate and reconsider, and a parked sibling (held `getblock`, `preciousblock`). Last, a mainnet view of the same hub refuses the regtest-only methods and still takes `submitblock`. |
 | `block_cache_and_mempool_hub_surface` | Net | BlockCache locator/eviction + MempoolHub accept/remove/reorg on mature chain. Eviction uses body depth 16. |
 | `store_error_and_corrupt_paths` | Store | Error/corrupt surfaces |
@@ -639,7 +620,7 @@ catalog journey that should catch it, then restore the expression. The
 journey fails while the mutant is applied and passes once the expression
 is restored. That is the local proof. A package-only `cargo mutants` run
 is not the gate: a journey outside the mutated crate must be able to catch
-the mutant. The operator VM never runs `cargo mutants`; that host rule is
+the mutant. The operator VM never runs it; that disk rule is
 [`rearden-vm-HOST.md`](rearden-vm-HOST.md).
 
 A new production behavior still needs a test that fails when that behavior

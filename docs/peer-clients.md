@@ -95,54 +95,48 @@ folded into S03** (`ValidateInputPrevoutsUnspent`: an input must reference a
 prevout that exists and is still unspent). Wording nits only elsewhere (H02
 “MUST achieve” vs “MUST NOT exceed”; H04 “strictly greater”; H05 `<= now+2h`).
 
-This table is the Hornet checklist. Named rows for rules we own stay in
-[`consensus-tests.md`](./consensus-tests.md). Do not import Hornet DSL.
+This table is the Hornet checklist. The witness is the matrix ID in
+[`consensus-tests.md`](./consensus-tests.md). Do not copy test names or
+reject strings here. Do not import Hornet DSL. Selector:
+`./scripts/test-hornet-rules.sh`.
 
-Happy = accept at/under the limit. Boundary = exact limit accept + one-past
-reject (or the Core-equivalent edge). Tests live in the suites named in
-[`consensus-tests.md`](./consensus-tests.md) (`structure_rule_tests`,
-`header.rs` `median_time_past_tests`, `consensus_rules`, `finality_tests`,
-`sigop_cost_tests`). Named selector: `./scripts/test-hornet-rules.sh`.
-
-| ID | Hornet rule (`spec.h` / spec.html) | Happy | Boundary / reject |
-|----|-------------------------------------|-------|-------------------|
-| **H01** | Parent hash is a valid header | `header_and_spending_boundaries` (`validate_header` height 1) | `header_and_spending_boundaries` (`BadPrev`) |
-| **H02** | Header hash `<=` claimed target | same journey (regtest grind) | `h7_rejects_header_hash_above_target` (mainnet bits, nonce misses) |
-| **H03** | `nBits` matches difficulty adjust | same journey | `header_and_spending_boundaries` (wrong bits); testnet 20 min min-diff: `testnet_min_difficulty_after_20_minute_gap` |
-| **H04** | `time > MTP(11)` | journey: `mtp+1` accepts | journey: `time == mtp` rejects |
-| **H05** | `time <= now + 2h` | `h8_timestamp_exactly_two_hours_accepts_plus_one_rejects` (`now+7200`) | same test (`now+7201`); `h8_rejects_timestamp_too_far_in_future` |
-| **H06** | Version not retired by BIP34/66/65 | `h9_version_floors_at_bip34_66_65` (v2 @ BIP34, v3 @ BIP66, v4 @ BIP65 / regtest h=1) | same test (v1 @ BIP34, v2 @ BIP66, v3 @ BIP65 / regtest v3) |
-| **L01** | ≥1 transaction | `rpc_regtest_from_genesis` good `submitblock` | same (empty body → `bad-blk-length`, including an equal-work sibling) |
-| **L02** | Merkle root matches unique txid tree | `s6_rejects_merkle_root_mismatch` (matching accepts) | same; odd-leaf: `merkle_root_bytes_single_and_odd` |
-| **L03** | Stripped size `<= 1_000_000` | `s14_stripped_size_1_000_000_accepts_1_000_001_rejects` | same (`1_000_001`) |
-| **L04** | First tx is the only coinbase | `rpc_regtest_from_genesis` good `submitblock` | same (`bad-cb-missing`); second coinbase `rpc_regtest_mature_chain_ops` and an equal-work sibling on `rpc_regtest_from_genesis` (`bad-cb-multiple`) |
-| **L05** | Legacy sigop **count** `<= 20_000` | `rpc_regtest_from_genesis` (`20_000`) | same (`20_001` → `bad-blk-sigops`) |
-| **L06** | ≥1 input | `s15_rejects_empty_vin` (one input accepts) | same (empty `vin` on non-coinbase) |
-| **L07** | ≥1 output | `rpc_regtest_from_genesis` good `submitblock`; journey non-coinbase empty `vout` | same (coinbase with no outputs → `bad-txns-vout-empty`) |
-| **L08** | Tx stripped size `<= 1_000_000` | `s16_tx_stripped_size_1_000_000_accepts_1_000_001_rejects` | same (`check_tx_local`) |
-| **L09** | Output amounts non-negative | `rpc_regtest_from_genesis` good `submitblock` (subsidy in range) | rust-bitcoin `Amount` is `u64` — negative is unrepresentable |
-| **L10** | Output sum `<= 21e6` BTC | `rpc_regtest_from_genesis` submit of exactly `MAX_MONEY` (`bad-cb-amount`, not toolarge) | same (`MAX_MONEY+1` → `bad-txns-vout-toolarge`; two under-max outputs → `bad-txns-txouttotal-toolarge`) |
-| **L11** | No duplicate outpoints in a tx | `rpc_regtest_from_genesis` (unique inputs connect) | same (two identical prevouts → `bad-txns-inputs-duplicate`) |
-| **L12** | Coinbase scriptSig length `2..=100` | `rpc_regtest_from_genesis` (padded height push and 100 bytes) | same (under 2 and 101 → `bad-cb-length`) |
-| **L13** | Non-coinbase inputs non-null | `rpc_regtest_from_genesis` (non-null inputs connect) | same (null among two inputs → `bad-txns-prevout-null`) |
-| **C01** | All txs final at height / locktime | journey: `locktime=100` at height 101 | journey: `locktime==height` |
-| **C02** | Pre-SegWit block has no witness | `s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce` | `consensus_rules::header_and_spending_boundaries` (`unexpected witness before segwit`) |
-| **C03** | Weight `<= 4_000_000` WU | `s4_weight_4_000_000_accepts_4_000_001_rejects` (no-witness 4 M and witness 4 M) | same (`4_000_001` via +1 witness byte); `s4_rejects_overweight_block` |
-| **C04** | BIP34 coinbase height push | `s7_rejects_bip34_missing_after_activation_signet` (height push at activation) | same; `s7_*` activation / pre-activation |
-| **C05** | Witness data ⇒ commitment | `rpc_regtest_from_genesis` (no witness, no commitment) | same (witness, no commitment → `missing witness commitment`) |
-| **C06** | Commitment ⇒ 32-byte nonce | `s8_accepts_witness_commitment_with_reserved_value` | `s8_rejects_empty_or_multi_item_coinbase_witness_reserved` |
-| **C07** | Commitment matches witness merkle + nonce | `s8_accepts_witness_commitment_with_reserved_value` (`apply_witness_commitment`) | `rpc_regtest_from_genesis` (32-byte nonce, zero commitment → `witness commitment mismatch`) |
-| **S01** | BIP30 unique unspent creates | every connecting block; exception table `is_bip30_repeat_matches_core` (91842 / 91880) | `buried_rules_and_a_lying_header_path` |
-| **S02** | Prevout exists *(merged into S03 in `spec.h`)* | journey OP_TRUE spend of height-1 coinbase | journey: random txid → `MissingPrevout`; journey child-before-parent same-block |
-| **S03** | Prevout still unspent | journey first spend | journey second spend of same outpoint; journey same-block two spends |
-| **S04** | Sigop **cost** `<= 80_000` | `rpc_regtest_from_genesis` (20 000×CHECKSIG) | same (`20_001` → cost 80 004, `bad-blk-sigops`); `sigop_cost_tests::*` (P2SH/witness) |
-| **S05** | Coinbase `<=` subsidy + fees | journey exact 50 BTC empty pads; overlay interval=2 25 BTC; `p1_block_subsidy_halvings` | journey `subsidy+1` sat; overlay 50 BTC at interval |
-| **S06** | Tx `out <= in` | journey `in==out` (zero fee) | journey `in+1` |
-| **S07** | Scripts succeed | journey anyone-can-spend `OP_TRUE`; Core `script_tests` / `tx_valid` | Core `tx_invalid` / `script_tests` reject rows |
-| **S08** | BIP68 relative finality | journey `nSequence=10` at height 101; time-type after MTP clears; `bip68_height_relative_lock` | journey `nSequence=200` at 101; time-type just short; `finality_tests` 109/110 edge |
-| **S09** | Coinbase maturity 100 | journey spend at height 101 (`created+100`) | journey spend at height 100 |
-
-Connect-path journey: `rbitcoin-test` `header_and_spending_boundaries`.
+| ID | Hornet rule (`spec.h` / spec.html) | Our pin |
+|----|-------------------------------------|---------|
+| **H01** | Parent hash is a valid header | **H1**, **H2** |
+| **H02** | Header hash `<=` claimed target | **H7** |
+| **H03** | `nBits` matches difficulty adjust | **H5**; testnet 20 min gap **H10** |
+| **H04** | `time > MTP(11)` | **H3** |
+| **H05** | `time <= now + 2h` | **H8** |
+| **H06** | Version not retired by BIP34/66/65 | **H9** |
+| **L01** | ≥1 transaction | **S1** |
+| **L02** | Merkle root matches unique txid tree | **S6** |
+| **L03** | Stripped size `<= 1_000_000` | **S14** |
+| **L04** | First tx is the only coinbase | **S2**, **S3** |
+| **L05** | Legacy sigop **count** `<= 20_000` | Hornet counts sigops. We charge cost. **S11** |
+| **L06** | ≥1 input | **S15** |
+| **L07** | ≥1 output | **S13** |
+| **L08** | Tx stripped size `<= 1_000_000` | **S16** |
+| **L09** | Output amounts non-negative | `Amount` is `u64`, so a negative output is unrepresentable. The sum cap is **S10** |
+| **L10** | Output sum `<= 21e6` BTC | **S10** |
+| **L11** | No duplicate outpoints in a tx | **S17** |
+| **L12** | Coinbase scriptSig length `2..=100` | **S9** |
+| **L13** | Non-coinbase inputs non-null | **S18** |
+| **C01** | All txs final at height / locktime | **C36** |
+| **C02** | Pre-SegWit block has no witness | **S8** |
+| **C03** | Weight `<= 4_000_000` WU | **S4** |
+| **C04** | BIP34 coinbase height push | **S7** |
+| **C05** | Witness data ⇒ commitment | **S8** |
+| **C06** | Commitment ⇒ 32-byte nonce | **S8** |
+| **C07** | Commitment matches witness merkle + nonce | **S8** |
+| **S01** | BIP30 unique unspent creates | **C37** |
+| **S02** | Prevout exists *(merged into S03 in `spec.h`)* | **C38** |
+| **S03** | Prevout still unspent | **C38** |
+| **S04** | Sigop **cost** `<= 80_000` | Legacy count **S11**. P2SH and witness cost **S12** |
+| **S05** | Coinbase `<=` subsidy + fees | **C22** |
+| **S06** | Tx `out <= in` | **C40** |
+| **S07** | Scripts succeed | **C15**, **C16** |
+| **S08** | BIP68 relative finality | **C41** |
+| **S09** | Coinbase maturity 100 | **C28** |
 
 ### 4. satd E2E flake-gate
 

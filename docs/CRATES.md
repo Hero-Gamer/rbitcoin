@@ -22,7 +22,7 @@ shared libraries through storage and runtime crates to composition and tools;
 | `rbitcoin-test` | High-level scenario and integration-test harness |
 | `rbitcoin-bench` | Optional Electrum/Esplora client benchmark |
 
-For crate-specific boundaries and read-first rules, see
-`crates/<name>/AGENTS.md` when present. Test locations and suite selection are
+For crate neighbors and read-first links, see
+`crates/<name>/AGENTS.md` when present. Those files own no facts. Test locations and suite selection are
 in [`TESTING.md`](../TESTING.md). Agent task routing is in
 [`ORIENT.md`](./ORIENT.md).

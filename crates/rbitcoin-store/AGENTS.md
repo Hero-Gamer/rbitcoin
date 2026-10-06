@@ -24,14 +24,6 @@ Open the row that matches the change. Leave the other owners closed.
 - Heads: `src/hashhead.rs`, `src/header_table.rs`, `src/scripthash.rs`
 - Fixtures: `src/testutil.rs` (`TempDir`, `tiny_store`)
 
-## Rules here
-
-- No locks on the hot path.
-- No large process-resident body or pin caches (FIFO, LRU, or sticky residency).
-- Grow files with fallocate / `set_len` and a published high-water mark. No remap-epoch schemes.
-- Do not replace a purpose-built IO machine with batched `pread` / `pwrite` without asking.
-- Schema change in the same commit: soft migrate, bump, or refuse. Never a silent wipe.
-
 ## Verify
 
 `cargo test -p rbitcoin-store --lib`

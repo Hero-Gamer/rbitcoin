@@ -84,9 +84,9 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 | S3 | No later coinbase | `BadBlock("coinbase not first")` (`bad-cb-multiple`) | `rpc_regtest_mature_chain_ops` (`chain_ops_submit_repeated_txids`) and `rpc_regtest_from_genesis` (equal-work sibling); tip cache `chain::tests::hostile_peer_session` |
 | S4 | Weight ≤ 4_000_000 WU | `BadBlock("…weight…")` | `s4_rejects_overweight_block`, `s4_weight_4_000_000_accepts_4_000_001_rejects` |
 | S5 | Unique txids | `BadBlock("duplicate txid")` (`bad-txns-inputs-missingorspent`, as Core rejects the second copy at connect) | `structure_rule_tests::s5_rejects_duplicate_txid`; tip cache `chain::tests::hostile_peer_session` |
-| S6 | Merkle root matches txids, checked before every other body rule; a repeated tail (CVE-2012-2459) is mutated | `BadBlock("merkle root mismatch")`, `BadBlock("bad-txns-duplicate")` | `structure_rule_tests::s6_rejects_merkle_root_mismatch`, `body_rules_run_after_the_header_merkle_check` (+ `merkle_root_bytes_single_and_odd`; store `merkle_mutation_flags_a_repeated_tail_at_any_level`) |
+| S6 | Merkle root matches txids, checked before every other body rule; a repeated tail (CVE-2012-2459) is mutated | `BadBlock("merkle root mismatch")`, `BadBlock("bad-txns-duplicate")`; RPC `bad-txnmrklroot` | `structure_rule_tests::s6_rejects_merkle_root_mismatch`, `body_rules_run_after_the_header_merkle_check` (+ `merkle_root_bytes_single_and_odd`; store `merkle_mutation_flags_a_repeated_tail_at_any_level`; RPC `rpc_regtest_from_genesis`) |
 | S7 | BIP34 height in coinbase (h≥1) | `BadBlock("bip34…")` | `s7_rejects_bip34_missing_at_height_1`, `s7_bip34_not_required_at_height_0`, `s7_regtest_rejects_bip34_missing_at_height_1`, `s7_regtest_bip34_activation_height_override` |
-| S8 | Witness commitment when any witness; reject witness before SegWit activation | missing / mismatch / `BadBlock("unexpected witness before segwit")` | `rpc_regtest_from_genesis` (`missing witness commitment`, `witness commitment mismatch`); `s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce` (pre-segwit `aa21a9ed` is data); `consensus_rules::header_and_spending_boundaries` (connect-path `unexpected witness before segwit`) |
+| S8 | Witness commitment when any witness; a commitment needs a 32-byte nonce; reject witness before SegWit activation | missing / mismatch / `BadBlock("unexpected witness before segwit")` | `rpc_regtest_from_genesis` (`missing witness commitment`, `witness commitment mismatch`); `s8_accepts_witness_commitment_with_reserved_value` and `s8_rejects_empty_or_multi_item_coinbase_witness_reserved` (nonce); `s8_mainnet_accepts_pre_segwit_commitment_magic_without_nonce` (pre-segwit `aa21a9ed` is data); `consensus_rules::header_and_spending_boundaries` (connect-path `unexpected witness before segwit`) |
 | S9 | Coinbase scriptSig length 2..=100, after the merkle check | `bad-cb-length` | `rpc_regtest_from_genesis` (under 2 and 101 reject; a padded height push and 100 bytes connect); `short_coinbase_under_a_real_header_is_merkle_mismatch` |
 | S10 | Output value / sum ≤ MAX_MONEY | `toolarge` | `rpc_regtest_from_genesis` submit (`bad-txns-vout-toolarge` above MAX_MONEY; MAX_MONEY is `bad-cb-amount`; two under-max outputs sum to `bad-txns-txouttotal-toolarge`) |
 | S11 | Legacy sigops cost ≤ 80_000 | `bad-blk-sigops` | `rpc_regtest_from_genesis` (20_000 connect / 20_001 reject) |
@@ -98,7 +98,7 @@ header version/time, `finality_tests`, `sigop_cost_tests`,
 | S17 | No duplicate outpoints in a tx | `bad-txns-inputs-duplicate` | `rpc_regtest_from_genesis` |
 | S18 | Non-coinbase inputs non-null | `bad-txns-prevout-null` | `rpc_regtest_from_genesis` |
 
-Location: `crates/rbitcoin-consensus/src/block/structure_rule_tests.rs` for the rows that still name a unit there. S1, S2, S8's missing and mismatched witness commitment, S9, S10, S11, S13, S17, and S18 are `submitblock` on `rpc_regtest_from_genesis`, including S1–S3 on an equal-work sibling. S3 on a tip extend is `rpc_regtest_mature_chain_ops`.
+The Test column is the witness. Do not copy it into [`TESTING.md`](../TESTING.md) or [`peer-clients.md`](./peer-clients.md).
 
 ## B. Header — `validate_header` / helpers
 
@@ -123,7 +123,6 @@ version floors and exact +2h).
 
 | ID | Rule | Error signal | Test |
 |----|------|--------------|------|
-| C1–C14 | (see prior matrix) | … | structure / locktime / script unit tests |
 | C15 | Core `tx_valid` / `tx_invalid` | accept / reject at listed flags; valid still accepts with extra implemented flags off (FillFlags-implied bits skipped); invalid still rejects with extra **restriction** flags on (not P2SH/WITNESS/TAPROOT class changes) | `script::core_tx_vectors::*` |
 | C16 | Core `script_tests.json` | accept / reject | `script::core_vectors::core_script_tests_all_rows` |
 | C17 | Stack + altstack share `MAX_STACK_SIZE` | `stack size` | `stack_and_altstack_share_max_size_on_pushdata` ([022](./external_findings/022-stack-altstack-share-max-size.md)) |
@@ -142,6 +141,11 @@ version floors and exact +2h).
 | C33 | P2WPKH fast path (native + nested): strict DER only with DERSIG; witness element ≤ 520 | `PUSH_SIZE` / DER reject | `p2wpkh_der_follows_bip66_flag_and_push_size` |
 | C34 | Base CHECKMULTISIG FindAndDelete of an empty sig removes every OP_0 opcode before the other sigs hash scriptCode | accept / `SIG_DER` | `legacy_multisig_empty_sig_deletes_op_0_from_script_code` |
 | C35 | P2SH scriptPubKey `HASH160 <20> EQUAL` runs on the scriptSig stack: 1000 items fail `MAX_STACK_SIZE` at the `<20>` push, with or without BIP16 | `stack size` | `p2sh_script_pubkey_push_counts_against_max_stack_size` ([086](./external_findings/086-p2sh-spk-stack-size.md)) |
+| C36 | A tx is final at the connect height | `locktime=100` accepts at height 101; `locktime==height` rejects | `header_and_spending_boundaries` |
+| C37 | BIP30: a txid is not created again while an unspent output of that txid still exists. Exceptions 91842 and 91880 | every connecting block; `is_bip30_repeat_matches_core` | `buried_rules_and_a_lying_header_path` |
+| C38 | An input's prevout exists and is still unspent | height-1 coinbase spend accepts | missing txid → `MissingPrevout`; child-before-parent; a second spend of the same outpoint; two spends in one block. `header_and_spending_boundaries` |
+| C40 | A tx's output sum ≤ its input sum | `in==out` accepts | `in+1` rejects. `header_and_spending_boundaries` |
+| C41 | BIP68 relative finality | `nSequence=10` at height 101 accepts; time-type after MTP | `nSequence=200` at 101 rejects; `finality_tests` 109/110 |
 
 ## Adding a new rule
 

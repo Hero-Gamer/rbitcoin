@@ -15,12 +15,6 @@ Open the row that matches the change. Leave the other owners closed.
 | What operators can pass | [`OPERATOR.md`](../../OPERATOR.md) |
 | 0.8 mempool CORE_RPC over TCP + Core cookie (`--rpc-cookie-file`); unix `rpc.sock` optional | [`docs/operator/interfaces.md`](../../docs/operator/interfaces.md#mempoolspace-core_rpc), [`docs/rpc.md`](../../docs/rpc.md) |
 
-## Rules here
-
-- Document a new method in `docs/rpc.md` in the same change. Do not imply Core-complete RPC.
-- Do not invent `rpcuser` / `rpcpassword` (already refused).
-- Do not grow a `*_for_test` backdoor. Tests drive the shipped method.
-
 ## Verify
 
 `cargo test -p rbitcoin-rpc --lib`
