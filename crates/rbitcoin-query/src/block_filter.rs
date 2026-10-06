@@ -249,8 +249,87 @@ impl Query {
         &self,
         block: &Block,
     ) -> Result<(Vec<u8>, FilterHeader), QueryError> {
+        let spent = self.spent_scripts(block)?;
+        let filter = self.basic_filter_content(block, &spent)?;
+        let prev = self.parent_basic_filter_header(&block.header.prev_blockhash.to_byte_array())?;
+        let header = filter.filter_header(&prev);
+        Ok((filter.content.clone(), header))
+    }
+
+    fn basic_filter_content(
+        &self,
+        block: &Block,
+        spent: &[Vec<u8>],
+    ) -> Result<BlockFilter, QueryError> {
         let hash = block.block_hash().to_byte_array();
-        let mut spent: Vec<Vec<u8>> = Vec::new();
+        let outputs: Vec<&[u8]> = block
+            .txdata
+            .iter()
+            .flat_map(|tx| tx.output.iter().map(|o| o.script_pubkey.as_bytes()))
+            .collect();
+        let spent_refs: Vec<&[u8]> = spent.iter().map(|s| s.as_slice()).collect();
+        basic_filter_from_scripts(&hash, outputs, spent_refs)
+    }
+
+    /// Header of `prev_hash`. Zeros are only the genesis prev-header. A sealed
+    /// best-chain row is that row; every other stored block is rebuilt back
+    /// to the last sealed header, or to genesis, and linked in chain order.
+    fn parent_basic_filter_header(&self, prev_hash: &[u8; 32]) -> Result<FilterHeader, QueryError> {
+        if *prev_hash == [0u8; 32] {
+            return Ok(FilterHeader::from_byte_array([0u8; 32]));
+        }
+        let mut pending = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = *prev_hash;
+        let anchor = loop {
+            if cursor == [0u8; 32] {
+                break FilterHeader::from_byte_array([0u8; 32]);
+            }
+            if let Some(h) = self.height_of_hash(&cursor)? {
+                if let Some((_, header)) = self.basic_filter_at(h.0)? {
+                    break header;
+                }
+            }
+            if !seen.insert(cursor) {
+                return Err(StoreError::Corrupt("invariant: blockfilter header cycle"));
+            }
+            pending.push(cursor);
+            cursor = self.prev_header_hash(&cursor)?;
+        };
+        let mut header = anchor;
+        for hash in pending.iter().rev() {
+            let block = self.block_for_basic_filter(hash)?;
+            let spent = self.spent_scripts(&block)?;
+            let filter = self.basic_filter_content(&block, &spent)?;
+            header = filter.filter_header(&header);
+        }
+        Ok(header)
+    }
+
+    fn prev_header_hash(&self, hash: &[u8; 32]) -> Result<[u8; 32], QueryError> {
+        let Some((_, rec)) = self.get_header_by_hash(hash)? else {
+            return Err(StoreError::Corrupt(
+                "invariant: blockfilter parent header missing",
+            ));
+        };
+        if rec.prev_fk.is_null() {
+            return Ok([0u8; 32]);
+        }
+        Ok(self.get_header(rec.prev_fk)?.hash)
+    }
+
+    fn block_for_basic_filter(&self, hash: &[u8; 32]) -> Result<Block, QueryError> {
+        if let Some(h) = self.height_of_hash(hash)? {
+            return self.reconstruct_block_at_height(h);
+        }
+        self.reconstruct_archived_block(hash)?
+            .ok_or(StoreError::Corrupt(
+                "invariant: blockfilter parent body missing",
+            ))
+    }
+
+    fn spent_scripts(&self, block: &Block) -> Result<Vec<Vec<u8>>, QueryError> {
+        let mut spent = Vec::new();
         for tx in &block.txdata {
             for inp in &tx.input {
                 if inp.previous_output == OutPoint::null() {
@@ -266,28 +345,7 @@ impl Query {
                 spent.push(out.script);
             }
         }
-        let outputs: Vec<&[u8]> = block
-            .txdata
-            .iter()
-            .flat_map(|tx| tx.output.iter().map(|o| o.script_pubkey.as_bytes()))
-            .collect();
-        let spent_refs: Vec<&[u8]> = spent.iter().map(|s| s.as_slice()).collect();
-        let filter = basic_filter_from_scripts(&hash, outputs, spent_refs)?;
-        let prev = self.parent_basic_filter_header(&block.header.prev_blockhash.to_byte_array())?;
-        let header = filter.filter_header(&prev);
-        Ok((filter.content.clone(), header))
-    }
-
-    fn parent_basic_filter_header(&self, prev_hash: &[u8; 32]) -> Result<FilterHeader, QueryError> {
-        if *prev_hash == [0u8; 32] {
-            return Ok(FilterHeader::from_byte_array([0u8; 32]));
-        }
-        if let Some(h) = self.height_of_hash(prev_hash)? {
-            if let Some((_, header)) = self.basic_filter_at(h.0)? {
-                return Ok(header);
-            }
-        }
-        Ok(FilterHeader::from_byte_array([0u8; 32]))
+        Ok(spent)
     }
 
     /// Filter bytes and header at `height`. `None` past the watermark.

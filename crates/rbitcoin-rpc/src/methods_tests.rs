@@ -213,10 +213,22 @@ fn signet_reports_default_challenge_and_unknown_filtertype_is_minus_five() {
     let _ = std::fs::remove_dir_all(&dir_signet);
 }
 
-#[test]
-fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
+fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
     use bitcoin::bip158::{BlockFilter, FilterHeader};
     use bitcoin::hashes::Hash;
+    let parent = FilterHeader::from_byte_array(
+        rbitcoin_primitives::hex_decode(parent_header_hex)
+            .unwrap()
+            .try_into()
+            .unwrap(),
+    );
+    let filter = BlockFilter::new(&rbitcoin_primitives::hex_decode(filter_hex).unwrap());
+    rbitcoin_primitives::hex_encode(filter.filter_header(&parent).as_byte_array())
+}
+
+#[test]
+fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
+    use bitcoin::bip158::BlockFilter;
 
     let (ctx, dir, _hub) = ctx_regtest_hub();
     let (hex, _spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
@@ -231,12 +243,51 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
 
     let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
     let height1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
     let g = dispatch(&ctx, "getblockfilter", vec![genesis.clone()]).unwrap();
     let one_before = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap();
+    let two_before = dispatch(&ctx, "getblockfilter", vec![height2]).unwrap();
     let tip_before = dispatch(&ctx, "getblockfilter", vec![tip.clone()]).unwrap();
     assert!(
         tip_before["filter"].as_str().unwrap().len() > 2,
         "{tip_before}"
+    );
+    let zero = "00".repeat(32);
+    assert_eq!(
+        g["header"],
+        json!(filter_header_hex(g["filter"].as_str().unwrap(), &zero)),
+        "genesis filter header chains from the zero prev-header"
+    );
+    assert_eq!(
+        one_before["header"],
+        json!(filter_header_hex(
+            one_before["filter"].as_str().unwrap(),
+            g["header"].as_str().unwrap(),
+        )),
+        "height 1 chains from the genesis filter header before anything is sealed, got {one_before}"
+    );
+    assert_eq!(
+        two_before["header"],
+        json!(filter_header_hex(
+            two_before["filter"].as_str().unwrap(),
+            one_before["header"].as_str().unwrap(),
+        )),
+        "height 2 chains through an unsealed parent, got {two_before}"
+    );
+    let tip_block = dispatch(&ctx, "getblock", vec![tip.clone()]).unwrap();
+    let parent_before = dispatch(
+        &ctx,
+        "getblockfilter",
+        vec![tip_block["previousblockhash"].clone()],
+    )
+    .unwrap();
+    assert_eq!(
+        tip_before["header"],
+        json!(filter_header_hex(
+            tip_before["filter"].as_str().unwrap(),
+            parent_before["header"].as_str().unwrap(),
+        )),
+        "tip chains from its unsealed parent, got {tip_before}"
     );
 
     let body = rbitcoin_primitives::hex_decode(g["filter"].as_str().unwrap()).unwrap();
@@ -258,24 +309,9 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
 
     let one = dispatch(&ctx, "getblockfilter", vec![height1]).unwrap();
     assert_eq!(one["filter"], one_before["filter"]);
-    assert_ne!(
-        one["header"], one_before["header"],
-        "sealing the parent must change the child filter header"
-    );
-    let parent = FilterHeader::from_byte_array(
-        rbitcoin_primitives::hex_decode(g["header"].as_str().unwrap())
-            .unwrap()
-            .try_into()
-            .unwrap(),
-    );
-    let child = BlockFilter::new(
-        &rbitcoin_primitives::hex_decode(one["filter"].as_str().unwrap()).unwrap(),
-    );
     assert_eq!(
-        one["header"],
-        json!(rbitcoin_primitives::hex_encode(
-            child.filter_header(&parent).as_byte_array()
-        ))
+        one["header"], one_before["header"],
+        "sealing the parent must not change the child filter header"
     );
 
     dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
@@ -283,6 +319,10 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     assert_eq!(
         stale["filter"], tip_before["filter"],
         "a stored block off the best chain still has a basic filter"
+    );
+    assert_eq!(
+        stale["header"], tip_before["header"],
+        "a stale block keeps the same BIP157 header, got {stale}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

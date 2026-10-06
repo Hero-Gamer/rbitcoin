@@ -7,8 +7,10 @@ Fixed
   solution failure is reported as `bad-signet-blksig`.
 - **`getblockfilter` serves a stored block that is not sealed yet.** A
   best-chain height already in the index still uses that row. A known
-  block that is stale or not sealed is rebuilt from the body. An unknown
-  `filtertype` is `-5`. REST `/rest/blockfilter/` stays watermark-only.
+  block that is stale or not sealed is rebuilt from the body, and its
+  header is the BIP157 chain from the last sealed header or from genesis.
+  An unknown `filtertype` is `-5`. REST `/rest/blockfilter/` stays
+  watermark-only.
 - **`submitpackage` package-evaluates a child-with-parents remainder.**
   Members that failed static min relay, the dynamic mempool floor, or
   missing inputs are retried together, including when the child spends a
