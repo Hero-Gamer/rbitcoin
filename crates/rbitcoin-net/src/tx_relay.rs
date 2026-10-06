@@ -2616,6 +2616,8 @@ impl MempoolHub {
     }
 
     /// `wtxid` records that this announcement is a wtxid inv.
+    /// [`ParentNote::RequestNow`] is the one in-flight getdata.
+    /// [`ParentNote::Deferred`] is recorded and not asked yet.
     /// [`ParentNote::PeerCapped`] is this peer's own cap. [`ParentNote::GlobalFull`]
     /// skips the row and is not misbehavior.
     pub(crate) fn note_inv_tx_requested(
@@ -2634,6 +2636,10 @@ impl MempoolHub {
 
     pub(crate) fn forget_parent_anns_for_peer(&self, peer: u64) {
         self.parent_req.lock().unwrap().forget_peer(peer);
+    }
+
+    pub(crate) fn note_tx_not_found(&self, peer: u64, hash: [u8; 32]) {
+        self.parent_req.lock().unwrap().note_not_found(peer, hash);
     }
 
     pub(crate) fn announcer_peers_for(&self, txid: &Txid, wtxid: &Wtxid) -> Vec<u64> {
@@ -5222,7 +5228,7 @@ mod tests {
             if i < cap as u32 {
                 assert_eq!(
                     accepted,
-                    ParentNote::Accepted,
+                    ParentNote::RequestNow,
                     "announcement {i} under the cap"
                 );
             } else {
@@ -5250,7 +5256,7 @@ mod tests {
         while n < global {
             assert_eq!(
                 hub.note_inv_tx_requested(peer, parent_hash(n), false, 1_000, false),
-                ParentNote::Accepted
+                ParentNote::RequestNow
             );
             n += 1;
             if n.is_multiple_of(per_peer) {
@@ -5277,7 +5283,7 @@ mod tests {
         let wtxid = Wtxid::from_byte_array(hash);
         assert_eq!(
             hub.note_inv_tx_requested(1, hash, false, 1_000, false),
-            ParentNote::Accepted
+            ParentNote::RequestNow
         );
         hub.note_recent_reject(wtxid);
         assert_eq!(hub.announcer_peers_for(&txid, &wtxid), vec![1]);
@@ -5292,6 +5298,39 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_makes_the_waiting_wtxid_peer_due() {
+        let dir = tmp();
+        let store_dir = tmp();
+        let q = Query::open_or_create_tiny(&store_dir).unwrap();
+        let hub = MempoolHub::open(&dir, Arc::new(q)).unwrap();
+        let hash = [0xde; 32];
+        let now = 1_000u64;
+        assert_eq!(
+            hub.note_inv_tx_requested(1, hash, true, now, true),
+            ParentNote::RequestNow
+        );
+        assert_eq!(
+            hub.note_inv_tx_requested(3, hash, true, now, true),
+            ParentNote::Deferred
+        );
+        assert!(
+            hub.take_due_parent_getdata(3, now).is_empty(),
+            "the second announcer waits out the in-flight window"
+        );
+        hub.forget_parent_anns_for_peer(1);
+        let due = hub.take_due_parent_getdata(3, now);
+        assert_eq!(
+            due.len(),
+            1,
+            "disconnect of the in-flight peer makes the waiter due immediately"
+        );
+        assert_eq!(due[0].hash, hash);
+        assert!(due[0].wtxid);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[test]
     fn wtxid_followup_is_requested_as_wtx() {
         let dir = tmp();
         let store_dir = tmp();
@@ -5300,12 +5339,12 @@ mod tests {
         let hash = [0xab; 32];
         assert_eq!(
             hub.note_inv_tx_requested(1, hash, false, 1_000, true),
-            ParentNote::Accepted
+            ParentNote::RequestNow
         );
         assert_eq!(
             hub.note_inv_tx_requested(3, hash, false, 1_000, true),
-            ParentNote::Accepted,
-            "the wtxid follow-up is its own row"
+            ParentNote::Deferred,
+            "the wtxid follow-up is its own row and is not a second getdata"
         );
         let missing = BTreeSet::from([Txid::from_byte_array(hash)]);
         hub.schedule_orphan_parents(&missing, 2, false, 1_000);
@@ -5342,7 +5381,7 @@ mod tests {
         hub.schedule_orphan_parents(&missing, 2, false, t0);
         assert_eq!(
             hub.note_inv_tx_requested(2, hash, false, t0, true),
-            ParentNote::Accepted,
+            ParentNote::RequestNow,
             "the same peer's wtxid inv is a second announcement"
         );
         let due = t0 + TXID_RELAY_DELAY_SECS;

@@ -3265,6 +3265,105 @@ async fn inv_getdata_charges_send_budget() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A notfound for the in-flight wtxid makes the waiting announcer due now.
+#[tokio::test]
+async fn notfound_makes_the_waiting_wtxid_peer_due() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("wtx-notfound");
+    hub.ensure_genesis().unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+        .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let peers = crate::peers::PeerHub::new();
+    let peer1 = inbound_peer(&peers);
+    let peer2 = inbound_peer(&peers);
+    let wtxid = bitcoin::Wtxid::from_byte_array([0xef; 32]);
+    let inv = [Inventory::WTx(wtxid)];
+    let noted = peer1.clock_now();
+    let (tx1, mut rx1) = mpsc::unbounded_channel();
+    let (tx2, _rx2) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    on_inv(&hub, &tx1, &mut follow, Some(&peer1), &inv).unwrap();
+    on_inv(&hub, &tx2, &mut follow, Some(&peer2), &inv).unwrap();
+    assert!(matches!(
+        rx1.try_recv().unwrap().expect_msg(),
+        NetworkMessage::GetData(_)
+    ));
+    handle_peer_inventory_msg(
+        &NetworkMessage::NotFound(vec![Inventory::WTx(wtxid)]),
+        &hub,
+        &tx1,
+        &mut follow,
+        Some(&peer1),
+    )
+    .unwrap();
+    let mp = hub.mempool().unwrap();
+    let due = mp.take_due_parent_getdata(peer2.id, noted);
+    assert_eq!(
+        due.len(),
+        1,
+        "notfound from the in-flight peer makes the waiter due immediately"
+    );
+    assert!(due[0].wtxid);
+    assert_eq!(due[0].hash, wtxid.to_byte_array());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Two inbound peers announce the same unknown wtxid. Only the first is
+/// asked. The second stays queued until that request's interval ends.
+#[tokio::test]
+async fn second_wtxid_inv_waits_while_first_request_is_inflight() {
+    use bitcoin::hashes::Hash;
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("wtx-one-inflight");
+    hub.ensure_genesis().unwrap();
+    let t = hub.tip_header().unwrap().time;
+    hub.clock.set_mock(i64::from(t) + 1);
+    assert!(!hub.in_ibd(), "wtxid inv getdata pin is not IBD");
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+        .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(mp).is_ok());
+    let peers = crate::peers::PeerHub::new();
+    let peer1 = inbound_peer(&peers);
+    let peer2 = inbound_peer(&peers);
+    let wtxid = bitcoin::Wtxid::from_byte_array([0xee; 32]);
+    let inv = [Inventory::WTx(wtxid)];
+    let noted = peer1.clock_now();
+    let (tx1, mut rx1) = mpsc::unbounded_channel();
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    on_inv(&hub, &tx1, &mut follow, Some(&peer1), &inv).unwrap();
+    on_inv(&hub, &tx2, &mut follow, Some(&peer2), &inv).unwrap();
+    match rx1.try_recv().unwrap().expect_msg() {
+        NetworkMessage::GetData(v) => {
+            assert_eq!(v, vec![Inventory::WTx(wtxid)]);
+        }
+        other => panic!("first announcer must be asked, got {other:?}"),
+    }
+    assert!(
+        rx2.try_recv().is_err(),
+        "a second announcer is not asked while the first request is in flight"
+    );
+    let mp = hub.mempool().unwrap();
+    let due = mp.take_due_parent_getdata(
+        peer2.id,
+        noted.saturating_add(crate::tx_relay::GETDATA_TX_INTERVAL_SECS + 2),
+    );
+    assert_eq!(
+        due.len(),
+        1,
+        "after the interval the waiting peer is selected"
+    );
+    assert!(due[0].wtxid);
+    assert_eq!(due[0].hash, wtxid.to_byte_array());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A full process-wide parent table skips a new announcement. The peer stays
 /// connected, and getdata / getheaders already collected in that inv still go out.
 #[tokio::test]
@@ -3287,7 +3386,7 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
     let keep = [0x42; 32];
     assert_eq!(
         mp.note_inv_tx_requested(peer.id, keep, true, 1_000, false),
-        crate::tx_relay::ParentNote::Accepted
+        crate::tx_relay::ParentNote::RequestNow
     );
     let mut n = 0u32;
     let mut filler = peer.id.saturating_add(1);
@@ -3296,13 +3395,16 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
         let mut hash = [0u8; 32];
         hash[..4].copy_from_slice(&n.to_le_bytes());
         match mp.note_inv_tx_requested(filler, hash, false, 1_000, false) {
-            crate::tx_relay::ParentNote::Accepted => {
+            crate::tx_relay::ParentNote::RequestNow => {
                 n += 1;
                 per_peer += 1;
                 if per_peer == 5_000 {
                     filler += 1;
                     per_peer = 0;
                 }
+            }
+            crate::tx_relay::ParentNote::Deferred => {
+                panic!("a fresh hash is the in-flight request");
             }
             crate::tx_relay::ParentNote::GlobalFull => break,
             crate::tx_relay::ParentNote::PeerCapped => {
@@ -3337,10 +3439,22 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
         }
     }
     assert!(saw_headers, "block inv still requests headers");
-    assert_eq!(
-        getdata,
-        vec![kept],
-        "getdata already collected is sent, and the refused announcement is not"
+    assert!(
+        getdata.is_empty(),
+        "an in-flight announcement is not asked again, and a full table skips the new one"
+    );
+    let keep_txid = Txid::from_byte_array(keep);
+    let fresh_txid = Txid::from_byte_array([0x77; 32]);
+    let mp = hub.mempool().unwrap();
+    assert!(
+        mp.announcer_peers_for(&keep_txid, &bitcoin::Wtxid::from_byte_array(keep))
+            .contains(&peer.id),
+        "the announcement recorded before the table filled stays"
+    );
+    assert!(
+        mp.announcer_peers_for(&fresh_txid, &bitcoin::Wtxid::from_byte_array([0x77; 32]))
+            .is_empty(),
+        "a full table does not record the new announcement"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
