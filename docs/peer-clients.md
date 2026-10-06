@@ -121,17 +121,17 @@ reject (or the Core-equivalent edge). Tests live in the suites named in
 | **L07** | ≥1 output | `rpc_regtest_from_genesis` good `submitblock`; journey non-coinbase empty `vout` | same (coinbase with no outputs → `bad-txns-vout-empty`) |
 | **L08** | Tx stripped size `<= 1_000_000` | `s16_tx_stripped_size_1_000_000_accepts_1_000_001_rejects` | same (`check_tx_local`) |
 | **L09** | Output amounts non-negative | `rpc_regtest_from_genesis` good `submitblock` (subsidy in range) | rust-bitcoin `Amount` is `u64` — negative is unrepresentable |
-| **L10** | Output sum `<= 21e6` BTC | `rpc_regtest_from_genesis` submit of exactly `MAX_MONEY` (`bad-cb-amount`, not toolarge) | same (`MAX_MONEY+1` → `bad-txns-vout-toolarge`); two under-max outputs: `s10_rejects_txouttotal_toolarge` |
-| **L11** | No duplicate outpoints in a tx | `s17_rejects_duplicate_outpoints` (unique inputs accept) | same (two identical prevouts) |
+| **L10** | Output sum `<= 21e6` BTC | `rpc_regtest_from_genesis` submit of exactly `MAX_MONEY` (`bad-cb-amount`, not toolarge) | same (`MAX_MONEY+1` → `bad-txns-vout-toolarge`; two under-max outputs → `bad-txns-txouttotal-toolarge`) |
+| **L11** | No duplicate outpoints in a tx | `rpc_regtest_from_genesis` (unique inputs connect) | same (two identical prevouts → `bad-txns-inputs-duplicate`) |
 | **L12** | Coinbase scriptSig length `2..=100` | `rpc_regtest_from_genesis` (padded height push and 100 bytes) | same (under 2 and 101 → `bad-cb-length`) |
-| **L13** | Non-coinbase inputs non-null | `s18_rejects_non_coinbase_null_prevout` (non-null accepts) | same (null among two inputs) |
+| **L13** | Non-coinbase inputs non-null | `rpc_regtest_from_genesis` (non-null inputs connect) | same (null among two inputs → `bad-txns-prevout-null`) |
 | **C01** | All txs final at height / locktime | journey: `locktime=100` at height 101 | journey: `locktime==height` |
 | **C02** | Pre-SegWit block has no witness | `s8_mainnet_rejects_witness_before_segwit` (no-witness accepts) | same (witness before segwit) |
 | **C03** | Weight `<= 4_000_000` WU | `s4_weight_4_000_000_accepts_4_000_001_rejects` (no-witness 4 M and witness 4 M) | same (`4_000_001` via +1 witness byte); `s4_rejects_overweight_block` |
 | **C04** | BIP34 coinbase height push | `s7_rejects_bip34_missing_after_activation_signet` (height push at activation) | same; `s7_*` activation / pre-activation |
-| **C05** | Witness data ⇒ commitment | `s8_rejects_missing_witness_commitment` (no witness, no commitment) | same (witness, no commitment) |
+| **C05** | Witness data ⇒ commitment | `rpc_regtest_from_genesis` (no witness, no commitment) | same (witness, no commitment → `missing witness commitment`) |
 | **C06** | Commitment ⇒ 32-byte nonce | `s8_accepts_witness_commitment_with_reserved_value` | `s8_rejects_empty_or_multi_item_coinbase_witness_reserved` |
-| **C07** | Commitment matches witness merkle + nonce | same accept test (`apply_witness_commitment`) | `s8_rejects_wrong_witness_commitment` |
+| **C07** | Commitment matches witness merkle + nonce | `s8_accepts_witness_commitment_with_reserved_value` (`apply_witness_commitment`) | `rpc_regtest_from_genesis` (32-byte nonce, zero commitment → `witness commitment mismatch`) |
 | **S01** | BIP30 unique unspent creates | every connecting block; exception table `is_bip30_repeat_matches_core` (91842 / 91880) | `buried_rules_and_a_lying_header_path` |
 | **S02** | Prevout exists *(merged into S03 in `spec.h`)* | journey OP_TRUE spend of height-1 coinbase | journey: random txid → `MissingPrevout`; journey child-before-parent same-block |
 | **S03** | Prevout still unspent | journey first spend | journey second spend of same outpoint; journey same-block two spends |

@@ -85,6 +85,7 @@ fn rpc_regtest_from_genesis() {
     chain_ops_submit_rejects(&ctx, &hub, &p2wpkh);
     chain_ops_equal_work_sibling_checkblock(&ctx, &hub);
     chain_ops_coinbase_script_and_sigops(&ctx, &hub, &p2wpkh);
+    chain_ops_submit_tx_shape(&ctx, &hub, &p2wpkh);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -816,6 +817,110 @@ fn chain_ops_coinbase_script_and_sigops(
     sig_bad.header.merkle_root = sig_bad.compute_merkle_root().unwrap();
     regrind(&mut sig_bad);
     assert_eq!(submit(&sig_bad), "bad-blk-sigops");
+}
+
+/// Tx-shape and witness-commitment rejects. None of these connect.
+fn chain_ops_submit_tx_shape(
+    ctx: &RpcContext,
+    hub: &rbitcoin_net::ChainHub,
+    p2wpkh: &ScriptBuf,
+) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{OutPoint, Sequence, TxIn, TxOut, Witness};
+    let submit = |block: &Block| dispatch(ctx, "submitblock", vec![json!(block_hex(block))]).unwrap();
+    let next = |extra: Vec<Transaction>| {
+        let h = tip_count(ctx) as u32 + 1;
+        let time = hub.tip_header().unwrap().time + 1;
+        rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            time,
+            h,
+            p2wpkh.clone(),
+            extra,
+        )
+    };
+    let tx_in = |prev: OutPoint| TxIn {
+        previous_output: prev,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    let one_out = |sat: u64| {
+        vec![TxOut {
+            value: Amount::from_sat(sat),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }]
+    };
+    let bare = |input: Vec<TxIn>, output: Vec<TxOut>| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input,
+        output,
+    };
+    let op = OutPoint {
+        txid: Txid::from_byte_array([3; 32]),
+        vout: 0,
+    };
+    let before = tip_count(ctx);
+    assert_eq!(
+        submit(&next(vec![bare(vec![tx_in(op), tx_in(op)], one_out(1))])),
+        "bad-txns-inputs-duplicate"
+    );
+    let mixed = bare(
+        vec![
+            tx_in(OutPoint {
+                txid: Txid::from_byte_array([4; 32]),
+                vout: 0,
+            }),
+            tx_in(OutPoint::null()),
+        ],
+        one_out(1),
+    );
+    assert_eq!(submit(&next(vec![mixed])), "bad-txns-prevout-null");
+
+    // Each output is under MAX_MONEY. The sum is not.
+    let half = 11_000_000 * 100_000_000;
+    let mut sum = next(vec![]);
+    sum.txdata[0].output = vec![
+        TxOut {
+            value: Amount::from_sat(half),
+            script_pubkey: p2wpkh.clone(),
+        },
+        TxOut {
+            value: Amount::from_sat(half),
+            script_pubkey: p2wpkh.clone(),
+        },
+    ];
+    sum.header.merkle_root = sum.compute_merkle_root().unwrap();
+    regrind(&mut sum);
+    assert_eq!(submit(&sum), "bad-txns-txouttotal-toolarge");
+
+    let spend = bare(
+        vec![tx_in(OutPoint {
+            txid: Txid::from_byte_array([9; 32]),
+            vout: 0,
+        })],
+        one_out(1),
+    );
+    let mut missing = next(vec![spend.clone()]);
+    missing.txdata[1].input[0].witness = Witness::from_slice(&[vec![0x01]]);
+    assert_eq!(submit(&missing), "missing witness commitment");
+
+    // A 32-byte nonce with a commitment of zeros is not the witness merkle.
+    let mut wrong = next(vec![spend]);
+    wrong.txdata[1].input[0].witness = Witness::from_slice(&[vec![0x02]]);
+    wrong.txdata[0].input[0].witness = Witness::from_slice(&[[0x11u8; 32]]);
+    let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    spk.extend([0u8; 32]);
+    wrong.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(spk),
+    });
+    wrong.header.merkle_root = wrong.compute_merkle_root().unwrap();
+    regrind(&mut wrong);
+    assert_eq!(submit(&wrong), "witness commitment mismatch");
+    assert_eq!(tip_count(ctx), before);
 }
 
 /// Past 120 blocks and short of the 144 retarget window.

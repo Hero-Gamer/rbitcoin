@@ -784,39 +784,6 @@ fn s7_regtest_bip34_activation_height_override() {
     assert_bad_block(err, "bip34");
 }
 
-#[test]
-fn s8_rejects_missing_witness_commitment() {
-    validate_block_structure(&block_with(vec![coinbase(1)]), &ctx_h(1))
-        .expect("no witness, no commitment");
-    let mut spend = non_coinbase_spend(9);
-    // Non-empty witness forces BIP141 commitment path.
-    spend.input[0].witness = Witness::from_slice(&[vec![0x01]]);
-    let b = block_with(vec![coinbase(1), spend]);
-    // coinbase has no aa21a9ed output
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert_bad_block(err, "witness commitment");
-}
-
-#[test]
-fn s8_rejects_wrong_witness_commitment() {
-    let mut spend = non_coinbase_spend(10);
-    spend.input[0].witness = Witness::from_slice(&[vec![0x02]]);
-    let mut cb = coinbase(1);
-    // Fake commitment: OP_RETURN magic + zeros
-    let mut spk = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    spk.extend([0u8; 32]);
-    cb.output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(spk),
-    });
-    let b = block_with(vec![cb, spend]);
-    let err = validate_block_structure(&b, &ctx_h(1)).unwrap_err();
-    assert!(
-        matches!(err, ConsensusError::BadBlock(s) if s.contains("witness")),
-        "got {err:?}"
-    );
-}
-
 /// Core `CheckWitnessMalleation` only when SegWit is active. Pre-segwit
 /// `aa21a9ed` OP_RETURN is data (mainnet 434499), not a BIP141 nonce demand.
 #[test]
@@ -1016,26 +983,6 @@ fn p3_default_milestone_heights() {
     );
     assert!(crate::default_milestone_anchor(Network::Signet).is_none());
     assert!(crate::default_milestone_anchor(Network::Regtest).is_none());
-}
-
-#[test]
-fn s10_rejects_txouttotal_toolarge() {
-    // Two outputs each under MAX_MONEY but sum over.
-    let half = 11_000_000 * 100_000_000u64; // 11M BTC each
-    let mut cb = coinbase(0);
-    cb.output = vec![
-        TxOut {
-            value: Amount::from_sat(half),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        },
-        TxOut {
-            value: Amount::from_sat(half),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        },
-    ];
-    let b = block_with(vec![cb]);
-    let err = validate_block_structure(&b, &ctx_h(0)).unwrap_err();
-    assert_bad_block(err, "txouttotal");
 }
 
 #[test]
@@ -2624,45 +2571,6 @@ fn s16_tx_stripped_size_1_000_000_accepts_1_000_001_rejects() {
 }
 
 #[test]
-fn s17_rejects_duplicate_outpoints() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
-    let op = OutPoint {
-        txid: bitcoin::Txid::from_byte_array([3; 32]),
-        vout: 0,
-    };
-    let dup = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![
-            TxIn {
-                previous_output: op,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            },
-            TxIn {
-                previous_output: op,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            },
-        ],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    assert_bad_tx(
-        validate_block_structure(&block_with(vec![coinbase(0), dup]), &ctx_h(0)).unwrap_err(),
-        "duplicate",
-    );
-}
-
-#[test]
 fn s17_many_unique_outpoints_accept() {
     let mut input = Vec::with_capacity(64);
     for i in 0..64u32 {
@@ -2688,44 +2596,6 @@ fn s17_many_unique_outpoints_accept() {
         }],
     };
     check_tx_local(&many, many.base_size()).expect("64 unique inputs");
-}
-
-#[test]
-fn s18_rejects_non_coinbase_null_prevout() {
-    validate_block_structure(
-        &block_with(vec![coinbase(0), non_coinbase_spend(1)]),
-        &ctx_h(0),
-    )
-    .unwrap();
-    let mixed = Transaction {
-        version: TxVersion::ONE,
-        lock_time: LockTime::ZERO,
-        input: vec![
-            TxIn {
-                previous_output: OutPoint {
-                    txid: bitcoin::Txid::from_byte_array([4; 32]),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            },
-            TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            },
-        ],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    assert_bad_tx(
-        validate_block_structure(&block_with(vec![coinbase(0), mixed]), &ctx_h(0)).unwrap_err(),
-        "prevout-null",
-    );
 }
 
 #[test]
