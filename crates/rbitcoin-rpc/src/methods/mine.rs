@@ -3,10 +3,7 @@ use bitcoin::consensus::{deserialize, encode::serialize_hex};
 use bitcoin::hashes::Hash;
 use bitcoin::key::PublicKey;
 use bitcoin::script::Builder;
-use bitcoin::{
-    Address, Amount, Block, BlockHash, Network as BtcNetwork, OutPoint, ScriptBuf, Transaction,
-    Txid,
-};
+use bitcoin::{Address, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
 use rbitcoin_net::Selected;
 use rbitcoin_primitives::{Height, Network};
 use serde_json::{json, Value};
@@ -736,166 +733,21 @@ pub(crate) fn gbt_proposal(ctx: &RpcContext, req: Option<&Value>) -> Result<Valu
 }
 
 /// Core `TestBlockValidity` for GBT proposal: no PoW, no UTXO write.
-/// Core `TestBlockValidity` for GBT proposal: no PoW, no UTXO write.
 pub(crate) fn gbt_check_proposal(ctx: &RpcContext, block: &Block) -> Result<(), String> {
-    let tip_h = ctx.query.tip_height().ok_or("no tip")?;
-    let (_, tip_rec) = ctx
-        .query
-        .header_at_height(tip_h)
-        .map_err(|e| e.to_string())?
-        .ok_or("tip header missing")?;
-    if block.header.prev_blockhash.to_byte_array() != tip_rec.hash {
-        return Err("inconclusive-not-best-prevblk".into());
+    if let Some(chain) = ctx.chain.as_ref() {
+        return chain.check_block_proposal(block);
     }
-    let height = tip_h.0.saturating_add(1);
-    let params = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.params.clone())
-        .unwrap_or_else(|| match ctx.network {
-            Network::Regtest => rbitcoin_consensus::ChainParams::regtest(),
-            Network::Signet => rbitcoin_consensus::ChainParams::signet(),
-            Network::Testnet => rbitcoin_consensus::ChainParams::testnet(),
-            Network::Mainnet => rbitcoin_consensus::ChainParams::mainnet(),
-        });
-    let expected = rbitcoin_consensus::expected_next_bits(
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+    rbitcoin_net::check_block_proposal_with(
         ctx.query.as_ref(),
-        &params,
-        Height(height),
-        block.header.time,
+        &rbitcoin_consensus::ChainParams::for_network(ctx.network),
+        rbitcoin_consensus::Milestone::NONE,
+        now,
+        block,
     )
-    .map(|c| c.to_consensus())
-    .unwrap_or(tip_rec.bits);
-    if block.header.bits.to_consensus() != expected {
-        return Err("bad-diffbits".into());
-    }
-    let mtp = rbitcoin_consensus::median_time_past(ctx.query.as_ref(), tip_h)
-        .unwrap_or(tip_rec.timestamp);
-    // Core is `<=` MTP. Proposal uses `<` so a template stamped at the
-    // parent's mediantime+1 still validates after that parent is submitted
-    // (new MTP often equals that stamp on an incrementing cache).
-    if block.header.time < mtp {
-        return Err("time-too-old".into());
-    }
-    let now = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.clock.now_secs() as u32)
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
-                .unwrap_or(0)
-        });
-    if u64::from(block.header.time) > u64::from(now).saturating_add(2 * 60 * 60) {
-        return Err("time-too-new".into());
-    }
-    let milestone = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.milestone)
-        .unwrap_or(rbitcoin_consensus::Milestone::NONE);
-    // Spends before txid-uniqueness: two copies of the same non-coinbase
-    // tx are `bad-txns-inputs-missingorspent` (Core CheckBlock order).
-    gbt_proposal_connect(ctx, block, height, mtp)?;
-    let mut seen = std::collections::HashSet::new();
-    for tx in &block.txdata {
-        if !seen.insert(tx.compute_txid()) {
-            return Err("bad-txns-duplicate".into());
-        }
-    }
-    let vctx = rbitcoin_consensus::ValidationContext::at(&params, Height(height), milestone);
-    if let Err(e) = rbitcoin_consensus::validate_block_structure(block, &vctx) {
-        return Err(rbitcoin_consensus::block_reject_reason(&e));
-    }
-    Ok(())
-}
-
-pub(crate) fn gbt_proposal_connect(
-    ctx: &RpcContext,
-    block: &Block,
-    height: u32,
-    mtp: u32,
-) -> Result<(), String> {
-    if block.txdata.is_empty() {
-        return Err("bad-blk-length".into());
-    }
-    if !block.txdata[0].is_coinbase() {
-        return Err("bad-cb-missing".into());
-    }
-    let mut created: std::collections::HashMap<OutPoint, bitcoin::TxOut> =
-        std::collections::HashMap::new();
-    let mut spent: std::collections::HashSet<OutPoint> = std::collections::HashSet::new();
-    for tx in block.txdata.iter() {
-        if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
-            return Err("bad-txns-nonfinal".into());
-        }
-        if tx.is_coinbase() {
-            let tid = tx.compute_txid();
-            for (vout, o) in tx.output.iter().enumerate() {
-                created.insert(
-                    OutPoint {
-                        txid: tid,
-                        vout: vout as u32,
-                    },
-                    o.clone(),
-                );
-            }
-            continue;
-        }
-        let mut in_val = 0u64;
-        for inp in &tx.input {
-            let op = inp.previous_output;
-            if !spent.insert(op) {
-                return Err("bad-txns-inputs-missingorspent".into());
-            }
-            let txout = if let Some(o) = created.get(&op) {
-                o.clone()
-            } else if let Some(o) = gbt_chain_txout(ctx, &op) {
-                o
-            } else {
-                return Err("bad-txns-inputs-missingorspent".into());
-            };
-            in_val = in_val.saturating_add(txout.value.to_sat());
-        }
-        let out_val: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
-        if out_val > in_val {
-            return Err("bad-txns-in-belowout".into());
-        }
-        let tid = tx.compute_txid();
-        for (vout, o) in tx.output.iter().enumerate() {
-            created.insert(
-                OutPoint {
-                    txid: tid,
-                    vout: vout as u32,
-                },
-                o.clone(),
-            );
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn gbt_chain_txout(ctx: &RpcContext, op: &OutPoint) -> Option<bitcoin::TxOut> {
-    let tid = op.txid.to_byte_array();
-    if ctx.query.is_outpoint_spent(&tid, op.vout).ok()? {
-        return None;
-    }
-    let (fk, rec) = ctx.query.get_tx_by_txid(&tid).ok().flatten()?;
-    let out = ctx
-        .query
-        .tx_output_at_fk(fk, op.vout)
-        .ok()
-        .or_else(|| ctx.query.tx_output(&rec, op.vout).ok())?;
-    let value = if out.value < 0 {
-        Amount::ZERO
-    } else {
-        Amount::from_sat(out.value as u64)
-    };
-    Some(bitcoin::TxOut {
-        value,
-        script_pubkey: ScriptBuf::from_bytes(out.script),
-    })
 }
 
 /// Tip height, difficulty, pooledtx, and `blockmintxfee` (BTC/kvB, `sat_btc_json`).
