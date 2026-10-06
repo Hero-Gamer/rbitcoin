@@ -1969,10 +1969,10 @@ fn bip30_ignores_unspendable_outputs() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// Core `CScript::IsUnspendable` outputs are not coins. Spending one is a
-/// missing input, not a script-size failure.
+/// An unspendable script is still a coin. Core drops it from the UTXO set;
+/// we do not, so the spend resolves and fails in the script.
 #[test]
-fn spending_an_unspendable_output_is_missing() {
+fn spending_an_unspendable_output_still_resolves() {
     use super::resolve_prevout;
     use rbitcoin_primitives::Fk;
     use rbitcoin_query::BatchParents;
@@ -2029,14 +2029,14 @@ fn spending_an_unspendable_output_is_missing() {
     };
     let oversized = try_spend(vec![0x51; 10_001]);
     assert!(
-        matches!(oversized, Err(ConsensusError::MissingPrevout)),
-        "oversized scriptPubKey is not a coin, got {}",
+        oversized.is_ok(),
+        "oversized scriptPubKey is still a coin, got {}",
         show(&oversized)
     );
     let op_return = try_spend(vec![0x6a, 0x01, 0x42]);
     assert!(
-        matches!(op_return, Err(ConsensusError::MissingPrevout)),
-        "OP_RETURN is not a coin, got {}",
+        op_return.is_ok(),
+        "OP_RETURN is still a coin, got {}",
         show(&op_return)
     );
     let max = try_spend(vec![0x51; 10_000]);

@@ -25,3 +25,6 @@ Fixed
   budget stays weight (`--mempool-size-mb` × 1_000_000). The Core field is
   that budget divided by 4, the same unit as `bytes`.
   `rbitcoin_mempool_max_weight` still reports weight.
+- **An unspendable output is still a coin.** A script that starts with
+  `OP_RETURN`, or is longer than 10_000 bytes, resolves and fails in the
+  script. Core functional `generateblock` text for that spend is shim-only.

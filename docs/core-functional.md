@@ -63,7 +63,10 @@ proxy rewrites multi-tx `testmempoolaccept` abort-class rows
 (`missing-inputs` / `max-fee-exceeded` / `bip125-replacement-disallowed`) to
 `{txid,wtxid}`; the node keeps earlier `allowed: true`.
 `getmempoolinfo.maxmempool` is already the virtual-size byte cap. The shim's
-4× `-maxmempool` map makes that number match Core. The proxy answers `gettxoutsetinfo`
+4× `-maxmempool` map makes that number match Core. A `generateblock` spend of
+an unspendable output still fails the script on the node; the proxy rewrites
+that error to Core's `CheckTxInputs` missing-input sentence
+(`feature_block.py`). The proxy answers `gettxoutsetinfo`
 with `getblockcount`, `getbestblockhash`, and `txouts: -1` so
 `rpc_scantxoutset.py` can compare an empty scan. The node does not
 implement that method. `rpc_packages.py` `run` includes that named shim
