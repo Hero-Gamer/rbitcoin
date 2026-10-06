@@ -5155,6 +5155,17 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         proposed.is_null(),
         "a template built on this tip is a valid proposal: {proposed}"
     );
+    let mut fat_cb: Block = deserialize(&rbitcoin_primitives::hex_decode(&hex).unwrap()).unwrap();
+    let cb = &mut fat_cb.txdata[0].output[0].value;
+    *cb = bitcoin::Amount::from_sat(cb.to_sat() + 1);
+    fat_cb.header.merkle_root = fat_cb.compute_merkle_root().unwrap();
+    let over_subsidy = dispatch(
+        &ctx,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit"], "mode": "proposal", "data": serialize_hex(&fat_cb)})],
+    )
+    .unwrap();
+    assert_eq!(over_subsidy, "bad-cb-amount", "{over_subsidy}");
     let mut block: Block = deserialize(&rbitcoin_primitives::hex_decode(&hex).unwrap()).unwrap();
     let original_bits = block.header.bits;
     let original_time = block.header.time;

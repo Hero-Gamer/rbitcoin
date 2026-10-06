@@ -734,20 +734,23 @@ pub(crate) fn gbt_proposal(ctx: &RpcContext, req: Option<&Value>) -> Result<Valu
 
 /// Core `TestBlockValidity` for GBT proposal: no PoW, no UTXO write.
 pub(crate) fn gbt_check_proposal(ctx: &RpcContext, block: &Block) -> Result<(), String> {
-    if let Some(chain) = ctx.chain.as_ref() {
-        return chain.check_block_proposal(block);
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0);
-    rbitcoin_net::check_block_proposal_with(
-        ctx.query.as_ref(),
-        &rbitcoin_consensus::ChainParams::for_network(ctx.network),
-        rbitcoin_consensus::Milestone::NONE,
-        now,
-        block,
-    )
+    let priced = match ctx.chain.as_ref() {
+        Some(chain) => chain.check_block_proposal(block),
+        None => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as u32)
+                .unwrap_or(0);
+            rbitcoin_net::check_block_proposal_with(
+                ctx.query.as_ref(),
+                &rbitcoin_consensus::ChainParams::for_network(ctx.network),
+                rbitcoin_consensus::Milestone::NONE,
+                now,
+                block,
+            )
+        }
+    };
+    priced.map(|_fees| ())
 }
 
 /// Tip height, difficulty, pooledtx, and `blockmintxfee` (BTC/kvB, `sat_btc_json`).
