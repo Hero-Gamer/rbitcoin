@@ -24,11 +24,41 @@ use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
 use rbitcoin_test::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 use rbitcoin_test::{
-    assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, MatureRegtestChain,
+    assert_reconstruct_eq, open_mature_regtest_with_spend, pad_empty_from, MatureRegtestChain,
     TestDatadir,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn query_tip_hash(q: &Query) -> BlockHash {
+    let h = q.tip_height().unwrap();
+    let (_, rec) = q.header_at_height(h).unwrap().unwrap();
+    BlockHash::from_byte_array(rec.hash)
+}
+
+#[test]
+fn shared_mature_regtest_copy_keeps_the_other_tip() {
+    let params = ChainParams::regtest();
+    let a = TestDatadir::new().unwrap();
+    let b = TestDatadir::new().unwrap();
+    let (qa, ca) = open_mature_regtest_with_spend(a.store_path(), &params);
+    let (qb, cb) = open_mature_regtest_with_spend(b.store_path(), &params);
+    assert_eq!(qa.tip_height(), qb.tip_height());
+    assert_eq!(ca.tip_hash(), cb.tip_hash());
+    assert_eq!(query_tip_hash(&qa), ca.tip_hash());
+    assert_eq!(ca.matured_coinbase_txid, cb.matured_coinbase_txid);
+    assert!(ca.tip_height() > params.coinbase_maturity());
+    let next = ca.tip_height() + 1;
+    let block = mine_regtest_block(
+        ca.tip_hash(),
+        ca.blocks.last().unwrap().header.time + 600,
+        next,
+        vec![],
+    );
+    accept_and_connect_block(&qa, &params, Height(next), &block, Milestone::NONE).unwrap();
+    assert_eq!(query_tip_hash(&qb), cb.tip_hash());
+    assert_ne!(query_tip_hash(&qa), query_tip_hash(&qb));
+}
 
 /// One mature pad: mempool persist, restart leftover through catch-up then
 /// tip-mode purge, then `--milestone` skip-below / check-above, then missing
@@ -39,8 +69,7 @@ use std::sync::Arc;
 fn analog_milestone_and_mempool_persist() {
     let params = ChainParams::regtest();
     let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-    let chain = build_mature_regtest_with_spend(&q, &params);
+    let (q, chain) = open_mature_regtest_with_spend(td.store_path(), &params);
 
     let spend_block = &chain.blocks[chain.spend_height as usize];
     let spend_txid = spend_block.txdata[1].compute_txid();
@@ -626,8 +655,7 @@ fn analog_block_filters_from_class_a() {
 
     let params = ChainParams::regtest();
     let td = TestDatadir::new().unwrap();
-    let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-    let chain = build_mature_regtest_with_spend(&q, &params);
+    let (q, chain) = open_mature_regtest_with_spend(td.store_path(), &params);
     let mut blocks = chain.blocks.clone();
 
     let spend = &blocks[chain.spend_height as usize].txdata[1];

@@ -8,7 +8,8 @@ pub mod mine;
 pub mod overlay;
 
 pub use chain_fixture::{
-    assert_reconstruct_eq, build_mature_regtest_with_spend, pad_empty_from, MatureRegtestChain,
+    assert_reconstruct_eq, build_mature_regtest_with_spend, open_mature_regtest_with_spend,
+    pad_empty_from, MatureRegtestChain,
 };
 
 use std::path::PathBuf;
