@@ -355,6 +355,11 @@ if [[ "$BIN" == "store_reorg" ]]; then
 fi
 
 if [[ "$BIN" == "script_kernel_differential" ]]; then
+  kernel_json="third_party/bitcoin/src/test/data/script_tests.json"
+  if [[ -f "$kernel_json" ]]; then
+    python3 "$ROOT/scripts/script-kernel-seeds.py" \
+      "$kernel_json" fuzz/corpus/script_kernel_differential 32
+  fi
   merge_seed fuzz/corpus/script_kernel_differential \
     crates/rbitcoin-consensus/tests/fixtures/script_kernel_op_true.bin
   merge_seed fuzz/corpus/script_kernel_differential \

@@ -1,9 +1,12 @@
-//! Script differentials the legacy one-byte kernel cannot reach.
+//! Script differential against `bitcoinconsensus`.
 //!
-//! Structured inputs (`0xFE`) carry an independent Core flag word, witness
-//! bytes, and fixed discriminators. Flag combinations that abort
-//! `libbitcoinconsensus` are [`KernelCmp::Skip`]. A different verdict is
-//! [`KernelCmp::Disagree`] even when our word is stricter than Core's.
+//! Every executed input is `0xFE`, then a Core flag word, a shape, and a
+//! payload. Anything else is a skip. Shape 0 is opcode soup: transaction
+//! version, sequence, locktime, amount, then length-prefixed scriptSig,
+//! scriptPubKey, and witness. Shapes 1–8 are fixed discriminators. Flag
+//! combinations that abort `libbitcoinconsensus` are [`KernelCmp::Skip`].
+//! A different verdict is [`KernelCmp::Disagree`] even when our word is
+//! stricter than Core's.
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
@@ -167,20 +170,40 @@ fn spend(
     script_pubkey: Vec<u8>,
     witness: Witness,
 ) -> (Vec<TxOut>, Transaction) {
+    spend_fields(
+        TxVersion::TWO,
+        Sequence::MAX,
+        LockTime::ZERO,
+        Amount::from_sat(50_0000_0000),
+        script_sig,
+        script_pubkey,
+        witness,
+    )
+}
+
+fn spend_fields(
+    version: TxVersion,
+    sequence: Sequence,
+    lock_time: LockTime,
+    amount: Amount,
+    script_sig: Vec<u8>,
+    script_pubkey: Vec<u8>,
+    witness: Witness,
+) -> (Vec<TxOut>, Transaction) {
     let prevouts = vec![TxOut {
-        value: Amount::from_sat(50_0000_0000),
+        value: amount,
         script_pubkey: ScriptBuf::from_bytes(script_pubkey),
     }];
     let tx = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
+        version,
+        lock_time,
         input: vec![TxIn {
             previous_output: OutPoint {
                 txid: bitcoin::Txid::from_byte_array([1; 32]),
                 vout: 0,
             },
             script_sig: ScriptBuf::from_bytes(script_sig),
-            sequence: Sequence::MAX,
+            sequence,
             witness,
         }],
         output: vec![TxOut {
@@ -267,7 +290,15 @@ fn read_u16(data: &[u8], at: &mut usize) -> Option<usize> {
 }
 
 fn raw_spend(payload: &[u8]) -> Option<(Vec<TxOut>, Transaction)> {
-    let mut at = 0usize;
+    let header = payload.get(..20)?;
+    let version = i32::from_le_bytes(header[0..4].try_into().ok()?);
+    let sequence = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    let lock_time = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let amount = i64::from_le_bytes(header[12..20].try_into().ok()?);
+    if amount < 0 {
+        return None;
+    }
+    let mut at = 20usize;
     let sig_len = read_u16(payload, &mut at)?;
     if sig_len > 10_000 {
         return None;
@@ -294,7 +325,15 @@ fn raw_spend(payload: &[u8]) -> Option<(Vec<TxOut>, Transaction)> {
         at += n;
     }
     let refs: Vec<&[u8]> = items.iter().map(|v| v.as_slice()).collect();
-    Some(spend(sig, spk, Witness::from_slice(&refs)))
+    Some(spend_fields(
+        TxVersion::non_standard(version),
+        Sequence::from_consensus(sequence),
+        LockTime::from_consensus(lock_time),
+        Amount::from_sat(amount as u64),
+        sig,
+        spk,
+        Witness::from_slice(&refs),
+    ))
 }
 
 /// Node flags and Core flags for one height, on `spend`.
@@ -359,15 +398,12 @@ fn signet_block_bare_commitment() -> Block {
     }
 }
 
-/// Legacy half-split, or `0xFE || u32-le flags || shape || payload`.
+/// `0xFE || u32-le flags || shape || payload`. Any other prefix skips.
 pub fn compare_kernel_bytes(data: &[u8]) -> Option<KernelCmp> {
-    if data.first().copied() == Some(STRUCTURED) {
-        return compare_structured(&data[1..]);
+    if data.first().copied() != Some(STRUCTURED) {
+        return None;
     }
-    let (sig, pk, flags) = crate::script_kernel::parse_kernel_input(data)?;
-    Some(crate::script_kernel::compare_script_kernel(
-        &sig, &pk, flags,
-    ))
+    compare_structured(&data[1..])
 }
 
 fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
@@ -473,9 +509,10 @@ mod tests {
             compare_spend(prev.clone(), tx.clone(), flags),
             KernelCmp::Skip
         ));
+        let err = verify_tx_scripts_with_flags(prev, tx, flags_to_ours(flags)).unwrap_err();
         assert!(
-            verify_tx_scripts_with_flags(prev, tx, flags_to_ours(flags)).is_ok(),
-            "empty-sig deletion is not a hard fail without a Core verdict to match"
+            err.to_string().contains("SIG_FINDANDDELETE"),
+            "CONST_SCRIPTCODE rejects the empty-sig OP_0 deletion: {err}"
         );
     }
 
@@ -636,5 +673,30 @@ mod tests {
             compare_kernel_bytes(&raw),
             Some(KernelCmp::Agree { .. } | KernelCmp::Disagree { .. })
         ));
+    }
+
+    #[test]
+    fn legacy_half_split_is_not_executed() {
+        assert_eq!(compare_kernel_bytes(&[0x1f, 0x51]), None);
+    }
+
+    #[test]
+    fn raw_shape_carries_version_sequence_locktime_and_amount() {
+        let flags = VERIFY_P2SH | VERIFY_WITNESS;
+        let mut raw = vec![STRUCTURED];
+        raw.extend_from_slice(&flags.to_le_bytes());
+        raw.push(SHAPE_RAW);
+        raw.extend_from_slice(&2i32.to_le_bytes());
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&5_000_000_000i64.to_le_bytes());
+        raw.extend_from_slice(&0u16.to_le_bytes());
+        raw.extend_from_slice(&1u16.to_le_bytes());
+        raw.push(0x51);
+        raw.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            compare_kernel_bytes(&raw),
+            Some(KernelCmp::Agree { accept: true })
+        );
     }
 }

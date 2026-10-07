@@ -88,6 +88,31 @@ assert_ok "script_kernel listed in fuzz Cargo.toml" \
   grep -q 'name = "script_kernel_differential"' "$ROOT/fuzz/Cargo.toml"
 assert_ok "script_kernel listed in fuzz.yml matrix" \
   grep -q '{ bin: script_kernel_differential, core: false }' "$ROOT/.github/workflows/fuzz.yml"
+seed_tmp="$(mktemp -d)"
+python3 "$ROOT/scripts/script-kernel-seeds.py" \
+  "$ROOT/scripts/testdata/script-kernel-seed-rows.json" "$seed_tmp" 32
+seed_n="$(find "$seed_tmp" -name 'core_script_*.bin' | wc -l)"
+assert_ok "script kernel seed picker writes four fixture rows" \
+  test "$seed_n" = "4"
+assert_ok "script kernel seeds prefer altstack tuck and cms" \
+  cmp -s <(python3 - "$seed_tmp" <<'PY'
+import pathlib, sys
+d = pathlib.Path(sys.argv[1])
+first = (d / "core_script_00.bin").read_bytes()
+second = (d / "core_script_01.bin").read_bytes()
+third = (d / "core_script_02.bin").read_bytes()
+# 0xFE, flags, shape 0, then the fixed spend header, then scripts.
+assert first[0] == 0xFE and first[5] == 0
+# OP_TUCK comment row is scriptSig=1 (0x51), scriptPubKey=1 EQUAL (0x51 0x87).
+assert b"\x51\x87" in first
+# OP_TOALTSTACK is opcode 0x6b on the second preferred row's scriptPubKey.
+assert b"\x6b" in second
+# CHECKMULTISIG is opcode 0xae.
+assert b"\xae" in third
+print("ok")
+PY
+) <(printf 'ok\n')
+rm -rf "$seed_tmp"
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" chain_review_differential)"
 assert_ok "chain_review dry-run bin" \
