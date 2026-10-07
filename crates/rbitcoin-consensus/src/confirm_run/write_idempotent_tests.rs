@@ -2267,7 +2267,6 @@ fn write_refuses_empty_packed_ins() {
     use crate::params::ChainParams;
     use crate::regtest_pad::mine_empty_regtest;
     use rbitcoin_primitives::Height;
-    use rbitcoin_store::StoreError;
     use std::sync::Arc;
 
     let (path, q) = tmp_query();
@@ -2281,13 +2280,14 @@ fn write_refuses_empty_packed_ins() {
     {
         let plan = stamped.plan.as_mut().expect("plan");
         assert!(
-            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
-            "stamp fills packed ins"
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "stamp leaves packed ins empty"
         );
         for (_, ins) in plan.packed.iter_mut() {
             ins.clear();
         }
     }
+    let script = items[0].1.txdata[0].input[0].script_sig.to_bytes();
     let mat = confirm_wire_load_from_plan(
         &q,
         &params,
@@ -2298,13 +2298,9 @@ fn write_refuses_empty_packed_ins() {
     )
     .expect("load");
     let ok = confirm_scripts_phase(mat.batch).expect("scripts");
-    match confirm_write_phase(&q, &params, Milestone::NONE, ok.batch) {
-        Err(crate::ConsensusError::Store(StoreError::Corrupt(msg))) => {
-            assert!(msg.contains("packed ins empty at write"), "got {msg}");
-        }
-        Err(e) => panic!("expected packed ins empty, got {e}"),
-        Ok(_) => panic!("write must not fill packed ins from wire"),
-    }
+    confirm_write_phase(&q, &params, Milestone::NONE, ok.batch).expect("write encodes from wire");
+    let (_tx, ins, _outs) = q.store().get_tx_full(rbitcoin_primitives::Fk(2)).unwrap();
+    assert_eq!(ins[0].script_sig, script);
     let _ = std::fs::remove_dir_all(&path);
 }
 
@@ -2910,8 +2906,8 @@ fn store_start_states_lookup_load_confirm() {
         assert!(stamped.plan.is_some(), "S0 must plan Class A");
         let plan = stamped.plan.as_ref().expect("plan");
         assert!(
-            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
-            "IBD stamp fills packed InputRecords; write does not refill"
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "IBD stamp leaves packed ins empty; commit encodes from the wire tx"
         );
         assert!(
             !plan.edges.is_empty(),

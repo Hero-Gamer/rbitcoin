@@ -5,7 +5,7 @@ use super::*;
 type CreatePin = rbitcoin_query::CreatePin;
 
 struct PlanSpend<'a> {
-    spend_edges: rbitcoin_query::SpendEdges,
+    spend_edges: std::borrow::Cow<'a, rbitcoin_query::SpendEdges>,
     parent_vouts: U64Map<Vec<u32>>,
     vouts_from_stamp: bool,
     batch_pin_by_id: U64Map<&'a CreatePin>,
@@ -34,7 +34,7 @@ fn spend_edges_from_plan<'a>(
             "invariant: plan spend edges empty",
         )));
     }
-    let spend_edges = plan.edges.clone();
+    let spend_edges = std::borrow::Cow::Borrowed(&plan.edges);
     let fill_vouts = parent_pin.parent_vouts.is_empty();
     let (parent_vouts, vouts_from_stamp) = if fill_vouts {
         let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
@@ -344,14 +344,20 @@ fn denserels_by_stamped_range(
 /// **txout body by range** from [`ParentPinStamp`] (lookup-stamped). Load never
 /// reads head / `tx.idx` / `txid.body`. Load **copies** lookup-stamped
 /// `spent_range` onto pins. Write [`collect_spend_abs_after_fill`] is abs-or-Corrupt.
-pub(super) fn pin_for_wire_batch(
+pub(super) fn pin_for_wire_batch<'a>(
     query: &Query,
-    plan: Option<&rbitcoin_query::ArchiveWritePlan>,
+    plan: Option<&'a rbitcoin_query::ArchiveWritePlan>,
     parent_pin: &mut ParentPinStamp,
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
     in_flight: Option<&rbitcoin_query::InFlight>,
-) -> Result<(rbitcoin_query::BatchParents, rbitcoin_query::SpendEdges), ConsensusError> {
+) -> Result<
+    (
+        rbitcoin_query::BatchParents,
+        std::borrow::Cow<'a, rbitcoin_query::SpendEdges>,
+    ),
+    ConsensusError,
+> {
     let t_pin = Instant::now();
     let t_thin = Instant::now();
 
@@ -365,7 +371,7 @@ pub(super) fn pin_for_wire_batch(
         None => {
             let (edges, vouts) = spend_edges_from_stamp(parent_pin, metas, wire_blocks);
             PlanSpend {
-                spend_edges: edges,
+                spend_edges: std::borrow::Cow::Owned(edges),
                 parent_vouts: vouts,
                 vouts_from_stamp: false,
                 batch_pin_by_id: U64Map::default(),

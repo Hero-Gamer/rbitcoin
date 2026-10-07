@@ -1170,6 +1170,16 @@ fn confirm_txstat_miss_is_corrupt() {
         }],
     )];
     plan.planned_fks = vec![child_fk];
+    plan.edges.insert(
+        child_fk.get().unwrap(),
+        vec![crate::SpendEdge {
+            prev_txid: parent_txid,
+            vout: 0,
+            spend_fk: child_fk,
+            create_fk: parent_fk,
+            vin: 0,
+        }],
+    );
     plan.body_est = 256;
     let err = q
         .archive_commit_plan_defer_head_parents(plan, Some(&BatchParents::new()))
@@ -1250,7 +1260,18 @@ fn archive_plan_fee_rows_follow_packed_txs() {
             witness: vec![],
         }],
     )];
-    bad.planned_fks = vec![Fk(parent_fk.get().unwrap() + 1)];
+    let child_fk = Fk(parent_fk.get().unwrap() + 1);
+    bad.planned_fks = vec![child_fk];
+    bad.edges.insert(
+        child_fk.get().unwrap(),
+        vec![crate::SpendEdge {
+            prev_txid: parent_txid,
+            vout: 0,
+            spend_fk: child_fk,
+            create_fk: parent_fk,
+            vin: 0,
+        }],
+    );
     bad.body_est = 256;
     bad.tx_fees = vec![1, 2];
     let err = q
