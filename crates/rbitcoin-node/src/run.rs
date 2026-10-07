@@ -1192,7 +1192,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             }
 
             if matches!(wake, TipFollowWake::Perf) {
-                if let Err(e) = mempool_blocking(&mempool, |mp| mp.persist_due()).await? {
+                if let Err(e) = mempool_blocking(&mempool, |mp| {
+                    mp.publish_fee_floor();
+                    mp.persist_due()
+                })
+                .await?
+                {
                     warn!("mempool persist_due: {e}");
                 }
                 let mp = mempool.sample_reset_perf();

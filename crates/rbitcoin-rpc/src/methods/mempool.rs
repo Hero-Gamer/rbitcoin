@@ -52,7 +52,7 @@ pub(crate) fn getmempoolinfo(ctx: &RpcContext) -> Result<Value, Value> {
         // The hub budget stays weight; the metric reports that weight.
         "maxmempool": mp.max_weight() / 4,
         "mempoolminfee": sat_btc_json(mp.mempool_min_fee_sat_kvb() as i64),
-        "minrelaytxfee": relay_fee_json(),
+        "minrelaytxfee": sat_btc_json(mp.min_relay_sat_kvb() as i64),
         "incrementalrelayfee": relay_fee_json(),
         "relay_enabled": mp.relay_enabled(),
         "unbroadcastcount": mp.unbroadcast_count(),

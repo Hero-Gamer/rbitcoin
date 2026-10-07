@@ -639,9 +639,12 @@ pub struct MempoolHub {
     /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
     /// and does not walk `wtxid_by_txid`.
     expiry_order: Mutex<BTreeMap<(u64, Wtxid), Txid>>,
-    /// Min-relay overlay (sat/kvB). Session FeeFilter reads this
-    /// without taking `inner`.
+    /// Min-relay overlay (sat/kvB). Readers avoid `inner`.
     min_relay_sat_kvb: AtomicU64,
+    /// Enforced admission floor (sat/kvB): configured min, the near-full
+    /// bump, and the decaying eviction floor. Handshake FeeFilter and
+    /// Electrum read this without taking `inner`.
+    fee_floor_sat_kvb: AtomicU64,
     /// Age-INV log: `(due_secs, accept_gen) → (txid, wtxid)`. Not `inner`.
     age_inv: Mutex<BTreeMap<(u64, u64), (Txid, Wtxid)>>,
     /// Min live `accept_at` (`u64::MAX` if empty).
@@ -803,6 +806,9 @@ impl MempoolHub {
             min_relay_sat_kvb: AtomicU64::new(
                 rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
             ),
+            fee_floor_sat_kvb: AtomicU64::new(
+                rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+            ),
             fee_deltas: Mutex::new(HashMap::new()),
             template_updates: AtomicU64::new(0),
             age_inv: Mutex::new(BTreeMap::new()),
@@ -818,6 +824,7 @@ impl MempoolHub {
             u.retain(|t| hub.contains(t));
         }
         hub.reindex_live_scripthashes();
+        hub.publish_fee_floor();
         Ok(Arc::new(hub))
     }
 
@@ -1238,16 +1245,22 @@ impl MempoolHub {
                 }
             }
         }
-        let mut n = 0usize;
-        let mut g = self.lock_write();
-        for t in kill.iter().rev() {
-            if g.graph.get(t).is_some() && g.remove_txid(t).is_ok() {
-                self.unindex_txid(t);
-                n += 1;
+        let n = {
+            let mut n = 0usize;
+            let mut g = self.lock_write();
+            for t in kill.iter().rev() {
+                if g.graph.get(t).is_some() && g.remove_txid(t).is_ok() {
+                    self.unindex_txid(t);
+                    n += 1;
+                }
             }
-        }
+            if n > 0 {
+                self.note_template_update();
+            }
+            n
+        };
         if n > 0 {
-            self.note_template_update();
+            self.publish_fee_floor();
         }
         n
     }
@@ -1848,6 +1861,7 @@ impl MempoolHub {
                 self.meter_accept_wall(us, true);
                 self.publish_admitted(tx, &r, &prevouts, utxo);
                 let _ = self.expire_stale();
+                self.publish_fee_floor();
                 Ok(r)
             }
             Err(e) => self.finish_accept_err(us, e),
@@ -1912,6 +1926,7 @@ impl MempoolHub {
                 self.publish_admitted(&parent, &parent_res, &prevouts_p, utxo);
                 self.publish_admitted(child, &r, &prevouts_c, utxo);
                 let _ = self.expire_stale();
+                self.publish_fee_floor();
                 Some(r)
             }
             Err(_) => {
@@ -1959,6 +1974,8 @@ impl MempoolHub {
             self.unindex_txid(tid);
             deltas.remove(tid);
         }
+        drop(deltas);
+        self.publish_fee_floor();
     }
 
     fn note_if_accept_failure(&self, tx: &Transaction, e: &AcceptError) {
@@ -2417,6 +2434,7 @@ impl MempoolHub {
             self.promote_orphans_staged(r.txid, &utxo);
         }
         self.note_template_update();
+        self.publish_fee_floor();
         Ok(accepted)
     }
 
@@ -2797,6 +2815,7 @@ impl MempoolHub {
                 break;
             }
         }
+        self.publish_fee_floor();
     }
 
     /// This node's own block budget (GBT / `generate`): template weight and
@@ -2871,7 +2890,20 @@ impl MempoolHub {
     }
 
     pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
-        self.lock_read().mempool_min_fee_sat_kvb()
+        self.publish_fee_floor()
+    }
+
+    /// Reactor-safe load of the last published admission floor (sat/kvB).
+    pub fn fee_floor_sat_kvb(&self) -> u64 {
+        self.fee_floor_sat_kvb.load(Ordering::Acquire)
+    }
+
+    /// Recompute the admission floor and publish it. Takes `inner` read,
+    /// so callers must be off the reactor and must not already hold `inner`.
+    pub fn publish_fee_floor(&self) -> u64 {
+        let floor = self.lock_read().mempool_min_fee_sat_kvb();
+        self.fee_floor_sat_kvb.store(floor, Ordering::Release);
+        floor
     }
 
     /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
@@ -3116,6 +3148,7 @@ impl MempoolHub {
     pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
         self.min_relay_sat_kvb.store(sat_kvb, Ordering::Release);
         self.lock_write().set_min_relay_sat_kvb(sat_kvb);
+        self.publish_fee_floor();
     }
 
     pub fn min_relay_sat_kvb(&self) -> u64 {

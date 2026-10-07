@@ -551,6 +551,31 @@ async fn accept_client_ping_and_shutdown() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn electrum_fee_reports_follow_configured_and_enforced_floor() {
+    let (dir, q) = tmp_store();
+    let q = std::sync::Arc::new(q);
+    let mp =
+        MempoolHub::open_with_weight(dir.join("mempool"), std::sync::Arc::clone(&q), 0).unwrap();
+    mp.set_min_relay_sat_kvb(2_500);
+    let params = ChainParams::regtest();
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(cfg, q, params, tip_tx, Some(mp))
+        .await
+        .expect("listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let info = electrum_tcp_rpc(&mut stream, 1, "mempool.get_info", json!([])).await;
+    let relay = electrum_tcp_rpc(&mut stream, 2, "blockchain.relayfee", json!([])).await;
+    let sats = |v: &Value| (v.as_f64().unwrap() * 100_000_000.0).round() as u64;
+    assert_eq!(sats(&info["result"]["minrelaytxfee"]), 2_500, "{info}");
+    assert_eq!(sats(&info["result"]["mempoolminfee"]), 2_600, "{info}");
+    assert_eq!(sats(&info["result"]["incrementalrelayfee"]), 100, "{info}");
+    assert_eq!(sats(&relay["result"]), 2_600, "{relay}");
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// On a 1-worker runtime, ping must complete while another socket is inside
 /// a real blocking store query (`blockchain.block.headers`).
 #[tokio::test(flavor = "current_thread")]
