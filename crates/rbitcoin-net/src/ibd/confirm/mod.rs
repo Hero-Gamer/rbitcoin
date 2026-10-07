@@ -1317,6 +1317,22 @@ pub(crate) fn format_stamp_reject_missing_prevout(
     s
 }
 
+/// A stamp miss reads the pipeline's own view (in-flight and load-batch
+/// skeleton), not the chain, so on a lone block it is an engine fault: the
+/// block goes back once, and a repeat halts IBD. A batched miss keeps its
+/// consensus class, which isolates the retry to one block at a time.
+fn stamp_reject_class(
+    e: &rbitcoin_consensus::ConsensusError,
+    batch_len: usize,
+) -> ConfirmRejectClass {
+    match e {
+        rbitcoin_consensus::ConsensusError::MissingPrevout if batch_len == 1 => {
+            ConfirmRejectClass::EngineFault
+        }
+        _ => ConfirmRejectClass::from_consensus(e),
+    }
+}
+
 pub(crate) fn stamp_reject_operator_msg(err: &str, stats: &rbitcoin_query::ConfirmStats) -> String {
     if err == "missing prevout" {
         let last = stats.last_plan_batch();
@@ -2112,7 +2128,7 @@ pub(crate) fn spawn_confirm_engine(
                         let class = if session_fault {
                             ConfirmRejectClass::EngineFault
                         } else {
-                            ConfirmRejectClass::from_consensus(&e)
+                            stamp_reject_class(&e, wire_batch.len())
                         };
                         load_fail_rewind_wave(
                             &feed_load,

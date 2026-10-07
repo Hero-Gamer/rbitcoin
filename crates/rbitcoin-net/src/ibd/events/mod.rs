@@ -828,11 +828,7 @@ pub(crate) fn apply_confirm_reject(
         warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
         return;
     }
-    let class = if err.contains("parent create_fk unresolved")
-        || err.contains("spend annotate missing pin denserels")
-    {
-        ConfirmRejectClass::EngineFault
-    } else if class == ConfirmRejectClass::ConsensusInvalid {
+    let class = if class == ConfirmRejectClass::ConsensusInvalid {
         if let Some(h) = hub {
             class.trust_consensus(h, hash)
         } else {

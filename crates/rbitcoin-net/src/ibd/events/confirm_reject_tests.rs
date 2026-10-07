@@ -2476,8 +2476,10 @@ fn batched_write_reject_offers_the_wave_back() {
 
 /// tip+1 spends an output that tip+2 creates, and both write in one
 /// batch. Core connects one block at a time, so tip+1's input is missing.
-/// The batch reject is isolated, and tip+1 alone is rejected again: the
-/// parent is not on the chain, and tip+1 never connects.
+/// The batch reject is isolated, and tip+1 alone fails its load stamp: the
+/// parent is not on the chain, and tip+1 never connects. That stamp miss is
+/// an engine fault, so tip+1 goes back to the body queue and is tried
+/// again, and the repeat halts IBD without marking the hash invalid.
 #[test]
 fn batched_spend_of_a_later_block_is_rejected_alone() {
     use super::super::assign::tests::lock_default_assign_stop;
@@ -2511,41 +2513,20 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
 
     let rejects = rig.pump(
         |_, hash| if hash == h1 { b1.clone() } else { b2.clone() },
-        |_, _, seen| seen.len() == 2,
+        |st, _, _| st.halt.is_some(),
     );
-    assert_eq!(
-        rejects,
-        [
-            (h1, ConfirmRejectClass::Cascade, 2),
-            (h1, ConfirmRejectClass::ConsensusInvalid, 1)
-        ],
-        "the batch event is a cascade; the one-block event is still ConsensusInvalid"
-    );
-    // Apply reads the load-stamp line (`parent create_fk unresolved` inside
-    // the rewritten missing-prevout text) as an engine fault. The event
-    // class stays ConsensusInvalid. The first fault requeues and does not
-    // blacklist. The same line again halts, and the hash stays off the
-    // invalid set. Finding 087.
-    let err = rig
-        .last_reject_err
-        .clone()
-        .expect("the one-block retry has an operator line");
+    // The fault's retry is not isolated, so the repeat may batch again.
     assert!(
-        err.contains("parent create_fk unresolved"),
-        "load-stamp miss must be the engine-fault line, got {err}"
+        matches!(
+            rejects.as_slice(),
+            [
+                (a, ConfirmRejectClass::Cascade, 2),
+                (b, ConfirmRejectClass::EngineFault, 1),
+                (c, ConfirmRejectClass::EngineFault, _),
+            ] if [a, b, c] == [&h1; 3]
+        ),
+        "the batch event is a cascade; the one-block stamp miss is a fault: {rejects:?}"
     );
-    assert!(rig.st.engine_fault_seen.contains(&h1));
-    assert!(!rig.st.body.is_rejected(&h1));
-    assert!(rig.st.halt.is_none(), "the first engine fault requeues");
-    apply_confirm_reject(
-        &mut rig.st,
-        t + 1,
-        h1,
-        &err,
-        Some(rig.hub.query.as_ref()),
-        Some(&rig.hub),
-    );
-    assert!(rig.st.halt.is_some(), "the second engine fault halts IBD");
     assert!(!rig.st.body.is_rejected(&h1));
     assert!(!rig.st.reorg.invalid.contains(h1.to_byte_array()));
     assert_eq!(rig.hub.tip_height(), Some(t));
