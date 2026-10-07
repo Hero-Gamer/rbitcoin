@@ -66,8 +66,10 @@ assert_ok "store_reorg dry-run bin" \
   grep -qx "FUZZ_BIN=store_reorg" <<<"$out"
 assert_ok "store_reorg dry-run sanitizer address" \
   grep -qx "FUZZ_SANITIZER=address" <<<"$out"
-assert_ok "store_reorg dry-run no Core" \
-  grep -qx "FUZZ_NO_CORE=1" <<<"$out"
+assert_ok "store_reorg dry-run timeout 60" \
+  grep -qx "FUZZ_TIMEOUT=60" <<<"$out"
+assert_ok "store_reorg dry-run prints CORE_BITCOIND" \
+  grep -q '^RBITCOIN_CORE_BITCOIND=' <<<"$out"
 assert_ok "store_reorg dry-run does not export deleted RBITCOIN_HEAD_SCALE" \
   test "$(grep -c 'RBITCOIN_HEAD_SCALE' <<<"$out" || true)" = "0"
 assert_ok "store_reorg ops seed" \

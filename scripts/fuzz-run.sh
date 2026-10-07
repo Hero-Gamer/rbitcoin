@@ -152,7 +152,7 @@ elif [[ "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" ]]; then
   timeout=90
 elif [[ "$BIN" == "store_reorg" ]]; then
   sanitizer="address"
-  timeout=30
+  timeout=60
 elif [[ "$BIN" == "script_kernel_differential" ]]; then
   sanitizer="address"
   timeout=1
@@ -185,10 +185,10 @@ if [[ "${FUZZ_DRY_RUN:-}" == "1" ]]; then
   if [[ "$BIN" == "script_differential" || "$BIN" == "script_verify_differential" ]]; then
     echo "FUZZ_MAX_LEN=2000"
   fi
-  if [[ "$BIN" == "block_differential" || "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" || "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" || "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" ]]; then
+  if [[ "$BIN" == "block_differential" || "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" || "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" || "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" || "$BIN" == "store_reorg" ]]; then
     echo "RBITCOIN_CORE_BITCOIND=${RBITCOIN_CORE_BITCOIND:-}"
   fi
-  if [[ "$BIN" == "store_reorg" || "$BIN" == "asmap" ]]; then
+  if [[ "$BIN" == "asmap" ]]; then
     echo "FUZZ_NO_CORE=1"
   fi
   if [[ "$BIN" == "script_kernel_differential" ]]; then
@@ -344,6 +344,7 @@ fi
 
 if [[ "$BIN" == "store_reorg" ]]; then
   export RBITCOIN_IO="${RBITCOIN_IO:-fd}"
+  export RBITCOIN_CORE_BITCOIND="$(./scripts/core-functional/fetch-bitcoind.sh)"
   merge_seed fuzz/corpus/store_reorg \
     crates/rbitcoin-net/tests/fixtures/store_reorg_ops.bin
   log="${TMPDIR:-/tmp}/rbtc-fuzz-store-reorg.$$.log"
