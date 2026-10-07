@@ -1,5 +1,8 @@
 //! Shared regtest chain builders so scenarios mine a mature chain once.
 
+use std::path::Path;
+use std::sync::OnceLock;
+
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, Block, BlockHash, Txid};
 use rbitcoin_consensus::{
@@ -12,6 +15,7 @@ use crate::mine::{mine_regtest_block, regtest_genesis, spend_anyone_can_spend};
 
 /// Blocks `0..=tip` accepted into `query`, including a spend of block-1 coinbase
 /// at the tip when maturity allows.
+#[derive(Clone)]
 pub struct MatureRegtestChain {
     pub blocks: Vec<Block>,
     /// Height of the block that spends block-1 coinbase (last block).
@@ -32,9 +36,97 @@ impl MatureRegtestChain {
 
 /// Build genesis → pad through coinbase maturity → one spend of height-1 coinbase.
 ///
-/// Mines and accepts **once**. Callers should reuse `blocks` for reconstruct / spend
-/// assertions instead of rebuilding parallel 100-block chains.
+/// Mines into `query`. A plain-regtest empty store should use
+/// [`open_mature_regtest_with_spend`], which mines once per process and copies.
 pub fn build_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> MatureRegtestChain {
+    mine_mature_regtest_with_spend(query, params)
+}
+
+/// One plain-regtest mature chain per process. Each caller gets a private store copy.
+struct SharedMatureRegtest {
+    keep: crate::TempDir,
+    chain: MatureRegtestChain,
+}
+
+fn shared_mature_regtest() -> &'static SharedMatureRegtest {
+    static PAD: OnceLock<SharedMatureRegtest> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let keep = crate::TempDir::labeled("mature-regtest-pad").expect("mature pad dir");
+        let q = Query::open_or_create_tiny(keep.path()).unwrap();
+        let chain = mine_mature_regtest_with_spend(&q, &ChainParams::regtest());
+        q.flush().expect("flush mature regtest pad");
+        drop(q);
+        SharedMatureRegtest { keep, chain }
+    })
+}
+
+fn plain_regtest(params: &ChainParams) -> bool {
+    let base = ChainParams::regtest();
+    params.network == base.network
+        && params.genesis_hash == base.genesis_hash
+        && params.pow_limit == base.pow_limit
+        && params.checkpoints.is_empty()
+        && params.signet_challenge.is_none()
+        && params.bip34_hash.is_none()
+        && params.csv_height() == base.csv_height()
+        && params.segwit_height() == base.segwit_height()
+        && params.subsidy_halving_interval() == base.subsidy_halving_interval()
+        && params.no_pow_retargeting() == base.no_pow_retargeting()
+        && params.allow_min_difficulty_blocks() == base.allow_min_difficulty_blocks()
+        && params.difficulty_adjustment_interval() == base.difficulty_adjustment_interval()
+}
+
+fn dir_occupied(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .ok()
+        .is_some_and(|mut d| d.next().is_some())
+}
+
+fn copy_store_tree(src: &Path, dst: &Path) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
+}
+
+/// Copy the process-lifetime plain-regtest mature chain into `store` and open it.
+///
+/// A non-empty directory, or params that are not plain regtest, is mined into
+/// that store and does not read or write the shared pad. Header timestamps
+/// stay the pad's.
+pub fn open_mature_regtest_with_spend(
+    store: impl AsRef<Path>,
+    params: &ChainParams,
+) -> (Query, MatureRegtestChain) {
+    let store = store.as_ref();
+    if !plain_regtest(params) || dir_occupied(store) {
+        let q = Query::open_or_create_tiny(store).unwrap();
+        let chain = mine_mature_regtest_with_spend(&q, params);
+        return (q, chain);
+    }
+    let pad = shared_mature_regtest();
+    std::fs::create_dir_all(store).unwrap();
+    copy_store_tree(pad.keep.path(), store);
+    let q = Query::open_or_create_tiny(store).unwrap();
+    q.flush().expect("flush mature regtest copy");
+    let tip = q.tip_height().map(|h| h.0);
+    assert_eq!(tip, Some(pad.chain.tip_height()));
+    let (_, rec) = q
+        .header_at_height(Height(pad.chain.tip_height()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.hash, *pad.chain.tip_hash().as_byte_array());
+    (q, pad.chain.clone())
+}
+
+fn mine_mature_regtest_with_spend(query: &Query, params: &ChainParams) -> MatureRegtestChain {
     let ms = Milestone::NONE;
     let maturity = params.coinbase_maturity();
 

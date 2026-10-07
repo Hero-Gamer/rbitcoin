@@ -658,7 +658,7 @@ fn getnetworkinfo_localrelay_follows_mempool_relay() {
 
 #[test]
 fn blocksonly_sendraw_admits_valid_tx() {
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     ctx.mempool.as_ref().unwrap().set_relay_enabled(false);
     let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
     let off = dispatch(&ctx, "getnetworkinfo", vec![]).unwrap();
@@ -1419,6 +1419,24 @@ fn ctx_from_mature_pad(max_wu: u64) -> (RpcContext, TempDir, Arc<rbitcoin_net::C
     regtest_ctx(dir, hub, max_wu)
 }
 
+#[test]
+fn mature_pad_copy_keeps_the_other_tip() {
+    let (a, dir_a, hub_a) = ctx_from_mature_pad(300_000_000);
+    let (_b, dir_b, hub_b) = ctx_from_mature_pad(300_000_000);
+    assert_eq!(hub_a.tip_height(), hub_b.tip_height());
+    assert!(hub_a.tip_height().unwrap() >= 101);
+    let tip_b = hub_b.tip_hash().unwrap();
+    assert_eq!(hub_a.tip_hash().unwrap(), tip_b);
+    let h1_a = hub_a.query.reconstruct_block_at_height(Height(1)).unwrap();
+    let h1_b = hub_b.query.reconstruct_block_at_height(Height(1)).unwrap();
+    assert_eq!(h1_a.txdata[0].compute_txid(), h1_b.txdata[0].compute_txid());
+    dispatch(&a, "generate", vec![json!(1)]).unwrap();
+    assert_ne!(hub_a.tip_hash().unwrap(), tip_b);
+    assert_eq!(hub_b.tip_hash().unwrap(), tip_b);
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
+}
+
 fn open_regtest_hub(
     store: impl AsRef<std::path::Path>,
     params: rbitcoin_consensus::ChainParams,
@@ -1503,7 +1521,7 @@ fn assert_getblock_core_header_keys(obj: &Value, header: &Value) {
 fn getblock_verbosity_2_size_weight_and_tx_fee() {
     use bitcoin::consensus::encode::deserialize;
 
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let (hex, _spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
     let hashes = dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
@@ -1931,7 +1949,7 @@ fn getrawtransaction_verbose_mid_disconnect_has_no_block_fields() {
 
 #[test]
 fn gettxout_leftover_is_connected_not_unconfirmed() {
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let (hex, spend) = mature_coinbase_spend_hex(&ctx, 50_0000_0000 - 1_000);
     dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
     let cb_txid = hash_hex_display(&spend.input[0].previous_output.txid.to_byte_array());
@@ -1973,7 +1991,6 @@ fn mature_coinbase_spend(
     keep_sat: u64,
     script: ScriptBuf,
 ) -> (String, Transaction) {
-    dispatch(ctx, "generate", vec![json!(101)]).unwrap();
     spend_generated_coinbase(ctx, 1, keep_sat, script)
 }
 
@@ -2084,7 +2101,7 @@ fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
 
 #[test]
 fn sendrawtransaction_maxburnamount_default_rejects_op_return() {
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let burn = 1_000u64;
     let (hex, spend) = mature_coinbase_spend(&ctx, burn, ScriptBuf::from_bytes(vec![0x6a]));
     let e = dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
@@ -2222,7 +2239,7 @@ fn submitpackage_child_fail_keeps_parent() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let (parent_hex, parent) = mature_coinbase_spend(
         &ctx,
         50_0000_0000 - 1_000,
@@ -2368,7 +2385,7 @@ fn rpc_submit_nonstandard_version_is_version() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let (parent_hex, parent) = mature_coinbase_spend(
         &ctx,
         50_0000_0000 - 1_000,
@@ -2449,8 +2466,7 @@ fn mempool_under_pressure() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
 
-    let (ctx, dir, _hub) = ctx_regtest_hub();
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let spk = ScriptBuf::from_bytes(vec![0x51]);
     let (parent_hex, parent) = spend_generated_coinbase(&ctx, 1, 50_0000_0000 - 1_000, spk.clone());
     let child = child_of(&parent, 1_000);
@@ -2690,7 +2706,7 @@ fn submitpackage_oversized_spk_is_scriptpubkey() {
     use bitcoin::consensus::encode::serialize;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    let (ctx, dir, _hub) = ctx_regtest_hub();
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
     let (parent_hex, parent) = mature_coinbase_spend(
         &ctx,
         50_0000_0000 - 1_000,
@@ -4671,9 +4687,8 @@ fn submitblock_store_fault_does_not_cache_block_invalid() {
 fn submitblock_sibling_spend_is_not_cached_invalid() {
     use rbitcoin_primitives::Height;
 
-    let (ctx, dir, hub) = ctx_regtest_hub();
+    let (ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
     let mature = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
     let spend = Transaction {
         version: bitcoin::transaction::Version::TWO,

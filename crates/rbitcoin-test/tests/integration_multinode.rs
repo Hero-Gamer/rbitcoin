@@ -47,39 +47,83 @@ async fn start_node_inbound(dir: &TempDir, max_inbound: usize) -> P2PNode {
     .expect("listen")
 }
 
+fn copy_store_tree(src: &std::path::Path, dst: &std::path::Path) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
+}
+
+fn tip_hash_of(q: &Query) -> BlockHash {
+    let h = q.tip_height().expect("tip");
+    let (_, rec) = q.header_at_height(h).unwrap().unwrap();
+    BlockHash::from_byte_array(rec.hash)
+}
+
+struct PaddedQueryPad {
+    keep: TempDir,
+}
+
+/// Mature regtest with basic filters sealed through height 1, once per process.
+fn padded_query_pad() -> &'static PaddedQueryPad {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<PaddedQueryPad> = OnceLock::new();
+    PAD.get_or_init(|| {
+        use rbitcoin_consensus::accept_and_connect_block;
+        use rbitcoin_test::pad_empty_from;
+
+        let keep = TempDir::labeled("padded-query").expect("padded query pad");
+        let store = keep.path().join("store");
+        std::fs::create_dir_all(&store).unwrap();
+        let q = Query::open_or_create_tiny(&store).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = regtest_genesis();
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        pad_empty_from(
+            &q,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            params.coinbase_maturity() + 1,
+        );
+        q.set_block_filter_index(true).unwrap();
+        let heights = q.index_heights(0, 1, None).unwrap();
+        let window = q.read_index_window(&heights).unwrap();
+        let built: Vec<_> = (0..heights.len())
+            .map(|i| {
+                (
+                    q.basic_filter_from_window(&window, i).unwrap(),
+                    heights[i].header_fk,
+                )
+            })
+            .collect();
+        assert_eq!(q.commit_window_filters(0, &built).unwrap(), 2);
+        assert_eq!(q.basic_filter_hwm().unwrap(), Some(1));
+        q.flush().expect("flush padded query");
+        drop(q);
+        PaddedQueryPad { keep }
+    })
+}
+
 /// Mature regtest pad with basic filters sealed through height 1 only.
 ///
-/// Connecting the chain releases the index through the tip. Commit 0..=1
-/// directly and leave live append off, so a later connect does not seal
-/// the rest.
+/// The chain is a private copy of the process pad. Re-open the filter index
+/// so the sealed watermark stays height 1. Live append stays off, so a later
+/// connect does not seal the rest.
 fn open_padded_query(dir: &TempDir) -> Query {
-    use rbitcoin_consensus::accept_and_connect_block;
-    use rbitcoin_test::pad_empty_from;
-
-    let q = Query::open_or_create_tiny(dir.path().join("store")).unwrap();
-    let params = ChainParams::regtest();
-    let genesis = regtest_genesis();
-    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
-    pad_empty_from(
-        &q,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        params.coinbase_maturity() + 1,
-    );
+    let dest = dir.path().join("store");
+    std::fs::create_dir_all(&dest).unwrap();
+    copy_store_tree(&padded_query_pad().keep.path().join("store"), &dest);
+    let q = Query::open_or_create_tiny(&dest).unwrap();
     q.set_block_filter_index(true).unwrap();
-    let heights = q.index_heights(0, 1, None).unwrap();
-    let window = q.read_index_window(&heights).unwrap();
-    let built: Vec<_> = (0..heights.len())
-        .map(|i| {
-            (
-                q.basic_filter_from_window(&window, i).unwrap(),
-                heights[i].header_fk,
-            )
-        })
-        .collect();
-    assert_eq!(q.commit_window_filters(0, &built).unwrap(), 2);
     assert_eq!(q.basic_filter_hwm().unwrap(), Some(1));
     q
 }
@@ -833,6 +877,35 @@ fn mine_on(node: &P2PNode, height: u32) -> BlockHash {
     let h = b.block_hash();
     node.ingest_block(height, b).unwrap();
     h
+}
+
+#[test]
+fn padded_query_copy_keeps_the_other_tip_and_filter_hwm() {
+    use rbitcoin_consensus::accept_and_connect_block;
+
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    let qa = open_padded_query(&a);
+    let qb = open_padded_query(&b);
+    assert_eq!(qa.tip_height(), qb.tip_height());
+    let tip_b = tip_hash_of(&qb);
+    assert_eq!(tip_hash_of(&qa), tip_b);
+    assert_eq!(qa.basic_filter_hwm().unwrap(), Some(1));
+    assert_eq!(qb.basic_filter_hwm().unwrap(), Some(1));
+    let h = qa.tip_height().unwrap().0;
+    let time = qa.header_at_height(Height(h)).unwrap().unwrap().1.timestamp;
+    let block = mine_regtest_block(tip_hash_of(&qa), time + 600, h + 1, vec![]);
+    accept_and_connect_block(
+        &qa,
+        &ChainParams::regtest(),
+        Height(h + 1),
+        &block,
+        Milestone::NONE,
+    )
+    .unwrap();
+    assert_eq!(tip_hash_of(&qb), tip_b);
+    assert_eq!(qb.basic_filter_hwm().unwrap(), Some(1));
+    assert_ne!(tip_hash_of(&qa), tip_b);
 }
 
 /// Mature-pad follow: HB coinbase compact, 2-tx compact → getblocktxn, same-peer

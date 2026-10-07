@@ -1783,11 +1783,37 @@ struct WireRig {
     cbs: Vec<bitcoin::Txid>,
 }
 
-impl WireRig {
-    fn new(label: &str, peers: usize) -> Self {
-        use super::super::assign::tests::dummy_slot;
+struct WirePad {
+    // The confirmed-set seed still reads this store after `WireRig::new` returns.
+    _dir: rbitcoin_query::testutil::TempDir,
+    _hub: std::sync::Arc<crate::chain::ChainHub>,
+    tip: BlockHash,
+    tip_time: u32,
+    t: u32,
+    cbs: Vec<bitcoin::Txid>,
+}
+
+fn copy_store_tree(src: &std::path::Path, dst: &std::path::Path) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
+}
+
+/// Direct-index maturity+2 regtest, mined once per process.
+fn wire_pad() -> &'static WirePad {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<WirePad> = OnceLock::new();
+    PAD.get_or_init(|| {
         use rbitcoin_consensus::{pad_empty_from, ChainParams};
-        let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled(label);
+        let (dir, hub0) = crate::chain::tiny_regtest_hub_labeled("wire-pad");
         hub0.query.enter_direct_index_mode().unwrap();
         let hub = std::sync::Arc::new(hub0);
         hub.ensure_genesis().unwrap();
@@ -1805,7 +1831,39 @@ impl WireRig {
             last,
             2,
         );
+        hub.query.flush().expect("flush wire pad");
         let t = hub.tip_height().unwrap();
+        WirePad {
+            _dir: dir,
+            _hub: hub,
+            tip,
+            tip_time,
+            t,
+            cbs,
+        }
+    })
+}
+
+impl WireRig {
+    fn new(label: &str, peers: usize) -> Self {
+        use super::super::assign::tests::dummy_slot;
+        use rbitcoin_consensus::ChainParams;
+        let pad = wire_pad();
+        let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect("wire copy");
+        copy_store_tree(pad._dir.path(), dir.path());
+        let q = Query::open_or_create_tiny(dir.path()).unwrap();
+        // IndexMode lives on the open Query and defaults to Tip. The pad was
+        // connected in Direct; re-enter so later confirms stay on that path.
+        q.enter_direct_index_mode().unwrap();
+        let hub = std::sync::Arc::new(crate::chain::ChainHub::new(
+            q,
+            ChainParams::regtest(),
+            rbitcoin_consensus::Milestone::NONE,
+        ));
+        assert_eq!(hub.tip_hash(), Some(pad.tip));
+        assert_eq!(hub.tip_height(), Some(pad.t));
+        assert!(hub.query.index_mode().is_direct());
+        let (tip, tip_time, t, cbs) = (pad.tip, pad.tip_time, pad.t, pad.cbs.clone());
         let mut st = IbdWorkState::new((1..=peers).map(dummy_slot).collect(), Some(tip), Some(t));
         let feed = std::sync::Arc::new(super::super::confirm::ConfirmFeed::new());
         st.confirm_feed = Some(std::sync::Arc::clone(&feed));
@@ -2060,6 +2118,32 @@ impl WireRig {
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+#[test]
+fn wire_pad_copy_keeps_the_other_tip() {
+    use bitcoin::ScriptBuf;
+
+    let a = WireRig::new("wire-iso-a", 1);
+    let b = WireRig::new("wire-iso-b", 1);
+    assert_eq!(a.t, b.t);
+    assert!(a.t >= 102);
+    assert_eq!(a.tip, b.tip);
+    assert_eq!(a.cbs, b.cbs);
+    assert!(a.hub.query.index_mode().is_direct());
+    assert!(b.hub.query.index_mode().is_direct());
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        a.tip,
+        a.tip_time + 600,
+        a.t + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![WireRig::spend(a.cbs[0])],
+    );
+    a.hub.accept_block(block).unwrap();
+    assert_eq!(b.hub.tip_hash(), Some(b.tip));
+    assert_ne!(a.hub.tip_hash(), Some(b.tip));
+    a.finish();
+    b.finish();
 }
 
 /// Peers answer the getdata for tip+1 with a body the header does not

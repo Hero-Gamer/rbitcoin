@@ -11,7 +11,7 @@ use rbitcoin_electrum::electrum_scripthash_hex;
 use rbitcoin_node::{run_p2p, NodeConfig, Sv2AuthoritySecret};
 use rbitcoin_primitives::{Height, Network};
 use rbitcoin_query::Query;
-use rbitcoin_test::{build_mature_regtest_with_spend, TestDatadir};
+use rbitcoin_test::{open_mature_regtest_with_spend, TestDatadir};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1215,6 +1215,38 @@ fn fee_history_has_height(dir: &std::path::Path, height: u32) -> bool {
     false
 }
 
+#[test]
+fn shared_mature_regtest_copy_keeps_the_other_tip() {
+    use rbitcoin_test::mine::mine_regtest_block;
+
+    fn tip_hash(q: &Query) -> bitcoin::BlockHash {
+        let h = q.tip_height().unwrap();
+        let (_, rec) = q.header_at_height(h).unwrap().unwrap();
+        bitcoin::BlockHash::from_byte_array(rec.hash)
+    }
+
+    let params = ChainParams::regtest();
+    let a = TestDatadir::new().unwrap();
+    let b = TestDatadir::new().unwrap();
+    let (qa, ca) = open_mature_regtest_with_spend(a.store_path(), &params);
+    let (qb, cb) = open_mature_regtest_with_spend(b.store_path(), &params);
+    assert_eq!(qa.tip_height(), qb.tip_height());
+    assert_eq!(ca.tip_hash(), cb.tip_hash());
+    assert_eq!(tip_hash(&qa), ca.tip_hash());
+    assert_eq!(ca.matured_coinbase_txid, cb.matured_coinbase_txid);
+    assert!(ca.tip_height() > params.coinbase_maturity());
+    let next = ca.tip_height() + 1;
+    let block = mine_regtest_block(
+        ca.tip_hash(),
+        ca.blocks.last().unwrap().header.time + 600,
+        next,
+        vec![],
+    );
+    accept_and_connect_block(&qa, &params, Height(next), &block, Milestone::NONE).unwrap();
+    assert_eq!(tip_hash(&qb), cb.tip_hash());
+    assert_ne!(tip_hash(&qa), tip_hash(&qb));
+}
+
 /// A node that leaves IBD with relay on preloads fee history from the chain
 /// and keeps it in the mempool dir (snapshot plus per-connect journal), and a
 /// restart preloads again on top of that file. With flow cold and too little history for any target,
@@ -1227,8 +1259,7 @@ async fn fee_history_backfills_from_the_chain_when_relay_starts() {
     let td = TestDatadir::new().unwrap();
     let params = ChainParams::regtest();
     {
-        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-        build_mature_regtest_with_spend(&q, &params);
+        let (q, _chain) = open_mature_regtest_with_spend(td.store_path(), &params);
         q.flush().unwrap();
     }
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
@@ -3028,8 +3059,7 @@ async fn sv2_tp_bootstrap() {
     let td = TestDatadir::new().unwrap();
     let params = ChainParams::regtest();
     let coinbase = {
-        let q = Query::open_or_create_tiny(td.store_path()).unwrap();
-        let chain = build_mature_regtest_with_spend(&q, &params);
+        let (q, chain) = open_mature_regtest_with_spend(td.store_path(), &params);
         q.flush().unwrap();
         chain.blocks[2].txdata[0].compute_txid()
     };
