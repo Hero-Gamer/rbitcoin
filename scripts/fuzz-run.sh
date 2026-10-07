@@ -134,7 +134,17 @@ timeout=10
 if [[ "$BIN" == "block_differential" ]]; then
   sanitizer="none"
   timeout=90
-elif [[ "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" ]]; then
+elif [[ "$BIN" == "block_spend_differential" ]]; then
+  # Sunday ASan uses a short per-input budget. Weekdays stay unsanitized.
+  weekday="${FUZZ_WEEKDAY:-$(date +%u)}"
+  if [[ "$weekday" == "7" ]]; then
+    sanitizer="address"
+    timeout=90
+  else
+    sanitizer="none"
+    timeout=180
+  fi
+elif [[ "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" ]]; then
   sanitizer="none"
   timeout=180
 elif [[ "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" ]]; then
@@ -145,7 +155,7 @@ elif [[ "$BIN" == "store_reorg" ]]; then
   timeout=30
 elif [[ "$BIN" == "script_kernel_differential" ]]; then
   sanitizer="address"
-  timeout=10
+  timeout=1
 elif [[ "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" ]]; then
   sanitizer="none"
   timeout=180
@@ -178,7 +188,7 @@ if [[ "${FUZZ_DRY_RUN:-}" == "1" ]]; then
   if [[ "$BIN" == "block_differential" || "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" || "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" || "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" ]]; then
     echo "RBITCOIN_CORE_BITCOIND=${RBITCOIN_CORE_BITCOIND:-}"
   fi
-  if [[ "$BIN" == "store_reorg" || "$BIN" == "asmap" ]]; then
+  if [[ "$BIN" == "asmap" || "$BIN" == "store_reorg" ]]; then
     echo "FUZZ_NO_CORE=1"
   fi
   if [[ "$BIN" == "script_kernel_differential" ]]; then
@@ -355,6 +365,18 @@ if [[ "$BIN" == "store_reorg" ]]; then
 fi
 
 if [[ "$BIN" == "script_kernel_differential" ]]; then
+  kernel_json="third_party/bitcoin/src/test/data/script_tests.json"
+  kernel_fixture="scripts/testdata/script-kernel-seed-rows.json"
+  if [[ -f "$kernel_json" ]]; then
+    python3 "$ROOT/scripts/script-kernel-seeds.py" \
+      "$kernel_json" fuzz/corpus/script_kernel_differential 32
+  elif [[ -f "$kernel_fixture" ]]; then
+    echo "fuzz-run: script_kernel seeds from $kernel_fixture (script_tests.json absent)"
+    python3 "$ROOT/scripts/script-kernel-seeds.py" \
+      "$kernel_fixture" fuzz/corpus/script_kernel_differential 32
+  else
+    echo "fuzz-run: script_kernel seeds skipped; no script_tests.json or fixture" >&2
+  fi
   merge_seed fuzz/corpus/script_kernel_differential \
     crates/rbitcoin-consensus/tests/fixtures/script_kernel_op_true.bin
   merge_seed fuzz/corpus/script_kernel_differential \
@@ -491,7 +513,7 @@ if [[ "$BIN" == "script_differential" || "$BIN" == "script_verify_differential" 
   dict_args=(-dict=fuzz/dict/script.dict)
 fi
 set +e
-env -u CARGO_TARGET_DIR cargo fuzz run --target "$target" --sanitizer none "$BIN" -- \
+env -u CARGO_TARGET_DIR cargo fuzz run --target "$target" --sanitizer "$sanitizer" "$BIN" -- \
   -max_total_time="$(fuzz_max_total_time)" \
   -timeout="$timeout" \
   -max_len="$max_len" \

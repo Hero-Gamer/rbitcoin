@@ -2,7 +2,7 @@
 
 use bitcoin::absolute::LockTime;
 use bitcoin::bip152::{HeaderAndShortIds, ShortId};
-use bitcoin::consensus::encode::deserialize;
+use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
@@ -14,8 +14,19 @@ use bitcoin::{
 use rbitcoin_consensus::{
     genesis_block, grind_regtest_pow, mine_regtest_paying, ChainParams, REGTEST_BLOCK_SPACING,
 };
-use rbitcoin_net::{encode_v2_contents, shortid_map_from_txs, try_reconstruct, NetError};
-use std::collections::HashSet;
+use rbitcoin_net::{
+    drain_pending_now, encode_v2_contents, shortid_map_from_txs, try_reconstruct, ChainHub,
+    NetError, PendingBlocks,
+};
+use std::collections::{HashMap, HashSet};
+use tokio::sync::mpsc;
+
+use rbitcoin_primitives::hex_encode;
+
+use crate::block_diff::{
+    same_hash_merkle_mutant, verdict_from_core_reply, BlockOracle, CompareOne, DiffVerdict,
+    OracleReply,
+};
 
 /// BIP324 application contents for `cmpctblock`.
 pub fn encode_cmpctblock_v2(hsi: &HeaderAndShortIds) -> Result<Vec<u8>, NetError> {
@@ -49,9 +60,26 @@ pub fn encode_verack_v2() -> Result<Vec<u8>, NetError> {
 
 /// BIP324 `getheaders` with empty locator (Core stays connected).
 pub fn encode_getheaders_empty_v2() -> Result<Vec<u8>, NetError> {
+    encode_getheaders_v2(Vec::new(), BlockHash::from_byte_array([0; 32]))
+}
+
+/// BIP324 `feefilter` when `payload` is an 8-byte little-endian fee.
+pub fn encode_feefilter_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let bytes: [u8; 8] = payload.try_into().ok()?;
+    let amt = i64::from_le_bytes(bytes);
+    encode_v2_contents(NetworkMessage::FeeFilter(amt)).ok()
+}
+
+/// BIP324 `inv` when `payload` is a consensus-encoded inventory vector.
+pub fn encode_inv_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let inv = deserialize::<Vec<bitcoin::p2p::message_blockdata::Inventory>>(payload).ok()?;
+    encode_v2_contents(NetworkMessage::Inv(inv)).ok()
+}
+
+/// BIP324 `getheaders` for a locator and stop hash.
+pub fn encode_getheaders_v2(locator: Vec<BlockHash>, stop: BlockHash) -> Result<Vec<u8>, NetError> {
     encode_v2_contents(NetworkMessage::GetHeaders(GetHeadersMessage::new(
-        Vec::new(),
-        BlockHash::from_byte_array([0; 32]),
+        locator, stop,
     )))
 }
 
@@ -115,6 +143,137 @@ pub fn prepare_cmpct_fuzz_case(data: &[u8]) -> Option<CmpctFuzzCase> {
 /// missing ring, not a split. Omitting a Core index disagrees.
 pub fn cmpct_getblocktxn_agrees(ours: &[u64], core: &[u64]) -> bool {
     core.iter().all(|i| ours.contains(i))
+}
+
+/// A drain error that drops the peer. That is a disagreement, not a skip.
+pub fn cmpct_drain_disconnects(err: &NetError) -> bool {
+    matches!(
+        err,
+        NetError::Disconnected
+            | NetError::Protocol(_)
+            | NetError::V1Peer
+            | NetError::Bip324(_)
+            | NetError::MessageTooLarge(_)
+    )
+}
+
+fn cmpct_drain_harness(err: &NetError) -> bool {
+    matches!(
+        err,
+        NetError::Io(_)
+            | NetError::Timeout
+            | NetError::Store(_)
+            | NetError::Cancelled
+            | NetError::Encode(_)
+    )
+}
+
+/// Full local reconstruct, when the compact case has one.
+pub fn reconstructed_cmpct_block(case: &CmpctFuzzCase) -> Option<bitcoin::Block> {
+    if !rbitcoin_net::prefilled_indexes_ok(&case.hsi) {
+        return None;
+    }
+    let avail = shortid_map_from_txs(&case.hsi.header, case.hsi.nonce, 2, &case.fill_txs);
+    try_reconstruct(&case.hsi, &avail, 2).ok()
+}
+
+fn drain_one(hub: &ChainHub, block: bitcoin::Block) -> Result<(), NetError> {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut pending = PendingBlocks::new();
+    pending.insert(block.block_hash(), block);
+    let mut headers = HashMap::new();
+    let mut requested = HashSet::new();
+    drain_pending_now(hub, &tx, &mut pending, &mut headers, &mut requested, true)
+}
+
+fn follow_core_verdict(oracle: &dyn BlockOracle, hex: &str) -> Result<DiffVerdict, CompareOne> {
+    let reply = oracle.submitblock_hex(hex);
+    if matches!(reply, OracleReply::Dead)
+        || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
+    {
+        return Err(CompareOne::Harness("oracle dead"));
+    }
+    let reason = match &reply {
+        OracleReply::Reason(s) => s.as_str(),
+        _ => "",
+    };
+    // `duplicate` means Core already has this body. `duplicate-invalid` is a
+    // reject, including the reply after `invalidateblock`.
+    if matches!(reply, OracleReply::NullAccept) || reason == "duplicate" {
+        return Ok(DiffVerdict::Accept);
+    }
+    if reason == "duplicate-invalid" {
+        return Ok(DiffVerdict::Reject);
+    }
+    Ok(verdict_from_core_reply(&reply))
+}
+
+/// Mutated compact body, then the honest block for that header, both through
+/// `drain_pending_now`. Core sees the honest body only. A tip that stays put
+/// is a hub reject, scored against Core's `submitblock` of that body.
+pub fn follow_invalid_cmpct(
+    hub: &ChainHub,
+    oracle: &dyn BlockOracle,
+    mutated: bitcoin::Block,
+    successor: bitcoin::Block,
+) -> CompareOne {
+    let succ_hash = successor.block_hash();
+    if let Err(e) = drain_one(hub, mutated) {
+        return if cmpct_drain_harness(&e) {
+            CompareOne::Harness("drain")
+        } else {
+            CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            }
+        };
+    }
+    if let Err(e) = drain_one(hub, successor.clone()) {
+        if cmpct_drain_harness(&e) {
+            return CompareOne::Harness("drain successor");
+        }
+        if cmpct_drain_disconnects(&e) {
+            return CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            };
+        }
+    }
+    let hex = hex_encode(serialize(&successor));
+    let core = match follow_core_verdict(oracle, &hex) {
+        Ok(v) => v,
+        Err(fate) => return fate,
+    };
+    let hub_accept = hub.tip_hash() == Some(succ_hash) && !hub.is_block_invalid(&succ_hash);
+    match (hub_accept, core) {
+        (true, DiffVerdict::Accept) => CompareOne::Agreed { accept: true },
+        (false, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
+        (true, DiffVerdict::Reject) => CompareOne::Disagreed {
+            ours: true,
+            core: false,
+            hex,
+        },
+        (false, DiffVerdict::Accept) => CompareOne::Disagreed {
+            ours: false,
+            core: true,
+            hex,
+        },
+        (_, DiffVerdict::Skip) => CompareOne::Skipped,
+    }
+}
+
+/// When this compact case reconstructs locally, drain a same-hash mutant and
+/// then the honest body. `None` means there is no local body to replay.
+pub fn follow_reconstructed_cmpct(
+    hub: &ChainHub,
+    oracle: &dyn BlockOracle,
+    case: &CmpctFuzzCase,
+) -> Option<CompareOne> {
+    let block = reconstructed_cmpct_block(case)?;
+    let mutated = same_hash_merkle_mutant(&block)?;
+    Some(follow_invalid_cmpct(hub, oracle, mutated, block))
 }
 
 /// Missing indexes using the case fill set (empty = mempool-cold).
@@ -234,6 +393,125 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join(name)
+    }
+
+    #[test]
+    fn drain_disconnect_is_a_disagreement() {
+        let err = NetError::Disconnected;
+        assert!(cmpct_drain_disconnects(&err));
+        assert!(!cmpct_drain_disconnects(&NetError::Timeout));
+    }
+
+    #[test]
+    fn invalid_compact_then_honest_body_advances_the_tip() {
+        use std::cell::Cell;
+
+        use rbitcoin_consensus::{genesis_block, mine_regtest_paying, Milestone};
+        use rbitcoin_net::ChainHub;
+
+        struct Accepts {
+            n: Cell<u32>,
+        }
+        impl BlockOracle for Accepts {
+            fn submitblock_hex(&self, _hex: &str) -> OracleReply {
+                self.n.set(self.n.get() + 1);
+                OracleReply::NullAccept
+            }
+            fn liveness_ok(&self) -> bool {
+                true
+            }
+            fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_reconsider_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+        }
+
+        let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("cmpct-follow");
+        let params = crate::block_diff::diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let genesis = genesis_block(&params);
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+        );
+        let mutated = same_hash_merkle_mutant(&honest).expect("mutant");
+        let oracle = Accepts { n: Cell::new(0) };
+        let fate = follow_invalid_cmpct(&hub, &oracle, mutated, honest.clone());
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: true }),
+            "{fate:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
+        assert!(!hub.is_block_invalid(&honest.block_hash()));
+        assert_eq!(oracle.n.get(), 1);
+    }
+
+    #[test]
+    fn honest_body_both_reject_is_not_a_core_accept() {
+        use std::cell::Cell;
+
+        use rbitcoin_consensus::{genesis_block, mine_regtest_paying, Milestone};
+        use rbitcoin_net::ChainHub;
+
+        struct Rejects {
+            n: Cell<u32>,
+        }
+        impl BlockOracle for Rejects {
+            fn submitblock_hex(&self, _hex: &str) -> OracleReply {
+                self.n.set(self.n.get() + 1);
+                OracleReply::Reason("bad-txns-inputs-missingorspent".into())
+            }
+            fn liveness_ok(&self) -> bool {
+                true
+            }
+            fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_reconsider_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+        }
+
+        let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("cmpct-follow-reject");
+        let params = crate::block_diff::diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let genesis = genesis_block(&params);
+        let mix = sha256::Hash::hash(b"no-connect");
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![cmpct_fuzz_dummy_tx(mix, 0)],
+        );
+        let mutated = same_hash_merkle_mutant(&honest).expect("mutant");
+        let oracle = Rejects { n: Cell::new(0) };
+        let fate = follow_invalid_cmpct(&hub, &oracle, mutated, honest.clone());
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: false }),
+            "{fate:?}"
+        );
+        assert_ne!(hub.tip_hash(), Some(honest.block_hash()));
+        assert_eq!(oracle.n.get(), 1);
     }
 
     #[test]

@@ -1,0 +1,7 @@
+[
+  ["Format is: [[wit..., amount]?, scriptSig, scriptPubKey, flags, expected_scripterror]"],
+  ["", "DEPTH 0 EQUAL", "P2SH", "OK"],
+  ["1", "1 EQUAL", "P2SH", "OK", "mentions OP_TUCK in a comment"],
+  ["", "OP_TOALTSTACK OP_FROMALTSTACK", "P2SH", "OK"],
+  ["2", "2 CHECKMULTISIG", "P2SH", "OK"]
+]

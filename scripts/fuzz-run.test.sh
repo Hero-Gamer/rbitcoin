@@ -66,6 +66,8 @@ assert_ok "store_reorg dry-run bin" \
   grep -qx "FUZZ_BIN=store_reorg" <<<"$out"
 assert_ok "store_reorg dry-run sanitizer address" \
   grep -qx "FUZZ_SANITIZER=address" <<<"$out"
+assert_ok "store_reorg dry-run timeout 30" \
+  grep -qx "FUZZ_TIMEOUT=30" <<<"$out"
 assert_ok "store_reorg dry-run no Core" \
   grep -qx "FUZZ_NO_CORE=1" <<<"$out"
 assert_ok "store_reorg dry-run does not export deleted RBITCOIN_HEAD_SCALE" \
@@ -84,10 +86,39 @@ assert_ok "script_kernel dry-run dict" \
   grep -qx "FUZZ_DICT=fuzz/dict/script.dict" <<<"$out"
 assert_ok "script_kernel dry-run max_len 2000" \
   grep -qx "FUZZ_MAX_LEN=2000" <<<"$out"
+assert_ok "script_kernel dry-run timeout 1" \
+  grep -qx "FUZZ_TIMEOUT=1" <<<"$out"
+assert_ok "script_kernel seeds fall back to the committed fixture" \
+  grep -q 'script-kernel-seed-rows.json' "$ROOT/scripts/fuzz-run.sh"
 assert_ok "script_kernel listed in fuzz Cargo.toml" \
   grep -q 'name = "script_kernel_differential"' "$ROOT/fuzz/Cargo.toml"
 assert_ok "script_kernel listed in fuzz.yml matrix" \
   grep -q '{ bin: script_kernel_differential, core: false }' "$ROOT/.github/workflows/fuzz.yml"
+seed_tmp="$(mktemp -d)"
+python3 "$ROOT/scripts/script-kernel-seeds.py" \
+  "$ROOT/scripts/testdata/script-kernel-seed-rows.json" "$seed_tmp" 32
+seed_n="$(find "$seed_tmp" -name 'core_script_*.bin' | wc -l)"
+assert_ok "script kernel seed picker writes four fixture rows" \
+  test "$seed_n" = "4"
+assert_ok "script kernel seeds prefer altstack tuck and cms" \
+  cmp -s <(python3 - "$seed_tmp" <<'PY'
+import pathlib, sys
+d = pathlib.Path(sys.argv[1])
+first = (d / "core_script_00.bin").read_bytes()
+second = (d / "core_script_01.bin").read_bytes()
+third = (d / "core_script_02.bin").read_bytes()
+# 0xFE, flags, shape 0, then the fixed spend header, then scripts.
+assert first[0] == 0xFE and first[5] == 0
+# OP_TUCK comment row is scriptSig=1 (0x51), scriptPubKey=1 EQUAL (0x51 0x87).
+assert b"\x51\x87" in first
+# OP_TOALTSTACK is opcode 0x6b on the second preferred row's scriptPubKey.
+assert b"\x6b" in second
+# CHECKMULTISIG is opcode 0xae.
+assert b"\xae" in third
+print("ok")
+PY
+) <(printf 'ok\n')
+rm -rf "$seed_tmp"
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" chain_review_differential)"
 assert_ok "chain_review dry-run bin" \
@@ -226,7 +257,7 @@ assert_ok "differential dry-run in-process (no -jobs)" \
 assert_ok "differential dry-run timeout 90" \
   grep -qx "FUZZ_TIMEOUT=90" <<<"$out"
 
-out="$(FUZZ_DRY_RUN=1 "$RUN" block_spend_differential)"
+out="$(FUZZ_DRY_RUN=1 FUZZ_WEEKDAY=1 "$RUN" block_spend_differential)"
 assert_ok "spend-differential dry-run bin" \
   grep -qx "FUZZ_BIN=block_spend_differential" <<<"$out"
 assert_ok "spend-differential dry-run does not export deleted RBITCOIN_HEAD_SCALE" \
@@ -239,6 +270,12 @@ assert_ok "spend-differential dry-run in-process (no -jobs)" \
   grep -qx "FUZZ_JOBS=in-process" <<<"$out"
 assert_ok "spend-differential dry-run timeout 180" \
   grep -qx "FUZZ_TIMEOUT=180" <<<"$out"
+
+out="$(FUZZ_DRY_RUN=1 FUZZ_WEEKDAY=7 "$RUN" block_spend_differential)"
+assert_ok "sunday spend dry-run sanitizer address" \
+  grep -qx "FUZZ_SANITIZER=address" <<<"$out"
+assert_ok "sunday spend dry-run timeout 90" \
+  grep -qx "FUZZ_TIMEOUT=90" <<<"$out"
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" script_differential)"
 assert_ok "script-differential dry-run bin" \

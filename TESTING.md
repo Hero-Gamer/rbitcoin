@@ -438,19 +438,19 @@ API.
 | `electrum_json` | Electrum JSON-RPC line parse (ASan, `electrum.dict`) | none |
 | `asmap` | Core asmap bytecode `AsMap::from_bytes` then `interpret_ip16` on leftover 16 bytes (ASan, no Core). Junk must not panic or hang | none |
 | `v2_session` | BIP324 handshake + structured ping/pong vs a live v31.1 `bitcoind` v2 peer (ASan). Matching `pong` is a comparison. Garbage slice remains for encoder ASan. | official **v31.1** `bitcoind` tarball (`scripts/core-functional/fetch-bitcoind.sh`), `-listen=1` |
-| `cmpct_differential` | structured BIP152 recipe → `try_reconstruct` missing indexes vs Core `getblocktxn` (ASan). Fill-flag extras go to Core extra-txn first. Raw-wire arm is skip if decode fails. Full reconstruct (no `getblocktxn`) is a comparison. **Not** accept/reject; **not** two-node reorg. Duplicate-txid fill (018) may request extra indexes Core extra-txn already placed; Core's request must be a subset of ours | same tarball, `-listen=1` |
-| `block_differential` | height-1 `ChainHub::accept_received_block` vs Core `submitblock`, **accept vs reject only** | same tarball |
-| `block_spend_differential` | height-101 spend of a mature pad coinbase, same path and oracle | same tarball |
-| `script_differential` | height-101 same-block spend whose **executed scriptPubKey** is fuzzer-owned, same path and oracle | same tarball |
+| `cmpct_differential` | structured BIP152 recipe → `try_reconstruct` missing indexes vs Core `getblocktxn` (ASan). Fill-flag extras go to Core extra-txn first. Raw-wire arm is skip if decode fails. Full reconstruct (no `getblocktxn`) is a comparison, then `drain_pending_now` of a same-hash mutant and the honest body. Core is not invalidated first, and Core sees the honest body only. Hub accept with Core `submitblock` null or `duplicate` agrees. Both rejecting agrees. A tip that stays put is not treated as a Core accept. A disconnect-class error from the mutant drain is a disagreement. **Not** a second node process. Duplicate-txid fill (018) may request extra indexes Core extra-txn already placed; Core's request must be a subset of ours | same tarball, `-listen=1` |
+| `block_differential` | height-1 `ChainHub::accept_received_block` vs Core `submitblock`, **accept vs reject only**. An input longer than 16 bytes whose tail control byte is `0xFE` submits a same-hash merkle mutant first. The honest block is replayed only when both sides rejected that mutant, so an accept or a split is not replaced by the honest result. Duplicating the last tx keeps the computed merkle root only for an odd count of at least 3; shorter and even counts fail `check_merkle_root` | same tarball |
+| `block_spend_differential` | height-101 spend of a mature pad coinbase, same path and oracle, including the `0xFE` honest-twin replay. Weekdays are `--sanitizer none` and `-timeout=180`. Sunday (`FUZZ_WEEKDAY=7`) is `--sanitizer address` and `-timeout=90` so the maturity pad and Core spawn fit under ASan | same tarball |
+| `script_differential` | height-101 same-block spend whose **executed scriptPubKey** is fuzzer-owned, same path and oracle, including the `0xFE` honest-twin replay | same tarball |
 | `block_fork_differential` | 2-block heavier fork off the pad (sibling of a pad+1 stem), same path and oracle | same tarball |
 | `cmpct_reorg_differential` | same fork child, but hub delivers **child then parent** through `drain_pending` (014/020); Core `submitblock`s parent then child. Accept vs reject of C / final tip | same tarball |
 | `block_reorg_n_differential` | `DIFF_REORG_N` heavier side vs 1-block stem; same rewind/restore as fork | same tarball |
 | `block_csv_differential` | BIP68 relative lock (full `u32` nSequence + version + MTP `time_shift`) vs Core `submitblock` | same tarball |
 | `mempool_differential` | `MempoolHub::test_accept` vs Core `testmempoolaccept`. **Consensus-class only** — Core standardness / fee / RBF / dust is skip (COMPAT) | same tarball, `-acceptnonstdtxn=1` |
 | `script_verify_differential` | `verify_tx_scripts_detached` vs Core `testmempoolaccept` of the parent+spend package. Same policy skip | same tarball, `-acceptnonstdtxn=1` |
-| `store_reorg` | Tiny-hub `{extend, sibling, rewind}` connect churn (ASan, no Core). Equal-work siblings park in `held_bodies`; sibling ops no-op once `held_body_count` hits 16 so `try_apply_held` stays inside `-timeout=30` on one persistent hub (reopening the store leaked ASan RSS to 2 GiB). Store `Corrupt` / probe-exhausted **panics** | none |
-| `script_kernel_differential` | In-process script verify vs `bitcoinconsensus` (ASan, **fuzz workspace only**). Legacy half-split still forces P2SH\|WITNESS. `0xFE` inputs carry an independent flag word, witness bytes, and fixed discriminators (empty-sig CHECKMULTISIG, non-canonical DER, typed P2PKH/P2WPKH, flag schedule, BIP16 exception, empty signet solution). Aborting flag combinations are skips. Disagreement panics | Core interpreter via `bitcoinconsensus` crate |
-| `p2p_sequence_differential` | Up to 8 `{ping, headers, block}` steps vs live Core v2 + `compare_one` for block | same tarball, `-listen=1` |
+| `store_reorg` | Tiny-hub `{extend, sibling, rewind}` connect churn (ASan, no Core). Sibling ops no-op once `held_body_count` hits 16 so one input cannot walk 320 bodies under the ASan timeout. Extend stops at height 32. After the op list the hub is dropped and the same datadir is reopened; the tip hash must match. The previous `Query` is dropped first, so this is not the two-live-`Query` RSS growth. A separate test rejects a second spend on a reopened hub. Store `Corrupt` / probe-exhausted **panics** | none, `-timeout=30` |
+| `script_kernel_differential` | In-process script verify vs `bitcoinconsensus` (ASan, **fuzz workspace only**). Every executed input is `0xFE`, a Core flag word, a shape, and a payload. Shape 0 is opcode soup: tx version, sequence, locktime, amount, then length-prefixed scriptSig, scriptPubKey, and witness. Shapes 1–8 stay the fixed discriminators (empty-sig CHECKMULTISIG, non-canonical DER, typed P2PKH/P2WPKH, flag schedule, BIP16 exception, empty signet solution). Any other prefix skips. Aborting flag combinations are skips. Disagreement panics. The runner plants at most 32 shape-0 seeds from Core `script_tests.json` when that file is present, otherwise from `scripts/testdata/script-kernel-seed-rows.json` (`OP_TOALTSTACK`, `OP_TUCK`, and `CHECKMULTISIG` first). Our verifier has a 100ms thread-CPU budget (`SCRIPT_KERNEL_VERIFY_BUDGET`); a second sample must also exceed it. libFuzzer `-timeout=1` is the hang backstop | Core interpreter via `bitcoinconsensus` crate |
+| `p2p_sequence_differential` | Up to 8 steps vs live Core v2. Bytes that do not start with `0xA5` stay `{ping, headers, block, skip}`. `0xA5` steps are `tag || u16le len || payload`: ping, headers, block, tx (consensus-class only, hub mempool attached), getheaders, cmpct, blocktxn, feefilter, and inv. Inv and feefilter payloads stay inside that `u16` length. A feefilter or inv is sent to the local `P2PNode`; a drop fails the input. It is not a Core comparison, because Core is whitelisted and the payload is re-encoded. An empty getheaders answer is not a comparison. A non-empty list of known hashes is. A dropped Core session is reconnected; a failed reconnect skips that step. A ping match, a consensus-class tx agree, a header-sequence agree, or a compact-index agree is a comparison | same tarball, `-listen=1` |
 | `chain_review_differential` | Fresh `ChainHub` per shape: height-only milestone spend, genesis coinbase spend, unspendable BIP30 replay, same-batch immature coinbase, height-0 BIP68 lock, mutated-then-honest body, reorg respend. Injected or live `submitblock` reply. No skip. `"duplicate"` is an accept only when that block is active or `valid-fork`; the rule is `core_fate` in `fuzz/src/chain_review.rs`. Harness failure exits 2 | same tarball, `--sanitizer none`, `-testactivationheight=bip34@100000000` |
 
 ```bash
@@ -463,7 +463,7 @@ API.
 ./scripts/fuzz-run.sh v2_session                # live Core v2 peer, ping/pong compare, ASan
 ./scripts/fuzz-run.sh cmpct_differential        # compact missing indexes vs getblocktxn, ASan
 ./scripts/fuzz-run.sh block_differential        # fetch bitcoind, --sanitizer none
-./scripts/fuzz-run.sh block_spend_differential  # 100-block pad, --sanitizer none, -timeout=180
+./scripts/fuzz-run.sh block_spend_differential  # 100-block pad; weekdays --sanitizer none -timeout=180; Sunday address -timeout=30
 ./scripts/fuzz-run.sh script_differential       # mutate executed scriptPubKey, --sanitizer none
 ./scripts/fuzz-run.sh block_fork_differential   # pad+stem, 2-block fork, --sanitizer none
 ./scripts/fuzz-run.sh cmpct_reorg_differential  # child-first drain_pending vs Core
@@ -472,8 +472,8 @@ API.
 ./scripts/fuzz-run.sh mempool_differential      # test_accept vs testmempoolaccept
 ./scripts/fuzz-run.sh script_verify_differential # detached scripts vs testmempoolaccept package
 ./scripts/fuzz-run.sh store_reorg                # tiny hub connect/disconnect, ASan, no Core
-./scripts/fuzz-run.sh script_kernel_differential # ours vs libbitcoinconsensus, ASan, no Core
-./scripts/fuzz-run.sh p2p_sequence_differential  # ping/headers/block vs Core, --sanitizer none
+./scripts/fuzz-run.sh script_kernel_differential # ours vs libbitcoinconsensus, ASan, -timeout=1, 100ms verify budget
+./scripts/fuzz-run.sh p2p_sequence_differential  # tagged steps vs Core, --sanitizer none
 ./scripts/fuzz-run.sh chain_review_differential  # hub review shapes vs submitblock, --sanitizer none
 ```
 
@@ -508,6 +508,10 @@ on leftover garbage is not a consensus split.
 (short leftover zeros). Version 0 → tx v1 (CSV ignored); otherwise v2.
 `time_shift` is added to the spend header time so MTP can satisfy or fail
 `SEQUENCE_LOCKTIME_TYPE_FLAG`.
+
+An external multi-message campaign stays on Fuzzamoto scenarios `ir` and
+`compact_blocks`. This tree does not vendor that harness or run it in
+GitHub Actions.
 
 Skip-rate gate: after `Done N runs` with N≥1000, `comparisons/runs` must
 be ≥ **0.01** for submitblock diffs. Skip-heavy jobs (`mempool_differential`,

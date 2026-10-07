@@ -67,6 +67,15 @@ pub fn classify_v2_cmpct_peer(contents: &[u8]) -> CmpctPeerFrame {
     }
 }
 
+/// Header hashes from a decrypted `headers` payload. Other messages are `None`.
+pub fn v2_header_hashes(contents: &[u8]) -> Option<Vec<BlockHash>> {
+    let frame = crate::v2::parse_v2_contents(Magic::REGTEST, contents).ok()?;
+    match frame.decode().payload() {
+        NetworkMessage::Headers(headers) => Some(headers.iter().map(|h| h.block_hash()).collect()),
+        _ => None,
+    }
+}
+
 /// Prefill indexes must decode in-range. Out-of-range is a malformed `cmpctblock`.
 pub fn prefilled_indexes_ok(hsi: &HeaderAndShortIds) -> bool {
     let total = hsi.short_ids.len().saturating_add(hsi.prefilled_txs.len());
@@ -991,6 +1000,18 @@ mod tests {
         let pong = crate::v2::encode_v2_contents(NetworkMessage::Pong(7)).unwrap();
         assert_eq!(classify_v2_cmpct_peer(&pong), CmpctPeerFrame::Pong(7));
         assert_eq!(classify_v2_cmpct_peer(&[]), CmpctPeerFrame::Other);
+    }
+
+    #[test]
+    fn v2_header_hashes_reads_a_headers_payload() {
+        use rbitcoin_consensus::{genesis_block, ChainParams};
+        let genesis = genesis_block(&ChainParams::regtest());
+        let hash = genesis.block_hash();
+        let frame =
+            crate::v2::encode_v2_contents(NetworkMessage::Headers(vec![genesis.header])).unwrap();
+        assert_eq!(v2_header_hashes(&frame), Some(vec![hash]));
+        let ping = crate::v2::encode_v2_contents(NetworkMessage::Ping(1)).unwrap();
+        assert_eq!(v2_header_hashes(&ping), None);
     }
 
     #[test]

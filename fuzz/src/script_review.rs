@@ -1,9 +1,14 @@
-//! Script differentials the legacy one-byte kernel cannot reach.
+//! Script differential against `bitcoinconsensus`.
 //!
-//! Structured inputs (`0xFE`) carry an independent Core flag word, witness
-//! bytes, and fixed discriminators. Flag combinations that abort
-//! `libbitcoinconsensus` are [`KernelCmp::Skip`]. A different verdict is
-//! [`KernelCmp::Disagree`] even when our word is stricter than Core's.
+//! Every executed input is `0xFE`, then a Core flag word, a shape, and a
+//! payload. Anything else is a skip. Shape 0 is opcode soup: transaction
+//! version, sequence, locktime, amount, then length-prefixed scriptSig,
+//! scriptPubKey, and witness. Shapes 1–8 are fixed discriminators. Flag
+//! combinations that abort `libbitcoinconsensus` are [`KernelCmp::Skip`].
+//! A different verdict is [`KernelCmp::Disagree`] even when our word is
+//! stricter than Core's.
+
+use std::time::Duration;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
@@ -51,6 +56,77 @@ const SHAPE_V0: u8 = 5;
 const SHAPE_DERSIG: u8 = 6;
 const SHAPE_BIP16: u8 = 7;
 const SHAPE_SIGNET: u8 = 8;
+
+/// Thread CPU time for our verifier. libFuzzer `-timeout=1` is the hang
+/// backstop; this bound is what fails a quadratic script. Do not start looser.
+/// A single sample over the bound is run once more. Panic only when both
+/// samples exceed it, so a scheduler stall is not a finding.
+pub const SCRIPT_KERNEL_VERIFY_BUDGET: Duration = Duration::from_millis(100);
+
+pub fn verify_budget_exceeded(elapsed: Duration) -> bool {
+    elapsed > SCRIPT_KERNEL_VERIFY_BUDGET
+}
+
+/// Both samples have to be over the budget. A missing clock does not panic.
+pub fn verify_budget_confirmed(first: Option<Duration>, second: Option<Duration>) -> bool {
+    match (first, second) {
+        (Some(a), Some(b)) => verify_budget_exceeded(a) && verify_budget_exceeded(b),
+        _ => false,
+    }
+}
+
+#[repr(C)]
+struct TimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn thread_cpu_now() -> Option<Duration> {
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    extern "C" {
+        fn clock_gettime(clk_id: i32, tp: *mut TimeSpec) -> i32;
+    }
+    let mut ts = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a timespec this function owns. `clock_gettime` writes
+    // that object and does not retain the pointer. Clock 3 is
+    // CLOCK_THREAD_CPUTIME_ID on Linux.
+    if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    Some(
+        Duration::from_secs(ts.tv_sec.max(0) as u64)
+            + Duration::from_nanos(ts.tv_nsec.max(0) as u64),
+    )
+}
+
+fn sample_cpu<T>(verify: &mut dyn FnMut() -> T) -> (T, Option<Duration>) {
+    let start = thread_cpu_now();
+    let value = verify();
+    let elapsed = match (start, thread_cpu_now()) {
+        (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+        _ => None,
+    };
+    (value, elapsed)
+}
+
+fn our_verify_within_budget<T>(prefix: &[u8], mut verify: impl FnMut() -> T) -> T {
+    let (value, first) = sample_cpu(&mut verify);
+    if !first.is_some_and(verify_budget_exceeded) {
+        return value;
+    }
+    let (value, second) = sample_cpu(&mut verify);
+    if verify_budget_confirmed(first, second) {
+        let n = prefix.len().min(8);
+        panic!(
+            "script-kernel verify budget first={first:?} second={second:?} prefix={:02x?}",
+            &prefix[..n]
+        );
+    }
+    value
+}
 
 /// Core `GetBlockScriptFlags` (validation.cpp): P2SH|WITNESS|TAPROOT from
 /// genesis, replaced only by the two exception hashes, then the height-gated
@@ -149,12 +225,22 @@ fn classify(ours: bool, core: bool) -> KernelCmp {
 
 /// Run the shipped verifier and `bitcoinconsensus` on one spend.
 pub fn compare_spend(prevouts: Vec<TxOut>, tx: Transaction, flags: u32) -> KernelCmp {
+    compare_spend_prefixed(prevouts, tx, flags, &[])
+}
+
+fn compare_spend_prefixed(
+    prevouts: Vec<TxOut>,
+    tx: Transaction,
+    flags: u32,
+    prefix: &[u8],
+) -> KernelCmp {
     if flags_abort_libconsensus(flags) {
         return KernelCmp::Skip;
     }
     debug_assert_eq!(UNMAPPED_POLICY & (VERIFY_P2SH | VERIFY_WITNESS), 0);
-    let ours =
-        verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), flags_to_ours(flags)).is_ok();
+    let ours = our_verify_within_budget(prefix, || {
+        verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), flags_to_ours(flags)).is_ok()
+    });
     match core_script_verdict(&prevouts, &tx, flags) {
         Ok(core) => classify(ours, core),
         Err(Error::ERR_INVALID_FLAGS) => KernelCmp::Skip,
@@ -167,20 +253,40 @@ fn spend(
     script_pubkey: Vec<u8>,
     witness: Witness,
 ) -> (Vec<TxOut>, Transaction) {
+    spend_fields(
+        TxVersion::TWO,
+        Sequence::MAX,
+        LockTime::ZERO,
+        Amount::from_sat(50_0000_0000),
+        script_sig,
+        script_pubkey,
+        witness,
+    )
+}
+
+fn spend_fields(
+    version: TxVersion,
+    sequence: Sequence,
+    lock_time: LockTime,
+    amount: Amount,
+    script_sig: Vec<u8>,
+    script_pubkey: Vec<u8>,
+    witness: Witness,
+) -> (Vec<TxOut>, Transaction) {
     let prevouts = vec![TxOut {
-        value: Amount::from_sat(50_0000_0000),
+        value: amount,
         script_pubkey: ScriptBuf::from_bytes(script_pubkey),
     }];
     let tx = Transaction {
-        version: TxVersion::TWO,
-        lock_time: LockTime::ZERO,
+        version,
+        lock_time,
         input: vec![TxIn {
             previous_output: OutPoint {
                 txid: bitcoin::Txid::from_byte_array([1; 32]),
                 vout: 0,
             },
             script_sig: ScriptBuf::from_bytes(script_sig),
-            sequence: Sequence::MAX,
+            sequence,
             witness,
         }],
         output: vec![TxOut {
@@ -267,7 +373,15 @@ fn read_u16(data: &[u8], at: &mut usize) -> Option<usize> {
 }
 
 fn raw_spend(payload: &[u8]) -> Option<(Vec<TxOut>, Transaction)> {
-    let mut at = 0usize;
+    let header = payload.get(..20)?;
+    let version = i32::from_le_bytes(header[0..4].try_into().ok()?);
+    let sequence = u32::from_le_bytes(header[4..8].try_into().ok()?);
+    let lock_time = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let amount = i64::from_le_bytes(header[12..20].try_into().ok()?);
+    if amount < 0 {
+        return None;
+    }
+    let mut at = 20usize;
     let sig_len = read_u16(payload, &mut at)?;
     if sig_len > 10_000 {
         return None;
@@ -294,7 +408,15 @@ fn raw_spend(payload: &[u8]) -> Option<(Vec<TxOut>, Transaction)> {
         at += n;
     }
     let refs: Vec<&[u8]> = items.iter().map(|v| v.as_slice()).collect();
-    Some(spend(sig, spk, Witness::from_slice(&refs)))
+    Some(spend_fields(
+        TxVersion::non_standard(version),
+        Sequence::from_consensus(sequence),
+        LockTime::from_consensus(lock_time),
+        Amount::from_sat(amount as u64),
+        sig,
+        spk,
+        Witness::from_slice(&refs),
+    ))
 }
 
 /// Node flags and Core flags for one height, on `spend`.
@@ -302,6 +424,7 @@ pub fn compare_at_height(
     height: u32,
     block_hash: &[u8; 32],
     spend_tx: (Vec<TxOut>, Transaction),
+    prefix: &[u8],
 ) -> KernelCmp {
     let params = ChainParams::mainnet();
     let core_flags = core_block_script_flags(&params, height, block_hash);
@@ -310,22 +433,30 @@ pub fn compare_at_height(
     }
     let ours_flags = ScriptVerifyFlags::for_block(&params, height, block_hash, 0);
     let (prevouts, tx) = spend_tx;
-    let ours = verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), ours_flags).is_ok();
+    let ours = our_verify_within_budget(prefix, || {
+        verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), ours_flags).is_ok()
+    });
     let core = core_accept(&prevouts, &tx, core_flags);
     classify(ours, core)
 }
 
 pub fn compare_signet_empty(challenge: &[u8]) -> KernelCmp {
+    compare_signet_empty_prefixed(challenge, &[])
+}
+
+fn compare_signet_empty_prefixed(challenge: &[u8], prefix: &[u8]) -> KernelCmp {
     if challenge.is_empty() || challenge.len() > 10_000 {
         return KernelCmp::Skip;
     }
     let block = signet_block_bare_commitment();
     let script = Script::from_bytes(challenge);
-    let ours = validate_signet_block_solution(&block, script).is_ok();
     let Ok((to_spend, to_sign)) = signet_challenge_transactions(&block, script) else {
         return KernelCmp::Skip;
     };
     let core_flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DERSIG | VERIFY_NULLDUMMY;
+    let ours = our_verify_within_budget(prefix, || {
+        validate_signet_block_solution(&block, script).is_ok()
+    });
     let core = core_accept(&to_spend.output, &to_sign, core_flags);
     classify(ours, core)
 }
@@ -359,18 +490,15 @@ fn signet_block_bare_commitment() -> Block {
     }
 }
 
-/// Legacy half-split, or `0xFE || u32-le flags || shape || payload`.
+/// `0xFE || u32-le flags || shape || payload`. Any other prefix skips.
 pub fn compare_kernel_bytes(data: &[u8]) -> Option<KernelCmp> {
-    if data.first().copied() == Some(STRUCTURED) {
-        return compare_structured(&data[1..]);
+    if data.first().copied() != Some(STRUCTURED) {
+        return None;
     }
-    let (sig, pk, flags) = crate::script_kernel::parse_kernel_input(data)?;
-    Some(crate::script_kernel::compare_script_kernel(
-        &sig, &pk, flags,
-    ))
+    compare_structured(&data[1..], data)
 }
 
-fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
+fn compare_structured(data: &[u8], input: &[u8]) -> Option<KernelCmp> {
     if data.len() < 5 {
         return None;
     }
@@ -380,33 +508,51 @@ fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
     Some(match shape {
         SHAPE_RAW => {
             let (prev, tx) = raw_spend(payload)?;
-            compare_spend(prev, tx, flags)
+            compare_spend_prefixed(prev, tx, flags, input)
         }
-        SHAPE_CMS => compare_spend_pair(cms_empty_sig_spend(), flags),
-        SHAPE_DER => compare_spend_pair(witness_der_spend(), flags),
-        SHAPE_P2PKH => compare_spend_pair(typed_p2pkh_spend(), flags),
-        SHAPE_P2WPKH => compare_spend_pair(typed_p2wpkh_spend(), flags),
-        SHAPE_V0 => compare_v0_at_payload_height(payload),
+        SHAPE_CMS => {
+            let pair = cms_empty_sig_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_DER => {
+            let pair = witness_der_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_P2PKH => {
+            let pair = typed_p2pkh_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_P2WPKH => {
+            let pair = typed_p2wpkh_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_V0 => compare_v0_at_payload_height(payload, input),
         SHAPE_DERSIG => {
             let height = payload_height(payload);
-            compare_at_height(height, &[0x11; 32], nullfail_spend())
+            compare_at_height(height, &[0x11; 32], nullfail_spend(), input)
         }
-        SHAPE_BIP16 => compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, bip16_bare_spend()),
+        SHAPE_BIP16 => {
+            compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, bip16_bare_spend(), input)
+        }
         SHAPE_SIGNET => {
             let challenge = if payload.is_empty() {
                 vec![0x52]
             } else {
                 payload.to_vec()
             };
-            compare_signet_empty(&challenge)
+            compare_signet_empty_prefixed(&challenge, input)
         }
         _ => return None,
     })
 }
 
-fn compare_spend_pair(pair: (Vec<TxOut>, Transaction), flags: u32) -> KernelCmp {
+fn compare_spend_pair_prefixed(
+    pair: (Vec<TxOut>, Transaction),
+    flags: u32,
+    prefix: &[u8],
+) -> KernelCmp {
     let (prev, tx) = pair;
-    compare_spend(prev, tx, flags)
+    compare_spend_prefixed(prev, tx, flags, prefix)
 }
 
 /// v0 program vs `for_block` only once segwit is active.
@@ -414,7 +560,7 @@ fn compare_spend_pair(pair: (Vec<TxOut>, Transaction), flags: u32) -> KernelCmp 
 /// Below that height `for_block` leaves WITNESS off, so this program is a
 /// true bare script, while `GetBlockScriptFlags` has had WITNESS on since
 /// genesis. A missing height is not treated as 1000.
-fn compare_v0_at_payload_height(payload: &[u8]) -> KernelCmp {
+fn compare_v0_at_payload_height(payload: &[u8], prefix: &[u8]) -> KernelCmp {
     if payload.len() < 4 {
         return KernelCmp::Skip;
     }
@@ -422,7 +568,7 @@ fn compare_v0_at_payload_height(payload: &[u8]) -> KernelCmp {
     if !ChainParams::mainnet().segwit_active_at(height) {
         return KernelCmp::Skip;
     }
-    compare_at_height(height, &[0x11; 32], v0_program_spend())
+    compare_at_height(height, &[0x11; 32], v0_program_spend(), prefix)
 }
 
 fn payload_height(payload: &[u8]) -> u32 {
@@ -445,6 +591,8 @@ fn bip16_bare_spend() -> (Vec<TxOut>, Transaction) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use rbitcoin_consensus::verify_tx_scripts_with_flags;
 
@@ -473,9 +621,10 @@ mod tests {
             compare_spend(prev.clone(), tx.clone(), flags),
             KernelCmp::Skip
         ));
+        let err = verify_tx_scripts_with_flags(prev, tx, flags_to_ours(flags)).unwrap_err();
         assert!(
-            verify_tx_scripts_with_flags(prev, tx, flags_to_ours(flags)).is_ok(),
-            "empty-sig deletion is not a hard fail without a Core verdict to match"
+            err.to_string().contains("SIG_FINDANDDELETE"),
+            "CONST_SCRIPTCODE rejects the empty-sig OP_0 deletion: {err}"
         );
     }
 
@@ -546,7 +695,7 @@ mod tests {
         assert_eq!(ours, core, "for_block and GetBlockScriptFlags diverge");
         assert!(!core, "empty v0 witness rejects once WITNESS is on");
         assert!(matches!(
-            compare_at_height(height, &hash, (prev, tx)),
+            compare_at_height(height, &hash, (prev, tx), &[]),
             KernelCmp::Agree { accept: false }
         ));
 
@@ -619,7 +768,7 @@ mod tests {
         let ours_flags =
             ScriptVerifyFlags::for_block(&params, 170_060, &BIP16_EXCEPTION_MAINNET, 0);
         let ours = verify_tx_scripts_with_flags(prev.clone(), tx.clone(), ours_flags).is_ok();
-        match compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, (prev, tx)) {
+        match compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, (prev, tx), &[]) {
             KernelCmp::Agree { accept } if accept == ours && ours == core => {}
             KernelCmp::Disagree { ours: o, core: c } if o == ours && c == core && ours != core => {}
             other => panic!("bip16 ours={ours} core={core}: {other:?}"),
@@ -636,5 +785,49 @@ mod tests {
             compare_kernel_bytes(&raw),
             Some(KernelCmp::Agree { .. } | KernelCmp::Disagree { .. })
         ));
+    }
+
+    #[test]
+    fn verify_budget_rejects_only_past_one_hundred_milliseconds() {
+        assert!(!verify_budget_exceeded(Duration::from_millis(0)));
+        assert!(!verify_budget_exceeded(Duration::from_millis(100)));
+        assert!(verify_budget_exceeded(Duration::from_millis(101)));
+        assert!(!verify_budget_confirmed(
+            Some(Duration::from_millis(101)),
+            Some(Duration::from_millis(1)),
+        ));
+        assert!(verify_budget_confirmed(
+            Some(Duration::from_millis(101)),
+            Some(Duration::from_millis(101)),
+        ));
+        assert!(!verify_budget_confirmed(
+            None,
+            Some(Duration::from_millis(101))
+        ));
+    }
+
+    #[test]
+    fn legacy_half_split_is_not_executed() {
+        assert_eq!(compare_kernel_bytes(&[0x1f, 0x51]), None);
+    }
+
+    #[test]
+    fn raw_shape_carries_version_sequence_locktime_and_amount() {
+        let flags = VERIFY_P2SH | VERIFY_WITNESS;
+        let mut raw = vec![STRUCTURED];
+        raw.extend_from_slice(&flags.to_le_bytes());
+        raw.push(SHAPE_RAW);
+        raw.extend_from_slice(&2i32.to_le_bytes());
+        raw.extend_from_slice(&u32::MAX.to_le_bytes());
+        raw.extend_from_slice(&0u32.to_le_bytes());
+        raw.extend_from_slice(&5_000_000_000i64.to_le_bytes());
+        raw.extend_from_slice(&0u16.to_le_bytes());
+        raw.extend_from_slice(&1u16.to_le_bytes());
+        raw.push(0x51);
+        raw.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            compare_kernel_bytes(&raw),
+            Some(KernelCmp::Agree { accept: true })
+        );
     }
 }

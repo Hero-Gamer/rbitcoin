@@ -114,6 +114,9 @@ pub const DIFF_MUT_SHUFFLE: u8 = 0x40;
 pub const SCRIPT_FUZZ_CTRL: u8 = 0x80;
 /// Structured `{n_tx, has_witness, extra_size}` prefix for spend / height-1 prepare.
 pub const BLOCK_STRUCT_CTRL: u8 = 0x81;
+/// Tail control byte (inputs longer than 16 bytes): compare a same-hash
+/// merkle mutant, then submit the honest block to both nodes.
+pub const HONEST_TWIN_MARK: u8 = 0xFE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffTip {
@@ -274,11 +277,40 @@ pub fn store_reorg_apply(hub: &ChainHub, data: &[u8]) -> Result<u32, String> {
     Ok(n)
 }
 
-/// Fuzz-only cap on parked equal-work siblings. Production `HeldBodies` is 320;
-/// walking that many under ASan exceeds `-timeout=30`. Keep this small so one
-/// tiny hub lasts a 1h job (reopening the store every 16 applies grew RSS to
-/// libFuzzer's 2 GiB limit).
+/// Fuzz-only cap on parked equal-work siblings. Production `HeldBodies` is 320.
+/// Walking that many under ASan exceeds the per-input timeout, so the cap is 16.
 pub const STORE_REORG_HELD_CAP: usize = 16;
+
+/// Drop `hub` and open the same datadir. The old `Query` is gone before the
+/// new one exists. The tip hash must survive.
+pub fn reopen_store_hub(hub: ChainHub, store_path: &Path) -> Result<ChainHub, String> {
+    let tip = hub.tip_hash().ok_or("no tip hash")?;
+    drop(hub);
+    let q = rbitcoin_query::Query::open_or_create_tiny(store_path)
+        .map_err(|e| format!("reopen: {e}"))?;
+    let next = ChainHub::new(
+        q,
+        diff_regtest_params(),
+        rbitcoin_consensus::Milestone::NONE,
+    );
+    if next.tip_hash() != Some(tip) {
+        return Err("tip hash changed across reopen".into());
+    }
+    Ok(next)
+}
+
+/// Ops, then one reopen. The old `Query` is dropped before the new open.
+/// The tip hash must match. This input does not mine a maturity pad or ask
+/// Core: extend stops at height 32, and Core has none of this chain.
+pub fn store_reorg_round(
+    hub: ChainHub,
+    store_path: &Path,
+    data: &[u8],
+) -> Result<(ChainHub, u32), String> {
+    let n = store_reorg_apply(&hub, data)?;
+    let hub = reopen_store_hub(hub, store_path)?;
+    Ok((hub, n))
+}
 
 pub fn mine_diff_pad(hub: &ChainHub, last: u32) -> Result<DiffPad, &'static str> {
     if last < 1 {
@@ -901,6 +933,44 @@ pub fn parse_testmempoolaccept_json(body: &str) -> Result<OracleReply, &'static 
     Err("malformed")
 }
 
+/// One raw transaction: consensus-class only. Core standardness, fee, RBF,
+/// and dust are skips.
+pub fn compare_tx_bytes(hub: &ChainHub, oracle: &dyn BlockOracle, raw: &[u8]) -> CompareOne {
+    let Ok(tx) = deserialize::<Transaction>(raw) else {
+        return CompareOne::NotABlock;
+    };
+    let Some(mp) = hub.mempool() else {
+        return CompareOne::Skipped;
+    };
+    let ours = match mempool_ours_consensus(mp.test_accept(&tx)) {
+        Ok(v) => v,
+        Err(msg) => return CompareOne::Harness(msg),
+    };
+    if ours == DiffVerdict::Skip {
+        return CompareOne::Skipped;
+    }
+    let hex = hex_encode(serialize(&tx));
+    let reply = oracle.testmempoolaccept_hex(&hex);
+    if let OracleReply::Reason(reason) = &reply {
+        if is_core_mempool_policy_skip(reason) {
+            return CompareOne::Skipped;
+        }
+    }
+    let core = verdict_from_core_reply(&reply);
+    match (ours, core) {
+        (DiffVerdict::Accept, DiffVerdict::Accept) => CompareOne::Agreed { accept: true },
+        (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
+        (DiffVerdict::Skip, _) | (_, DiffVerdict::Skip) => CompareOne::Skipped,
+        (DiffVerdict::Accept, DiffVerdict::Reject) | (DiffVerdict::Reject, DiffVerdict::Accept) => {
+            CompareOne::Disagreed {
+                ours: ours == DiffVerdict::Accept,
+                core: core == DiffVerdict::Accept,
+                hex,
+            }
+        }
+    }
+}
+
 pub fn compare_mempool_one(
     hub: &ChainHub,
     tip: &DiffTip,
@@ -1258,7 +1328,8 @@ pub fn compare_one(
     let Some(block) = prepare_height1_candidate(tip, data) else {
         return CompareOne::NotABlock;
     };
-    compare_prepared(hub, tip, oracle, block)
+    let (offered, honest) = offered_with_twin(block, data);
+    compare_prepared_twin(hub, tip, oracle, offered, honest)
 }
 
 pub fn compare_spend_one(
@@ -1271,7 +1342,8 @@ pub fn compare_spend_one(
     let Some(block) = prepare_spend_candidate(tip, mature, data) else {
         return CompareOne::NotABlock;
     };
-    compare_prepared(hub, tip, oracle, block)
+    let (offered, honest) = offered_with_twin(block, data);
+    compare_prepared_twin(hub, tip, oracle, offered, honest)
 }
 
 pub fn compare_script_one(
@@ -1284,7 +1356,8 @@ pub fn compare_script_one(
     let Some(block) = prepare_script_candidate(tip, mature, data) else {
         return CompareOne::NotABlock;
     };
-    compare_prepared(hub, tip, oracle, block)
+    let (offered, honest) = offered_with_twin(block, data);
+    compare_prepared_twin(hub, tip, oracle, offered, honest)
 }
 
 fn restore_stem(
@@ -1716,7 +1789,151 @@ fn finish_reorg_compare(
     }
 }
 
+/// Same header as `honest`, with the last transaction repeated.
+///
+/// The block hash matches. The computed merkle root also matches when
+/// `honest` has an odd transaction count of at least 3, because that last
+/// leaf is already duplicated inside the tree. A 1-tx or 2-tx block, or any
+/// even count, changes the computed root, so `check_merkle_root` fails
+/// (`bad-txnmrklroot`). A count that keeps the root still fails consensus as
+/// a duplicate transaction. Both shapes are submitted.
+pub fn same_hash_merkle_mutant(honest: &Block) -> Option<Block> {
+    let last = honest.txdata.last()?.clone();
+    let mut txdata = honest.txdata.clone();
+    txdata.push(last);
+    let mutant = Block {
+        header: honest.header,
+        txdata,
+    };
+    if mutant.block_hash() != honest.block_hash() || mutant.txdata == honest.txdata {
+        return None;
+    }
+    Some(mutant)
+}
+
+fn wants_honest_twin(data: &[u8]) -> bool {
+    data.len() > 16 && data[data.len() - 16] == HONEST_TWIN_MARK
+}
+
+fn offered_with_twin(block: Block, data: &[u8]) -> (Block, Option<Block>) {
+    if !wants_honest_twin(data) {
+        return (block, None);
+    }
+    match same_hash_merkle_mutant(&block) {
+        Some(mutant) => (mutant, Some(block)),
+        None => (block, None),
+    }
+}
+
+/// Hub rejected the honest body and Core accepted it.
+pub fn honest_replay_verdict(ours: DiffVerdict, core: DiffVerdict) -> CompareOne {
+    match (ours, core) {
+        (DiffVerdict::Accept, DiffVerdict::Accept) => CompareOne::Agreed { accept: true },
+        (DiffVerdict::Reject, DiffVerdict::Accept) => CompareOne::Disagreed {
+            ours: false,
+            core: true,
+            hex: String::new(),
+        },
+        (DiffVerdict::Accept, DiffVerdict::Reject) => CompareOne::Disagreed {
+            ours: true,
+            core: false,
+            hex: String::new(),
+        },
+        (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
+        (DiffVerdict::Skip, _) | (_, DiffVerdict::Skip) => CompareOne::Skipped,
+    }
+}
+
+fn replay_honest_twin(
+    hub: &ChainHub,
+    tip: &DiffTip,
+    oracle: &dyn BlockOracle,
+    honest: Block,
+) -> CompareOne {
+    let keep = tip.height;
+    let hash = honest.block_hash();
+    let hex = hex_encode(serialize(&honest));
+    let ours = match verdict_from_accept(hub.accept_received_block(honest)) {
+        Ok(v) => v,
+        Err(msg) => return CompareOne::Harness(msg),
+    };
+    let reply = oracle.submitblock_hex(&hex);
+    if matches!(reply, OracleReply::Dead)
+        || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
+    {
+        if ours == DiffVerdict::Accept {
+            let _ = hub.rewind_to_height(keep);
+        }
+        let _ = oracle.core_rewind_to_height(keep);
+        return CompareOne::Harness("oracle dead");
+    }
+    let core = verdict_from_core_reply(&reply);
+    if matches!((ours, core), (DiffVerdict::Accept, DiffVerdict::Accept))
+        && hub.is_block_invalid(&hash)
+    {
+        let _ = hub.rewind_to_height(keep);
+        let _ = oracle.core_rewind_to_height(keep);
+        return CompareOne::Disagreed {
+            ours: true,
+            core: true,
+            hex,
+        };
+    }
+    match honest_replay_verdict(ours, core) {
+        CompareOne::Agreed { accept: true } => rewind_agreed(hub, oracle, keep, true),
+        CompareOne::Agreed { accept: false } => CompareOne::Agreed { accept: false },
+        CompareOne::Disagreed { ours, core, .. } => {
+            if ours {
+                let _ = hub.rewind_to_height(keep);
+            }
+            let _ = oracle.core_rewind_to_height(keep);
+            CompareOne::Disagreed { ours, core, hex }
+        }
+        other => {
+            if ours == DiffVerdict::Accept {
+                let _ = hub.rewind_to_height(keep);
+            }
+            let _ = oracle.core_rewind_to_height(keep);
+            other
+        }
+    }
+}
+
 fn compare_prepared(
+    hub: &ChainHub,
+    tip: &DiffTip,
+    oracle: &dyn BlockOracle,
+    block: Block,
+) -> CompareOne {
+    compare_prepared_twin(hub, tip, oracle, block, None)
+}
+
+fn compare_prepared_twin(
+    hub: &ChainHub,
+    tip: &DiffTip,
+    oracle: &dyn BlockOracle,
+    block: Block,
+    honest: Option<Block>,
+) -> CompareOne {
+    let offered_hash = block.block_hash();
+    let offered_len = block.txdata.len();
+    let prior = compare_offered(hub, tip, oracle, block);
+    let Some(honest) = honest else {
+        return prior;
+    };
+    // A different hash has no twin. The same body is already the honest block.
+    if honest.block_hash() != offered_hash || honest.txdata.len() == offered_len {
+        return prior;
+    }
+    // Replay only after both sides reject the mutant. An accept, a skip, or
+    // a split is the result; submitting the honest body would hide it.
+    match prior {
+        CompareOne::Agreed { accept: false } => replay_honest_twin(hub, tip, oracle, honest),
+        other => other,
+    }
+}
+
+fn compare_offered(
     hub: &ChainHub,
     tip: &DiffTip,
     oracle: &dyn BlockOracle,
@@ -1975,6 +2192,109 @@ mod tests {
     }
 
     #[test]
+    fn honest_reject_against_core_accept_disagrees() {
+        assert_eq!(
+            honest_replay_verdict(DiffVerdict::Reject, DiffVerdict::Accept),
+            CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn same_hash_mutant_replays_the_honest_block() {
+        let (_dir, hub, tip) = tmp_diff_hub();
+        let honest = {
+            let raw = different_height1();
+            deserialize::<Block>(&raw).unwrap()
+        };
+        let mutant = same_hash_merkle_mutant(&honest).expect("duplicate tail");
+        assert_eq!(mutant.block_hash(), honest.block_hash());
+        assert!(!mutant.check_merkle_root());
+        let mock = MockOracle::new(OracleReply::Reason("bad-txnmrklroot".into()))
+            .then(OracleReply::NullAccept);
+        let cmp = compare_prepared_twin(&hub, &tip, &mock, mutant, Some(honest.clone()));
+        assert!(
+            matches!(cmp, CompareOne::Agreed { accept: true }),
+            "{cmp:?}"
+        );
+        assert_eq!(mock.submits.get(), 2, "honest submit follows the mutant");
+        assert!(!hub.is_block_invalid(&honest.block_hash()));
+        assert_eq!(hub.tip_height(), Some(0));
+    }
+
+    #[test]
+    fn core_accept_of_a_rejected_mutant_is_not_replayed_away() {
+        let (_dir, hub, tip) = tmp_diff_hub();
+        let honest = {
+            let raw = different_height1();
+            deserialize::<Block>(&raw).unwrap()
+        };
+        let mutant = same_hash_merkle_mutant(&honest).expect("duplicate tail");
+        assert!(!mutant.check_merkle_root());
+        let mock = MockOracle::new(OracleReply::NullAccept);
+        let cmp = compare_prepared_twin(&hub, &tip, &mock, mutant, Some(honest));
+        assert_eq!(
+            mock.submits.get(),
+            1,
+            "honest replay must not hide the split"
+        );
+        assert!(
+            matches!(
+                cmp,
+                CompareOne::Disagreed {
+                    ours: false,
+                    core: true,
+                    ..
+                }
+            ),
+            "{cmp:?}"
+        );
+    }
+
+    #[test]
+    fn odd_count_duplicate_keeps_the_merkle_root() {
+        use bitcoin::hashes::Hash;
+        use rbitcoin_consensus::genesis_block;
+        let params = diff_regtest_params();
+        let genesis = genesis_block(&params);
+        let mut extras = Vec::new();
+        for n in 1u8..=2 {
+            extras.push(Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([n; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            });
+        }
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time.saturating_add(REGTEST_BLOCK_SPACING),
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            extras,
+        );
+        assert_eq!(honest.txdata.len(), 3);
+        let mutant = same_hash_merkle_mutant(&honest).expect("duplicate tail");
+        assert_eq!(mutant.block_hash(), honest.block_hash());
+        assert!(mutant.check_merkle_root());
+        assert_eq!(mutant.txdata.len(), 4);
+    }
+
+    #[test]
     fn parse_testmempoolaccept_json_allowed_and_policy() {
         assert!(matches!(
             parse_testmempoolaccept_json(
@@ -2173,6 +2493,63 @@ mod tests {
             "held_body_count {n} > fuzz cap {STORE_REORG_HELD_CAP}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopen_then_respend_is_rejected() {
+        use rbitcoin_consensus::Milestone;
+        use rbitcoin_query::testutil::tiny_query_labeled;
+        let (dir, q) = tiny_query_labeled("reopen-respend");
+        let path = dir.path().to_path_buf();
+        let params = diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let g = genesis_block(&params);
+        let mut hash = g.block_hash();
+        let mut time = g.header.time;
+        let mut spent = None;
+        for h in 1..=100 {
+            let b = mine_empty_regtest(hash, time.saturating_add(REGTEST_BLOCK_SPACING), h);
+            if h == 1 {
+                spent = Some(OutPoint {
+                    txid: b.txdata[0].compute_txid(),
+                    vout: 0,
+                });
+            }
+            match hub.accept_received_block(b.clone()) {
+                Ok(AcceptOutcome::Accepted { height }) if height == h => {}
+                other => panic!("pad {h}: {other:?}"),
+            }
+            hash = b.block_hash();
+            time = b.header.time;
+        }
+        let spent = spent.expect("height-1 coin");
+        let spend = mine_diff_paying(
+            hash,
+            time.saturating_add(REGTEST_BLOCK_SPACING),
+            101,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![default_op_true_spend(spent, 1)],
+        );
+        match hub.accept_received_block(spend) {
+            Ok(AcceptOutcome::Accepted { .. }) => {}
+            other => panic!("mature spend: {other:?}"),
+        }
+        let tip = hub.tip_hash();
+        let hub = reopen_store_hub(hub, &path).expect("reopen");
+        assert_eq!(hub.tip_hash(), tip);
+        let again = mine_diff_paying(
+            hub.tip_hash().unwrap(),
+            time.saturating_add(REGTEST_BLOCK_SPACING * 2),
+            102,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![default_op_true_spend(spent, 2)],
+        );
+        match verdict_from_accept(hub.accept_received_block(again)) {
+            Ok(DiffVerdict::Reject) => {}
+            other => panic!("reopened hub must reject the respend: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]
