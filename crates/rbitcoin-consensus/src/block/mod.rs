@@ -879,6 +879,94 @@ impl ScriptVerifyFlags {
     }
 }
 
+/// Prevout scripts for one script job.
+///
+/// Owned jobs (tests, non-wire connect) store [`TxOut`]. Confirm jobs store
+/// [`rbitcoin_query::SharedPrevoutScript`]: same-block bytes stay in the wire
+/// block, historical bytes stay in the pin outs `Arc`.
+#[derive(Clone, Debug)]
+pub(crate) enum JobPrevouts {
+    Owned(Vec<TxOut>),
+    Shared(Vec<rbitcoin_query::SharedPrevoutScript>),
+}
+
+impl PartialEq for JobPrevouts {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        (0..self.len())
+            .all(|i| self.amount(i) == other.amount(i) && self.script(i) == other.script(i))
+    }
+}
+
+impl Eq for JobPrevouts {}
+
+impl JobPrevouts {
+    pub(crate) fn owned(v: Vec<TxOut>) -> Self {
+        Self::Owned(v)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len(),
+            Self::Shared(v) => v.len(),
+        }
+    }
+
+    pub(crate) fn script(&self, i: usize) -> &[u8] {
+        match self {
+            Self::Owned(v) => v[i].script_pubkey.as_bytes(),
+            Self::Shared(v) => v[i].bytes(),
+        }
+    }
+
+    pub(crate) fn amount(&self, i: usize) -> Amount {
+        match self {
+            Self::Owned(v) => v[i].value,
+            Self::Shared(v) => Amount::from_sat(v[i].amount_sat() as u64),
+        }
+    }
+
+    /// Contiguous [`TxOut`]s. Shared jobs copy script bytes into this vec for
+    /// rust-bitcoin sighash (`Prevouts::All`), which takes owned outputs.
+    pub(crate) fn with_txouts<R>(&self, f: impl FnOnce(&[TxOut]) -> R) -> R {
+        match self {
+            Self::Owned(v) => f(v),
+            Self::Shared(v) => {
+                let owned: Vec<TxOut> = v
+                    .iter()
+                    .map(|s| TxOut {
+                        value: Amount::from_sat(s.amount_sat() as u64),
+                        script_pubkey: ScriptBuf::from_bytes(s.bytes().to_vec()),
+                    })
+                    .collect();
+                f(&owned)
+            }
+        }
+    }
+}
+
+impl std::ops::Index<usize> for JobPrevouts {
+    type Output = TxOut;
+
+    fn index(&self, index: usize) -> &TxOut {
+        match self {
+            Self::Owned(v) => &v[index],
+            Self::Shared(_) => panic!("shared prevout is not a TxOut"),
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for JobPrevouts {
+    fn index_mut(&mut self, index: usize) -> &mut TxOut {
+        match self {
+            Self::Owned(v) => &mut v[index],
+            Self::Shared(_) => panic!("shared prevout is not a TxOut"),
+        }
+    }
+}
+
 /// Script-verify job for one non-coinbase create.
 ///
 /// Confirm assemble attaches the wire [`Arc<Block>`] (no tx deep-clone). `txid`
@@ -887,7 +975,7 @@ impl ScriptVerifyFlags {
 pub struct ScriptCheckJob {
     /// Wire txid (assemble / [`Self::new`]); used for mempool preverified skip.
     pub(crate) txid: [u8; 32],
-    pub(crate) prevouts: Vec<TxOut>,
+    pub(crate) prevouts: JobPrevouts,
     /// Owned (tests) or shared wire block + index (confirm path).
     pub(crate) tx: JobTx,
     pub(crate) flags: ScriptVerifyFlags,
@@ -934,10 +1022,11 @@ impl ScriptCheckJob {
         tx: Transaction,
         flags: ScriptVerifyFlags,
     ) -> Self {
-        Self::from_parts(txid, prevouts, JobTx::owned(tx), flags)
+        Self::from_parts(txid, JobPrevouts::owned(prevouts), JobTx::owned(tx), flags)
     }
 
-    /// Confirm assemble: share the wire [`Arc<Block>`] (no `Transaction` clone).
+    /// Tests that share a wire block but still own prevout `TxOut`s.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn with_shared_tx(
         txid: [u8; 32],
@@ -946,14 +1035,19 @@ impl ScriptCheckJob {
         tx_index: usize,
         flags: ScriptVerifyFlags,
     ) -> Self {
-        Self::from_parts(txid, prevouts, JobTx::shared(block, tx_index), flags)
+        Self::from_parts(
+            txid,
+            JobPrevouts::owned(prevouts),
+            JobTx::shared(block, tx_index),
+            flags,
+        )
     }
 
     /// Single construction site for activation + production standardness defaults.
     #[inline]
     fn from_parts(
         txid: [u8; 32],
-        prevouts: Vec<TxOut>,
+        prevouts: JobPrevouts,
         tx: JobTx,
         flags: ScriptVerifyFlags,
     ) -> Self {
@@ -983,6 +1077,16 @@ impl ScriptCheckJob {
                 &self.tx,
             )))
         })
+    }
+
+    #[inline]
+    pub(crate) fn prevout_script(&self, i: usize) -> &[u8] {
+        self.prevouts.script(i)
+    }
+
+    #[inline]
+    pub(crate) fn prevout_amount(&self, i: usize) -> Amount {
+        self.prevouts.amount(i)
     }
 
     #[inline]
@@ -1292,6 +1396,7 @@ fn assemble_non_cb_tx(
         pending_creates,
         batch_parents,
         spend_edges,
+        wire,
         acc,
         spends,
         build_script_jobs,
@@ -1321,9 +1426,12 @@ fn assemble_non_cb_tx(
     if build_script_jobs {
         let t_job = Instant::now();
         let mut job = if let Some(w) = wire {
-            ScriptCheckJob::with_shared_tx(txid, prevouts, Arc::clone(w), ti, flags)
+            ScriptCheckJob::from_parts(txid, prevouts, JobTx::shared(Arc::clone(w), ti), flags)
         } else {
-            ScriptCheckJob::with_txid(txid, prevouts, tx.clone(), flags)
+            let JobPrevouts::Owned(v) = prevouts else {
+                return Err(ConsensusError::BadTx("owned prevouts"));
+            };
+            ScriptCheckJob::with_txid(txid, v, tx.clone(), flags)
         };
         if let Some(ps) = pres {
             if should_use_pres(ti, ps.len()) {
@@ -1373,6 +1481,7 @@ fn assemble_non_cb_inputs(
     pending_creates: &PendingCreates,
     batch_parents: &rbitcoin_query::BatchParents,
     spend_edges: &rbitcoin_query::SpendEdges,
+    wire: Option<&Arc<Block>>,
     acc: &mut AsmPrevoutAcc,
     spends: &mut Vec<(
         [u8; 32],
@@ -1382,12 +1491,16 @@ fn assemble_non_cb_inputs(
         u32,
     )>,
     build_script_jobs: bool,
-) -> Result<(i64, Vec<TxOut>, u64), ConsensusError> {
+) -> Result<(i64, JobPrevouts, u64), ConsensusError> {
     let mut value_in = 0i64;
-    let mut prevouts: Vec<TxOut> = if build_script_jobs {
-        Vec::with_capacity(tx.input.len())
+    let mut prevouts = if build_script_jobs && wire.is_some() {
+        JobPrevouts::Shared(Vec::with_capacity(tx.input.len()))
     } else {
-        Vec::new()
+        JobPrevouts::owned(Vec::with_capacity(if build_script_jobs {
+            tx.input.len()
+        } else {
+            0
+        }))
     };
     let edges = spend_fk.and_then(|fk| fk.get().and_then(|id| spend_edges.get(&id)));
     let mut tx_in_sigops = 0u64;
@@ -1426,6 +1539,7 @@ fn assemble_non_cb_inputs(
             bip16_active,
             flags.witness_active,
             build_script_jobs,
+            wire,
             acc,
         )?;
         let create_fk = prev_out.create_fk;
@@ -1441,7 +1555,14 @@ fn assemble_non_cb_inputs(
             .checked_add(prev_out.txout.value.to_sat() as i64)
             .ok_or(ConsensusError::BadTx("value in overflow"))?;
         if build_script_jobs {
-            prevouts.push(prev_out.txout);
+            match &mut prevouts {
+                JobPrevouts::Shared(v) => v.push(
+                    prev_out
+                        .shared
+                        .expect("wire confirm prevout shares script bytes"),
+                ),
+                JobPrevouts::Owned(v) => v.push(prev_out.txout),
+            }
         }
     }
     Ok((value_in, prevouts, tx_in_sigops))
@@ -2308,8 +2429,8 @@ fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32,
 #[inline]
 fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
     let tx: &bitcoin::Transaction = &job.tx;
-    for (i, prev) in job.prevouts.iter().enumerate() {
-        if !is_anyone_can_spend(prev.script_pubkey.as_script()) {
+    for i in 0..job.prevouts.len() {
+        if !is_anyone_can_spend(Script::from_bytes(job.prevout_script(i))) {
             return true;
         }
         let Some(vin) = tx.input.get(i) else {
@@ -2343,6 +2464,8 @@ pub fn block_subsidy(height: u32, params: &ChainParams) -> i64 {
 
 struct ResolvedPrevout {
     txout: TxOut,
+    /// Set when the script bytes stay in a block or pin `Arc`.
+    shared: Option<rbitcoin_query::SharedPrevoutScript>,
     /// P2SH+witness sigop cost for this input's prevout script (not legacy).
     input_sigops: u64,
     /// Class A create fk for this prevout (or `NULL` for same-block). Load pin
@@ -2450,6 +2573,7 @@ fn resolve_prevout(
     bip16: bool,
     witness: bool,
     need_script_buf: bool,
+    wire: Option<&Arc<Block>>,
     acc: &mut AsmPrevoutAcc,
 ) -> Result<ResolvedPrevout, ConsensusError> {
     let prev_txid = op.txid.to_byte_array();
@@ -2461,15 +2585,25 @@ fn resolve_prevout(
             let o = tx.output.get(v).ok_or(ConsensusError::MissingPrevout)?;
             acc.in_n = acc.in_n.saturating_add(1);
             acc.same_n = acc.same_n.saturating_add(1);
+            let shared = if need_script_buf {
+                wire.map(|w| rbitcoin_query::SharedPrevoutScript::Wire {
+                    block: Arc::clone(w),
+                    tx_index: pj as u32,
+                    vout: op.vout,
+                })
+            } else {
+                None
+            };
             return Ok(ResolvedPrevout {
-                txout: if need_script_buf {
-                    o.clone()
-                } else {
+                txout: if shared.is_some() || !need_script_buf {
                     TxOut {
                         value: o.value,
                         script_pubkey: ScriptBuf::new(),
                     }
+                } else {
+                    o.clone()
                 },
+                shared,
                 input_sigops: prevout_spk_sigops(inp, o.script_pubkey.as_bytes(), bip16, witness),
                 create_fk: rbitcoin_primitives::Fk::NULL,
             });
@@ -2480,32 +2614,44 @@ fn resolve_prevout(
     // hard invariants (load must fill schema-13 identity + denserels).
     enum PinLook {
         Mismatch,
-        Hit { txout: TxOut, input_sigops: u64 },
+        Hit {
+            txout: TxOut,
+            shared: Option<rbitcoin_query::SharedPrevoutScript>,
+            input_sigops: u64,
+        },
     }
 
     if let Some(prev_fk) = prev_fk_hint {
+        let shared_for_hit = if need_script_buf {
+            batch_parents.share_parent_prevout(prev_fk, op.vout)
+        } else {
+            None
+        };
         match batch_parents.get_parent_txout_parts(
             prev_fk,
             op.vout,
-            |value, script, parent_txid| {
+            move |value, script, parent_txid| {
                 if parent_txid != prev_txid {
                     return PinLook::Mismatch;
                 }
+                let shared = shared_for_hit;
                 PinLook::Hit {
                     txout: TxOut {
                         value: Amount::from_sat(value as u64),
-                        script_pubkey: if need_script_buf {
+                        script_pubkey: if shared.is_none() && need_script_buf {
                             ScriptBuf::from_bytes(script.to_vec())
                         } else {
                             ScriptBuf::new()
                         },
                     },
+                    shared,
                     input_sigops: prevout_spk_sigops(inp, script, bip16, witness),
                 }
             },
         ) {
             Some(PinLook::Hit {
                 txout,
+                shared,
                 input_sigops,
             }) => {
                 acc.in_n = acc.in_n.saturating_add(1);
@@ -2514,6 +2660,7 @@ fn resolve_prevout(
                 confirm_phase_stats::tl_note_batch_hit();
                 return Ok(ResolvedPrevout {
                     txout,
+                    shared,
                     input_sigops,
                     create_fk: prev_fk,
                 });

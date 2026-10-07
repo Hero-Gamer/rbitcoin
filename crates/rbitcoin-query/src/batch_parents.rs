@@ -33,6 +33,55 @@ pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64Map, U64Set};
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
 
+/// Script bytes a confirm job can hold after the pin map is dropped.
+///
+/// `Wire` is an output inside a block `Arc`. `Pinned` is one vout inside the
+/// pin's outs `Arc` (records `Vec` or range-fill `OutputRecord`), not a second copy.
+#[derive(Clone, Debug)]
+pub enum SharedPrevoutScript {
+    Wire {
+        block: Arc<bitcoin::Block>,
+        tx_index: u32,
+        vout: u32,
+    },
+    Pinned(PinnedOuts),
+}
+
+/// One vout of a published pin-outs snapshot.
+#[derive(Clone, Debug)]
+pub struct PinnedOuts {
+    outs: Arc<PinOuts>,
+    vout: u32,
+}
+
+impl SharedPrevoutScript {
+    pub fn amount_sat(&self) -> i64 {
+        match self {
+            Self::Wire {
+                block,
+                tx_index,
+                vout,
+            } => block.txdata[*tx_index as usize].output[*vout as usize]
+                .value
+                .to_sat() as i64,
+            Self::Pinned(p) => p.outs.get_parts(p.vout).map(|(v, _)| v).unwrap_or(0),
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Wire {
+                block,
+                tx_index,
+                vout,
+            } => block.txdata[*tx_index as usize].output[*vout as usize]
+                .script_pubkey
+                .as_bytes(),
+            Self::Pinned(p) => p.outs.get_parts(p.vout).map(|(_, s)| s).unwrap_or(&[]),
+        }
+    }
+}
+
 const CB_UNKNOWN: u8 = 0;
 const CB_FALSE: u8 = 1;
 const CB_TRUE: u8 = 2;
@@ -662,6 +711,15 @@ impl BatchParents {
     /// Sticky: multi-input spends of the same create reuse one outs Arc without
     /// re-entering the pin slot. The callback runs while that Arc is held.
     #[inline]
+    /// Clone the pin outs `Arc` for `vout`. The script bytes stay in that snapshot.
+    pub fn share_parent_prevout(&self, fk: Fk, vout: u32) -> Option<SharedPrevoutScript> {
+        let id = fk.get()?;
+        let e = self.pins.get(&id)?;
+        let outs = e.load_outs();
+        outs.get_parts(vout)?;
+        Some(SharedPrevoutScript::Pinned(PinnedOuts { outs, vout }))
+    }
+
     pub fn get_parent_txout_parts<R>(
         &self,
         fk: Fk,

@@ -25,7 +25,7 @@ pub(crate) fn verify(
     cache: &mut SighashCache<&Transaction>,
     tap_spent: &crypto::TapSpentHashes,
 ) -> Result<(), ConsensusError> {
-    let spk = job.prevouts[input_index].script_pubkey.as_bytes();
+    let spk = job.prevout_script(input_index);
     debug_assert!(spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20);
     let output_key = &spk[2..34];
 
@@ -89,21 +89,24 @@ fn verify_key_path(
     let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(sig_bytes)
         .map_err(|_| ConsensusError::Script("p2tr schnorr parse".into()))?;
 
-    let prevouts = Prevouts::All(&job.prevouts);
-    // BIP341: when the annex is present it is part of spend_type / sighash.
-    // `taproot_key_spend_signature_hash` always passes annex=None — wrong for
-    // annex spends (mainnet 896078 / f859a4e6… style).
-    let annex = bip341_annex(&input.witness)
-        .map(Annex::new)
-        .transpose()
-        .map_err(|_| ConsensusError::Script("p2tr annex".into()))?;
-    let sighash = cache
-        .taproot_signature_hash(input_index, &prevouts, annex, None, sighash_ty)
-        .map_err(|_| ConsensusError::Script("p2tr sighash".into()))?;
-    let msg = Message::from_digest(sighash.to_byte_array());
-    crypto::SECP.with(|secp| {
-        secp.verify_schnorr(&sig, &msg, &xonly)
-            .map_err(|_| ConsensusError::Script("p2tr schnorr".into()))
+    // rust-bitcoin sighash takes owned TxOuts. Shared jobs copy here only.
+    job.prevouts.with_txouts(|prevouts| {
+        let prevouts = Prevouts::All(prevouts);
+        // BIP341: when the annex is present it is part of spend_type / sighash.
+        // `taproot_key_spend_signature_hash` always passes annex=None — wrong for
+        // annex spends (mainnet 896078 / f859a4e6… style).
+        let annex = bip341_annex(&input.witness)
+            .map(Annex::new)
+            .transpose()
+            .map_err(|_| ConsensusError::Script("p2tr annex".into()))?;
+        let sighash = cache
+            .taproot_signature_hash(input_index, &prevouts, annex, None, sighash_ty)
+            .map_err(|_| ConsensusError::Script("p2tr sighash".into()))?;
+        let msg = Message::from_digest(sighash.to_byte_array());
+        crypto::SECP.with(|secp| {
+            secp.verify_schnorr(&sig, &msg, &xonly)
+                .map_err(|_| ConsensusError::Script("p2tr schnorr".into()))
+        })
     })
 }
 
@@ -200,21 +203,23 @@ fn verify_script_path<'a>(
         return Ok(());
     }
 
-    let exec = crypto::TapscriptExecData::new(
-        tx,
-        input_index,
-        &job.prevouts,
-        job.pre(),
-        tap_spent,
-        tapleaf_hash,
-        annex,
-    );
-    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript)
-        .with_tapscript(exec);
-    if interpreter::eval_script(script, &mut stack, &ctx)? {
-        interpreter::require_clean_true(&stack)?;
-    }
-    Ok(())
+    job.prevouts.with_txouts(|prevouts| {
+        let exec = crypto::TapscriptExecData::new(
+            tx,
+            input_index,
+            prevouts,
+            job.pre(),
+            tap_spent,
+            tapleaf_hash,
+            annex,
+        );
+        let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript)
+            .with_tapscript(exec);
+        if interpreter::eval_script(script, &mut stack, &ctx)? {
+            interpreter::require_clean_true(&stack)?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -284,7 +289,7 @@ mod bip341_tests {
         };
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -366,7 +371,7 @@ mod bip341_tests {
             };
             ScriptCheckJob {
                 txid: [0u8; 32],
-                prevouts: vec![prevout],
+                prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
                 tx: crate::block::JobTx::owned(tx),
                 flags: crate::block::ScriptVerifyFlags {
                     bip65_active: true,
@@ -596,10 +601,10 @@ mod bip341_tests {
         spk.extend([0u8; 32]);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
@@ -684,7 +689,7 @@ mod bip341_tests {
         let _ = internal; // used implicitly via tweak
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -751,7 +756,7 @@ mod bip341_tests {
 
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -838,7 +843,7 @@ mod bip341_tests {
             tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
             let job = ScriptCheckJob {
                 txid: [0u8; 32],
-                prevouts: vec![prevout.clone()],
+                prevouts: crate::block::JobPrevouts::owned(vec![prevout.clone()]),
                 tx: crate::block::JobTx::owned(tx.clone()),
                 flags: crate::block::ScriptVerifyFlags {
                     bip65_active: true,
@@ -883,7 +888,7 @@ mod bip341_tests {
             tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
             let job = ScriptCheckJob {
                 txid: [0u8; 32],
-                prevouts: vec![prevout],
+                prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
                 tx: crate::block::JobTx::owned(tx.clone()),
                 flags: crate::block::ScriptVerifyFlags {
                     bip65_active: true,
@@ -958,7 +963,7 @@ mod bip341_tests {
         tx.input[0].witness = Witness::from_slice(&[sig_v.as_slice(), annex_v.as_slice()]);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -1057,7 +1062,7 @@ mod bip341_tests {
         ]);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -1349,7 +1354,7 @@ mod bip341_tests {
         };
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -1472,7 +1477,7 @@ mod bip341_tests {
         tx.input[0].witness = Witness::from_slice(&wit_items);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -1526,7 +1531,7 @@ mod bip341_tests {
         };
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![prevout],
+            prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,

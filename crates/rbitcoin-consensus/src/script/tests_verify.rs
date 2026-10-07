@@ -57,7 +57,7 @@ fn make_p2wpkh_spend() -> (ScriptCheckJob, bool) {
 
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx.clone()),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -138,7 +138,7 @@ fn mainnet_508011_nested_p2wpkh_raw_sighash_0x65() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -193,7 +193,7 @@ fn pretaproot_v1_witness_program_anyone_can_spend() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx.clone()),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -241,7 +241,7 @@ fn empty_script_pubkey_rejects() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx.clone()),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -307,7 +307,7 @@ fn p2sh_legacy_multi_push_op_true_accepts() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx.clone()),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -355,7 +355,7 @@ fn mainnet_block_183_high_s_p2pk_accepts() {
     let vout = spend.input[0].previous_output.vout as usize;
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prev.output[vout].clone()],
+        prevouts: crate::block::JobPrevouts::owned(vec![prev.output[vout].clone()]),
         tx: crate::block::JobTx::owned(spend),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -407,7 +407,7 @@ fn mainnet_block_110300_sighash_type_zero_p2pkh() {
     assert_eq!(ss[1 + 72], 0x00);
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prev.output[0].clone()],
+        prevouts: crate::block::JobPrevouts::owned(vec![prev.output[0].clone()]),
         tx: crate::block::JobTx::owned(spend),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -467,7 +467,7 @@ fn mainnet_block_124276_lax_der_pre_bip66() {
 
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prev.output[0].clone()],
+        prevouts: crate::block::JobPrevouts::owned(vec![prev.output[0].clone()]),
         tx: crate::block::JobTx::owned(spend),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -633,7 +633,7 @@ fn mainnet_block_170060_pre_bip16_p2sh_as_bare() {
 
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prev.output[vout].clone()],
+        prevouts: crate::block::JobPrevouts::owned(vec![prev.output[vout].clone()]),
         tx: crate::block::JobTx::owned(spend.clone()),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: false,
@@ -697,7 +697,10 @@ fn mainnet_block_163685_scriptsig_codeseparator_checkmultisig() {
 
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prev.output[0].clone(), prev.output[1].clone()],
+        prevouts: crate::block::JobPrevouts::owned(vec![
+            prev.output[0].clone(),
+            prev.output[1].clone(),
+        ]),
         tx: crate::block::JobTx::owned(spend),
         // height 163685: pre-BIP65 / pre-BIP66 / pre-CSV
         flags: crate::block::ScriptVerifyFlags {
@@ -755,7 +758,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
 
     let mut job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prev.output[vout].clone()],
+        prevouts: crate::block::JobPrevouts::owned(vec![prev.output[vout].clone()]),
         tx: crate::block::JobTx::owned(spend),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -790,7 +793,7 @@ fn mainnet_block_140493_high_bit_s_lax_der_p2pkh() {
     }
     fn same(job: &crate::block::ScriptCheckJob) -> (String, String) {
         let tx: &bitcoin::Transaction = &job.tx;
-        let bare = script_flag_msg(super::verify_bare(job, 0, tx, &job.prevouts[0]));
+        let bare = script_flag_msg(super::verify_bare(job, 0, tx));
         let shipped = script_flag_msg(super::verify_job_all_inputs(job));
         (shipped, bare)
     }
@@ -854,7 +857,7 @@ fn mainnet_block_443992_p2sh_codeseparator_scriptcode() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(spend),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,  // 388381
@@ -904,7 +907,7 @@ fn cltv_in_scriptsig_with_op_true_spk_enforced() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -959,7 +962,7 @@ fn unknown_witness_v16_accepts_without_discourage() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -1008,7 +1011,7 @@ fn unknown_witness_v16_malleated_scriptsig() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -1062,7 +1065,7 @@ fn unknown_witness_v16_discourage_rejects() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -1118,7 +1121,7 @@ fn p2wsh_oversized_witness_element_rejected() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,
@@ -1188,7 +1191,7 @@ fn p2wsh_witness_script_larger_than_520_is_valid() {
     };
     let job = ScriptCheckJob {
         txid: [0u8; 32],
-        prevouts: vec![prevout],
+        prevouts: crate::block::JobPrevouts::owned(vec![prevout]),
         tx: crate::block::JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: true,

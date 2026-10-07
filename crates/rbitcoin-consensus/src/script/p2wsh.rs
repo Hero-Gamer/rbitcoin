@@ -13,7 +13,7 @@ pub(crate) fn verify(
     input_index: usize,
     tx: &Transaction,
 ) -> Result<(), ConsensusError> {
-    let spk = job.prevouts[input_index].script_pubkey.as_bytes();
+    let spk = job.prevout_script(input_index);
     debug_assert!(spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20);
     let mut scripthash = [0u8; 32];
     scripthash.copy_from_slice(&spk[2..34]);
@@ -90,10 +90,10 @@ mod tests {
         spk.extend([0u8; 32]);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(10),
                 script_pubkey: ScriptBuf::from_bytes(spk),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,

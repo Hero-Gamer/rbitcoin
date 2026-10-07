@@ -30,7 +30,7 @@ mod tests_flag_parity;
 mod tests_verify;
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Transaction, TxOut};
+use bitcoin::Transaction;
 
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
@@ -116,8 +116,7 @@ pub(crate) fn verify_input<'a>(
     if input_index >= job.prevouts.len() || input_index >= tx.input.len() {
         return Err(ConsensusError::Script("input index".into()));
     }
-    let prevout = &job.prevouts[input_index];
-    let spk = prevout.script_pubkey.as_script();
+    let spk = bitcoin::script::Script::from_bytes(job.prevout_script(input_index));
     let input = &tx.input[input_index];
     let has_witness = !input.witness.is_empty();
 
@@ -145,7 +144,7 @@ pub(crate) fn verify_input<'a>(
     match kind {
         ScriptKind::P2pkh => {
             if needs_interpreted_ecdsa(job) {
-                return verify_bare(job, input_index, tx, prevout);
+                return verify_bare(job, input_index, tx);
             }
             // Fast path: exact `<sig> <pubkey>` scriptSig. Historical mainnet has
             // non-standard P2PKH scriptSigs that still leave a valid stack for
@@ -154,9 +153,7 @@ pub(crate) fn verify_input<'a>(
             // codes stay.
             match p2pkh::verify(job, input_index, tx, sighash_cache(cache, tx)) {
                 Ok(()) => Ok(()),
-                Err(e) if p2pkh_scriptsig_shape_error(&e) => {
-                    verify_bare(job, input_index, tx, prevout)
-                }
+                Err(e) if p2pkh_scriptsig_shape_error(&e) => verify_bare(job, input_index, tx),
                 Err(e) => Err(e),
             }
         }
@@ -164,7 +161,7 @@ pub(crate) fn verify_input<'a>(
             // Pre-BIP16: HASH160/EQUAL is a bare script (push data, hash, equal) —
             // do **not** treat the last push as a redeemScript. Mainnet 170060.
             if !job.bip16_active {
-                return verify_bare(job, input_index, tx, prevout);
+                return verify_bare(job, input_index, tx);
             }
             let stack = nested::p2sh_script_sig_stack(job, input_index, tx)?;
             if let Some(res) = nested::try_p2sh_nested_segwit(
@@ -183,7 +180,7 @@ pub(crate) fn verify_input<'a>(
             nested::verify_p2sh_legacy(job, input_index, tx, stack)
         }
         ScriptKind::Bare | ScriptKind::P2wpkh | ScriptKind::P2wsh | ScriptKind::P2tr => {
-            verify_bare(job, input_index, tx, prevout)
+            verify_bare(job, input_index, tx)
         }
     }
 }
@@ -264,7 +261,6 @@ fn verify_bare(
     job: &ScriptCheckJob,
     input_index: usize,
     tx: &Transaction,
-    prevout: &TxOut,
 ) -> Result<(), ConsensusError> {
     // Fully run scriptSig, then scriptPubKey, sharing one stack. scriptSig is
     // not push-only in consensus for bare spends (SIGPUSHONLY is policy / BIP16-P2SH
@@ -284,7 +280,7 @@ fn verify_bare(
         );
         let _ = interpreter::eval_script(ss, &mut stack, &ctx_sig)?;
     }
-    let spk = prevout.script_pubkey.as_script();
+    let spk = bitcoin::script::Script::from_bytes(job.prevout_script(input_index));
     let ctx = interpreter::EvalContext::from_job(
         job,
         tx,
@@ -886,10 +882,10 @@ mod verify_routing_tests {
         };
         ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -953,7 +949,7 @@ mod verify_routing_tests {
         };
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![],
+            prevouts: crate::block::JobPrevouts::owned(vec![]),
             tx: crate::block::JobTx::owned(tx),
             flags: crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
             pre: std::sync::OnceLock::new(),
@@ -975,7 +971,7 @@ mod verify_routing_tests {
         };
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![],
+            prevouts: crate::block::JobPrevouts::owned(vec![]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -1001,10 +997,10 @@ mod verify_routing_tests {
 
         let job2 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
@@ -1169,10 +1165,10 @@ mod verify_routing_tests {
         spk.push(1);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(spk),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::TWO,
                 lock_time: LockTime::ZERO,
@@ -1407,10 +1403,10 @@ mod verify_routing_tests {
         ss.extend([0u8; 20]);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(p2sh),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(Transaction {
                 version: bitcoin::transaction::Version::ONE,
                 lock_time: LockTime::ZERO,

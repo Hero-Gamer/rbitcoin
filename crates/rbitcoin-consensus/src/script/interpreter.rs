@@ -309,11 +309,11 @@ impl<'a> EvalContext<'a> {
         script_code: &'a Script,
         sig_version: SigVersion,
     ) -> Self {
-        let amount = job
-            .prevouts
-            .get(input_index)
-            .map(|p| p.value)
-            .unwrap_or(Amount::ZERO);
+        let amount = if input_index < job.prevouts.len() {
+            job.prevout_amount(input_index)
+        } else {
+            Amount::ZERO
+        };
         Self::from_eval_parts(
             tx,
             input_index,

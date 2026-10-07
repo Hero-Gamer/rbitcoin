@@ -52,9 +52,7 @@ pub(crate) fn try_p2sh_nested_segwit(
         return Some(Err(ConsensusError::Script("WITNESS_MALLEATED_P2SH".into())));
     }
 
-    if let Err(e) =
-        check_p2sh_redeem_hash(job.prevouts[input_index].script_pubkey.as_bytes(), redeem)
-    {
+    if let Err(e) = check_p2sh_redeem_hash(job.prevout_script(input_index), redeem) {
         return Some(Err(e));
     }
     if !interpreter::cast_to_bool(program) {
@@ -98,7 +96,7 @@ pub(crate) fn verify_p2sh_legacy(
         return Err(ConsensusError::Script("p2sh empty scriptSig".into()));
     }
     let redeem = stack.pop().unwrap();
-    check_p2sh_redeem_hash(job.prevouts[input_index].script_pubkey.as_bytes(), &redeem)?;
+    check_p2sh_redeem_hash(job.prevout_script(input_index), &redeem)?;
 
     let redeem_script = Script::from_bytes(&redeem);
     let ctx = EvalContext::from_job(job, tx, input_index, redeem_script, SigVersion::Base);
@@ -224,10 +222,10 @@ mod tests {
     fn job_for(tx: Transaction, spk: ScriptBuf, witness_active: bool) -> ScriptCheckJob {
         ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: spk,
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -516,10 +514,10 @@ mod tests {
         tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]), // not 23-byte P2SH
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -548,10 +546,10 @@ mod tests {
         // Wrong redeem hash
         let job2 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xff]),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -591,10 +589,10 @@ mod tests {
         tx3.input[0].script_sig = ScriptBuf::from_bytes(ss2);
         let job3 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x00]), // short spk
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx3.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -624,10 +622,10 @@ mod tests {
         // wrong hash
         let job4 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0x01]),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx3.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -660,10 +658,10 @@ mod tests {
         tx5.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0xaa, 0x01, 0xbb]);
         let job5 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xaa]),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx5.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -694,10 +692,10 @@ mod tests {
         tx_empty.input[0].script_sig = ScriptBuf::new();
         let job_e = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0x51]),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx_empty.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -725,10 +723,10 @@ mod tests {
         tx_leg.input[0].script_sig = ScriptBuf::from_bytes(vec![0x01, 0x51]);
         let job_h = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&[0xff]),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx_leg.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -767,10 +765,10 @@ mod tests {
         tx.input[0].script_sig = ScriptBuf::from_bytes(ss);
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem_wsh),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -810,10 +808,10 @@ mod tests {
         tx2.input[0].script_sig = ScriptBuf::from_bytes(ss2);
         let job2 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem_wpkh),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx2.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,
@@ -850,10 +848,10 @@ mod tests {
         tx3.input[0].script_sig = ScriptBuf::from_bytes(ss3);
         let job3 = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(1),
                 script_pubkey: p2sh_spk(&redeem),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx3.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,

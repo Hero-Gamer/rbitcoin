@@ -390,7 +390,7 @@ fn run_script_row(
 
     let job = ScriptCheckJob {
         txid: spend.compute_txid().to_byte_array(),
-        prevouts: vec![prev],
+        prevouts: crate::block::JobPrevouts::owned(vec![prev]),
         tx: JobTx::owned(spend),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: flags.cltv,

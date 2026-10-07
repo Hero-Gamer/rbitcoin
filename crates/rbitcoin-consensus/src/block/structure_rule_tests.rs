@@ -1229,6 +1229,129 @@ fn assemble_pending_creates_is_txid_map_and_meters_flush() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+/// Confirm jobs keep prevout scripts in the wire block or the pin Arc.
+#[test]
+fn script_job_shares_prevout_script() {
+    use super::assemble_block_prevouts;
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_query::{BatchParents, OutPointSet, SpendEdge, SpendEdges};
+    use rbitcoin_store::{OutputRecord, TxRecord};
+
+    let (path, q) = rbitcoin_query::testutil::tiny_query_labeled("share-prevout-script");
+    let ctx = ctx_h(1);
+    let parent_txid = [0x42u8; 32];
+    let hist_script = vec![0x51, 0x11, 0x22];
+    let mut parents = BatchParents::new();
+    parents.insert_owned(
+        Fk(10),
+        TxRecord {
+            txid: parent_txid,
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        vec![(0, OutputRecord::unspent(50_0000_0000, hist_script.clone()))],
+        vec![0],
+        Some(false),
+        None,
+        Vec::new(),
+    );
+    let pin_ptr = parents
+        .get_parent_txout_parts(Fk(10), 0, |_, script, _| script.as_ptr())
+        .expect("pin script");
+
+    let same_script = vec![0x51, 0xab];
+    let mid = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array(parent_txid),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(40_0000_0000),
+            script_pubkey: ScriptBuf::from_bytes(same_script),
+        }],
+    };
+    let mid_txid = mid.compute_txid();
+    let child = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: mid_txid,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let block = block_with(vec![coinbase(1), mid, child]);
+    let wire = std::sync::Arc::new(block);
+    let tids: Vec<[u8; 32]> = wire
+        .txdata
+        .iter()
+        .map(|t| t.compute_txid().to_byte_array())
+        .collect();
+    let bh = wire.header.block_hash().to_byte_array();
+    let bip16 = bip16_active_from_prev_mtp(ctx.params, ctx.height.0, &bh, 0);
+    let mut edges = SpendEdges::default();
+    edges.insert(
+        2,
+        vec![SpendEdge {
+            prev_txid: parent_txid,
+            vout: 0,
+            spend_fk: Fk(2),
+            create_fk: Fk(10),
+            vin: 0,
+        }],
+    );
+    let mut spent = OutPointSet::default();
+    let mut creates = super::PendingCreates::default();
+    let (jobs, _, _, _) = assemble_block_prevouts(
+        &q,
+        &wire,
+        &ctx,
+        Some(&[Fk(1), Fk(2), Fk(3)]),
+        &mut spent,
+        &mut creates,
+        &parents,
+        &edges,
+        &tids,
+        0,
+        &bh,
+        bip16,
+        Some(&wire),
+        None,
+    )
+    .expect("assemble shared prevouts");
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(
+        jobs[0].prevout_script(0).as_ptr(),
+        pin_ptr,
+        "historical prevout script is the pin allocation"
+    );
+    assert_eq!(
+        jobs[1].prevout_script(0).as_ptr(),
+        wire.txdata[1].output[0].script_pubkey.as_bytes().as_ptr(),
+        "same-block prevout script is the wire output"
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
+
 /// Optimistic IBD: unstamped parent must not recover via `tx_fk_by_txid_tip`.
 #[test]
 fn optimistic_assemble_unstamped_parent_is_invariant() {
@@ -1869,6 +1992,7 @@ fn spending_an_unspendable_output_still_resolves() {
             false,
             true,
             true,
+            None,
             &mut super::AsmPrevoutAcc::default(),
         )
     };
@@ -1997,6 +2121,7 @@ fn n1_assemble_cold_why_reasons() {
             false,
             false,
             true,
+            None,
             &mut super::AsmPrevoutAcc::default(),
         )
         .err()
@@ -2018,6 +2143,7 @@ fn n1_assemble_cold_why_reasons() {
             false,
             false,
             true,
+            None,
             &mut super::AsmPrevoutAcc::default(),
         )
         .err()
@@ -2049,6 +2175,7 @@ fn n1_assemble_cold_why_reasons() {
             false,
             false,
             true,
+            None,
             &mut super::AsmPrevoutAcc::default(),
         )
         .expect("batch hit");
@@ -2077,6 +2204,7 @@ fn n1_assemble_cold_why_reasons() {
             false,
             false,
             true,
+            None,
             &mut super::AsmPrevoutAcc::default(),
         ) {
             Ok(_) => panic!("mismatch must hard-fail"),
@@ -2113,6 +2241,7 @@ fn n1_assemble_cold_why_reasons() {
             false,
             false,
             true,
+            None,
             &mut super::AsmPrevoutAcc::default(),
         ) {
             Ok(_) => panic!("vout_miss must hard-fail"),
