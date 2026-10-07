@@ -134,7 +134,17 @@ timeout=10
 if [[ "$BIN" == "block_differential" ]]; then
   sanitizer="none"
   timeout=90
-elif [[ "$BIN" == "block_spend_differential" || "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" ]]; then
+elif [[ "$BIN" == "block_spend_differential" ]]; then
+  # Sunday ASan uses a short per-input budget. Weekdays stay unsanitized.
+  weekday="${FUZZ_WEEKDAY:-$(date +%u)}"
+  if [[ "$weekday" == "7" ]]; then
+    sanitizer="address"
+    timeout=30
+  else
+    sanitizer="none"
+    timeout=180
+  fi
+elif [[ "$BIN" == "block_fork_differential" || "$BIN" == "script_differential" || "$BIN" == "cmpct_reorg_differential" || "$BIN" == "block_reorg_n_differential" || "$BIN" == "block_csv_differential" || "$BIN" == "mempool_differential" || "$BIN" == "script_verify_differential" ]]; then
   sanitizer="none"
   timeout=180
 elif [[ "$BIN" == "v2_session" || "$BIN" == "cmpct_differential" ]]; then
@@ -496,7 +506,7 @@ if [[ "$BIN" == "script_differential" || "$BIN" == "script_verify_differential" 
   dict_args=(-dict=fuzz/dict/script.dict)
 fi
 set +e
-env -u CARGO_TARGET_DIR cargo fuzz run --target "$target" --sanitizer none "$BIN" -- \
+env -u CARGO_TARGET_DIR cargo fuzz run --target "$target" --sanitizer "$sanitizer" "$BIN" -- \
   -max_total_time="$(fuzz_max_total_time)" \
   -timeout="$timeout" \
   -max_len="$max_len" \

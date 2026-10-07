@@ -253,7 +253,7 @@ assert_ok "differential dry-run in-process (no -jobs)" \
 assert_ok "differential dry-run timeout 90" \
   grep -qx "FUZZ_TIMEOUT=90" <<<"$out"
 
-out="$(FUZZ_DRY_RUN=1 "$RUN" block_spend_differential)"
+out="$(FUZZ_DRY_RUN=1 FUZZ_WEEKDAY=1 "$RUN" block_spend_differential)"
 assert_ok "spend-differential dry-run bin" \
   grep -qx "FUZZ_BIN=block_spend_differential" <<<"$out"
 assert_ok "spend-differential dry-run does not export deleted RBITCOIN_HEAD_SCALE" \
@@ -266,6 +266,12 @@ assert_ok "spend-differential dry-run in-process (no -jobs)" \
   grep -qx "FUZZ_JOBS=in-process" <<<"$out"
 assert_ok "spend-differential dry-run timeout 180" \
   grep -qx "FUZZ_TIMEOUT=180" <<<"$out"
+
+out="$(FUZZ_DRY_RUN=1 FUZZ_WEEKDAY=7 "$RUN" block_spend_differential)"
+assert_ok "sunday spend dry-run sanitizer address" \
+  grep -qx "FUZZ_SANITIZER=address" <<<"$out"
+assert_ok "sunday spend dry-run timeout 30" \
+  grep -qx "FUZZ_TIMEOUT=30" <<<"$out"
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" script_differential)"
 assert_ok "script-differential dry-run bin" \

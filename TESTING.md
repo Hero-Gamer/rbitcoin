@@ -440,7 +440,7 @@ API.
 | `v2_session` | BIP324 handshake + structured ping/pong vs a live v31.1 `bitcoind` v2 peer (ASan). Matching `pong` is a comparison. Garbage slice remains for encoder ASan. | official **v31.1** `bitcoind` tarball (`scripts/core-functional/fetch-bitcoind.sh`), `-listen=1` |
 | `cmpct_differential` | structured BIP152 recipe → `try_reconstruct` missing indexes vs Core `getblocktxn` (ASan). Fill-flag extras go to Core extra-txn first. Raw-wire arm is skip if decode fails. Full reconstruct (no `getblocktxn`) is a comparison, then `drain_pending_now` of a same-hash mutant and the honest body: both must return ok, the tip must advance, and Core `submitblock` of that body must accept. A disconnect-class error from the first drain is a disagreement. **Not** a second node process. Duplicate-txid fill (018) may request extra indexes Core extra-txn already placed; Core's request must be a subset of ours | same tarball, `-listen=1` |
 | `block_differential` | height-1 `ChainHub::accept_received_block` vs Core `submitblock`, **accept vs reject only**. An input longer than 16 bytes whose tail control byte is `0xFE` compares a same-hash merkle mutant first, then submits the honest block to both; the hash must not stay invalid | same tarball |
-| `block_spend_differential` | height-101 spend of a mature pad coinbase, same path and oracle, including the `0xFE` honest-twin replay | same tarball |
+| `block_spend_differential` | height-101 spend of a mature pad coinbase, same path and oracle, including the `0xFE` honest-twin replay. Weekdays are `--sanitizer none` and `-timeout=180`. Sunday (`FUZZ_WEEKDAY=7`) is `--sanitizer address` and `-timeout=30` | same tarball |
 | `script_differential` | height-101 same-block spend whose **executed scriptPubKey** is fuzzer-owned, same path and oracle, including the `0xFE` honest-twin replay | same tarball |
 | `block_fork_differential` | 2-block heavier fork off the pad (sibling of a pad+1 stem), same path and oracle | same tarball |
 | `cmpct_reorg_differential` | same fork child, but hub delivers **child then parent** through `drain_pending` (014/020); Core `submitblock`s parent then child. Accept vs reject of C / final tip | same tarball |
@@ -463,7 +463,7 @@ API.
 ./scripts/fuzz-run.sh v2_session                # live Core v2 peer, ping/pong compare, ASan
 ./scripts/fuzz-run.sh cmpct_differential        # compact missing indexes vs getblocktxn, ASan
 ./scripts/fuzz-run.sh block_differential        # fetch bitcoind, --sanitizer none
-./scripts/fuzz-run.sh block_spend_differential  # 100-block pad, --sanitizer none, -timeout=180
+./scripts/fuzz-run.sh block_spend_differential  # 100-block pad; weekdays --sanitizer none -timeout=180; Sunday address -timeout=30
 ./scripts/fuzz-run.sh script_differential       # mutate executed scriptPubKey, --sanitizer none
 ./scripts/fuzz-run.sh block_fork_differential   # pad+stem, 2-block fork, --sanitizer none
 ./scripts/fuzz-run.sh cmpct_reorg_differential  # child-first drain_pending vs Core
