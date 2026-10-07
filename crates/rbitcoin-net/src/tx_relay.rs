@@ -1864,7 +1864,12 @@ impl MempoolHub {
                 self.publish_fee_floor();
                 Ok(r)
             }
-            Err(e) => self.finish_accept_err(us, e),
+            Err(e) => {
+                // Eviction inside the commit may have raised the rolling floor
+                // before the error returned. The write guard is already gone.
+                self.publish_fee_floor();
+                self.finish_accept_err(us, e)
+            }
         }
     }
 
@@ -1897,9 +1902,16 @@ impl MempoolHub {
         // Parent is live until the child commits (or we roll it back). A
         // concurrent spender of the parent that lands in this window survives
         // `remove_txid(parent)` if the child then fails.
-        let parent_res = {
+        let parent_commit = {
             let mut g = self.lock_write();
-            g.commit_after_script(&parent, prep_p).ok()?
+            g.commit_after_script(&parent, prep_p)
+        };
+        let parent_res = match parent_commit {
+            Ok(r) => r,
+            Err(_) => {
+                self.publish_fee_floor();
+                return None;
+            }
         };
         let spec_c = AdmitSpec {
             report_orphans: false,
@@ -1931,6 +1943,7 @@ impl MempoolHub {
             }
             Err(_) => {
                 self.rollback_1p1c_parent(&parent_res.txid);
+                self.publish_fee_floor();
                 None
             }
         }
@@ -2398,6 +2411,9 @@ impl MempoolHub {
                 }
                 Err(e) => {
                     self.rollback_package_accepted(&accepted);
+                    // The first member can evict and fail with nothing to roll
+                    // back, so the rollback publish does not run.
+                    self.publish_fee_floor();
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());
@@ -2900,8 +2916,12 @@ impl MempoolHub {
 
     /// Recompute the admission floor and publish it. Takes `inner` read,
     /// so callers must be off the reactor and must not already hold `inner`.
+    ///
+    /// The guard stays alive across the store. Dropping it first lets a
+    /// slower publisher write the snapshot it read before this one.
     pub fn publish_fee_floor(&self) -> u64 {
-        let floor = self.lock_read().mempool_min_fee_sat_kvb();
+        let g = self.lock_read();
+        let floor = g.mempool_min_fee_sat_kvb();
         self.fee_floor_sat_kvb.store(floor, Ordering::Release);
         floor
     }
@@ -5736,6 +5756,79 @@ mod tests {
         assert!(hub.tx_inv_due(&poor.compute_wtxid()));
         assert!(hub.tx_inv_due(&sponsored.compute_wtxid()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit that evicts and then returns `mempool full` has already raised
+    /// the rolling floor. The published atomic is what peers and Electrum read.
+    #[test]
+    fn failed_commit_publishes_raised_fee_floor() {
+        let (_store, owned_q, owned_cbs) = pad_cbs(3);
+        let q = &owned_q;
+        let cbs = owned_cbs.as_slice();
+        for package in [false, true] {
+            let dir = tmp();
+            let hub = MempoolHub::open_with_weight(&dir, Arc::clone(q), 50_000).unwrap();
+            hub.set_relay_enabled(true);
+            // 520-byte pushes stay within the script element cap. Nineteen of
+            // them plus a small child exceed a 50_000 WU budget; the parent
+            // script is still spendable with an empty signature.
+            let mut fat = Vec::with_capacity(10_000);
+            for _ in 0..19 {
+                fat.push(0x4d);
+                fat.extend_from_slice(&520u16.to_le_bytes());
+                fat.extend(std::iter::repeat_n(0u8, 520));
+                fat.push(0x75);
+            }
+            fat.push(0x51);
+            let parent = spend_true(cbs[0], 100_000, ScriptBuf::from_bytes(fat));
+            assert!(
+                hub.accept_tx(&parent).is_ok(),
+                "package={package}: parent must fit"
+            );
+            let advertised = hub.fee_floor_sat_kvb();
+            let child = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - 100_000 - 200_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51; 9_000]),
+                }],
+            };
+            let err = if package {
+                hub.accept_package(std::slice::from_ref(&child)).map(|_| ())
+            } else {
+                hub.accept_tx(&child).map(|_| ())
+            };
+            assert!(
+                matches!(err, Err(AcceptError::Policy("mempool full"))),
+                "package={package}: child must be evicted with its parent, got {err:?}"
+            );
+            assert!(!hub.try_contains(&child.compute_txid()));
+            assert!(
+                !hub.try_contains(&parent.compute_txid()),
+                "package={package}: parent chunk must have been evicted"
+            );
+            let enforced = hub.lock_read().mempool_min_fee_sat_kvb();
+            assert!(
+                enforced > advertised,
+                "package={package}: eviction must raise the floor ({advertised} -> {enforced})"
+            );
+            assert_eq!(
+                hub.fee_floor_sat_kvb(),
+                enforced,
+                "package={package}: failed commit must publish the raised floor, still {advertised}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
