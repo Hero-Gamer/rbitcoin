@@ -25,6 +25,140 @@ fn connect_genesis(q: &Query, params: &ChainParams) {
     accept_and_connect_block(q, params, Height::GENESIS, &g, Milestone::NONE).unwrap();
 }
 
+/// Empty regtest through height 100, mined once. Snapshots at 11, 99, and 100
+/// are the same headers; callers copy before they connect.
+struct EmptyChainSnaps {
+    _keep: TestDatadir,
+    h11: std::path::PathBuf,
+    h99: std::path::PathBuf,
+    h100: std::path::PathBuf,
+}
+
+enum EmptySnap {
+    H11,
+    H99,
+    H100,
+}
+
+fn empty_chain_snaps() -> &'static EmptyChainSnaps {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<EmptyChainSnaps> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let keep = TestDatadir::new().expect("empty chain pad");
+        let live = keep.store_path();
+        std::fs::create_dir_all(&live).unwrap();
+        extend_empty_chain(&live, 11);
+        let h11 = keep.path().join("h11");
+        std::fs::create_dir_all(&h11).unwrap();
+        copy_store_tree(&live, &h11);
+        extend_empty_chain(&live, 99);
+        let h99 = keep.path().join("h99");
+        std::fs::create_dir_all(&h99).unwrap();
+        copy_store_tree(&live, &h99);
+        extend_empty_chain(&live, 100);
+        EmptyChainSnaps {
+            _keep: keep,
+            h11,
+            h99,
+            h100: live,
+        }
+    })
+}
+
+fn extend_empty_chain(store: &std::path::Path, last: u32) {
+    let q = Query::open_or_create_tiny(store).unwrap();
+    let params = ChainParams::regtest();
+    if q.tip_height().is_none() {
+        connect_genesis(&q, &params);
+        let g = regtest_genesis();
+        let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+        accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    }
+    let h = q.tip_height().unwrap().0;
+    if h < last {
+        let tip = q.reconstruct_block_at_height(Height(h)).unwrap();
+        pad_empty_from(&q, &params, tip.block_hash(), tip.header.time, h + 1, last);
+    }
+    q.flush().expect("flush empty chain");
+}
+
+fn copy_store_tree(src: &std::path::Path, dst: &std::path::Path) {
+    for ent in std::fs::read_dir(src).expect("read store") {
+        let ent = ent.expect("store entry");
+        let to = dst.join(ent.file_name());
+        let ty = ent.file_type().expect("file type");
+        if ty.is_dir() {
+            std::fs::create_dir_all(&to).unwrap();
+            copy_store_tree(&ent.path(), &to);
+        } else {
+            std::fs::copy(ent.path(), &to).unwrap();
+        }
+    }
+}
+
+fn open_empty_snap(which: EmptySnap) -> (TestDatadir, Query) {
+    let pad = empty_chain_snaps();
+    let src = match which {
+        EmptySnap::H11 => &pad.h11,
+        EmptySnap::H99 => &pad.h99,
+        EmptySnap::H100 => &pad.h100,
+    };
+    let td = TestDatadir::new().unwrap();
+    let dst = td.store_path();
+    std::fs::create_dir_all(&dst).unwrap();
+    copy_store_tree(src, &dst);
+    let q = Query::open_or_create_tiny(&dst).unwrap();
+    q.flush().expect("flush empty chain copy");
+    (td, q)
+}
+
+#[test]
+fn empty_through_100_copy_keeps_the_other_tip() {
+    let (_da, qa) = open_empty_snap(EmptySnap::H100);
+    let (_db, qb) = open_empty_snap(EmptySnap::H100);
+    let (_d99, q99) = open_empty_snap(EmptySnap::H99);
+    assert_eq!(qa.tip_height(), Some(Height(100)));
+    assert_eq!(qb.tip_height(), Some(Height(100)));
+    let tip_a = qa.reconstruct_block_at_height(Height(100)).unwrap();
+    let tip_b = qb.reconstruct_block_at_height(Height(100)).unwrap();
+    assert_eq!(tip_a.block_hash(), tip_b.block_hash());
+    let cb_a = qa.reconstruct_block_at_height(Height(1)).unwrap();
+    let cb_b = qb.reconstruct_block_at_height(Height(1)).unwrap();
+    assert_eq!(cb_a.txdata[0].compute_txid(), cb_b.txdata[0].compute_txid());
+    assert_eq!(q99.tip_height(), Some(Height(99)));
+    assert_eq!(
+        q99.reconstruct_block_at_height(Height(99))
+            .unwrap()
+            .block_hash(),
+        qa.reconstruct_block_at_height(Height(99))
+            .unwrap()
+            .block_hash()
+    );
+    let next = mine_regtest_block(tip_a.block_hash(), tip_a.header.time + 600, 101, vec![]);
+    accept_and_connect_block(
+        &qa,
+        &ChainParams::regtest(),
+        Height(101),
+        &next,
+        Milestone::NONE,
+    )
+    .unwrap();
+    assert_ne!(
+        qa.reconstruct_block_at_height(Height(101))
+            .unwrap()
+            .block_hash(),
+        tip_b.block_hash()
+    );
+    assert_eq!(qb.tip_height(), Some(Height(100)));
+    assert_eq!(
+        qb.reconstruct_block_at_height(Height(100))
+            .unwrap()
+            .block_hash(),
+        tip_b.block_hash()
+    );
+    assert_eq!(q99.tip_height(), Some(Height(99)));
+}
+
 // ─── Header rules ───────────────────────────────────────────────────────────
 
 fn pin_h4_checkpoint_and_h6_pow_limit(
@@ -269,12 +403,12 @@ fn coinbase_maturity_holds_inside_one_confirm_batch() {
 /// (`bad-txns-inputs-missingorspent`), not a batch pin hit.
 #[test]
 fn same_batch_spend_of_a_later_block_is_missing() {
-    let (_td, q, params) = regtest_q();
-    connect_genesis(&q, &params);
-    let g = regtest_genesis();
-    let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
-    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
-    let (tip, time) = pad_empty_from(&q, &params, b1.block_hash(), b1.header.time, 2, 100);
+    let (_td, q) = open_empty_snap(EmptySnap::H100);
+    let params = ChainParams::regtest();
+    assert_eq!(q.tip_height(), Some(Height(100)));
+    let tip_blk = q.reconstruct_block_at_height(Height(100)).unwrap();
+    let (tip, time) = (tip_blk.block_hash(), tip_blk.header.time);
+    let b1 = q.reconstruct_block_at_height(Height(1)).unwrap();
 
     let parent = spend_anyone_can_spend(
         b1.txdata[0].compute_txid(),
@@ -397,39 +531,52 @@ fn header_and_spending_boundaries() {
     accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
     let cb_txid = b1.txdata[0].compute_txid();
 
-    let mut tip = b1.block_hash();
-    let mut time = b1.header.time;
-    (tip, time) = pad_empty_from(&q, &params, tip, time, 2, 11);
-
-    let mtp = median_time_past(&q, Height(11)).unwrap();
+    let (_d11, q11) = open_empty_snap(EmptySnap::H11);
+    assert_eq!(q11.tip_height(), Some(Height(11)));
+    let tip11 = q11.reconstruct_block_at_height(Height(11)).unwrap();
+    assert_eq!(
+        q11.reconstruct_block_at_height(Height(1)).unwrap().txdata[0].compute_txid(),
+        cb_txid
+    );
+    let tip = tip11.block_hash();
+    let mtp = median_time_past(&q11, Height(11)).unwrap();
     let mut eq = mine_regtest_block(tip, mtp, 12, vec![]);
-    let expected = expected_next_bits(&q, &params, Height(12), eq.header.time).unwrap();
+    let expected = expected_next_bits(&q11, &params, Height(12), eq.header.time).unwrap();
     eq.header.bits = expected;
     grind_pow(&mut eq);
-    let err = validate_header(&q, &params, Height(12), &eq.header).unwrap_err();
+    let err = validate_header(&q11, &params, Height(12), &eq.header).unwrap_err();
     assert!(
         matches!(err, ConsensusError::BadHeader(s) if s.contains("median-time")),
         "time==mtp: {err:?}"
     );
 
     let mut after = mine_regtest_block(tip, mtp + 1, 12, vec![]);
-    after.header.bits = expected_next_bits(&q, &params, Height(12), after.header.time).unwrap();
+    after.header.bits = expected_next_bits(&q11, &params, Height(12), after.header.time).unwrap();
     grind_pow(&mut after);
-    validate_header(&q, &params, Height(12), &after.header).expect("time==mtp+1");
+    validate_header(&q11, &params, Height(12), &after.header).expect("time==mtp+1");
 
-    (tip, time) = pad_empty_from(&q, &params, tip, time, 12, 99);
-    assert_eq!(q.tip_height(), Some(Height(99)));
-
+    let (_d99, q99) = open_empty_snap(EmptySnap::H99);
+    assert_eq!(q99.tip_height(), Some(Height(99)));
+    let tip99 = q99.reconstruct_block_at_height(Height(99)).unwrap();
     let immature = spend_anyone_can_spend(cb_txid, 0, Amount::from_sat(49_0000_0000));
-    let bad100 = mine_regtest_block(tip, time + 600, 100, vec![immature]);
-    let err = accept_and_connect_block(&q, &params, Height(100), &bad100, Milestone::NONE);
+    let bad100 = mine_regtest_block(
+        tip99.block_hash(),
+        tip99.header.time + 600,
+        100,
+        vec![immature],
+    );
+    let err = accept_and_connect_block(&q99, &params, Height(100), &bad100, Milestone::NONE);
     assert!(
         matches!(err, Err(ConsensusError::BadTx(s)) if s.contains("immature")),
         "immature at created+99: {err:?}"
     );
+    assert_eq!(q99.tip_height(), Some(Height(99)));
 
-    (tip, time) = pad_empty_from(&q, &params, tip, time, 100, 100);
+    let (_d100, q) = open_empty_snap(EmptySnap::H100);
     assert_eq!(q.tip_height(), Some(Height(100)));
+    let tip100 = q.reconstruct_block_at_height(Height(100)).unwrap();
+    let tip = tip100.block_hash();
+    let mut time = tip100.header.time;
     time += 600;
 
     for (prev_txid, case) in [

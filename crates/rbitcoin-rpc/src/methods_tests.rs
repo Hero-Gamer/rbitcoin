@@ -10,11 +10,16 @@ use std::time::Duration;
 
 fn ctx_empty() -> (RpcContext, TempDir) {
     let dir = TempDir::labeled("rpc-meth").expect("temp dir");
+    let ctx = open_ctx(&dir);
+    (ctx, dir)
+}
+
+fn open_ctx(dir: &TempDir) -> RpcContext {
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
     let mp =
         MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
     mp.set_relay_enabled(true);
-    let ctx = RpcContext {
+    RpcContext {
         query: q,
         mempool: Some(mp),
         network: Network::Regtest,
@@ -37,8 +42,97 @@ fn ctx_empty() -> (RpcContext, TempDir) {
 
         alert_notify: None,
         alert_fired: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
+/// Genesis plus empty blocks `1..=102` (genesis time + 600s). `collect_coinbases`
+/// does not change those block bytes, so the height-102 mempool tests share one pad.
+struct Empty102Pad {
+    store: std::path::PathBuf,
+    _dir: TempDir,
+    coinbases: Vec<Txid>,
+}
+
+fn empty_102_pad() -> &'static Empty102Pad {
+    use std::sync::OnceLock;
+    static PAD: OnceLock<Empty102Pad> = OnceLock::new();
+    PAD.get_or_init(|| {
+        let (ctx, dir) = ctx_empty();
+        let params = rbitcoin_consensus::ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        rbitcoin_consensus::accept_and_connect_block(
+            &ctx.query,
+            &params,
+            Height::GENESIS,
+            &genesis,
+            rbitcoin_consensus::Milestone::NONE,
+        )
+        .unwrap();
+        let (_tip, _time, coinbases) = rbitcoin_consensus::pad_empty_from(
+            &ctx.query,
+            &params,
+            genesis.block_hash(),
+            genesis.header.time,
+            1,
+            102,
+            2,
+        );
+        ctx.query.flush().expect("flush empty-102 pad");
+        Empty102Pad {
+            store: dir.path().join("store"),
+            _dir: dir,
+            coinbases,
+        }
+    })
+}
+
+fn ctx_from_empty_102() -> (RpcContext, TempDir, Vec<Txid>) {
+    let dir = TempDir::labeled("rpc-meth").expect("temp dir");
+    let dest = dir.path().join("store");
+    copy_store_tree(&empty_102_pad().store, &dest);
+    let ctx = open_ctx(&dir);
+    ctx.query.flush().expect("flush empty-102 copy");
+    assert_eq!(ctx.query.tip_height(), Some(Height(102)));
+    (ctx, dir, empty_102_pad().coinbases.clone())
+}
+
+#[test]
+fn empty_102_pad_copy_keeps_the_other_tip() {
+    use rbitcoin_consensus::{
+        accept_and_connect_block, mine_empty_regtest, ChainParams, Milestone,
     };
-    (ctx, dir)
+
+    let (a, dir_a, cbs_a) = ctx_from_empty_102();
+    let (b, dir_b, cbs_b) = ctx_from_empty_102();
+    assert_eq!(a.query.tip_height(), Some(Height(102)));
+    assert_eq!(a.query.tip_height(), b.query.tip_height());
+    let tip_a = a.query.reconstruct_block_at_height(Height(102)).unwrap();
+    let tip_b = b.query.reconstruct_block_at_height(Height(102)).unwrap();
+    assert_eq!(tip_a.block_hash(), tip_b.block_hash());
+    assert_eq!(cbs_a, cbs_b);
+    let h1_a = a.query.reconstruct_block_at_height(Height(1)).unwrap();
+    let h1_b = b.query.reconstruct_block_at_height(Height(1)).unwrap();
+    assert_eq!(h1_a.txdata[0].compute_txid(), h1_b.txdata[0].compute_txid());
+    let next = mine_empty_regtest(tip_a.block_hash(), tip_a.header.time + 600, 103);
+    accept_and_connect_block(
+        &a.query,
+        &ChainParams::regtest(),
+        Height(103),
+        &next,
+        Milestone::NONE,
+    )
+    .unwrap();
+    assert_ne!(a.query.tip_height(), Some(Height(102)));
+    assert_eq!(
+        b.query
+            .reconstruct_block_at_height(Height(102))
+            .unwrap()
+            .block_hash(),
+        tip_b.block_hash()
+    );
+    assert_eq!(b.query.tip_height(), Some(Height(102)));
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 fn named(obj: Value) -> RpcParams {
@@ -1096,29 +1190,7 @@ fn mempool_graph_fields_follow_cluster_and_unbroadcast() {
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-    use rbitcoin_primitives::Height;
-
-    let (ctx, dir) = ctx_empty();
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(
-        &ctx.query,
-        &params,
-        Height::GENESIS,
-        &genesis,
-        Milestone::NONE,
-    )
-    .unwrap();
-    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-        &ctx.query,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        102,
-        2,
-    );
+    let (ctx, dir, coinbase_txids) = ctx_from_empty_102();
     let mp = ctx.mempool.as_ref().expect("mempool");
     mp.set_relay_enabled(true);
     let spk = ScriptBuf::from_bytes(vec![0x51]);
@@ -1241,29 +1313,8 @@ fn getmempoolentry_vsize_ceils_weight() {
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use rbitcoin_consensus::policy::get_virtual_size;
-    use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
-    use rbitcoin_primitives::Height;
 
-    let (ctx, dir) = ctx_empty();
-    let params = ChainParams::regtest();
-    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    accept_and_connect_block(
-        &ctx.query,
-        &params,
-        Height::GENESIS,
-        &genesis,
-        Milestone::NONE,
-    )
-    .unwrap();
-    let (_tip, _tip_time, coinbase_txids) = rbitcoin_consensus::pad_empty_from(
-        &ctx.query,
-        &params,
-        genesis.block_hash(),
-        genesis.header.time,
-        1,
-        102,
-        1,
-    );
+    let (ctx, dir, coinbase_txids) = ctx_from_empty_102();
     let mp = ctx.mempool.as_ref().expect("mempool");
     mp.set_relay_enabled(true);
     let wit_script = ScriptBuf::from_bytes(vec![0x51]);
