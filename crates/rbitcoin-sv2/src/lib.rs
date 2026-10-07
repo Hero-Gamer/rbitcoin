@@ -9,7 +9,7 @@ pub mod testutil;
 mod transport;
 
 use bitcoin::secp256k1::{Keypair, Secp256k1};
-use rbitcoin_net::ChainHub;
+use rbitcoin_net::{ChainHub, RequestMeter};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -82,8 +82,20 @@ pub struct Sv2TpConfig {
     pub template_interval: Duration,
 }
 
+/// Template work across this listener's sessions, for `tip: perf` and
+/// `/metrics`.
+#[derive(Default)]
+pub struct Sv2TpStats {
+    /// Fee checks: one per session per interval once it has a template.
+    /// Counted only; a check that builds is timed under `builds`.
+    pub fee_checks: RequestMeter,
+    /// Template builds (constraints, tip, fee check), wall time each.
+    pub builds: RequestMeter,
+}
+
 pub struct Sv2TpHandle {
     pub local_addr: SocketAddr,
+    stats: Arc<Sv2TpStats>,
     /// X-only authority public key the clients verify the certificate against.
     pub(crate) authority_pubkey: [u8; 32],
     task: JoinHandle<()>,
@@ -99,6 +111,10 @@ impl Sv2TpHandle {
         v[..2].copy_from_slice(&1u16.to_le_bytes());
         v[2..].copy_from_slice(&self.authority_pubkey);
         bitcoin::base58::encode_check(&v)
+    }
+
+    pub fn stats(&self) -> Arc<Sv2TpStats> {
+        Arc::clone(&self.stats)
     }
 
     pub async fn shutdown(self) {
@@ -158,9 +174,11 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
     let chain = config.chain;
     let listener = TcpListener::bind(config.listen).await?;
     let local_addr = listener.local_addr()?;
+    let stats = Arc::new(Sv2TpStats::default());
     let slots = Arc::new(Semaphore::new(MAX_SESSIONS));
     let sessions: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let sessions_c = sessions.clone();
+    let stats_c = Arc::clone(&stats);
 
     let task = tokio::spawn(async move {
         loop {
@@ -196,6 +214,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
             };
             rbitcoin_log::info!("sv2: connect {peer}");
             let chain = Arc::clone(&chain);
+            let stats = Arc::clone(&stats_c);
             let h = tokio::spawn(async move {
                 let _slot = slot;
                 match session::serve(
@@ -206,6 +225,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     setup_timeout,
                     write_timeout,
                     fee_push,
+                    stats,
                 )
                 .await
                 {
@@ -221,6 +241,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
 
     Ok(Sv2TpHandle {
         local_addr,
+        stats,
         authority_pubkey,
         task,
         sessions,

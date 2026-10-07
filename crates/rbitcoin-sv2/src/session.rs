@@ -2,6 +2,7 @@
 
 use crate::template;
 use crate::transport::{Frame, NoiseConn, NoiseWriter};
+use crate::Sv2TpStats;
 use binary_sv2::{Seq064K, Str0255, B016M, B064K};
 use bitcoin::hashes::Hash;
 use bitcoin::{block, Block, BlockHash, CompactTarget, Transaction, TxMerkleNode, Witness};
@@ -127,6 +128,7 @@ impl Templates {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub(crate) async fn serve(
     stream: TcpStream,
     responder: Box<Responder>,
@@ -135,6 +137,7 @@ pub(crate) async fn serve(
     setup_timeout: Duration,
     write_timeout: Duration,
     fee_push: FeePush,
+    stats: Arc<Sv2TpStats>,
 ) -> io::Result<()> {
     let deadline = Instant::now() + setup_timeout;
     let setup = async {
@@ -166,6 +169,7 @@ pub(crate) async fn serve(
         chain,
         stale_grace,
         fee_push,
+        stats,
         constraints: None,
         templates: Templates::default(),
         built_at: None,
@@ -179,6 +183,10 @@ pub(crate) async fn serve(
     s.run(&mut frames, deadline).await
 }
 
+fn micros(d: Duration) -> u64 {
+    u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
+}
+
 fn missed_setup_deadline() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "sv2: setup deadline")
 }
@@ -188,6 +196,7 @@ struct Session {
     chain: Arc<ChainHub>,
     stale_grace: Duration,
     fee_push: FeePush,
+    stats: Arc<Sv2TpStats>,
     /// Last `CoinbaseOutputConstraints`: `(max_additional_size, sigops)`.
     constraints: Option<(u32, u16)>,
     templates: Templates,
@@ -319,6 +328,7 @@ impl Session {
     /// latest mempool anyway, so the check leaves it alone.
     async fn check_fees(&mut self) -> io::Result<()> {
         self.fee_check_at = Some(Instant::now() + self.fee_push.interval);
+        self.stats.fee_checks.note(0);
         let updates = self.chain.mempool().map_or(0, |m| m.template_updates());
         if updates == self.seen_updates || self.rebuild_at.is_some() {
             return Ok(());
@@ -360,11 +370,16 @@ impl Session {
         // returns: a failed one leaves the generation for the next check.
         let updates = self.chain.mempool().map_or(0, |m| m.template_updates());
         let c = Arc::clone(&self.chain);
+        let stats = Arc::clone(&self.stats);
         let t = tokio::task::spawn_blocking(move || {
             let _g = BlockingRegion::enter();
-            (!c.in_ibd())
-                .then(|| template::build(&c, size, sigops))
-                .transpose()
+            if c.in_ibd() {
+                return Ok(None);
+            }
+            let started = std::time::Instant::now();
+            let t = template::build(&c, size, sigops)?;
+            stats.builds.note(micros(started.elapsed()));
+            Ok::<_, io::Error>(Some(t))
         })
         .await
         .map_err(io::Error::other)??;

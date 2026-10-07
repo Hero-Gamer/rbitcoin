@@ -1078,3 +1078,23 @@ async fn fee_pushes_stay_an_interval_apart_under_steady_admission() {
 
     tp.shutdown().await;
 }
+
+/// An idle session checks once per interval and builds nothing: the
+/// counter did not move. The listener's stats count both.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_session_checks_each_interval_and_does_not_rebuild() {
+    let tc = shared_regtest(0);
+    let interval = Duration::from_millis(250);
+    let FirstTemplate { tp, c, .. } = first_template_every(&tc, interval).await;
+    let stats = tp.stats();
+    assert_eq!(stats.builds.totals().0, 1, "the first template");
+    tokio::time::sleep(4 * interval + interval / 2).await;
+    let checks = stats.fee_checks.totals().0;
+    assert!(
+        (2..=8).contains(&checks),
+        "about one check per interval, got {checks}"
+    );
+    assert_eq!(stats.builds.totals().0, 1, "an idle mempool is not rebuilt");
+    drop(c);
+    tp.shutdown().await;
+}
