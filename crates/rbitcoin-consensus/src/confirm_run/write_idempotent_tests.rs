@@ -2257,7 +2257,7 @@ fn pin_for_wire_create_pin_shares_script_bytes() {
 }
 
 #[test]
-fn write_refuses_empty_packed_ins() {
+fn write_encodes_seqsigwit_from_wire() {
     use super::{
         confirm_scripts_phase, confirm_wire_load_from_plan, confirm_wire_lookup_stamp,
         confirm_write_phase, ScriptPreverified,

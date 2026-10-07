@@ -154,11 +154,10 @@ fn block_866342_structure_scripts_and_overweight() {
             prevs.push(stxos.next().expect("stxos short"));
         }
         let txid = tx.compute_txid().to_byte_array();
-        let job = ScriptCheckJob::with_shared_tx(
+        let job = ScriptCheckJob::from_parts(
             txid,
-            prevs,
-            Arc::clone(&arc),
-            i,
+            crate::block::JobPrevouts::owned(prevs),
+            crate::block::JobTx::shared(Arc::clone(&arc), i),
             crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
         );
         crate::script::verify_job_all_inputs(&job).unwrap_or_else(|e| {

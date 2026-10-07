@@ -279,26 +279,6 @@ impl InputRecord {
     }
 }
 
-/// Wire input viewed as slices. `seqsigwit` stores sequence, script, and witness
-/// only (`PREV_ON_INPUTS`). `create_fk` / `prev_index` / `coinbase` are the
-/// `input.body` edge, not seqsigwit bytes.
-#[derive(Clone, Copy)]
-pub struct BorrowedInput<'a> {
-    pub sequence: u32,
-    pub script_sig: &'a [u8],
-    pub witness: &'a [&'a [u8]],
-    pub create_fk: Fk,
-    pub prev_index: u32,
-    pub coinbase: bool,
-}
-
-impl BorrowedInput<'_> {
-    #[inline]
-    pub fn is_coinbase(&self) -> bool {
-        self.coinbase || (self.create_fk.is_null() && self.prev_index == u32::MAX)
-    }
-}
-
 /// Same flags and payload as [`InputRecord::encode_into`].
 fn encode_seqsigwit_input<'a>(
     sequence: u32,
@@ -341,27 +321,18 @@ pub fn seqsigwit_input_len_upper(
     1 + 8 + 9 + 4 + 9 + script_len + 9 + witness_item_lens.map(|n| 9 + n).sum::<usize>()
 }
 
-pub fn borrowed_input_encoded_len(inp: &BorrowedInput<'_>) -> usize {
-    seqsigwit_input_len_upper(inp.script_sig.len(), inp.witness.iter().map(|i| i.len()))
-}
-
-/// Encode a borrowed input run. XOR matches [`encode_input_run_secret`].
-pub fn encode_borrowed_input_run(
-    inputs: &[BorrowedInput<'_>],
+/// One `seqsigwit` input from wire slices, XOR included when `secret` is set.
+pub fn encode_wire_seqsigwit_input<'a>(
+    sequence: u32,
+    script_sig: &[u8],
+    witness: impl ExactSizeIterator<Item = &'a [u8]>,
     out: &mut Vec<u8>,
     secret: Option<&crate::store_secret::StoreSecret>,
 ) {
-    for inp in inputs {
-        let start = out.len();
-        encode_seqsigwit_input(
-            inp.sequence,
-            inp.script_sig,
-            inp.witness.iter().copied(),
-            out,
-        );
-        if let Some(sec) = secret {
-            xor_script_regions_in_input(out, start, sec);
-        }
+    let start = out.len();
+    encode_seqsigwit_input(sequence, script_sig, witness, out);
+    if let Some(sec) = secret {
+        xor_script_regions_in_input(out, start, sec);
     }
 }
 
@@ -1289,28 +1260,22 @@ mod borrowed_input_encode_tests {
         items.iter().map(|i| i.as_slice()).collect()
     }
 
-    fn borrowed_of<'a>(rec: &'a InputRecord, wit: &'a [&'a [u8]]) -> BorrowedInput<'a> {
-        BorrowedInput {
-            sequence: rec.sequence,
-            script_sig: rec.script_sig.as_slice(),
-            witness: wit,
-            create_fk: rec.create_fk,
-            prev_index: rec.prev_index,
-            coinbase: rec.is_coinbase(),
-        }
-    }
-
     fn assert_matches(rec: &InputRecord, secret: Option<&crate::store_secret::StoreSecret>) {
         let wit = witness_refs(&rec.witness);
-        let borrowed = borrowed_of(rec, &wit);
         let mut owned = Vec::new();
         encode_seqsigwit_with_secret(std::slice::from_ref(rec), &mut owned, secret);
-        let mut from_borrow = Vec::new();
-        encode_borrowed_input_run(std::slice::from_ref(&borrowed), &mut from_borrow, secret);
-        assert_eq!(owned, from_borrow);
-        assert_eq!(borrowed.is_coinbase(), rec.is_coinbase());
-        assert!(borrowed_input_encoded_len(&borrowed) >= rec.encoded_len_exact());
-        assert_eq!(borrowed_input_encoded_len(&borrowed), rec.encoded_len());
+        let mut from_wire = Vec::new();
+        encode_wire_seqsigwit_input(
+            rec.sequence,
+            rec.script_sig.as_slice(),
+            wit.iter().copied(),
+            &mut from_wire,
+            secret,
+        );
+        assert_eq!(owned, from_wire);
+        let upper = seqsigwit_input_len_upper(rec.script_sig.len(), wit.iter().map(|i| i.len()));
+        assert!(upper >= rec.encoded_len_exact());
+        assert_eq!(upper, rec.encoded_len());
     }
 
     #[test]

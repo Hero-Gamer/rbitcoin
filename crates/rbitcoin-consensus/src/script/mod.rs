@@ -41,7 +41,7 @@ pub(crate) use classify::is_anyone_can_spend;
 /// Verify every non-anyone-can-spend input of a script job.
 ///
 /// One shared [`bitcoin::sighash::SighashCache`] per tx for typed paths (P2WPKH /
-/// P2TR key-path / nested). Interpreter paths own a cache for the script eval so
+/// nested). P2TR hashes borrowed prevout scripts. Interpreter paths own a cache for the script eval so
 /// multi-CHECKSIG (multisig) reuses midstate. Signet-heavy path is 1-input txs —
 /// that case avoids the multi-input loop overhead.
 ///
@@ -116,22 +116,13 @@ pub(crate) fn verify_input<'a>(
     if input_index >= job.prevouts.len() || input_index >= tx.input.len() {
         return Err(ConsensusError::Script("input index".into()));
     }
-    let spk = bitcoin::script::Script::from_bytes(job.prevout_script(input_index));
+    let spk = bitcoin::script::Script::from_bytes(job.prevout_script(input_index)?);
     let input = &tx.input[input_index];
     let has_witness = !input.witness.is_empty();
 
     if job.witness_active {
         if let Some((version, program)) = classify::witness_program(spk) {
-            return verify_native_witness(
-                job,
-                input_index,
-                tx,
-                cache,
-                pre,
-                tap_spent,
-                version,
-                program,
-            );
+            return verify_native_witness(job, input_index, tx, pre, tap_spent, version, program);
         }
     }
 
@@ -193,12 +184,10 @@ const PAY_TO_ANCHOR_PROGRAM: [u8; 2] = [0x4e, 0x73];
 /// Policy: a v1 32-byte program before Taproot and pay-to-anchor succeed
 /// without DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, as in Core.
 #[inline]
-#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-fn verify_native_witness<'a>(
+fn verify_native_witness(
     job: &ScriptCheckJob,
     input_index: usize,
-    tx: &'a Transaction,
-    cache: &mut Option<bitcoin::sighash::SighashCache<&'a Transaction>>,
+    tx: &Transaction,
     pre: &crate::TxPrecompute,
     tap_spent: &crypto::TapSpentHashes,
     version: u8,
@@ -221,9 +210,7 @@ fn verify_native_witness<'a>(
         (0, _) => Err(ConsensusError::Script(
             "WITNESS_PROGRAM_WRONG_LENGTH".into(),
         )),
-        (1, 32) if job.taproot_active => {
-            p2tr::verify(job, input_index, tx, sighash_cache(cache, tx), tap_spent)
-        }
+        (1, 32) if job.taproot_active => p2tr::verify(job, input_index, tx, tap_spent),
         (1, 32) => Ok(()),
         (1, 2) if program == PAY_TO_ANCHOR_PROGRAM => Ok(()),
         _ => {
@@ -277,17 +264,17 @@ fn verify_bare(
             input_index,
             ss,
             interpreter::SigVersion::Base,
-        );
+        )?;
         let _ = interpreter::eval_script(ss, &mut stack, &ctx_sig)?;
     }
-    let spk = bitcoin::script::Script::from_bytes(job.prevout_script(input_index));
+    let spk = bitcoin::script::Script::from_bytes(job.prevout_script(input_index)?);
     let ctx = interpreter::EvalContext::from_job(
         job,
         tx,
         input_index,
         spk,
         interpreter::SigVersion::Base,
-    );
+    )?;
     if interpreter::eval_script(spk, &mut stack, &ctx)? {
         if job.cleanstack {
             interpreter::require_clean_true(&stack)?;
@@ -570,27 +557,151 @@ pub(crate) mod crypto {
 
     /// Core `PrecomputedTransactionData` spent-output half: BIP341
     /// `sha_amounts` and `sha_scriptpubkeys`. One per tx, filled by the first
-    /// tapscript signature check that commits to the spent outputs.
+    /// taproot signature check that commits to the spent outputs.
+    ///
+    /// Hashes borrowed script bytes from the job. Does not build `TxOut`.
     #[derive(Default)]
     pub struct TapSpentHashes(std::cell::OnceCell<[[u8; 32]; 2]>);
 
     impl TapSpentHashes {
-        fn get(
-            &self,
-            pre: &crate::TxPrecompute,
-            prevouts: &[bitcoin::TxOut],
-        ) -> Result<[[u8; 32]; 2], ConsensusError> {
+        fn get(&self, job: &crate::block::ScriptCheckJob) -> Result<[[u8; 32]; 2], ConsensusError> {
             if let Some(hashes) = self.0.get() {
                 return Ok(*hashes);
             }
-            let mut spent = pre.clone();
-            spent.finish_spent(prevouts);
+            let mut failed: Option<ConsensusError> = None;
+            let mut spent = job.pre().clone();
+            let n = job.prevouts.len();
+            let ok = spent.finish_spent_parts(n, |i| match job.prevout_parts(i) {
+                Ok(parts) => Some(parts),
+                Err(e) => {
+                    failed = Some(e);
+                    None
+                }
+            });
+            if let Some(e) = failed {
+                return Err(e);
+            }
+            if !ok {
+                return Err(ConsensusError::Script("tapscript sighash prevouts".into()));
+            }
             let hashes = [
                 sighash_midstate(spent.sha_amounts)?,
                 sighash_midstate(spent.sha_scriptpubkeys)?,
             ];
             Ok(*self.0.get_or_init(|| hashes))
         }
+    }
+
+    /// SHA256 of `compact_size(annex) || annex` (BIP341, annex includes `0x50`).
+    pub fn annex_hash(annex: &[u8]) -> [u8; 32] {
+        use bitcoin::consensus::encode::VarInt;
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::{sha256, HashEngine};
+
+        let mut eng = sha256::Hash::engine();
+        VarInt(annex.len() as u64)
+            .consensus_encode(&mut eng)
+            .expect("hash engines do not error");
+        eng.input(annex);
+        sha256::Hash::from_engine(eng).to_byte_array()
+    }
+
+    /// BIP341 signature hash. `leaf` is `None` on the key path (ext flag 0)
+    /// and `Some((tapleaf, codesep))` on the script path (ext flag 1).
+    ///
+    /// Prevout scripts are borrowed from `job`. This does not allocate `TxOut`.
+    pub fn tap_signature_hash(
+        job: &crate::block::ScriptCheckJob,
+        input_index: usize,
+        hash_type: bitcoin::sighash::TapSighashType,
+        spent: &TapSpentHashes,
+        annex_hash: Option<[u8; 32]>,
+        leaf: Option<(bitcoin::TapLeafHash, u32)>,
+        single_output_hash: &std::cell::OnceCell<Option<[u8; 32]>>,
+    ) -> Result<[u8; 32], ConsensusError> {
+        use bitcoin::consensus::Encodable;
+        use bitcoin::hashes::{sha256, HashEngine};
+        use bitcoin::sighash::TapSighash;
+
+        const SIGHASH_ALL: u8 = 0x01;
+        const SIGHASH_SINGLE: u8 = 0x03;
+        const SIGHASH_ANYONECANPAY: u8 = 0x80;
+        const KEY_VERSION: u8 = 0;
+
+        let tx = &*job.tx;
+        let Some(txin) = tx.input.get(input_index) else {
+            return Err(ConsensusError::Script("tapscript sighash input".into()));
+        };
+        if job.prevouts.len() != tx.input.len() {
+            return Err(ConsensusError::Script("tapscript sighash prevouts".into()));
+        }
+        let pre = job.pre();
+        let hash_type = hash_type as u8;
+        let output_type = match hash_type {
+            0 => SIGHASH_ALL,
+            ty => ty & 0x03,
+        };
+        let anyone_can_pay = hash_type & SIGHASH_ANYONECANPAY != 0;
+        let ext_flag = u8::from(leaf.is_some());
+
+        let mut eng = TapSighash::engine();
+        eng.input(&[0, hash_type]);
+        tx.version
+            .consensus_encode(&mut eng)
+            .expect("hash engines do not error");
+        tx.lock_time
+            .consensus_encode(&mut eng)
+            .expect("hash engines do not error");
+        if !anyone_can_pay {
+            let [sha_amounts, sha_scriptpubkeys] = spent.get(job)?;
+            eng.input(&sighash_midstate(pre.sha_prevouts)?);
+            eng.input(&sha_amounts);
+            eng.input(&sha_scriptpubkeys);
+            eng.input(&sighash_midstate(pre.sha_sequences)?);
+        }
+        if output_type == SIGHASH_ALL {
+            eng.input(&sighash_midstate(pre.sha_outputs)?);
+        }
+        eng.input(&[(ext_flag << 1) | u8::from(annex_hash.is_some())]);
+        if anyone_can_pay {
+            let (value, script) = job.prevout_parts(input_index)?;
+            txin.previous_output
+                .consensus_encode(&mut eng)
+                .expect("hash engines do not error");
+            (value as u64)
+                .consensus_encode(&mut eng)
+                .expect("hash engines do not error");
+            bitcoin::Script::from_bytes(script)
+                .consensus_encode(&mut eng)
+                .expect("hash engines do not error");
+            txin.sequence
+                .consensus_encode(&mut eng)
+                .expect("hash engines do not error");
+        } else {
+            eng.input(&(input_index as u32).to_le_bytes());
+        }
+        if let Some(annex_hash) = &annex_hash {
+            eng.input(annex_hash);
+        }
+        if output_type == SIGHASH_SINGLE {
+            let output_hash = single_output_hash.get_or_init(|| {
+                tx.output.get(input_index).map(|out| {
+                    let mut out_eng = sha256::Hash::engine();
+                    out.consensus_encode(&mut out_eng)
+                        .expect("hash engines do not error");
+                    sha256::Hash::from_engine(out_eng).to_byte_array()
+                })
+            });
+            let output_hash = output_hash
+                .ok_or_else(|| ConsensusError::Script("tapscript sighash single".into()))?;
+            eng.input(&output_hash);
+        }
+        if let Some((tapleaf_hash, codeseparator_pos)) = leaf {
+            eng.input(tapleaf_hash.as_byte_array());
+            eng.input(&[KEY_VERSION]);
+            eng.input(&codeseparator_pos.to_le_bytes());
+        }
+        Ok(TapSighash::from_engine(eng).to_byte_array())
     }
 
     /// Core `ScriptExecutionData` for one tapscript spend: the BIP341/342
@@ -604,10 +715,8 @@ pub(crate) mod crypto {
     /// the same witness bytes; rehashing the spent outputs per input is
     /// quadratic in the input count.
     pub struct TapscriptExecData<'a> {
-        tx: &'a bitcoin::Transaction,
+        job: &'a crate::block::ScriptCheckJob,
         input_index: usize,
-        prevouts: &'a [bitcoin::TxOut],
-        pre: &'a crate::TxPrecompute,
         spent: &'a TapSpentHashes,
         tapleaf_hash: bitcoin::TapLeafHash,
         annex_hash: Option<[u8; 32]>,
@@ -615,37 +724,21 @@ pub(crate) mod crypto {
     }
 
     impl<'a> TapscriptExecData<'a> {
-        /// `annex` is the BIP341 annex including its `0x50` tag. `pre` and
-        /// `spent` belong to `tx`.
+        /// `annex` is the BIP341 annex including its `0x50` tag. `spent`
+        /// belongs to `job`'s transaction.
         pub fn new(
-            tx: &'a bitcoin::Transaction,
+            job: &'a crate::block::ScriptCheckJob,
             input_index: usize,
-            prevouts: &'a [bitcoin::TxOut],
-            pre: &'a crate::TxPrecompute,
             spent: &'a TapSpentHashes,
             tapleaf_hash: bitcoin::TapLeafHash,
             annex: Option<&[u8]>,
         ) -> Self {
-            use bitcoin::consensus::encode::VarInt;
-            use bitcoin::consensus::Encodable;
-            use bitcoin::hashes::{sha256, HashEngine};
-
-            let annex_hash = annex.map(|annex| {
-                let mut eng = sha256::Hash::engine();
-                VarInt(annex.len() as u64)
-                    .consensus_encode(&mut eng)
-                    .expect("hash engines do not error");
-                eng.input(annex);
-                sha256::Hash::from_engine(eng).to_byte_array()
-            });
             Self {
-                tx,
+                job,
                 input_index,
-                prevouts,
-                pre,
                 spent,
                 tapleaf_hash,
-                annex_hash,
+                annex_hash: annex.map(annex_hash),
                 single_output_hash: std::cell::OnceCell::new(),
             }
         }
@@ -657,85 +750,15 @@ pub(crate) mod crypto {
             hash_type: bitcoin::sighash::TapSighashType,
             codeseparator_pos: u32,
         ) -> Result<[u8; 32], ConsensusError> {
-            use bitcoin::consensus::Encodable;
-            use bitcoin::hashes::{sha256, HashEngine};
-            use bitcoin::sighash::TapSighash;
-
-            const SIGHASH_ALL: u8 = 0x01;
-            const SIGHASH_SINGLE: u8 = 0x03;
-            const SIGHASH_ANYONECANPAY: u8 = 0x80;
-            const EXT_FLAG_TAPSCRIPT: u8 = 1;
-            const KEY_VERSION: u8 = 0;
-
-            let (tx, input_index, prevouts, pre) =
-                (self.tx, self.input_index, self.prevouts, self.pre);
-            let (Some(txin), Some(spent_output)) =
-                (tx.input.get(input_index), prevouts.get(input_index))
-            else {
-                return Err(ConsensusError::Script("tapscript sighash input".into()));
-            };
-            if prevouts.len() != tx.input.len() {
-                return Err(ConsensusError::Script("tapscript sighash prevouts".into()));
-            }
-            let hash_type = hash_type as u8;
-            let output_type = match hash_type {
-                0 => SIGHASH_ALL,
-                ty => ty & 0x03,
-            };
-            let anyone_can_pay = hash_type & SIGHASH_ANYONECANPAY != 0;
-
-            let mut eng = TapSighash::engine();
-            eng.input(&[0, hash_type]);
-            tx.version
-                .consensus_encode(&mut eng)
-                .expect("hash engines do not error");
-            tx.lock_time
-                .consensus_encode(&mut eng)
-                .expect("hash engines do not error");
-            if !anyone_can_pay {
-                let [sha_amounts, sha_scriptpubkeys] = self.spent.get(pre, prevouts)?;
-                eng.input(&sighash_midstate(pre.sha_prevouts)?);
-                eng.input(&sha_amounts);
-                eng.input(&sha_scriptpubkeys);
-                eng.input(&sighash_midstate(pre.sha_sequences)?);
-            }
-            if output_type == SIGHASH_ALL {
-                eng.input(&sighash_midstate(pre.sha_outputs)?);
-            }
-            eng.input(&[(EXT_FLAG_TAPSCRIPT << 1) | u8::from(self.annex_hash.is_some())]);
-            if anyone_can_pay {
-                txin.previous_output
-                    .consensus_encode(&mut eng)
-                    .expect("hash engines do not error");
-                spent_output
-                    .consensus_encode(&mut eng)
-                    .expect("hash engines do not error");
-                txin.sequence
-                    .consensus_encode(&mut eng)
-                    .expect("hash engines do not error");
-            } else {
-                eng.input(&(input_index as u32).to_le_bytes());
-            }
-            if let Some(annex_hash) = &self.annex_hash {
-                eng.input(annex_hash);
-            }
-            if output_type == SIGHASH_SINGLE {
-                let output_hash = self.single_output_hash.get_or_init(|| {
-                    tx.output.get(input_index).map(|out| {
-                        let mut out_eng = sha256::Hash::engine();
-                        out.consensus_encode(&mut out_eng)
-                            .expect("hash engines do not error");
-                        sha256::Hash::from_engine(out_eng).to_byte_array()
-                    })
-                });
-                let output_hash = output_hash
-                    .ok_or_else(|| ConsensusError::Script("tapscript sighash single".into()))?;
-                eng.input(&output_hash);
-            }
-            eng.input(self.tapleaf_hash.as_byte_array());
-            eng.input(&[KEY_VERSION]);
-            eng.input(&codeseparator_pos.to_le_bytes());
-            Ok(TapSighash::from_engine(eng).to_byte_array())
+            tap_signature_hash(
+                self.job,
+                self.input_index,
+                hash_type,
+                self.spent,
+                self.annex_hash,
+                Some((self.tapleaf_hash, codeseparator_pos)),
+                &self.single_output_hash,
+            )
         }
     }
 
@@ -1305,7 +1328,7 @@ mod verify_routing_tests {
         assert_ne!(h_fast, h_slow);
     }
 
-    /// Tapscript sighash from cached leaf / annex / output hashes matches
+    /// Tapscript and key-path sighash from borrowed prevout scripts matches
     /// rust-bitcoin's `taproot_signature_hash` on every BIP341 hash type.
     #[test]
     fn tapscript_sighash_matches_rust_bitcoin_on_every_hash_type() {
@@ -1334,7 +1357,6 @@ mod verify_routing_tests {
             output: vec![output(4), output(5)],
         };
         let prevouts = vec![output(6), output(7), output(8)];
-        let pre = crate::TxPrecompute::from_tx(&tx);
         let leaf = ScriptBuf::from_bytes(vec![0x51, 0x75, 0x51]);
         let leaf_hash = TapLeafHash::from_script(&leaf, LeafVersion::TapScript);
         let annex_bytes = [0x50, 0x01, 0x02];
@@ -1347,26 +1369,51 @@ mod verify_routing_tests {
             TapSighashType::NonePlusAnyoneCanPay,
             TapSighashType::SinglePlusAnyoneCanPay,
         ];
+        let flags = crate::block::ScriptVerifyFlags::buried(true, true, true, true, true);
+        let job = crate::block::ScriptCheckJob::new(prevouts.clone(), tx.clone(), flags);
 
         let tap_spent = crypto::TapSpentHashes::default();
         for annex in [None, Some(&annex_bytes[..])] {
             for input_index in 0..tx.input.len() {
-                let exec = crypto::TapscriptExecData::new(
-                    &tx,
-                    input_index,
-                    &prevouts,
-                    &pre,
-                    &tap_spent,
-                    leaf_hash,
-                    annex,
-                );
+                let exec =
+                    crypto::TapscriptExecData::new(&job, input_index, &tap_spent, leaf_hash, annex);
+                let annex_oracle = annex.map(|a| Annex::new(a).unwrap());
+                let annex_hash = annex.map(crypto::annex_hash);
                 for ty in types {
+                    let single = std::cell::OnceCell::new();
+                    let key_ours = crypto::tap_signature_hash(
+                        &job,
+                        input_index,
+                        ty,
+                        &tap_spent,
+                        annex_hash,
+                        None,
+                        &single,
+                    );
+                    let key_oracle = SighashCache::new(&tx).taproot_signature_hash(
+                        input_index,
+                        &Prevouts::All(&prevouts),
+                        annex_oracle.clone(),
+                        None,
+                        ty,
+                    );
+                    match key_oracle {
+                        Ok(h) => assert_eq!(
+                            key_ours.expect("key path"),
+                            h.to_byte_array(),
+                            "key vin={input_index} {ty:?} annex={annex:?}"
+                        ),
+                        Err(_) => assert!(
+                            key_ours.is_err(),
+                            "key vin={input_index} {ty:?}: rust-bitcoin rejects, ours accepts"
+                        ),
+                    }
                     for codesep in [0xFFFF_FFFF, 0, 7] {
                         let ours = exec.signature_hash(ty, codesep);
                         let oracle = SighashCache::new(&tx).taproot_signature_hash(
                             input_index,
                             &Prevouts::All(&prevouts),
-                            annex.map(|a| Annex::new(a).unwrap()),
+                            annex_oracle.clone(),
                             Some((leaf_hash, codesep)),
                             ty,
                         );
@@ -1386,9 +1433,10 @@ mod verify_routing_tests {
             }
         }
 
-        let short = &prevouts[..2];
+        let short_job =
+            crate::block::ScriptCheckJob::new(prevouts[..2].to_vec(), tx.clone(), flags);
         let tap_spent = crypto::TapSpentHashes::default();
-        let exec = crypto::TapscriptExecData::new(&tx, 0, short, &pre, &tap_spent, leaf_hash, None);
+        let exec = crypto::TapscriptExecData::new(&short_job, 0, &tap_spent, leaf_hash, None);
         assert!(exec.signature_hash(TapSighashType::Default, 0).is_err());
     }
 

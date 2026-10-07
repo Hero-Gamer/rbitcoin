@@ -13,7 +13,7 @@ pub(crate) fn verify(
     input_index: usize,
     tx: &Transaction,
 ) -> Result<(), ConsensusError> {
-    let spk = job.prevout_script(input_index);
+    let spk = job.prevout_script(input_index)?;
     debug_assert!(spk.len() == 34 && spk[0] == 0x00 && spk[1] == 0x20);
     let mut scripthash = [0u8; 32];
     scripthash.copy_from_slice(&spk[2..34]);
@@ -69,7 +69,7 @@ pub(crate) fn execute_witness_v0<'w>(
         }
         stack.push(item.to_vec());
     }
-    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::WitnessV0);
+    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::WitnessV0)?;
     if interpreter::eval_script(script, &mut stack, &ctx)? {
         interpreter::require_clean_true(&stack)?;
     }

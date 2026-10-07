@@ -9,7 +9,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::key::XOnlyPublicKey;
 use bitcoin::script::Script;
 use bitcoin::secp256k1::{Message, Parity};
-use bitcoin::sighash::{Annex, Prevouts, SighashCache, TapSighashType};
+use bitcoin::sighash::TapSighashType;
 use bitcoin::taproot::{TapLeafHash, TapNodeHash, TapTweakHash};
 use bitcoin::{Transaction, Witness};
 
@@ -22,10 +22,9 @@ pub(crate) fn verify(
     job: &ScriptCheckJob,
     input_index: usize,
     tx: &Transaction,
-    cache: &mut SighashCache<&Transaction>,
     tap_spent: &crypto::TapSpentHashes,
 ) -> Result<(), ConsensusError> {
-    let spk = job.prevout_script(input_index);
+    let spk = job.prevout_script(input_index)?;
     debug_assert!(spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20);
     let output_key = &spk[2..34];
 
@@ -38,7 +37,7 @@ pub(crate) fn verify(
     // Key-path: one element, or sig + annex (BIP341: annex = last stack item
     // starting with 0x50 when there are ≥2 items).
     if wit_len == 1 || (wit_len == 2 && bip341_annex(&input.witness).is_some()) {
-        return verify_key_path(job, input_index, tx, output_key, cache);
+        return verify_key_path(job, input_index, tx, output_key, tap_spent);
     }
     verify_script_path(job, input_index, tx, output_key, tap_spent)
 }
@@ -61,7 +60,7 @@ fn verify_key_path(
     input_index: usize,
     tx: &Transaction,
     output_key: &[u8],
-    cache: &mut SighashCache<&Transaction>,
+    tap_spent: &crypto::TapSpentHashes,
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
     let sig_raw = input
@@ -89,24 +88,23 @@ fn verify_key_path(
     let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(sig_bytes)
         .map_err(|_| ConsensusError::Script("p2tr schnorr parse".into()))?;
 
-    // rust-bitcoin sighash takes owned TxOuts. Shared jobs copy here only.
-    job.prevouts.with_txouts(|prevouts| {
-        let prevouts = Prevouts::All(prevouts);
-        // BIP341: when the annex is present it is part of spend_type / sighash.
-        // `taproot_key_spend_signature_hash` always passes annex=None — wrong for
-        // annex spends (mainnet 896078 / f859a4e6… style).
-        let annex = bip341_annex(&input.witness)
-            .map(Annex::new)
-            .transpose()
-            .map_err(|_| ConsensusError::Script("p2tr annex".into()))?;
-        let sighash = cache
-            .taproot_signature_hash(input_index, &prevouts, annex, None, sighash_ty)
-            .map_err(|_| ConsensusError::Script("p2tr sighash".into()))?;
-        let msg = Message::from_digest(sighash.to_byte_array());
-        crypto::SECP.with(|secp| {
-            secp.verify_schnorr(&sig, &msg, &xonly)
-                .map_err(|_| ConsensusError::Script("p2tr schnorr".into()))
-        })
+    // BIP341: when the annex is present it is part of spend_type / sighash.
+    // Key path is the same message as script path with ext flag 0 (`leaf` absent).
+    let annex_hash = bip341_annex(&input.witness).map(crypto::annex_hash);
+    let single = std::cell::OnceCell::new();
+    let sighash = crypto::tap_signature_hash(
+        job,
+        input_index,
+        sighash_ty,
+        tap_spent,
+        annex_hash,
+        None,
+        &single,
+    )?;
+    let msg = Message::from_digest(sighash);
+    crypto::SECP.with(|secp| {
+        secp.verify_schnorr(&sig, &msg, &xonly)
+            .map_err(|_| ConsensusError::Script("p2tr schnorr".into()))
     })
 }
 
@@ -165,12 +163,12 @@ fn verify_control_commitment(
     Ok((leaf, tapleaf_hash))
 }
 
-fn verify_script_path<'a>(
-    job: &'a ScriptCheckJob,
+fn verify_script_path(
+    job: &ScriptCheckJob,
     input_index: usize,
-    tx: &'a Transaction,
+    tx: &Transaction,
     output_key_bytes: &[u8],
-    tap_spent: &'a crypto::TapSpentHashes,
+    tap_spent: &crypto::TapSpentHashes,
 ) -> Result<(), ConsensusError> {
     let input = &tx.input[input_index];
     let mut items: Vec<Vec<u8>> = (0..input.witness.len())
@@ -203,23 +201,13 @@ fn verify_script_path<'a>(
         return Ok(());
     }
 
-    job.prevouts.with_txouts(|prevouts| {
-        let exec = crypto::TapscriptExecData::new(
-            tx,
-            input_index,
-            prevouts,
-            job.pre(),
-            tap_spent,
-            tapleaf_hash,
-            annex,
-        );
-        let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript)
-            .with_tapscript(exec);
-        if interpreter::eval_script(script, &mut stack, &ctx)? {
-            interpreter::require_clean_true(&stack)?;
-        }
-        Ok(())
-    })
+    let exec = crypto::TapscriptExecData::new(job, input_index, tap_spent, tapleaf_hash, annex);
+    let ctx = EvalContext::from_job(job, tx, input_index, script, SigVersion::TapScript)?
+        .with_tapscript(exec);
+    if interpreter::eval_script(script, &mut stack, &ctx)? {
+        interpreter::require_clean_true(&stack)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -229,8 +217,16 @@ mod bip341_tests {
     use bitcoin::absolute::LockTime;
     use bitcoin::key::{TapTweak, TweakedKeypair};
     use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey};
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
     use bitcoin::taproot::{ControlBlock, LeafVersion, TaprootBuilder};
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    fn owned_prevout_mut(job: &mut ScriptCheckJob) -> &mut TxOut {
+        let crate::block::JobPrevouts::Owned(v) = &mut job.prevouts else {
+            panic!("owned prevouts");
+        };
+        &mut v[0]
+    }
 
     fn p2tr_spk(output_key: XOnlyPublicKey) -> ScriptBuf {
         let mut b = vec![0x51, 0x20];
@@ -492,10 +488,10 @@ mod bip341_tests {
     fn script_path_rejects_wrong_output_key() {
         let (mut job, _) = make_script_path_spend();
         // Flip a byte in the prevout output key → BIP341 commitment fails.
-        let spk = job.prevouts[0].script_pubkey.as_bytes();
+        let spk = owned_prevout_mut(&mut job).script_pubkey.as_bytes();
         let mut bad = spk.to_vec();
         bad[10] ^= 0x01;
-        job.prevouts[0].script_pubkey = ScriptBuf::from_bytes(bad);
+        owned_prevout_mut(&mut job).script_pubkey = ScriptBuf::from_bytes(bad);
         let err = script::verify_job_all_inputs(&job).unwrap_err();
         let msg = format!("{err}");
         assert!(
@@ -541,7 +537,7 @@ mod bip341_tests {
         let (mut job, _) = make_script_path_spend();
         let script = job.tx.input[0].witness.nth(0).unwrap().to_vec();
         job.tx.input[0].witness = Witness::from_slice(&[script.as_slice(), ctrl.as_slice()]);
-        job.prevouts[0].script_pubkey = p2tr_spk(output_key);
+        owned_prevout_mut(&mut job).script_pubkey = p2tr_spk(output_key);
         script::verify_job_all_inputs(&job).expect("two-node script path");
     }
 
@@ -639,13 +635,11 @@ mod bip341_tests {
             },
             pre: std::sync::OnceLock::new(),
         };
-        let mut cache = SighashCache::new(&*job.tx);
-        assert!(verify(&job, 0, &job.tx, &mut cache, &Default::default()).is_err());
+        assert!(verify(&job, 0, &job.tx, &Default::default()).is_err());
 
         let mut job2 = job;
         job2.tx.input[0].witness = Witness::from_slice(&[vec![0u8; 10]]);
-        let mut cache2 = SighashCache::new(&*job2.tx);
-        assert!(verify(&job2, 0, &job2.tx, &mut cache2, &Default::default()).is_err());
+        assert!(verify(&job2, 0, &job2.tx, &Default::default()).is_err());
     }
 
     #[test]

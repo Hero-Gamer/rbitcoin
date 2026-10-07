@@ -2,11 +2,12 @@
 //! `PrecomputedTransactionData` shape).
 //!
 //! Structure and scripts share this. Spent amounts/scripts are filled later
-//! via [`TxPrecompute::finish_spent`] when prevouts exist.
+//! via [`TxPrecompute::finish_spent`] or [`TxPrecompute::finish_spent_parts`]
+//! when prevouts exist.
 
 use bitcoin::consensus::encode::{Encodable, VarInt};
 use bitcoin::hashes::{sha256, sha256d, Hash, HashEngine};
-use bitcoin::{Transaction, TxOut};
+use bitcoin::{Script, Transaction, TxOut};
 use rbitcoin_primitives::script_sigop_count;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -278,14 +279,33 @@ impl TxPrecompute {
 
     /// BIP341 spent midstates. Call when `prevouts.len() == tx.input.len()`.
     pub fn finish_spent(&mut self, prevouts: &[TxOut]) {
+        let _ = self.finish_spent_parts(prevouts.len(), |i| {
+            let prev = prevouts.get(i)?;
+            Some((prev.value.to_sat() as i64, prev.script_pubkey.as_bytes()))
+        });
+    }
+
+    /// BIP341 spent midstates from borrowed amount and script bytes.
+    ///
+    /// `parts` is called once per input index. `false` means a prevout was
+    /// missing; the midstates are left unset.
+    pub fn finish_spent_parts<'a>(
+        &mut self,
+        n: usize,
+        mut parts: impl FnMut(usize) -> Option<(i64, &'a [u8])>,
+    ) -> bool {
         let mut enc_amt = sha256::Hash::engine();
         let mut enc_spk = sha256::Hash::engine();
-        for prev in prevouts {
-            let _ = prev.value.consensus_encode(&mut enc_amt);
-            let _ = prev.script_pubkey.consensus_encode(&mut enc_spk);
+        for i in 0..n {
+            let Some((value, script)) = parts(i) else {
+                return false;
+            };
+            let _ = (value as u64).consensus_encode(&mut enc_amt);
+            let _ = Script::from_bytes(script).consensus_encode(&mut enc_spk);
         }
         self.sha_amounts = Some(sha256::Hash::from_engine(enc_amt).to_byte_array());
         self.sha_scriptpubkeys = Some(sha256::Hash::from_engine(enc_spk).to_byte_array());
+        true
     }
 }
 

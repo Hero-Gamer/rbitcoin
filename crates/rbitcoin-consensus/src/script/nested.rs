@@ -52,7 +52,11 @@ pub(crate) fn try_p2sh_nested_segwit(
         return Some(Err(ConsensusError::Script("WITNESS_MALLEATED_P2SH".into())));
     }
 
-    if let Err(e) = check_p2sh_redeem_hash(job.prevout_script(input_index), redeem) {
+    let outer = match job.prevout_script(input_index) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(e)),
+    };
+    if let Err(e) = check_p2sh_redeem_hash(outer, redeem) {
         return Some(Err(e));
     }
     if !interpreter::cast_to_bool(program) {
@@ -96,10 +100,10 @@ pub(crate) fn verify_p2sh_legacy(
         return Err(ConsensusError::Script("p2sh empty scriptSig".into()));
     }
     let redeem = stack.pop().unwrap();
-    check_p2sh_redeem_hash(job.prevout_script(input_index), &redeem)?;
+    check_p2sh_redeem_hash(job.prevout_script(input_index)?, &redeem)?;
 
     let redeem_script = Script::from_bytes(&redeem);
-    let ctx = EvalContext::from_job(job, tx, input_index, redeem_script, SigVersion::Base);
+    let ctx = EvalContext::from_job(job, tx, input_index, redeem_script, SigVersion::Base)?;
     if interpreter::eval_script(redeem_script, &mut stack, &ctx)? {
         // BIP16: true top unless CLEANSTACK. Witness nested paths clean separately.
         if job.cleanstack {
@@ -133,7 +137,7 @@ pub(crate) fn p2sh_script_sig_stack(
     tx: &Transaction,
 ) -> Result<Vec<Vec<u8>>, ConsensusError> {
     let script_sig = tx.input[input_index].script_sig.as_script();
-    let ctx = EvalContext::from_job(job, tx, input_index, script_sig, SigVersion::Base);
+    let ctx = EvalContext::from_job(job, tx, input_index, script_sig, SigVersion::Base)?;
     let mut stack = Vec::new();
     let _ = interpreter::eval_script(script_sig, &mut stack, &ctx)?;
     require_room_for_p2sh_hash_push(&stack)?;

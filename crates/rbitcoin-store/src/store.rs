@@ -905,8 +905,8 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)] // same wave as append_stems_one_wave
-    /// Class A append. `input_edges[i]` is `(parent_fk, vout)` per vin; a null
-    /// parent is coinbase. `encode_in` writes `seqsigwit` for that row.
+    /// Class A append. `input_edges[i]` is one [`crate::InputEdge`] per vin.
+    /// `encode_in` writes `seqsigwit` for that row.
     pub fn put_tx_pins_encoded<P: crate::tx_table::PackedCreate>(
         &self,
         pins: &[&P],
@@ -914,7 +914,7 @@ impl Store {
         spent_overlay: &[Vec<(u32, Fk, u32)>],
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
-        input_edges: &[Vec<(Fk, u32)>],
+        input_edges: &[Vec<crate::input::InputEdge>],
         est_seqsigwit: usize,
         encode_in: impl FnMut(usize, &mut Vec<u8>),
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {

@@ -14,7 +14,7 @@ pub(crate) fn verify(
     tx: &Transaction,
     pre: &TxPrecompute,
 ) -> Result<(), ConsensusError> {
-    let spk = job.prevout_script(input_index);
+    let spk = job.prevout_script(input_index)?;
     debug_assert!(spk.len() == 22 && spk[0] == 0x00 && spk[1] == 0x14);
     let keyhash = &spk[2..22];
 
@@ -46,8 +46,8 @@ pub(crate) fn verify(
     let (sig, sighash_ty) = crypto::parse_der_sig(sig_raw, job.bip66_active)?;
     let pubkey = crypto::parse_pubkey(pubkey_raw)?;
 
-    let amount = job.prevout_amount(input_index);
-    let spk_script = bitcoin::script::Script::from_bytes(job.prevout_script(input_index));
+    let amount = job.prevout_amount(input_index)?;
+    let spk_script = bitcoin::script::Script::from_bytes(job.prevout_script(input_index)?);
     let sighash =
         crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk_script, amount, sighash_ty, pre)?;
     if crypto::verify_ecdsa(sighash, &sig, &pubkey) {
@@ -91,7 +91,7 @@ pub(crate) fn verify_with_keyhash(
     let (sig, sighash_ty) = crypto::parse_der_sig(sig_raw, job.bip66_active)?;
     let pubkey = crypto::parse_pubkey(pubkey_raw)?;
 
-    let amount = job.prevout_amount(input_index);
+    let amount = job.prevout_amount(input_index)?;
     let spk = bitcoin::script::Script::from_bytes(witness_program);
     let sighash =
         crypto::bip143_p2wpkh_signature_hash(tx, input_index, spk, amount, sighash_ty, pre)?;

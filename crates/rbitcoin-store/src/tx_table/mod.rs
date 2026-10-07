@@ -2367,31 +2367,17 @@ impl TxTable {
         spent_overlay: &[Vec<(u32, Fk, u32)>],
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
-        input_edges: &[Vec<(Fk, u32)>],
+        input_edges: &[Vec<crate::input::InputEdge>],
         est_seqsigwit: usize,
         encode_in: impl FnMut(usize, &mut Vec<u8>),
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        let edges: Vec<Vec<crate::input::InputEdge>> = input_edges
-            .iter()
-            .map(|row| {
-                row.iter()
-                    .map(|&(parent, vout)| {
-                        if parent.is_null() {
-                            crate::input::InputEdge::coinbase()
-                        } else {
-                            crate::input::InputEdge { parent, vout }
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
         self.put_pins_with_edges(
             pins,
             index,
             spent_overlay,
             txstat,
             header_ranges,
-            &edges,
+            input_edges,
             est_seqsigwit,
             encode_in,
         )

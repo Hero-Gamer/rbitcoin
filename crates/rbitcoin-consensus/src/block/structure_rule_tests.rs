@@ -1339,13 +1339,17 @@ fn script_job_shares_prevout_script() {
     )
     .expect("assemble shared prevouts");
     assert_eq!(jobs.len(), 2);
+    let hist = jobs[0].prevout_script(0).expect("historical script");
+    assert_eq!(hist, hist_script.as_slice());
     assert_eq!(
-        jobs[0].prevout_script(0).as_ptr(),
+        hist.as_ptr(),
         pin_ptr,
         "historical prevout script is the pin allocation"
     );
+    let same = jobs[1].prevout_script(0).expect("same-block script");
+    assert_eq!(same, wire.txdata[1].output[0].script_pubkey.as_bytes());
     assert_eq!(
-        jobs[1].prevout_script(0).as_ptr(),
+        same.as_ptr(),
         wire.txdata[1].output[0].script_pubkey.as_bytes().as_ptr(),
         "same-block prevout script is the wire output"
     );
@@ -2612,14 +2616,13 @@ fn script_job_shared_tx_is_wire_pointer() {
     };
     let block = Arc::new(block_with(vec![coinbase(1), spend]));
     let tid = block.txdata[1].compute_txid().to_byte_array();
-    let job = ScriptCheckJob::with_shared_tx(
+    let job = ScriptCheckJob::from_parts(
         tid,
-        vec![TxOut {
+        super::JobPrevouts::owned(vec![TxOut {
             value: Amount::from_sat(50_0000_0000),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-        Arc::clone(&block),
-        1,
+        }]),
+        super::JobTx::shared(Arc::clone(&block), 1),
         crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
     );
     assert!(std::ptr::eq(

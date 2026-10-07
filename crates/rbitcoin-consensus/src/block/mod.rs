@@ -728,6 +728,17 @@ impl JobTx {
             inner: JobTxInner::Shared { block, index },
         }
     }
+
+    fn output_at(&self, tx_index: u32, vout: u32) -> Option<&TxOut> {
+        match &self.inner {
+            JobTxInner::Shared { block, .. } => block
+                .txdata
+                .get(tx_index as usize)?
+                .output
+                .get(vout as usize),
+            JobTxInner::Owned(_) => None,
+        }
+    }
 }
 
 impl Deref for JobTx {
@@ -895,8 +906,32 @@ impl PartialEq for JobPrevouts {
         if self.len() != other.len() {
             return false;
         }
-        (0..self.len())
-            .all(|i| self.amount(i) == other.amount(i) && self.script(i) == other.script(i))
+        match (self, other) {
+            (Self::Owned(a), Self::Owned(b)) => a == b,
+            (Self::Shared(a), Self::Shared(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|(left, right)| match (left, right) {
+                            (
+                                rbitcoin_query::SharedPrevoutScript::Wire {
+                                    tx_index: t0,
+                                    vout: v0,
+                                },
+                                rbitcoin_query::SharedPrevoutScript::Wire {
+                                    tx_index: t1,
+                                    vout: v1,
+                                },
+                            ) => t0 == t1 && v0 == v1,
+                            (
+                                rbitcoin_query::SharedPrevoutScript::Pinned(_),
+                                rbitcoin_query::SharedPrevoutScript::Pinned(_),
+                            ) => left.parts() == right.parts(),
+                            _ => false,
+                        })
+            }
+            _ => false,
+        }
     }
 }
 
@@ -911,58 +946,6 @@ impl JobPrevouts {
         match self {
             Self::Owned(v) => v.len(),
             Self::Shared(v) => v.len(),
-        }
-    }
-
-    pub(crate) fn script(&self, i: usize) -> &[u8] {
-        match self {
-            Self::Owned(v) => v[i].script_pubkey.as_bytes(),
-            Self::Shared(v) => v[i].bytes(),
-        }
-    }
-
-    pub(crate) fn amount(&self, i: usize) -> Amount {
-        match self {
-            Self::Owned(v) => v[i].value,
-            Self::Shared(v) => Amount::from_sat(v[i].amount_sat() as u64),
-        }
-    }
-
-    /// Contiguous [`TxOut`]s. Shared jobs copy script bytes into this vec for
-    /// rust-bitcoin sighash (`Prevouts::All`), which takes owned outputs.
-    pub(crate) fn with_txouts<R>(&self, f: impl FnOnce(&[TxOut]) -> R) -> R {
-        match self {
-            Self::Owned(v) => f(v),
-            Self::Shared(v) => {
-                let owned: Vec<TxOut> = v
-                    .iter()
-                    .map(|s| TxOut {
-                        value: Amount::from_sat(s.amount_sat() as u64),
-                        script_pubkey: ScriptBuf::from_bytes(s.bytes().to_vec()),
-                    })
-                    .collect();
-                f(&owned)
-            }
-        }
-    }
-}
-
-impl std::ops::Index<usize> for JobPrevouts {
-    type Output = TxOut;
-
-    fn index(&self, index: usize) -> &TxOut {
-        match self {
-            Self::Owned(v) => &v[index],
-            Self::Shared(_) => panic!("shared prevout is not a TxOut"),
-        }
-    }
-}
-
-impl std::ops::IndexMut<usize> for JobPrevouts {
-    fn index_mut(&mut self, index: usize) -> &mut TxOut {
-        match self {
-            Self::Owned(v) => &mut v[index],
-            Self::Shared(_) => panic!("shared prevout is not a TxOut"),
         }
     }
 }
@@ -1025,27 +1008,9 @@ impl ScriptCheckJob {
         Self::from_parts(txid, JobPrevouts::owned(prevouts), JobTx::owned(tx), flags)
     }
 
-    /// Tests that share a wire block but still own prevout `TxOut`s.
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn with_shared_tx(
-        txid: [u8; 32],
-        prevouts: Vec<TxOut>,
-        block: Arc<Block>,
-        tx_index: usize,
-        flags: ScriptVerifyFlags,
-    ) -> Self {
-        Self::from_parts(
-            txid,
-            JobPrevouts::owned(prevouts),
-            JobTx::shared(block, tx_index),
-            flags,
-        )
-    }
-
     /// Single construction site for activation + production standardness defaults.
     #[inline]
-    fn from_parts(
+    pub(crate) fn from_parts(
         txid: [u8; 32],
         prevouts: JobPrevouts,
         tx: JobTx,
@@ -1079,14 +1044,58 @@ impl ScriptCheckJob {
         })
     }
 
-    #[inline]
-    pub(crate) fn prevout_script(&self, i: usize) -> &[u8] {
-        self.prevouts.script(i)
+    /// Amount and script bytes for input `i`.
+    ///
+    /// Shared wire prevouts read the job's block. Pinned prevouts read the outs
+    /// `Arc`. A missing vout is `Corrupt`, not an empty script.
+    pub(crate) fn prevout_parts(&self, i: usize) -> Result<(i64, &[u8]), ConsensusError> {
+        match &self.prevouts {
+            JobPrevouts::Owned(v) => {
+                let o =
+                    v.get(i)
+                        .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                            "invariant: prevout index",
+                        )))?;
+                Ok((o.value.to_sat() as i64, o.script_pubkey.as_bytes()))
+            }
+            JobPrevouts::Shared(v) => {
+                let slot =
+                    v.get(i)
+                        .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                            "invariant: prevout index",
+                        )))?;
+                match slot {
+                    rbitcoin_query::SharedPrevoutScript::Wire { tx_index, vout } => {
+                        let o = self.wire_output(*tx_index, *vout)?;
+                        Ok((o.value.to_sat() as i64, o.script_pubkey.as_bytes()))
+                    }
+                    rbitcoin_query::SharedPrevoutScript::Pinned(_) => {
+                        slot.parts().ok_or(ConsensusError::Store(
+                            rbitcoin_store::StoreError::Corrupt("invariant: pinned prevout vout"),
+                        ))
+                    }
+                }
+            }
+        }
+    }
+
+    fn wire_output(&self, tx_index: u32, vout: u32) -> Result<&TxOut, ConsensusError> {
+        self.tx
+            .output_at(tx_index, vout)
+            .ok_or(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: wire prevout",
+            )))
     }
 
     #[inline]
-    pub(crate) fn prevout_amount(&self, i: usize) -> Amount {
-        self.prevouts.amount(i)
+    pub(crate) fn prevout_script(&self, i: usize) -> Result<&[u8], ConsensusError> {
+        self.prevout_parts(i).map(|(_, script)| script)
+    }
+
+    #[inline]
+    pub(crate) fn prevout_amount(&self, i: usize) -> Result<Amount, ConsensusError> {
+        self.prevout_parts(i)
+            .map(|(value, _)| Amount::from_sat(value as u64))
     }
 
     #[inline]
@@ -1425,13 +1434,19 @@ fn assemble_non_cb_tx(
         .ok_or(ConsensusError::BadTx("fee overflow"))?;
     if build_script_jobs {
         let t_job = Instant::now();
-        let mut job = if let Some(w) = wire {
-            ScriptCheckJob::from_parts(txid, prevouts, JobTx::shared(Arc::clone(w), ti), flags)
-        } else {
-            let JobPrevouts::Owned(v) = prevouts else {
-                return Err(ConsensusError::BadTx("owned prevouts"));
-            };
-            ScriptCheckJob::with_txid(txid, v, tx.clone(), flags)
+        let mut job = match (wire, prevouts) {
+            (Some(w), JobPrevouts::Shared(v)) => ScriptCheckJob::from_parts(
+                txid,
+                JobPrevouts::Shared(v),
+                JobTx::shared(Arc::clone(w), ti),
+                flags,
+            ),
+            (None, JobPrevouts::Owned(v)) => ScriptCheckJob::with_txid(txid, v, tx.clone(), flags),
+            _ => {
+                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                    "invariant: script job prevouts",
+                )));
+            }
         };
         if let Some(ps) = pres {
             if should_use_pres(ti, ps.len()) {
@@ -1556,11 +1571,14 @@ fn assemble_non_cb_inputs(
             .ok_or(ConsensusError::BadTx("value in overflow"))?;
         if build_script_jobs {
             match &mut prevouts {
-                JobPrevouts::Shared(v) => v.push(
-                    prev_out
-                        .shared
-                        .expect("wire confirm prevout shares script bytes"),
-                ),
+                JobPrevouts::Shared(v) => {
+                    let shared = prev_out.shared.ok_or(ConsensusError::Store(
+                        rbitcoin_store::StoreError::Corrupt(
+                            "invariant: wire confirm prevout shares script bytes",
+                        ),
+                    ))?;
+                    v.push(shared);
+                }
                 JobPrevouts::Owned(v) => v.push(prev_out.txout),
             }
         }
@@ -2430,7 +2448,10 @@ fn mtp_at(query: &Query, height: Height, cache: &mut U32Map<u32>) -> Result<u32,
 fn job_needs_script_check(job: &ScriptCheckJob) -> bool {
     let tx: &bitcoin::Transaction = &job.tx;
     for i in 0..job.prevouts.len() {
-        if !is_anyone_can_spend(Script::from_bytes(job.prevout_script(i))) {
+        let Ok(spk) = job.prevout_script(i) else {
+            return true;
+        };
+        if !is_anyone_can_spend(Script::from_bytes(spk)) {
             return true;
         }
         let Some(vin) = tx.input.get(i) else {
@@ -2586,8 +2607,7 @@ fn resolve_prevout(
             acc.in_n = acc.in_n.saturating_add(1);
             acc.same_n = acc.same_n.saturating_add(1);
             let shared = if need_script_buf {
-                wire.map(|w| rbitcoin_query::SharedPrevoutScript::Wire {
-                    block: Arc::clone(w),
+                wire.map(|_| rbitcoin_query::SharedPrevoutScript::Wire {
                     tx_index: pj as u32,
                     vout: op.vout,
                 })
@@ -2612,60 +2632,9 @@ fn resolve_prevout(
 
     // Batch pin first (no TxRecord clone — A3). Pin identity/vout misses are
     // hard invariants (load must fill schema-13 identity + denserels).
-    enum PinLook {
-        Mismatch,
-        Hit {
-            txout: TxOut,
-            shared: Option<rbitcoin_query::SharedPrevoutScript>,
-            input_sigops: u64,
-        },
-    }
-
     if let Some(prev_fk) = prev_fk_hint {
-        let shared_for_hit = if need_script_buf {
-            batch_parents.share_parent_prevout(prev_fk, op.vout)
-        } else {
-            None
-        };
-        match batch_parents.get_parent_txout_parts(
-            prev_fk,
-            op.vout,
-            move |value, script, parent_txid| {
-                if parent_txid != prev_txid {
-                    return PinLook::Mismatch;
-                }
-                let shared = shared_for_hit;
-                PinLook::Hit {
-                    txout: TxOut {
-                        value: Amount::from_sat(value as u64),
-                        script_pubkey: if shared.is_none() && need_script_buf {
-                            ScriptBuf::from_bytes(script.to_vec())
-                        } else {
-                            ScriptBuf::new()
-                        },
-                    },
-                    shared,
-                    input_sigops: prevout_spk_sigops(inp, script, bip16, witness),
-                }
-            },
-        ) {
-            Some(PinLook::Hit {
-                txout,
-                shared,
-                input_sigops,
-            }) => {
-                acc.in_n = acc.in_n.saturating_add(1);
-                acc.batch_n = acc.batch_n.saturating_add(1);
-                #[cfg(test)]
-                confirm_phase_stats::tl_note_batch_hit();
-                return Ok(ResolvedPrevout {
-                    txout,
-                    shared,
-                    input_sigops,
-                    create_fk: prev_fk,
-                });
-            }
-            Some(PinLook::Mismatch) => {
+        if let Some((pinned, parent_txid)) = batch_parents.share_parent_prevout(prev_fk, op.vout) {
+            if parent_txid != prev_txid {
                 acc.cold_txid_mismatch_n = acc.cold_txid_mismatch_n.saturating_add(1);
                 #[cfg(test)]
                 confirm_phase_stats::tl_note_cold_why_txid_mismatch();
@@ -2673,15 +2642,34 @@ fn resolve_prevout(
                     "invariant: pin parent create identity mismatch wire prev_txid",
                 )));
             }
-            None if batch_parents.contains(prev_fk) => {
-                acc.cold_vout_miss_n = acc.cold_vout_miss_n.saturating_add(1);
-                #[cfg(test)]
-                confirm_phase_stats::tl_note_cold_why_vout_miss();
-                return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
-                    "invariant: pin incomplete outs for spent parent vout",
-                )));
-            }
-            None => {}
+            let (value, input_sigops) = {
+                let (value, script) = pinned.parts().ok_or(ConsensusError::Store(
+                    rbitcoin_store::StoreError::Corrupt(
+                        "invariant: pin incomplete outs for spent parent vout",
+                    ),
+                ))?;
+                (value, prevout_spk_sigops(inp, script, bip16, witness))
+            };
+            acc.in_n = acc.in_n.saturating_add(1);
+            acc.batch_n = acc.batch_n.saturating_add(1);
+            #[cfg(test)]
+            confirm_phase_stats::tl_note_batch_hit();
+            return Ok(ResolvedPrevout {
+                txout: TxOut {
+                    value: Amount::from_sat(value as u64),
+                    script_pubkey: ScriptBuf::new(),
+                },
+                shared: need_script_buf.then_some(pinned),
+                input_sigops,
+                create_fk: prev_fk,
+            });
+        } else if batch_parents.contains(prev_fk) {
+            acc.cold_vout_miss_n = acc.cold_vout_miss_n.saturating_add(1);
+            #[cfg(test)]
+            confirm_phase_stats::tl_note_cold_why_vout_miss();
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: pin incomplete outs for spent parent vout",
+            )));
         }
     }
 
