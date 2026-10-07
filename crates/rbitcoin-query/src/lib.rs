@@ -454,6 +454,9 @@ impl Query {
             (None, 0)
         };
         let (ph, prune_on) = Self::load_pruneheight(&store_path)?;
+        // Open rebuilt or backfilled `tx.head` through every Class A create,
+        // and nothing is queued: the drain starts there.
+        let head_drained = store.txs.head_last_inserted_fk();
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
@@ -487,7 +490,7 @@ impl Query {
             reconstruct_archived: AtomicU64::new(0),
             max_sh_creates: AtomicU32::new(DEFAULT_MAX_SH_CREATES),
             thin_tweak_body_bytes: AtomicU64::new(0),
-            head_drain_fk: AtomicU64::new(0),
+            head_drain_fk: AtomicU64::new(head_drained),
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
             confirm_stats: Arc::new(ConfirmStats::default()),

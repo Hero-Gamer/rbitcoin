@@ -3216,6 +3216,41 @@ fn ibd_spend_of_an_unknown_txid_is_invalid() {
     rig.finish();
 }
 
+/// The node restarts with the tip right below a block that spends an
+/// unknown txid. Open leaves `tx.head` holding every connected create, so
+/// the first block after the restart gets the tip path's read and is
+/// marked invalid, as it would be without the restart.
+#[test]
+fn spend_of_an_unknown_txid_after_restart_is_invalid() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("unknown-parent-restart", 1).restart(|_| {});
+    let t = rig.t;
+    let ghost = WireRig::spend(bitcoin::Txid::from_byte_array([0xcd; 32]));
+    let bad = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![ghost],
+    );
+    let hb = bad.block_hash();
+    rig.plant(&[&bad]);
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, _| bad.clone(),
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(hb.to_byte_array()),
+    );
+    assert_eq!(rejects, [(hb, ConfirmRejectClass::ConsensusInvalid, 1)]);
+    assert_eq!(rig.st.halt, None);
+    assert!(rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    rig.finish();
+}
+
 /// tip+1 creates a tx and tip+2 spends it, each confirmed alone. tip+2 is
 /// stamped as soon as tip+1 is the tip, while tip+1's `tx.head` insert may
 /// still be draining. The parent is on the chain, so tip+2 connects.

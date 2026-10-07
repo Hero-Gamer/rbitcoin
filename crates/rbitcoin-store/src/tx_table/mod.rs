@@ -2799,6 +2799,11 @@ impl TxTable {
         self.head.occupied()
     }
 
+    /// Highest create fk in `tx.head` (0 if empty).
+    pub fn head_last_inserted_fk(&self) -> u64 {
+        self.head.last_inserted_fk()
+    }
+
     /// See [`crate::segmented_head::SegmentedTxHead::unsynced_first_fk`].
     pub(crate) fn head_unsynced_first_fk(&self) -> u64 {
         self.head.unsynced_first_fk()
