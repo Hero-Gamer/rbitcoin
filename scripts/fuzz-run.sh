@@ -366,9 +366,16 @@ fi
 
 if [[ "$BIN" == "script_kernel_differential" ]]; then
   kernel_json="third_party/bitcoin/src/test/data/script_tests.json"
+  kernel_fixture="scripts/testdata/script-kernel-seed-rows.json"
   if [[ -f "$kernel_json" ]]; then
     python3 "$ROOT/scripts/script-kernel-seeds.py" \
       "$kernel_json" fuzz/corpus/script_kernel_differential 32
+  elif [[ -f "$kernel_fixture" ]]; then
+    echo "fuzz-run: script_kernel seeds from $kernel_fixture (script_tests.json absent)"
+    python3 "$ROOT/scripts/script-kernel-seeds.py" \
+      "$kernel_fixture" fuzz/corpus/script_kernel_differential 32
+  else
+    echo "fuzz-run: script_kernel seeds skipped; no script_tests.json or fixture" >&2
   fi
   merge_seed fuzz/corpus/script_kernel_differential \
     crates/rbitcoin-consensus/tests/fixtures/script_kernel_op_true.bin
