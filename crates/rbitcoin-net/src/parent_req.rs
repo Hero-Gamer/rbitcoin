@@ -18,10 +18,14 @@ pub(crate) struct DueParent {
     pub wtxid: bool,
 }
 
-/// Why `note_inv` did or did not record an announcement.
+/// Why `note_inv` did or did not ask this peer for the transaction now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ParentNote {
-    Accepted,
+    /// This peer holds the in-flight request. Send getdata now.
+    RequestNow,
+    /// Recorded, or already recorded. Another request for these bytes is
+    /// in flight, or this peer's own request is already live or failed.
+    Deferred,
     /// This peer's own counter is full.
     PeerCapped,
     /// The process-wide table is full. The announcement is skipped.
@@ -85,8 +89,8 @@ impl ParentTracker {
         now: u64,
         wtxid: bool,
     ) -> ParentNote {
-        if self.rearm_existing(peer, hash, now, wtxid) {
-            return ParentNote::Accepted;
+        if let Some(note) = self.rearm_existing(peer, hash, now, wtxid) {
+            return note;
         }
         if self.peer_at_cap(peer) {
             return ParentNote::PeerCapped;
@@ -101,6 +105,11 @@ impl ParentTracker {
             Some(until) => (Some(until), None),
             None => (None, Some(exp)),
         };
+        let note = if requested_until.is_some() {
+            ParentNote::RequestNow
+        } else {
+            ParentNote::Deferred
+        };
         self.add_ann(
             hash,
             ParentAnn {
@@ -113,7 +122,7 @@ impl ParentTracker {
                 wtxid,
             },
         );
-        ParentNote::Accepted
+        note
     }
 
     pub(super) fn schedule(&mut self, hash: [u8; 32], peer: u64, preferred: bool, reqtime: u64) {
@@ -141,21 +150,26 @@ impl ParentTracker {
         );
     }
 
-    /// True when this peer already had this kind of announcement for `hash`.
-    fn rearm_existing(&mut self, peer: u64, hash: [u8; 32], now: u64, wtxid: bool) -> bool {
-        let Some(slot) = self.by_hash.get_mut(&hash) else {
-            return false;
-        };
-        let Some(pos) = slot
+    /// `Some` when this peer already had this kind of announcement for `hash`.
+    fn rearm_existing(
+        &mut self,
+        peer: u64,
+        hash: [u8; 32],
+        now: u64,
+        wtxid: bool,
+    ) -> Option<ParentNote> {
+        let slot = self.by_hash.get_mut(&hash)?;
+        let pos = slot
             .anns
             .iter()
-            .position(|a| a.peer == peer && a.wtxid == wtxid)
-        else {
-            return false;
-        };
+            .position(|a| a.peer == peer && a.wtxid == wtxid)?;
+        let other_inflight = slot
+            .anns
+            .iter()
+            .any(|a| a.wtxid == wtxid && a.peer != peer && a.requested_until.is_some());
         let due_at = {
-            if slot.anns[pos].requested_until.is_some() || slot.anns[pos].failed {
-                return true;
+            if slot.anns[pos].requested_until.is_some() || slot.anns[pos].failed || other_inflight {
+                return Some(ParentNote::Deferred);
             }
             let exp = now.saturating_add(GETDATA_TX_INTERVAL_SECS);
             let due_at = slot.anns[pos].due_at;
@@ -167,7 +181,7 @@ impl ParentTracker {
             unindex(&mut self.due_by_peer, peer, t, &hash);
         }
         index_at(&mut self.inflight_by_peer, peer, due_at.1, hash);
-        true
+        Some(ParentNote::RequestNow)
     }
 
     fn add_ann(&mut self, hash: [u8; 32], ann: ParentAnn) {
@@ -186,6 +200,26 @@ impl ParentTracker {
             index_at(&mut self.inflight_by_peer, peer, exp, hash);
         } else if let Some(t) = due_at {
             index_at(&mut self.due_by_peer, peer, t, hash);
+        }
+    }
+
+    /// The peer answered notfound for a hash we asked it for. That request
+    /// is over, and a waiter of the same kind is due at its announcement.
+    pub(super) fn note_not_found(&mut self, peer: u64, hash: [u8; 32]) {
+        let inflight: Vec<(u64, bool)> = self
+            .by_hash
+            .get(&hash)
+            .map(|slot| {
+                slot.anns
+                    .iter()
+                    .filter(|a| a.peer == peer)
+                    .filter_map(|a| a.requested_until.map(|exp| (exp, a.wtxid)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (exp, wtxid) in inflight {
+            self.fail_inflight(&hash, peer, exp);
+            self.release_waiters(&hash, wtxid);
         }
     }
 
@@ -462,6 +496,42 @@ impl ParentTracker {
         if let Some(t) = ann.due_at {
             unindex(&mut self.due_by_peer, ann.peer, t, hash);
         }
+        if ann.requested_until.is_some() {
+            self.release_waiters(hash, ann.wtxid);
+        }
+    }
+
+    /// The in-flight request is gone. Waiters of this kind were due when
+    /// that window ended. They are due at their own announcement time.
+    fn release_waiters(&mut self, hash: &[u8; 32], wtxid: bool) {
+        if self.kind_inflight_until(hash, wtxid).is_some() {
+            return;
+        }
+        let waiters: Vec<(u64, u64, u64)> = self
+            .by_hash
+            .get(hash)
+            .map(|slot| {
+                slot.anns
+                    .iter()
+                    .filter(|a| a.wtxid == wtxid && !a.failed)
+                    .filter_map(|a| a.due_at.map(|due| (a.peer, due, a.reqtime)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (peer, due_at, reqtime) in waiters {
+            if due_at <= reqtime {
+                continue;
+            }
+            unindex(&mut self.due_by_peer, peer, due_at, hash);
+            if let Some(ann) = self.by_hash.get_mut(hash).and_then(|slot| {
+                slot.anns
+                    .iter_mut()
+                    .find(|a| a.peer == peer && a.wtxid == wtxid && a.due_at == Some(due_at))
+            }) {
+                ann.due_at = Some(reqtime);
+            }
+            index_at(&mut self.due_by_peer, peer, reqtime, *hash);
+        }
     }
 }
 
@@ -512,11 +582,11 @@ mod tests {
         t.schedule(hash, 2, true, 1_000);
         assert_eq!(
             t.note_inv(1, hash, false, 1_000, true),
-            ParentNote::Accepted
+            ParentNote::RequestNow
         );
         assert_eq!(
             t.note_inv(3, hash, false, 1_000, true),
-            ParentNote::Accepted
+            ParentNote::Deferred
         );
         let now = 1_000 + GETDATA_TX_INTERVAL_SECS;
         let mut saw_txid = false;
@@ -546,7 +616,7 @@ mod tests {
         let missing = [0x22; 32];
         assert_eq!(
             t.note_inv(1, inflight, true, 1_000, true),
-            ParentNote::Accepted
+            ParentNote::RequestNow
         );
         t.schedule(inflight, 2, false, 1_000);
         t.schedule(missing, 2, false, 1_000);

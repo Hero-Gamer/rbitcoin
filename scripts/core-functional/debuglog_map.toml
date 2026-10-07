@@ -31,6 +31,17 @@ emit = ['[net] Ignoring low-work compact block from peer {1}']
 match = 'Block validation error: (.+)'
 emit = ['Block validation error: {1}']
 
+# Pre-segwit witness block. The node already rejects with this sentence.
+[[rule]]
+match = 'unexpected witness before segwit'
+emit = ['unexpected-witness']
+
+# Empty v0 witness program. The node already rejects; Core's script error
+# text is the needle p2p_segwit.py reads.
+[[rule]]
+match = 'block-script-verify-flag-failed \(p2wsh empty witness\)'
+emit = ['block-script-verify-flag-failed (Witness program was passed an empty witness)']
+
 [[rule]]
 match = '([0-9a-f]{64}), bad-version\(0x([0-9a-f]{8})\)'
 emit = ['{1}, bad-version(0x{2})']

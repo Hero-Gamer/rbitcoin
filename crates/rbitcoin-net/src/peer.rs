@@ -2771,6 +2771,7 @@ fn handle_peer_inventory_msg(
             on_getblocktxn(hub, out_tx, follow, session, txs_request)?
         }
         NetworkMessage::Inv(items) => on_inv(hub, out_tx, follow, session, items)?,
+        NetworkMessage::NotFound(items) => on_notfound(hub, session, items),
         NetworkMessage::Headers(headers) => on_headers(hub, out_tx, follow, session, headers)?,
         NetworkMessage::MemPool
         | NetworkMessage::FilterLoad(_)
@@ -3341,6 +3342,25 @@ fn on_inv_block_needs_headers(
     })
 }
 
+fn on_notfound(hub: &ChainHub, session: Option<&crate::peers::LivePeer>, items: &[Inventory]) {
+    let Some(s) = session else {
+        return;
+    };
+    let Some(mp) = hub.mempool() else {
+        return;
+    };
+    for item in items {
+        let hash = match item {
+            Inventory::WTx(w) => w.to_byte_array(),
+            Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                txid.to_byte_array()
+            }
+            _ => continue,
+        };
+        mp.note_tx_not_found(s.id, hash);
+    }
+}
+
 fn on_inv_txid(
     hub: &ChainHub,
     session: Option<&crate::peers::LivePeer>,
@@ -3362,12 +3382,14 @@ fn on_inv_txid(
     if let Some(s) = session {
         match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
         {
-            crate::tx_relay::ParentNote::Accepted => {}
+            crate::tx_relay::ParentNote::RequestNow => {}
+            crate::tx_relay::ParentNote::Deferred | crate::tx_relay::ParentNote::GlobalFull => {
+                return None;
+            }
             crate::tx_relay::ParentNote::PeerCapped => {
                 *parent_capped = true;
                 return None;
             }
-            crate::tx_relay::ParentNote::GlobalFull => return None,
         }
     }
     Some(Inventory::WitnessTransaction(*txid))
@@ -3393,12 +3415,14 @@ fn on_inv_wtxid(
                 s.clock_now(),
                 true,
             ) {
-                crate::tx_relay::ParentNote::Accepted => {}
+                crate::tx_relay::ParentNote::RequestNow => {}
+                crate::tx_relay::ParentNote::Deferred | crate::tx_relay::ParentNote::GlobalFull => {
+                    return None;
+                }
                 crate::tx_relay::ParentNote::PeerCapped => {
                     *parent_capped = true;
                     return None;
                 }
-                crate::tx_relay::ParentNote::GlobalFull => return None,
             }
         }
         return Some(Inventory::WTx(*wtxid));

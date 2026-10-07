@@ -117,6 +117,14 @@ run "rolling minimum fee bump maps to Core needle" \
   "2026-01-01T00:00:00Z INFO mempool: rolling minimum fee bumped" \
   "rolling minimum fee bumped"
 
+run "pre-segwit witness block maps to Core unexpected-witness" \
+  "2026-10-06T22:32:43.054Z INFO Block validation error: unexpected witness before segwit" \
+  $'Block validation error: unexpected witness before segwit\nunexpected-witness'
+
+run "p2wsh empty witness maps to Core witness-program sentence" \
+  "2026-10-06T22:34:52.158Z INFO Block validation error: block-script-verify-flag-failed (p2wsh empty witness)" \
+  $'Block validation error: block-script-verify-flag-failed (p2wsh empty witness)\nblock-script-verify-flag-failed (Witness program was passed an empty witness)'
+
 run "unmapped is empty" \
   "2026-01-01T00:00:00Z INFO something else" \
   ""
