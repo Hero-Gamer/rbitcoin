@@ -45,10 +45,10 @@ to step over spend slots that old tip annotate bugs wrote. Schema 22
 refuses every datadir from before those fixes, and a valid chain
 cannot write such a slot. Treating it as unspent hid this bug.
 
-**Known gap:** in IBD, a missing prevout at the lookup stage is still
-an engine fault (requeue once, then halt), not a block verdict. This
-is the existing rule for any block that spends an unknown txid; this
-fix does not change it. The block is never connected.
+**Follow-up:** the one-block retry fails its load stamp, which was an
+engine fault (requeue once, then halt), not a verdict. Since
+[089](./089-missing-parent-verdict.md) a fresh read at the tip finds
+the parent off the connected chain, and block N is marked invalid.
 
 **Regression:** consensus matrix row C42;
 `rbitcoin-test` `consensus_rules::same_batch_spend_of_a_later_block_is_missing`;
