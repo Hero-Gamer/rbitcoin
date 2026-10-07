@@ -1148,7 +1148,15 @@ fn tip_announce_kept_prefix_of_failed_reorg_is_headers() {
     for i in 0..9u32 {
         time = time.saturating_add(1);
         let bip34_height = fork_h + 1 + i + if i == 8 { 100 } else { 0 };
-        let block = mine_on(prev, time, bip34_height, vec![]);
+        // The pad is mined at wall-clock times, so an `op_true` coinbase at
+        // `fork.time + 1` can be the main-chain block itself.
+        let block = rbitcoin_consensus::mine_regtest_paying(
+            prev,
+            time,
+            bip34_height,
+            ScriptBuf::from_bytes(vec![0x52]),
+            vec![],
+        );
         prev = block.block_hash();
         branch.push(block);
     }
