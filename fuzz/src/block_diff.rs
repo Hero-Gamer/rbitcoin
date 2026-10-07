@@ -226,11 +226,7 @@ fn store_reorg_accept(hub: &ChainHub, block: Block, expect_h: Option<u32>) -> Re
 }
 
 /// One `{extend | sibling | rewind}` step. `Ok(true)` means a connect ran.
-pub fn store_reorg_step(
-    hub: &ChainHub,
-    op: StoreReorgOp,
-    coin: &mut Option<OutPoint>,
-) -> Result<bool, String> {
+pub fn store_reorg_step(hub: &ChainHub, op: StoreReorgOp) -> Result<bool, String> {
     let height = hub.tip_height().ok_or("no tip height")?;
     let hash = hub.tip_hash().ok_or("no tip hash")?;
     match op {
@@ -256,12 +252,6 @@ pub fn store_reorg_step(
             );
             stamp_diff_coinbase(&mut b, next_diff_cb_uniq());
             remine_diff_header(&mut b);
-            if height == 0 {
-                *coin = Some(OutPoint {
-                    txid: b.txdata[0].compute_txid(),
-                    vout: 0,
-                });
-            }
             store_reorg_accept(hub, b, Some(height + 1))
         }
         StoreReorgOp::Sibling => {
@@ -278,17 +268,9 @@ pub fn store_reorg_step(
 }
 
 pub fn store_reorg_apply(hub: &ChainHub, data: &[u8]) -> Result<u32, String> {
-    store_reorg_apply_coin(hub, data, &mut None)
-}
-
-pub fn store_reorg_apply_coin(
-    hub: &ChainHub,
-    data: &[u8],
-    coin: &mut Option<OutPoint>,
-) -> Result<u32, String> {
     let mut n = 0u32;
     for &b in data.iter().take(32) {
-        if store_reorg_step(hub, StoreReorgOp::from_byte(b), coin)? {
+        if store_reorg_step(hub, StoreReorgOp::from_byte(b))? {
             n = n.saturating_add(1);
         }
     }
@@ -317,84 +299,16 @@ pub fn reopen_store_hub(hub: ChainHub, store_path: &Path) -> Result<ChainHub, St
     Ok(next)
 }
 
-fn connect_coin_spend(hub: &ChainHub, spent: OutPoint) -> Result<bool, String> {
-    let tip = hub.tip_hash().ok_or("no tip hash")?;
-    let height = hub.tip_height().ok_or("no tip height")?;
-    let hdr = hub.tip_header().ok_or("no tip header")?;
-    let block = mine_diff_paying(
-        tip,
-        hdr.time.saturating_add(REGTEST_BLOCK_SPACING),
-        height.saturating_add(1),
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![default_op_true_spend(spent, next_diff_cb_uniq())],
-    );
-    match verdict_from_accept(hub.accept_received_block(block)) {
-        Ok(DiffVerdict::Accept) => Ok(true),
-        Ok(_) => Ok(false),
-        Err(msg) => Err(msg.into()),
-    }
-}
-
-/// A second spend of `spent` must be a reject on the hub and on Core.
-pub fn respend_rejected(
-    hub: &ChainHub,
-    oracle: &dyn BlockOracle,
-    spent: OutPoint,
-) -> Result<(), String> {
-    let tip = hub.tip_hash().ok_or("no tip hash")?;
-    let height = hub.tip_height().ok_or("no tip height")?;
-    let hdr = hub.tip_header().ok_or("no tip header")?;
-    let block = mine_diff_paying(
-        tip,
-        hdr.time.saturating_add(REGTEST_BLOCK_SPACING),
-        height.saturating_add(1),
-        ScriptBuf::from_bytes(vec![0x51]),
-        vec![default_op_true_spend(spent, next_diff_cb_uniq())],
-    );
-    let ours = match verdict_from_accept(hub.accept_received_block(block.clone())) {
-        Ok(v) => v,
-        Err(msg) => return Err(msg.into()),
-    };
-    let hex = hex_encode(serialize(&block));
-    let reply = oracle.submitblock_hex(&hex);
-    if matches!(reply, OracleReply::Dead)
-        || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
-    {
-        return Err("oracle dead".into());
-    }
-    let core = verdict_from_core_reply(&reply);
-    match (ours, core) {
-        (DiffVerdict::Reject, DiffVerdict::Reject) => Ok(()),
-        _ => Err(format!(
-            "respend split ours={} core={} hex={hex}",
-            ours == DiffVerdict::Accept,
-            core == DiffVerdict::Accept
-        )),
-    }
-}
-
-/// Ops, then one reopen. A mature coin the ops reached is spent first, and
-/// the reopened hub must reject a second spend of that outpoint.
+/// Ops, then one reopen. The old `Query` is dropped before the new open.
+/// The tip hash must match. This input does not mine a maturity pad or ask
+/// Core: extend stops at height 32, and Core has none of this chain.
 pub fn store_reorg_round(
     hub: ChainHub,
     store_path: &Path,
     data: &[u8],
-    oracle: &dyn BlockOracle,
 ) -> Result<(ChainHub, u32), String> {
-    let mut coin = None;
-    let mut n = store_reorg_apply_coin(&hub, data, &mut coin)?;
-    let mut spent = None;
-    if let Some(op) = coin {
-        if hub.tip_height().unwrap_or(0) >= 100 && connect_coin_spend(&hub, op)? {
-            spent = Some(op);
-            n = n.saturating_add(1);
-        }
-    }
+    let n = store_reorg_apply(&hub, data)?;
     let hub = reopen_store_hub(hub, store_path)?;
-    if let Some(op) = spent {
-        respend_rejected(&hub, oracle, op)?;
-        n = n.saturating_add(1);
-    }
     Ok((hub, n))
 }
 
@@ -2322,7 +2236,11 @@ mod tests {
         assert!(!mutant.check_merkle_root());
         let mock = MockOracle::new(OracleReply::NullAccept);
         let cmp = compare_prepared_twin(&hub, &tip, &mock, mutant, Some(honest));
-        assert_eq!(mock.submits.get(), 1, "honest replay must not hide the split");
+        assert_eq!(
+            mock.submits.get(),
+            1,
+            "honest replay must not hide the split"
+        );
         assert!(
             matches!(
                 cmp,
@@ -2620,8 +2538,17 @@ mod tests {
         let tip = hub.tip_hash();
         let hub = reopen_store_hub(hub, &path).expect("reopen");
         assert_eq!(hub.tip_hash(), tip);
-        let mock = MockOracle::new(OracleReply::Reason("bad-txns-inputs-missingorspent".into()));
-        respend_rejected(&hub, &mock, spent).expect("respend rejected");
+        let again = mine_diff_paying(
+            hub.tip_hash().unwrap(),
+            time.saturating_add(REGTEST_BLOCK_SPACING * 2),
+            102,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![default_op_true_spend(spent, 2)],
+        );
+        match verdict_from_accept(hub.accept_received_block(again)) {
+            Ok(DiffVerdict::Reject) => {}
+            other => panic!("reopened hub must reject the respend: {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&path);
     }
 
@@ -2685,8 +2612,7 @@ mod tests {
         hub.hold_unconnected_body(s1);
         hub.hold_unconnected_body(s2);
         hub.hold_unconnected_body(s3);
-        store_reorg_step(&hub, StoreReorgOp::Extend, &mut None)
-            .expect("held heavier fork after extend");
+        store_reorg_step(&hub, StoreReorgOp::Extend).expect("held heavier fork after extend");
         assert!(hub.tip_height().is_some());
         let _ = fs::remove_dir_all(dir);
     }
