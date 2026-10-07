@@ -405,7 +405,7 @@ impl Session {
         }
         let mut txdata = Vec::with_capacity(1 + r.t.txs.len());
         txdata.push(coinbase);
-        txdata.extend(r.t.txs.iter().cloned());
+        txdata.extend(r.t.txs.iter().map(|tx| Transaction::clone(tx)));
         let block = Block { header, txdata };
         let hash = block.block_hash();
         let c = Arc::clone(&self.chain);
@@ -497,7 +497,7 @@ async fn on_request_transaction_data(
     let raw: Vec<Vec<u8>> = t
         .txs
         .iter()
-        .map(bitcoin::consensus::encode::serialize)
+        .map(|tx| bitcoin::consensus::encode::serialize(tx.as_ref()))
         .collect();
     let wire = |e: binary_sv2::Error| {
         io::Error::other(format!("sv2 RequestTransactionData.Success: {e:?}"))

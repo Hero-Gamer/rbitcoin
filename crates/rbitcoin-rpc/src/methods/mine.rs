@@ -12,6 +12,7 @@ use rbitcoin_primitives::{Height, Network};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 pub(crate) fn require_regtest(ctx: &RpcContext, method: &str) -> Result<(), Value> {
     if ctx.network != Network::Regtest {
@@ -124,7 +125,7 @@ pub(crate) fn hashes_json(hashes: &[BlockHash]) -> Value {
     json!(hashes.iter().map(|h| h.to_string()).collect::<Vec<_>>())
 }
 
-pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<(Transaction, Selected)> {
+pub(crate) fn mempool_block_txs(ctx: &RpcContext) -> Vec<(Arc<Transaction>, Selected)> {
     let min = ctx
         .chain
         .as_ref()
@@ -152,7 +153,7 @@ pub(crate) fn generate_with_mempool(
     let miner = require_regtest_miner(ctx, "generate")?;
     let extras: Vec<Transaction> = mempool_block_txs(ctx)
         .into_iter()
-        .map(|(tx, _)| tx)
+        .map(|(tx, _)| Transaction::clone(&tx))
         .collect();
     let hashes = miner
         .generate_to_script(nblocks, script, extras.clone())

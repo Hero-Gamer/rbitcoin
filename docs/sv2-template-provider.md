@@ -171,7 +171,9 @@ selected with.
 returns `Vec<Selected { txid, fee_sat, sigop_cost }>` in mining order.
 `fee_sat` is the base fee, not the `prioritisetransaction` delta.
 `MempoolHub::select_block_template` applies the node's deltas under the
-same lock and returns `Vec<(Transaction, Selected)>`. A larger
+same lock and returns `Vec<(Arc<Transaction>, Selected)>`: the pool's own
+bodies, not copies, so a template costs a pointer per tx and a body it
+holds outlives eviction or replacement. A larger
 `reserved_sigops` or a smaller `max_weight_wu` drops what no longer fits
 and still takes a later chunk. A running sigop cost of exactly 80_000
 fits; a chunk that would pass 80_000 is skipped.

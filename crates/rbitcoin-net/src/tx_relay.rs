@@ -2809,7 +2809,7 @@ impl MempoolHub {
     /// (best chunks first, `prioritisetransaction` deltas applied). Base fee
     /// and sigop cost come from the same read lock as the selection, so a tx
     /// evicted afterwards still reports what it was selected with.
-    pub fn select_block_template(&self, budget: SelectBudget) -> Vec<(Transaction, Selected)> {
+    pub fn select_block_template(&self, budget: SelectBudget) -> Vec<(Arc<Transaction>, Selected)> {
         let deltas = self.fee_deltas.lock().unwrap().clone();
         let g = self.lock_read();
         g.select_block_template(budget, |id| deltas.get(&id).copied().unwrap_or(0))
@@ -4616,7 +4616,7 @@ mod tests {
         hub.accept_tx(&tx).expect("16004 sigop cost fits a block");
         let picked = hub.select_block_template(hub.template_budget(0));
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].0, tx);
+        assert_eq!(*picked[0].0, tx);
         assert_eq!(
             (picked[0].1.fee_sat, picked[0].1.sigop_cost),
             (100_000, 16_004)
@@ -5147,7 +5147,7 @@ mod tests {
         assert_eq!(budget.reserved_sigops, 0);
         let picked = hub.select_block_template(budget);
         assert_eq!(picked.len(), 1);
-        assert_eq!(picked[0].0, tx);
+        assert_eq!(*picked[0].0, tx);
         assert_eq!(
             (picked[0].1.fee_sat, picked[0].1.sigop_cost),
             (4_999_999_001, 79_920)

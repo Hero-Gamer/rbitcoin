@@ -1901,15 +1901,18 @@ impl ActiveMempool {
 
     /// Mining-order live txs that fit `budget` (best chunks first) with
     /// `prioritisetransaction` deltas, each with its [`Selected`] meta.
+    ///
+    /// RAM trade: the bodies are the pool's own `Arc`s, not copies. A caller
+    /// that holds one past eviction or replacement keeps that body alive.
     pub fn select_block_template(
         &self,
         budget: SelectBudget,
         delta: impl Fn(Txid) -> i64,
-    ) -> Vec<(Transaction, Selected)> {
+    ) -> Vec<(Arc<Transaction>, Selected)> {
         self.graph
             .select_block_template(budget, delta)
             .into_iter()
-            .filter_map(|s| self.get_tx(&s.txid).map(|tx| (tx.clone(), s)))
+            .filter_map(|s| self.bodies.get(&s.txid).map(|tx| (Arc::clone(tx), s)))
             .collect()
     }
 }
