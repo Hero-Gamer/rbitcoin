@@ -1769,6 +1769,8 @@ struct WireRig {
         std::thread::JoinHandle<()>,
         std::sync::mpsc::Receiver<super::super::confirm::ConfirmEvent>,
     )>,
+    /// Operator line of the last confirm reject `pump` applied.
+    last_reject_err: Option<String>,
     st: IbdWorkState,
     write_next: std::sync::atomic::AtomicU32,
     book: crate::seeds::AddrMan,
@@ -1812,6 +1814,7 @@ impl WireRig {
             hub,
             feed,
             engine: None,
+            last_reject_err: None,
             st,
             write_next: std::sync::atomic::AtomicU32::new(t + 1),
             book: crate::seeds::AddrMan::new(),
@@ -1927,10 +1930,12 @@ impl WireRig {
                     hash,
                     class,
                     batch_len,
+                    err,
                     ..
                 } = &ev
                 {
                     rejects.push((*hash, *class, *batch_len));
+                    self.last_reject_err = Some(err.clone());
                 }
                 let (tx, one) = std::sync::mpsc::channel();
                 tx.send(ev).unwrap();
@@ -2430,12 +2435,35 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
             (h1, ConfirmRejectClass::Cascade, 2),
             (h1, ConfirmRejectClass::ConsensusInvalid, 1)
         ],
-        "one batch, named by tip+1, is isolated; then tip+1 alone is rejected"
+        "the batch event is a cascade; the one-block event is still ConsensusInvalid"
     );
-    // Known gap (087): apply reads the load-stamp miss as an engine fault,
-    // so tip+1 is not blacklisted; a repeat halts IBD.
+    // Apply reads the load-stamp line (`parent create_fk unresolved` inside
+    // the rewritten missing-prevout text) as an engine fault. The event
+    // class stays ConsensusInvalid. The first fault requeues and does not
+    // blacklist. The same line again halts, and the hash stays off the
+    // invalid set. Finding 087.
+    let err = rig
+        .last_reject_err
+        .clone()
+        .expect("the one-block retry has an operator line");
+    assert!(
+        err.contains("parent create_fk unresolved"),
+        "load-stamp miss must be the engine-fault line, got {err}"
+    );
     assert!(rig.st.engine_fault_seen.contains(&h1));
     assert!(!rig.st.body.is_rejected(&h1));
+    assert!(rig.st.halt.is_none(), "the first engine fault requeues");
+    apply_confirm_reject(
+        &mut rig.st,
+        t + 1,
+        h1,
+        &err,
+        Some(rig.hub.query.as_ref()),
+        Some(&rig.hub),
+    );
+    assert!(rig.st.halt.is_some(), "the second engine fault halts IBD");
+    assert!(!rig.st.body.is_rejected(&h1));
+    assert!(!rig.st.reorg.invalid.contains(h1.to_byte_array()));
     assert_eq!(rig.hub.tip_height(), Some(t));
     rig.finish();
 }
