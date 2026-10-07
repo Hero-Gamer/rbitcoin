@@ -1132,6 +1132,52 @@ async fn tip_announce_merkle_second_cmpct_disconnects() {
     );
 }
 
+/// A nine-block branch whose last block fails keeps its eight-block valid
+/// prefix. That tip is an eight-block reorg: headers, not inv.
+#[test]
+fn tip_announce_kept_prefix_of_failed_reorg_is_headers() {
+    let (_dir, hub) = open_tip_announce_hub("tip-kept-prefix-of-failed-reorg");
+    let hub = &hub;
+    use rbitcoin_primitives::Height;
+    let sent_tip = hub.tip_hash().unwrap();
+    let fork_h = hub.tip_height().unwrap() - 4;
+    let fork = hub.query.wire_header_at_height(Height(fork_h)).unwrap();
+    let mut prev = fork.block_hash();
+    let mut time = fork.time;
+    let mut branch = Vec::with_capacity(9);
+    for i in 0..9u32 {
+        time = time.saturating_add(1);
+        let bip34_height = fork_h + 1 + i + if i == 8 { 100 } else { 0 };
+        let block = mine_on(prev, time, bip34_height, vec![]);
+        prev = block.block_hash();
+        branch.push(block);
+    }
+    let mut tips = hub.subscribe_tips();
+    let err = hub
+        .accept_branch(&branch)
+        .expect_err("the last block has a wrong BIP34 height");
+    assert_eq!(
+        err.failing_block_hash(),
+        Some(branch[8].block_hash().to_byte_array())
+    );
+    let kept = branch[7].block_hash();
+    assert_eq!(hub.tip_hash(), Some(kept));
+    let mut last = None;
+    while let Ok(ev) = tips.try_recv() {
+        last = Some(ev);
+    }
+    let ev = last.expect("the kept prefix emits tip events");
+    assert_eq!(ev.hash, kept);
+    match tip_announce_decision(hub, &ev, true, Some(sent_tip), None, false) {
+        TipAnnounce::Headers(hs) => {
+            assert_eq!(hs.len(), 8);
+            assert_eq!(hs[0].prev_blockhash, fork.block_hash());
+            assert_eq!(hs[7].block_hash(), kept);
+        }
+        other => panic!("kept eight-block prefix must announce headers: {other:?}"),
+    }
+}
+
 /// After a reorg longer than eight blocks, announce inv until the peer's
 /// best header is on the new chain.
 #[test]

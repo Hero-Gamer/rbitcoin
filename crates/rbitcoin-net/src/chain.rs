@@ -2108,7 +2108,7 @@ impl ChainHub {
                 other => other.map(|_| ()),
             }
         } else {
-            self.try_apply_held().map(|_| ())
+            self.try_apply_held(None).map(|_| ())
         };
         if let Err(e) = result {
             *self.precious.write().unwrap() = prev;
@@ -2186,30 +2186,20 @@ impl ChainHub {
                 };
 
                 let new_height = parent_h.0.saturating_add(1);
-                if new_height > tip_h {
-                    if hold_unconnected {
-                        self.hold_body(block);
-                    }
-                    return Err(NetError::Protocol("gap above tip"));
-                }
+                validate_header(
+                    self.query.as_ref(),
+                    &self.params,
+                    Height(new_height),
+                    &block.header,
+                )
+                .map_err(|e| header_reject(&block.header, &e))?;
 
                 if new_height == tip_h {
-                    let cur_work = self
-                        .query
-                        .wire_header_at_height(Height(tip_h))
-                        .map_err(NetError::store)?
-                        .work();
-                    let new_work = block.header.work();
-                    let precious = *self.precious.read().unwrap() == Some(hash);
-                    if new_work > cur_work || (new_work == cur_work && precious) {
-                        self.disconnect_to(parent_h.0)?;
-                        self.connect_at(new_height, block)?;
-                        return Ok(AcceptOutcome::Accepted { height: new_height });
-                    }
-                    if hold_unconnected {
+                    let out = self.accept_branch_locked(std::slice::from_ref(block.as_ref()))?;
+                    if matches!(out, AcceptOutcome::IgnoredWeaker) && hold_unconnected {
                         self.hold_body(block);
                     }
-                    return Ok(AcceptOutcome::IgnoredWeaker);
+                    return Ok(out);
                 }
 
                 if hold_unconnected {
@@ -2228,23 +2218,42 @@ impl ChainHub {
 
     fn accept_branch_inner(&self, blocks: &[Block]) -> Result<AcceptOutcome, NetError> {
         let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.accept_branch_locked(blocks)
+    }
+
+    /// Err when any block of `blocks` fails connect, even when a heavier
+    /// valid prefix stays the tip.
+    fn accept_branch_locked(&self, blocks: &[Block]) -> Result<AcceptOutcome, NetError> {
+        let (out, failed) = self.accept_branch_prefix(blocks)?;
+        failed.map_or(Ok(out), Err)
+    }
+
+    /// [`Self::accept_branch_locked`] that also reports a kept prefix: when a
+    /// block fails after a heavier valid prefix connected, that prefix stays
+    /// the tip and the failure is returned beside `Accepted`.
+    fn accept_branch_prefix(
+        &self,
+        blocks: &[Block],
+    ) -> Result<(AcceptOutcome, Option<NetError>), NetError> {
         self.accept_branch_precheck(blocks)?;
         if let Some(out) = self.accept_branch_genesis_fill(blocks)? {
-            return Ok(out);
+            return Ok((out, None));
         }
         let fork_height = self.accept_branch_fork_height(blocks)?;
-        if let Some(out) = self.accept_branch_weaker(blocks, fork_height)? {
-            return Ok(out);
+        let old_work = self.work_from_fork_to_tip(fork_height)?;
+        if self.accept_branch_weaker(blocks, old_work)? {
+            return Ok((AcceptOutcome::IgnoredWeaker, None));
         }
         let old_path = self.accept_branch_collect_old(fork_height)?;
         self.accept_branch_disconnect(fork_height)?;
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
-        self.accept_branch_connect(blocks, fork_height, base, &old_path)?;
+        let (connected, failed) =
+            self.accept_branch_connect(blocks, fork_height, old_work, &old_path)?;
         self.announce_reorg_len.store(0, Ordering::Relaxed);
-        let height = base + (blocks.len() as u32) - 1;
+        let height = base + (connected.len() as u32) - 1;
         {
             let mut held = self.held_bodies.write().unwrap();
-            for b in blocks {
+            for b in connected {
                 held.remove(&b.block_hash());
             }
         }
@@ -2253,11 +2262,11 @@ impl ChainHub {
             if let Some(old) = old_path.last() {
                 forks.insert(old.block_hash());
             }
-            for b in blocks {
+            for b in connected {
                 forks.remove(&b.block_hash());
             }
         }
-        Ok(AcceptOutcome::Accepted { height })
+        Ok((AcceptOutcome::Accepted { height }, failed))
     }
 
     fn accept_branch_precheck(&self, blocks: &[Block]) -> Result<(), NetError> {
@@ -2352,37 +2361,27 @@ impl ChainHub {
         Ok(base + branch)
     }
 
-    fn accept_branch_weaker(
-        &self,
-        blocks: &[Block],
-        fork_height: Option<u32>,
-    ) -> Result<Option<AcceptOutcome>, NetError> {
+    fn accept_branch_weaker(&self, blocks: &[Block], old_work: Work) -> Result<bool, NetError> {
         let new_work = self.branch_header_work(blocks)?;
-        let our_work = self.work_from_fork_to_tip(fork_height)?;
         let branch_tip = blocks.last().map(Block::block_hash);
         let precious = *self.precious.read().unwrap() == branch_tip;
-        let equal_work = !work_better(new_work, our_work) && !work_better(our_work, new_work);
-        if self.tip_height().is_some()
-            && !work_better(new_work, our_work)
-            && !(precious && equal_work)
-        {
-            return Ok(Some(AcceptOutcome::IgnoredWeaker));
-        }
-        Ok(None)
+        let equal_work = !work_better(new_work, old_work) && !work_better(old_work, new_work);
+        Ok(self.tip_height().is_some()
+            && !work_better(new_work, old_work)
+            && !(precious && equal_work))
     }
 
     fn accept_branch_collect_old(&self, fork_height: Option<u32>) -> Result<Vec<Block>, NetError> {
         let tip_h = self.tip_height().unwrap_or(0);
-        let mut old_path: Vec<Block> = Vec::new();
-        if let Some(fh) = fork_height {
-            if tip_h > fh {
-                old_path.reserve((tip_h - fh) as usize);
-                for h in (fh + 1)..=tip_h {
-                    if let Some(b) = self.block_at_height(h)? {
-                        old_path.push(b);
-                    }
-                }
-            }
+        let Some(fh) = fork_height.filter(|fh| tip_h > *fh) else {
+            return Ok(Vec::new());
+        };
+        let mut old_path = Vec::with_capacity((tip_h - fh) as usize);
+        for h in (fh + 1)..=tip_h {
+            let b = self.block_at_height(h)?.ok_or_else(|| {
+                NetError::Store(format!("invariant: no body at connected height {h}"))
+            })?;
+            old_path.push(b);
         }
         Ok(old_path)
     }
@@ -2403,46 +2402,71 @@ impl ChainHub {
         Ok(())
     }
 
-    fn accept_branch_connect(
+    /// Connect `blocks` on the fork point and return the connected prefix,
+    /// with the connect failure that stopped it short.
+    ///
+    /// On a consensus failure the failing block is remembered as invalid and
+    /// the most-work valid chain wins, as in Core's `InvalidChainFound`: the
+    /// connected prefix stays if it has strictly more work than the old
+    /// branch, else the old branch is restored. A local fault always restores.
+    /// Each tip event carries the branch length connected so far, because a
+    /// later failure can leave that block the tip.
+    fn accept_branch_connect<'b>(
         &self,
-        blocks: &[Block],
+        blocks: &'b [Block],
         fork_height: Option<u32>,
-        base: u32,
+        old_work: Work,
         old_path: &[Block],
-    ) -> Result<(), NetError> {
-        self.announce_reorg_len
-            .store(blocks.len() as u32, Ordering::Relaxed);
+    ) -> Result<(&'b [Block], Option<NetError>), NetError> {
+        let base = fork_height.map(|h| h + 1).unwrap_or(0);
         for (i, b) in blocks.iter().enumerate() {
-            if let Err(e) = self.connect_at(base + i as u32, Arc::new(b.clone())) {
-                self.announce_reorg_len.store(0, Ordering::Relaxed);
-                let restore_failed = |msg: String| {
-                    if e.is_local_fault() {
-                        NetError::Store(msg)
-                    } else {
-                        NetError::Consensus(msg)
-                    }
-                };
-                if let Some(fh) = fork_height {
-                    if let Err(disc) = self.disconnect_to(fh) {
-                        return Err(restore_failed(format!(
-                            "reorg connect failed ({e}); disconnect for restore failed: {disc}"
-                        )));
-                    }
-                    for (j, ob) in old_path.iter().enumerate() {
-                        if let Err(re) = self.connect_at(base + j as u32, Arc::new(ob.clone())) {
-                            return Err(restore_failed(format!(
-                                "reorg connect failed ({e}); tip restore failed: {re}"
-                            )));
-                        }
-                    }
-                }
-                if e.is_local_fault() {
-                    return Err(e);
-                }
-                return Err(NetError::ConnectFailed {
-                    hash: b.block_hash().to_byte_array(),
-                    msg: e.to_string(),
-                });
+            self.announce_reorg_len
+                .store(i as u32 + 1, Ordering::Relaxed);
+            let Err(e) = self.connect_at(base + i as u32, Arc::new(b.clone())) else {
+                continue;
+            };
+            self.announce_reorg_len.store(0, Ordering::Relaxed);
+            if e.is_local_fault() {
+                self.accept_branch_restore(fork_height, old_path, &e)?;
+                return Err(e);
+            }
+            let failed = NetError::ConnectFailed {
+                hash: b.block_hash().to_byte_array(),
+                msg: e.to_string(),
+            };
+            let prefix = &blocks[..i];
+            if !prefix.is_empty() && work_better(self.branch_header_work(prefix)?, old_work) {
+                self.remember_failed_accept(b.block_hash(), &failed);
+                return Ok((prefix, Some(failed)));
+            }
+            self.accept_branch_restore(fork_height, old_path, &e)?;
+            return Err(failed);
+        }
+        Ok((blocks, None))
+    }
+
+    /// Put the old branch back after a failed connect. A restore that does
+    /// not finish leaves a torn tip: that is a local fault whatever `e` was,
+    /// so no caller marks a block invalid or tries another branch on it.
+    fn accept_branch_restore(
+        &self,
+        fork_height: Option<u32>,
+        old_path: &[Block],
+        e: &NetError,
+    ) -> Result<(), NetError> {
+        let Some(fh) = fork_height else {
+            return Ok(());
+        };
+        if let Err(disc) = self.disconnect_to(fh) {
+            return Err(NetError::Store(format!(
+                "reorg connect failed ({e}); disconnect for restore failed: {disc}"
+            )));
+        }
+        for (j, ob) in old_path.iter().enumerate() {
+            if let Err(re) = self.connect_at(fh + 1 + j as u32, Arc::new(ob.clone())) {
+                return Err(NetError::Store(format!(
+                    "reorg connect failed ({e}); tip restore failed: {re}"
+                )));
             }
         }
         Ok(())
@@ -2482,7 +2506,7 @@ impl ChainHub {
         match self.accept_incoming(block, true) {
             Ok(AcceptOutcome::Accepted { height }) => {
                 self.held_bodies.write().unwrap().remove(&hash);
-                match self.try_apply_held()? {
+                match self.apply_held_for(hash)? {
                     Some(o @ AcceptOutcome::Accepted { .. }) => Ok(o),
                     _ => Ok(AcceptOutcome::Accepted { height }),
                 }
@@ -2491,19 +2515,30 @@ impl ChainHub {
                 self.held_bodies.write().unwrap().remove(&hash);
                 Ok(AcceptOutcome::AlreadyHave)
             }
-            Ok(AcceptOutcome::IgnoredWeaker) => match self.try_apply_held()? {
-                Some(o) => Ok(o),
-                None => Ok(AcceptOutcome::IgnoredWeaker),
-            },
-            Err(NetError::SideBlock | NetError::UnknownParent)
-            | Err(NetError::Protocol("gap above tip")) => match self.try_apply_held()? {
-                Some(o) => Ok(o),
-                None => Ok(AcceptOutcome::IgnoredWeaker),
-            },
+            Ok(AcceptOutcome::IgnoredWeaker)
+            | Err(NetError::SideBlock)
+            | Err(NetError::UnknownParent) => Ok(self
+                .apply_held_for(hash)?
+                .unwrap_or(AcceptOutcome::IgnoredWeaker)),
             Err(e) => {
                 self.remember_failed_accept(hash, &e);
                 Err(e)
             }
+        }
+    }
+
+    /// [`Self::try_apply_held`] on behalf of `offered`. A held block that
+    /// fails connect is that block's verdict, already remembered. It is not
+    /// an error for the offered block.
+    fn apply_held_for(&self, offered: BlockHash) -> Result<Option<AcceptOutcome>, NetError> {
+        match self.try_apply_held(Some(offered)) {
+            Err(e)
+                if e.failing_block_hash()
+                    .is_some_and(|h| h != offered.to_byte_array()) =>
+            {
+                Ok(None)
+            }
+            other => other,
         }
     }
 
@@ -2691,18 +2726,18 @@ impl ChainHub {
         None
     }
 
-    fn try_apply_held(&self) -> Result<Option<AcceptOutcome>, NetError> {
+    /// The held (or archived) branch with the most total chain work, as in
+    /// Core's `CBlockIndexWorkComparator`. Equal work prefers the precious
+    /// tip, then the first-seen held tip.
+    fn best_held_branch(&self) -> Option<Vec<Block>> {
         let mut starts: Vec<BlockHash> = self.held_bodies.read().unwrap().keys().collect();
-        if let Some(p) = *self.precious.read().unwrap() {
+        let precious = *self.precious.read().unwrap();
+        if let Some(p) = precious {
             if !starts.contains(&p) {
                 starts.push(p);
             }
         }
-        if starts.is_empty() {
-            return Ok(None);
-        }
-        let precious = *self.precious.read().unwrap();
-        let mut best: Option<(Work, u64, Vec<Block>, bool)> = None;
+        let mut best: Option<(Work, bool, u64, Vec<Block>)> = None;
         for start in starts {
             if self.is_block_invalid(&start) {
                 continue;
@@ -2716,40 +2751,76 @@ impl ChainHub {
             {
                 continue;
             }
-            let Ok(w) = self.branch_header_work(&branch) else {
+            let Ok(w) = self.branch_chain_work(&branch) else {
                 continue;
             };
-            let tip = branch.last().map(Block::block_hash);
-            let is_p = tip == precious;
-            let seq = match tip {
-                Some(t) => self.held_bodies.read().unwrap().seq(t),
-                None => u64::MAX,
-            };
+            let tip = branch[branch.len() - 1].block_hash();
+            let is_p = Some(tip) == precious;
+            let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, bseq, _, was_p)) => {
-                    work_better(w, *bw)
-                        || (!work_better(*bw, w) && is_p && !*was_p)
-                        || (w.to_be_bytes() == bw.to_be_bytes() && !is_p && !*was_p && seq < *bseq)
+                Some((bw, was_p, bseq, _)) => {
+                    let tie = !work_better(*bw, w);
+                    work_better(w, *bw) || (tie && !*was_p && (is_p || seq < *bseq))
                 }
             };
             if take {
-                best = Some((w, seq, branch, is_p));
+                best = Some((w, is_p, seq, branch));
             }
         }
-        let Some((_, _, branch, _)) = best else {
-            return Ok(None);
-        };
-        match self.accept_branch_inner(&branch) {
-            Ok(AcceptOutcome::Accepted { height }) => Ok(Some(AcceptOutcome::Accepted { height })),
-            Ok(AcceptOutcome::IgnoredWeaker) => Ok(None),
-            Ok(other) => Ok(Some(other)),
-            Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => Ok(None),
-            Err(e) => {
-                let offered = branch[branch.len() - 1].block_hash();
-                self.remember_failed_accept(offered, &e);
-                Err(e)
+        best.map(|(_, _, _, branch)| branch)
+    }
+
+    /// Activate the most-work held branch. A branch that fails connect is
+    /// remembered as invalid and the next best is tried, so a failed heavier
+    /// branch does not hide a valid one. When `offered` is the block that
+    /// failed, its error is the result even if a kept prefix or another
+    /// branch became the tip. A local fault stops at once.
+    fn try_apply_held(
+        &self,
+        offered: Option<BlockHash>,
+    ) -> Result<Option<AcceptOutcome>, NetError> {
+        let mut applied = None;
+        let mut failed = None;
+        let mut offered_failed = None;
+        for _ in 0..=self.held_body_count() {
+            let Some(branch) = self.best_held_branch() else {
+                break;
+            };
+            let branch_tip = branch[branch.len() - 1].block_hash();
+            let attempt = {
+                let _guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+                self.accept_branch_prefix(&branch)
+            };
+            let e = match attempt {
+                Ok((o @ AcceptOutcome::Accepted { .. }, None)) => {
+                    applied = Some(o);
+                    break;
+                }
+                Ok((o @ AcceptOutcome::Accepted { .. }, Some(e))) => {
+                    applied = Some(o);
+                    e
+                }
+                Ok((AcceptOutcome::IgnoredWeaker, _)) => break,
+                Ok((other, _)) => return Ok(Some(other)),
+                Err(NetError::Protocol(s)) if s.contains("branch parent not on chain") => break,
+                Err(e) if e.is_local_fault() => return Err(e),
+                Err(e) => {
+                    self.remember_failed_accept(branch_tip, &e);
+                    e
+                }
+            };
+            if offered.is_some_and(|h| e.failing_block_hash() == Some(h.to_byte_array())) {
+                offered_failed.get_or_insert(e);
+            } else {
+                failed.get_or_insert(e);
             }
+        }
+        match (offered_failed, applied, failed) {
+            (Some(e), _, _) => Err(e),
+            (None, Some(o), _) => Ok(Some(o)),
+            (None, None, Some(e)) => Err(e),
+            (None, None, None) => Ok(None),
         }
     }
 
@@ -5275,7 +5346,8 @@ mod tests {
             matches!(err, NetError::Consensus(_) | NetError::ConnectFailed { .. }),
             "expected consensus fail, got {err}"
         );
-        // Tip restored to pre-attempt.
+        // The two-block valid prefix does not out-work the eight-block old
+        // branch, so the old tip is restored.
         assert_eq!(
             hub.tip_height(),
             Some(pre_h),
@@ -5520,6 +5592,189 @@ mod tests {
             other => panic!("expected invalidated refuse, got {other:?}"),
         }
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn mine_chain(hub: &ChainHub, len: u32, time: u32) -> Vec<Block> {
+        let mut prev = hub.tip_hash().unwrap();
+        let base = hub.tip_height().unwrap();
+        let mut out = Vec::new();
+        for h in base + 1..=base + len {
+            let b = mine(prev, time + h * 600, h);
+            prev = b.block_hash();
+            hub.accept_block(b.clone()).unwrap();
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn sibling_claiming_more_work_with_wrong_bits_keeps_the_tip() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 5, 1_300_060_000);
+        let tip = main[4].block_hash();
+        for h in (2..=5u32).rev() {
+            let parent = &main[h as usize - 2];
+            let mut bogus = mine(parent.block_hash(), parent.header.time + 1, h);
+            bogus.header.bits = CompactTarget::from_consensus(0x1700_ffff);
+            let err = hub
+                .accept_received_block(bogus)
+                .expect_err("a sibling with wrong nBits must be rejected");
+            assert!(err.to_string().contains("bits"), "height {h}: {err}");
+            assert_eq!(
+                hub.tip_hash(),
+                Some(tip),
+                "a rejected sibling at height {h} must not move the tip"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Side branch `w2, w3, w4` off `main[0]`, where `w4` has a wrong BIP34
+    /// height. `w2` and `w4` arrive first; returns `w3`'s outcome.
+    fn side_branch_with_bad_tip(
+        hub: &ChainHub,
+        main: &[Block],
+    ) -> (Result<AcceptOutcome, NetError>, [Block; 3]) {
+        let x1 = &main[0];
+        let w2 = mine_distinct(
+            x1.block_hash(),
+            x1.header.time + 1,
+            2,
+            &[main[1].block_hash()],
+        );
+        let w3 = mine(w2.block_hash(), w2.header.time + 600, 3);
+        let w4 = mine(w3.block_hash(), w3.header.time + 600, 9);
+        for early in [&w2, &w4] {
+            assert!(matches!(
+                hub.accept_received_block(early.clone()).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ));
+        }
+        let out = hub.accept_received_block(w3.clone());
+        (out, [w2, w3, w4])
+    }
+
+    #[test]
+    fn failed_branch_tip_keeps_the_heavier_valid_prefix() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 2, 1_300_070_000);
+        let (out, [_, w3, w4]) = side_branch_with_bad_tip(&hub, &main);
+        assert!(
+            matches!(out, Ok(AcceptOutcome::Accepted { height: 3 })),
+            "valid w3 out-works x2: {out:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(w3.block_hash()));
+        assert!(hub.is_block_invalid(&w4.block_hash()));
+        assert!(!hub.is_block_invalid(&w3.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `w2, w3` are held and out-work `x2`; the offered `w4` fails connect.
+    /// The prefix stays the tip, and the call that delivered `w4` fails.
+    #[test]
+    fn failed_offered_block_is_rejected_when_its_held_prefix_stays() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 2, 1_300_074_000);
+        let x1 = &main[0];
+        let w2 = mine_distinct(
+            x1.block_hash(),
+            x1.header.time + 1,
+            2,
+            &[main[1].block_hash()],
+        );
+        let w3 = mine(w2.block_hash(), w2.header.time + 600, 3);
+        let w4 = mine(w3.block_hash(), w3.header.time + 600, 9);
+        hub.hold_unconnected_body(w2);
+        hub.hold_unconnected_body(w3.clone());
+        let err = hub
+            .accept_received_block(w4.clone())
+            .expect_err("w4 has a wrong BIP34 height");
+        assert_eq!(
+            err.failing_block_hash(),
+            Some(w4.block_hash().to_byte_array())
+        );
+        assert_eq!(hub.tip_hash(), Some(w3.block_hash()));
+        assert!(hub.is_block_invalid(&w4.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_branch_tip_does_not_reject_the_offered_parent() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 3, 1_300_071_000);
+        let (out, [_, w3, w4]) = side_branch_with_bad_tip(&hub, &main);
+        assert!(
+            matches!(out, Ok(AcceptOutcome::IgnoredWeaker)),
+            "w3 only ties x3, and w4's failure is not w3's: {out:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(main[2].block_hash()));
+        assert!(hub.is_block_invalid(&w4.block_hash()));
+        assert!(!hub.is_block_invalid(&w3.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Two held branches score the same work from their own fork points.
+    /// The later one forks higher, so it has more total chain work.
+    #[test]
+    fn held_branch_with_more_total_work_beats_an_earlier_local_tie() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 3, 1_300_072_000);
+        let [x1, x2, x3] = [&main[0], &main[1], &main[2]];
+        let y2 = mine_distinct(x1.block_hash(), x1.header.time + 1, 2, &[x2.block_hash()]);
+        let y3 = mine(y2.block_hash(), y2.header.time + 600, 3);
+        let z3 = mine_distinct(x2.block_hash(), x2.header.time + 1, 3, &[x3.block_hash()]);
+        let z4 = mine(z3.block_hash(), z3.header.time + 600, 4);
+        for b in [&y2, &y3, &z3] {
+            assert!(matches!(
+                hub.accept_received_block(b.clone()).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ));
+        }
+        let out = hub.accept_received_block(z4.clone()).unwrap();
+        assert!(
+            matches!(out, AcceptOutcome::Accepted { height: 4 }),
+            "z4 has the most total work: {out:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(z4.block_hash()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `p2` completes two held branches. The heavier one fails at `m3`; the
+    /// lighter `n3` is still heavier than the tip and must win.
+    #[test]
+    fn failed_heavier_held_branch_does_not_hide_a_valid_one() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let main = mine_chain(&hub, 2, 1_300_073_000);
+        let x1 = &main[0];
+        let p2 = mine_distinct(
+            x1.block_hash(),
+            x1.header.time + 1,
+            2,
+            &[main[1].block_hash()],
+        );
+        let m3 = mine(p2.block_hash(), p2.header.time + 600, 9);
+        let m4 = mine(m3.block_hash(), m3.header.time + 600, 4);
+        let n3 = mine_distinct(p2.block_hash(), p2.header.time + 601, 3, &[m3.block_hash()]);
+        for b in [&m3, &m4, &n3] {
+            assert!(matches!(
+                hub.accept_received_block(b.clone()).unwrap(),
+                AcceptOutcome::IgnoredWeaker
+            ));
+        }
+        let out = hub.accept_received_block(p2.clone()).unwrap();
+        assert!(
+            matches!(out, AcceptOutcome::Accepted { height: 3 }),
+            "n3 is the most-work valid tip: {out:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(n3.block_hash()));
+        assert!(hub.is_block_invalid(&m3.block_hash()));
         let _ = std::fs::remove_dir_all(dir);
     }
 
