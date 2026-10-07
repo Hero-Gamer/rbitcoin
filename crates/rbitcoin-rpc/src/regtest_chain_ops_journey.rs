@@ -1178,7 +1178,7 @@ fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCo
             .set_block_min_tx_fee_sat_kvb(min);
         crate::methods::mine::mempool_block_txs(ctx)
             .into_iter()
-            .map(|(tx, _)| tx)
+            .map(|(tx, _)| Transaction::clone(&tx))
             .collect::<Vec<_>>()
     };
     // 2_000 sat is 0.5 sat/vB at 4_000 vB.

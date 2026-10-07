@@ -12,6 +12,7 @@ use rbitcoin_consensus::{
 use rbitcoin_net::{ChainHub, SelectBudget};
 use rbitcoin_primitives::Height;
 use std::io;
+use std::sync::Arc;
 use template_distribution_sv2::{NewTemplate, SetNewPrevHash};
 
 /// Coinbase witness reserved value the template's witness commitment is
@@ -35,8 +36,9 @@ pub(crate) struct Template {
     pub n_bits: u32,
     /// `n_bits` expanded, little-endian (no weak-block target).
     pub target: [u8; 32],
-    /// Non-coinbase txs in block order, kept past mempool eviction.
-    pub txs: Vec<Transaction>,
+    /// Non-coinbase txs in block order: the mempool's own bodies, kept alive
+    /// past eviction.
+    pub txs: Vec<Arc<Transaction>>,
 }
 
 impl Template {
