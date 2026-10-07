@@ -1922,8 +1922,9 @@ impl ActiveMempool {
 /// Requires strictly higher absolute fee over the **conflict set** (incl.
 /// descendants), a strictly higher true feerate, and the incremental relay
 /// fee on replacement vsize. Feerate is `new_fee * old_vsize > old_fee *
-/// new_vsize`, so a replacement that lands in the same whole sat/kvB bucket
-/// still pays when its real rate is higher.
+/// new_vsize` in `u128`, so a replacement that lands in the same whole
+/// sat/kvB bucket still pays when its real rate is higher, including when
+/// either product exceeds `u64::MAX`.
 pub fn rbf_pays_for_replacement(
     new_fee: u64,
     new_weight: u64,
@@ -1938,7 +1939,7 @@ pub fn rbf_pays_for_replacement(
     if new_v == 0 || old_v == 0 {
         return false;
     }
-    if new_fee.saturating_mul(old_v) <= old_fee.saturating_mul(new_v) {
+    if u128::from(new_fee) * u128::from(old_v) <= u128::from(old_fee) * u128::from(new_v) {
         return false;
     }
     let inc = new_v
@@ -2838,6 +2839,23 @@ mod tests {
         // One sat short of the incremental ceiling at the same vsize.
         assert!(!rbf_pays_for_replacement(100_099, 4000, 100_000, 4000));
         assert!(!rbf_pays_for_replacement(1, 0, 0, 4000));
+        // vsize 101_000 makes `fee * vsize` exceed u64::MAX for a fee still
+        // under MAX_MONEY. Same vsize, so the higher fee is a higher rate.
+        // The incremental ceiling at this vsize is 10_100 sat.
+        let old_fee = 200_000_000_000_000u64;
+        let weight = 404_000u64;
+        assert!(rbf_pays_for_replacement(
+            old_fee + 10_100,
+            weight,
+            old_fee,
+            weight
+        ));
+        assert!(!rbf_pays_for_replacement(
+            old_fee + 10_099,
+            weight,
+            old_fee,
+            weight
+        ));
     }
 
     #[test]
