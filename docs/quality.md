@@ -8,7 +8,7 @@ in [`CHANGELOG.md`](../CHANGELOG.md). 1.0 product gates:
 **Last reaudit:** 2026-09-17. Live schema: [`SCHEMA.md`](../SCHEMA.md).
 Core functional inventory: [`core-functional.md`](./core-functional.md).
 Findings **001–023** fixed. Nightly fuzz **21** jobs. Nightly mutants,
-8 hour budget split between new code and the backlog, cursor on the
+5 hour budget, first quarter on new code and the rest on the backlog, cursor on the
 `mutants-state` branch (not required; owner [`TESTING.md`](../TESTING.md)). Previous:
 2026-09-15.
 
