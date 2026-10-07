@@ -57,9 +57,13 @@ pub fn encode_verack_v2() -> Result<Vec<u8>, NetError> {
 
 /// BIP324 `getheaders` with empty locator (Core stays connected).
 pub fn encode_getheaders_empty_v2() -> Result<Vec<u8>, NetError> {
+    encode_getheaders_v2(Vec::new(), BlockHash::from_byte_array([0; 32]))
+}
+
+/// BIP324 `getheaders` for a locator and stop hash.
+pub fn encode_getheaders_v2(locator: Vec<BlockHash>, stop: BlockHash) -> Result<Vec<u8>, NetError> {
     encode_v2_contents(NetworkMessage::GetHeaders(GetHeadersMessage::new(
-        Vec::new(),
-        BlockHash::from_byte_array([0; 32]),
+        locator, stop,
     )))
 }
 

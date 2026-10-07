@@ -6,14 +6,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use bitcoin::hashes::Hash;
+use bitcoin::BlockHash;
 use libfuzzer_sys::fuzz_target;
 use rbitcoin_consensus::Milestone;
 use rbitcoin_fuzz::{
-    check_diff_env, compare_one, diff_regtest_params, encode_getheaders_empty_v2, encode_ping_v2,
-    encode_pong_v2, genesis_diff_tip, CompareOne, DiffTip,
+    check_diff_env, cmpct_getblocktxn_agrees, cmpct_missing_for_case, compare_one,
+    compare_tx_bytes, diff_regtest_params, encode_cmpctblock_v2, encode_getheaders_empty_v2,
+    encode_getheaders_v2, encode_ping_v2, encode_pong_v2, encode_tx_v2, genesis_diff_tip,
+    header_sequence_agrees, parse_p2p_sequence, prepare_cmpct_fuzz_case, spawn_bitcoind_p2p,
+    tmp_dir, BlockOracle, CompareOne, CoreChild, DiffTip, P2pSeqKind,
 };
-use rbitcoin_fuzz::{parse_p2p_sequence, spawn_bitcoind_p2p, tmp_dir, CoreChild, P2pSeqKind};
-use rbitcoin_net::{classify_v2_cmpct_peer, ChainHub, CmpctPeerFrame, V2PlainSession};
+use rbitcoin_net::{
+    classify_v2_cmpct_peer, v2_header_hashes, ChainHub, CmpctPeerFrame, NetError, V2PlainSession,
+};
 use rbitcoin_query::Query;
 use tokio::net::TcpStream;
 use tokio::runtime::{Builder, Runtime};
@@ -144,6 +150,151 @@ fn headers_live(b: &Base) -> bool {
         .is_some()
 }
 
+enum StepFate {
+    Compared,
+    Skip,
+    Disagree(String),
+}
+
+fn known_headers(b: &Base) -> Vec<BlockHash> {
+    let genesis = genesis_diff_tip(&diff_regtest_params()).hash;
+    let tip = b.hub.tip_hash().unwrap_or(genesis);
+    if tip == genesis {
+        vec![genesis]
+    } else {
+        vec![genesis, tip]
+    }
+}
+
+fn locator_from_tip(b: &Base, known: &[BlockHash]) -> Vec<BlockHash> {
+    let genesis = known[0];
+    let mut loc = Vec::new();
+    if let Some(tip) = b.hub.tip_hash() {
+        loc.push(tip);
+    }
+    if loc.last() != Some(&genesis) {
+        loc.push(genesis);
+    }
+    if loc.is_empty() {
+        loc.push(genesis);
+    }
+    loc
+}
+
+async fn answer_ping(sess: &mut V2PlainSession, contents: &[u8]) -> bool {
+    if let CmpctPeerFrame::Ping(n) = classify_v2_cmpct_peer(contents) {
+        let Ok(pong) = encode_pong_v2(n) else {
+            return false;
+        };
+        return sess.write_contents(&pong).await.is_ok();
+    }
+    true
+}
+
+fn getheaders_step(b: &Base) -> StepFate {
+    let known = known_headers(b);
+    let Ok(frame) = encode_getheaders_v2(
+        locator_from_tip(b, &known),
+        BlockHash::from_byte_array([0; 32]),
+    ) else {
+        return StepFate::Skip;
+    };
+    let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(sess) = slot.as_mut() else {
+        return StepFate::Skip;
+    };
+    let agreed = b.rt.block_on(async {
+        if sess.write_contents(&frame).await.is_err() {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + READ_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, sess.read_contents()).await {
+                Err(_) | Ok(Err(_)) => return None,
+                Ok(Ok(contents)) => {
+                    if let Some(hashes) = v2_header_hashes(&contents) {
+                        return Some(header_sequence_agrees(&hashes, &known));
+                    }
+                    if !answer_ping(sess, &contents).await {
+                        return None;
+                    }
+                }
+            }
+        }
+        None
+    });
+    match agreed {
+        Some(true) => StepFate::Compared,
+        Some(false) => StepFate::Disagree("header sequence left the hub".into()),
+        None => StepFate::Skip,
+    }
+}
+
+fn compact_step(b: &Base, payload: &[u8]) -> StepFate {
+    let Some(case) = prepare_cmpct_fuzz_case(payload) else {
+        return StepFate::Skip;
+    };
+    let Some(ours) = cmpct_missing_for_case(&case) else {
+        return StepFate::Skip;
+    };
+    let Ok(frame) = encode_cmpctblock_v2(&case.hsi) else {
+        return StepFate::Skip;
+    };
+    let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(sess) = slot.as_mut() else {
+        return StepFate::Skip;
+    };
+    let result = b.rt.block_on(async {
+        for tx in &case.fill_txs {
+            let encoded = encode_tx_v2(tx).map_err(|_| NetError::Protocol("tx encode"))?;
+            sess.write_contents(&encoded).await?;
+        }
+        sess.write_contents(&frame).await?;
+        let deadline = tokio::time::Instant::now() + READ_WAIT;
+        while tokio::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, sess.read_contents()).await {
+                Err(_) => return Ok(None),
+                Ok(Err(e)) => return Err(e),
+                Ok(Ok(contents)) => match classify_v2_cmpct_peer(&contents) {
+                    CmpctPeerFrame::GetBlockTxn(idx) => return Ok(Some(idx)),
+                    CmpctPeerFrame::Ping(n) => {
+                        let pong = encode_pong_v2(n).map_err(|_| NetError::Protocol("pong"))?;
+                        sess.write_contents(&pong).await?;
+                    }
+                    CmpctPeerFrame::Pong(_) | CmpctPeerFrame::Other => {}
+                },
+            }
+        }
+        Ok(None)
+    });
+    match result {
+        Ok(Some(core_idx)) => {
+            if !cmpct_getblocktxn_agrees(&ours, &core_idx) {
+                return StepFate::Disagree(format!("ours={ours:?} core={core_idx:?}"));
+            }
+            let hash = case.hsi.header.block_hash().to_string();
+            let _ = b.core.rpc.core_invalidate_hash(&hash);
+            StepFate::Compared
+        }
+        Ok(None) if ours.is_empty() => {
+            let hash = case.hsi.header.block_hash().to_string();
+            let _ = b.core.rpc.core_invalidate_hash(&hash);
+            StepFate::Compared
+        }
+        _ => StepFate::Skip,
+    }
+}
+
+fn finish_step(fate: StepFate, what: &str) {
+    match fate {
+        StepFate::Compared => note_comparison(),
+        StepFate::Skip => {}
+        StepFate::Disagree(detail) => panic!("p2p-sequence {what}: {detail}"),
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     let b = base();
     let steps = parse_p2p_sequence(data);
@@ -161,15 +312,36 @@ fuzz_target!(|data: &[u8]| {
             P2pSeqKind::Headers => {
                 let _ = headers_live(b);
             }
-            P2pSeqKind::Block => match compare_one(&b.hub, &mut tip, &b.core.rpc, data) {
+            P2pSeqKind::Block => {
+                let body = if data.first() == Some(&rbitcoin_fuzz::P2P_SEQ_IR) {
+                    step.payload.as_slice()
+                } else {
+                    data
+                };
+                match compare_one(&b.hub, &mut tip, &b.core.rpc, body) {
+                    CompareOne::Agreed { .. } => note_comparison(),
+                    CompareOne::NotABlock | CompareOne::Skipped => {}
+                    CompareOne::Disagreed { ours, core, hex } => {
+                        panic!("p2p-sequence block: ours={ours} core={core} hex={hex}");
+                    }
+                    CompareOne::Harness(msg) if msg == "oracle dead" => {}
+                    CompareOne::Harness(msg) => harness_failure(msg),
+                }
+            }
+            P2pSeqKind::Tx => match compare_tx_bytes(&b.hub, &b.core.rpc, &step.payload) {
                 CompareOne::Agreed { .. } => note_comparison(),
                 CompareOne::NotABlock | CompareOne::Skipped => {}
                 CompareOne::Disagreed { ours, core, hex } => {
-                    panic!("p2p-sequence block: ours={ours} core={core} hex={hex}");
+                    panic!("p2p-sequence tx: ours={ours} core={core} hex={hex}");
                 }
                 CompareOne::Harness(msg) if msg == "oracle dead" => {}
                 CompareOne::Harness(msg) => harness_failure(msg),
             },
+            P2pSeqKind::GetHeaders => finish_step(getheaders_step(b), "getheaders"),
+            P2pSeqKind::Cmpct | P2pSeqKind::Blocktxn => {
+                finish_step(compact_step(b, &step.payload), "cmpct");
+            }
+            P2pSeqKind::FeeFilter | P2pSeqKind::Inv => {}
         }
     }
 });

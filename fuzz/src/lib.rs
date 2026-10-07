@@ -10,8 +10,8 @@ mod script_review;
 pub use block_diff::{
     basic_auth_b64, build_jsonrpc_http_request, check_diff_env, compare_cmpct_reorg_one,
     compare_csv_age_one, compare_fork_n_one, compare_fork_one, compare_mempool_one, compare_one,
-    compare_script_one, compare_script_verify_one, compare_spend_one, diff_regtest_params,
-    genesis_diff_tip, mine_diff_pad, mine_diff_stem, parse_submitblock_json,
+    compare_script_one, compare_script_verify_one, compare_spend_one, compare_tx_bytes,
+    diff_regtest_params, genesis_diff_tip, mine_diff_pad, mine_diff_stem, parse_submitblock_json,
     parse_testmempoolaccept_json, rewind_oracle_until, split_http_body, store_reorg_apply,
     store_reorg_corrupt_is_finding, store_reorg_step, submit_pad_to_oracle, wait_for_file,
     BlockOracle, CompareOne, DiffPad, DiffTip, OracleReply, StoreReorgOp, DIFF_MATURE_PAD_HEIGHT,
@@ -20,11 +20,14 @@ pub use block_diff::{
 pub use chain_review::{compare_chain_plan, plan_chain_shape, ChainReview, PlannedSubmit};
 pub use cmpct_fuzz::{
     cmpct_drain_disconnects, cmpct_getblocktxn_agrees, cmpct_missing_for_case,
-    encode_cmpctblock_v2, encode_getheaders_empty_v2, encode_ping_v2, encode_pong_v2,
-    encode_sendcmpct_hb_v2, encode_tx_v2, encode_verack_v2, follow_reconstructed_cmpct,
-    prepare_cmpct_fuzz_case, prepare_cmpct_fuzz_hsi, CmpctFuzzCase,
+    encode_cmpctblock_v2, encode_getheaders_empty_v2, encode_getheaders_v2, encode_ping_v2,
+    encode_pong_v2, encode_sendcmpct_hb_v2, encode_tx_v2, encode_verack_v2,
+    follow_reconstructed_cmpct, prepare_cmpct_fuzz_case, prepare_cmpct_fuzz_hsi, CmpctFuzzCase,
 };
-pub use p2p_seq::{p2p_sequence_ping_comparisons, parse_p2p_sequence, P2pSeqKind, P2pSeqStep};
+pub use p2p_seq::{
+    header_sequence_agrees, p2p_sequence_ping_comparisons, parse_p2p_sequence, P2pSeqKind,
+    P2pSeqStep, P2P_SEQ_IR,
+};
 pub use script_kernel::{compare_script_kernel, kernel_forks, parse_kernel_input, KernelCmp};
 pub use script_review::{
     compare_kernel_bytes, compare_signet_empty, compare_spend, core_block_script_flags,

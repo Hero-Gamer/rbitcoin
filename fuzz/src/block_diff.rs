@@ -904,6 +904,44 @@ pub fn parse_testmempoolaccept_json(body: &str) -> Result<OracleReply, &'static 
     Err("malformed")
 }
 
+/// One raw transaction: consensus-class only. Core standardness, fee, RBF,
+/// and dust are skips.
+pub fn compare_tx_bytes(hub: &ChainHub, oracle: &dyn BlockOracle, raw: &[u8]) -> CompareOne {
+    let Ok(tx) = deserialize::<Transaction>(raw) else {
+        return CompareOne::NotABlock;
+    };
+    let Some(mp) = hub.mempool() else {
+        return CompareOne::Skipped;
+    };
+    let ours = match mempool_ours_consensus(mp.test_accept(&tx)) {
+        Ok(v) => v,
+        Err(msg) => return CompareOne::Harness(msg),
+    };
+    if ours == DiffVerdict::Skip {
+        return CompareOne::Skipped;
+    }
+    let hex = hex_encode(serialize(&tx));
+    let reply = oracle.testmempoolaccept_hex(&hex);
+    if let OracleReply::Reason(reason) = &reply {
+        if is_core_mempool_policy_skip(reason) {
+            return CompareOne::Skipped;
+        }
+    }
+    let core = verdict_from_core_reply(&reply);
+    match (ours, core) {
+        (DiffVerdict::Accept, DiffVerdict::Accept) => CompareOne::Agreed { accept: true },
+        (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
+        (DiffVerdict::Skip, _) | (_, DiffVerdict::Skip) => CompareOne::Skipped,
+        (DiffVerdict::Accept, DiffVerdict::Reject) | (DiffVerdict::Reject, DiffVerdict::Accept) => {
+            CompareOne::Disagreed {
+                ours: ours == DiffVerdict::Accept,
+                core: core == DiffVerdict::Accept,
+                hex,
+            }
+        }
+    }
+}
+
 pub fn compare_mempool_one(
     hub: &ChainHub,
     tip: &DiffTip,
