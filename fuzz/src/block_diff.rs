@@ -114,6 +114,9 @@ pub const DIFF_MUT_SHUFFLE: u8 = 0x40;
 pub const SCRIPT_FUZZ_CTRL: u8 = 0x80;
 /// Structured `{n_tx, has_witness, extra_size}` prefix for spend / height-1 prepare.
 pub const BLOCK_STRUCT_CTRL: u8 = 0x81;
+/// Tail control byte (inputs longer than 16 bytes): compare a same-hash
+/// merkle mutant, then submit the honest block to both nodes.
+pub const HONEST_TWIN_MARK: u8 = 0xFE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffTip {
@@ -1258,7 +1261,8 @@ pub fn compare_one(
     let Some(block) = prepare_height1_candidate(tip, data) else {
         return CompareOne::NotABlock;
     };
-    compare_prepared(hub, tip, oracle, block)
+    let (offered, honest) = offered_with_twin(block, data);
+    compare_prepared_twin(hub, tip, oracle, offered, honest)
 }
 
 pub fn compare_spend_one(
@@ -1271,7 +1275,8 @@ pub fn compare_spend_one(
     let Some(block) = prepare_spend_candidate(tip, mature, data) else {
         return CompareOne::NotABlock;
     };
-    compare_prepared(hub, tip, oracle, block)
+    let (offered, honest) = offered_with_twin(block, data);
+    compare_prepared_twin(hub, tip, oracle, offered, honest)
 }
 
 pub fn compare_script_one(
@@ -1284,7 +1289,8 @@ pub fn compare_script_one(
     let Some(block) = prepare_script_candidate(tip, mature, data) else {
         return CompareOne::NotABlock;
     };
-    compare_prepared(hub, tip, oracle, block)
+    let (offered, honest) = offered_with_twin(block, data);
+    compare_prepared_twin(hub, tip, oracle, offered, honest)
 }
 
 fn restore_stem(
@@ -1716,7 +1722,140 @@ fn finish_reorg_compare(
     }
 }
 
+/// Same header as `honest`, with the last transaction repeated. The block
+/// hash matches. `check_merkle_root` does not.
+pub fn same_hash_merkle_mutant(honest: &Block) -> Option<Block> {
+    let last = honest.txdata.last()?.clone();
+    let mut txdata = honest.txdata.clone();
+    txdata.push(last);
+    let mutant = Block {
+        header: honest.header,
+        txdata,
+    };
+    if mutant.block_hash() != honest.block_hash() || mutant.txdata == honest.txdata {
+        return None;
+    }
+    Some(mutant)
+}
+
+fn wants_honest_twin(data: &[u8]) -> bool {
+    data.len() > 16 && data[data.len() - 16] == HONEST_TWIN_MARK
+}
+
+fn offered_with_twin(block: Block, data: &[u8]) -> (Block, Option<Block>) {
+    if !wants_honest_twin(data) {
+        return (block, None);
+    }
+    match same_hash_merkle_mutant(&block) {
+        Some(mutant) => (mutant, Some(block)),
+        None => (block, None),
+    }
+}
+
+/// Hub rejected the honest body and Core accepted it.
+pub fn honest_replay_verdict(ours: DiffVerdict, core: DiffVerdict) -> CompareOne {
+    match (ours, core) {
+        (DiffVerdict::Accept, DiffVerdict::Accept) => CompareOne::Agreed { accept: true },
+        (DiffVerdict::Reject, DiffVerdict::Accept) => CompareOne::Disagreed {
+            ours: false,
+            core: true,
+            hex: String::new(),
+        },
+        (DiffVerdict::Accept, DiffVerdict::Reject) => CompareOne::Disagreed {
+            ours: true,
+            core: false,
+            hex: String::new(),
+        },
+        (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
+        (DiffVerdict::Skip, _) | (_, DiffVerdict::Skip) => CompareOne::Skipped,
+    }
+}
+
+fn replay_honest_twin(
+    hub: &ChainHub,
+    tip: &DiffTip,
+    oracle: &dyn BlockOracle,
+    honest: Block,
+) -> CompareOne {
+    let keep = tip.height;
+    let hash = honest.block_hash();
+    let hex = hex_encode(serialize(&honest));
+    let ours = match verdict_from_accept(hub.accept_received_block(honest)) {
+        Ok(v) => v,
+        Err(msg) => return CompareOne::Harness(msg),
+    };
+    let reply = oracle.submitblock_hex(&hex);
+    if matches!(reply, OracleReply::Dead)
+        || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
+    {
+        if ours == DiffVerdict::Accept {
+            let _ = hub.rewind_to_height(keep);
+        }
+        let _ = oracle.core_rewind_to_height(keep);
+        return CompareOne::Harness("oracle dead");
+    }
+    let core = verdict_from_core_reply(&reply);
+    if matches!((ours, core), (DiffVerdict::Accept, DiffVerdict::Accept))
+        && hub.is_block_invalid(&hash)
+    {
+        let _ = hub.rewind_to_height(keep);
+        let _ = oracle.core_rewind_to_height(keep);
+        return CompareOne::Disagreed {
+            ours: true,
+            core: true,
+            hex,
+        };
+    }
+    match honest_replay_verdict(ours, core) {
+        CompareOne::Agreed { accept: true } => rewind_agreed(hub, oracle, keep, true),
+        CompareOne::Agreed { accept: false } => CompareOne::Agreed { accept: false },
+        CompareOne::Disagreed { ours, core, .. } => {
+            if ours {
+                let _ = hub.rewind_to_height(keep);
+            }
+            let _ = oracle.core_rewind_to_height(keep);
+            CompareOne::Disagreed { ours, core, hex }
+        }
+        other => {
+            if ours == DiffVerdict::Accept {
+                let _ = hub.rewind_to_height(keep);
+            }
+            let _ = oracle.core_rewind_to_height(keep);
+            other
+        }
+    }
+}
+
 fn compare_prepared(
+    hub: &ChainHub,
+    tip: &DiffTip,
+    oracle: &dyn BlockOracle,
+    block: Block,
+) -> CompareOne {
+    compare_prepared_twin(hub, tip, oracle, block, None)
+}
+
+fn compare_prepared_twin(
+    hub: &ChainHub,
+    tip: &DiffTip,
+    oracle: &dyn BlockOracle,
+    block: Block,
+    honest: Option<Block>,
+) -> CompareOne {
+    let offered_hash = block.block_hash();
+    let offered_len = block.txdata.len();
+    let prior = compare_offered(hub, tip, oracle, block);
+    let Some(honest) = honest else {
+        return prior;
+    };
+    // A different hash has no twin. The same body is already the honest block.
+    if honest.block_hash() != offered_hash || honest.txdata.len() == offered_len {
+        return prior;
+    }
+    replay_honest_twin(hub, tip, oracle, honest)
+}
+
+fn compare_offered(
     hub: &ChainHub,
     tip: &DiffTip,
     oracle: &dyn BlockOracle,
@@ -1972,6 +2111,40 @@ mod tests {
             "rpc error"
         );
         assert_eq!(parse_submitblock_json("not json").unwrap_err(), "malformed");
+    }
+
+    #[test]
+    fn honest_reject_against_core_accept_disagrees() {
+        assert_eq!(
+            honest_replay_verdict(DiffVerdict::Reject, DiffVerdict::Accept),
+            CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn same_hash_mutant_replays_the_honest_block() {
+        let (_dir, hub, tip) = tmp_diff_hub();
+        let honest = {
+            let raw = different_height1();
+            deserialize::<Block>(&raw).unwrap()
+        };
+        let mutant = same_hash_merkle_mutant(&honest).expect("duplicate tail");
+        assert_eq!(mutant.block_hash(), honest.block_hash());
+        assert!(!mutant.check_merkle_root());
+        let mock = MockOracle::new(OracleReply::Reason("bad-txnmrklroot".into()))
+            .then(OracleReply::NullAccept);
+        let cmp = compare_prepared_twin(&hub, &tip, &mock, mutant, Some(honest.clone()));
+        assert!(
+            matches!(cmp, CompareOne::Agreed { accept: true }),
+            "{cmp:?}"
+        );
+        assert_eq!(mock.submits.get(), 2, "honest submit follows the mutant");
+        assert!(!hub.is_block_invalid(&honest.block_hash()));
+        assert_eq!(hub.tip_height(), Some(0));
     }
 
     #[test]
