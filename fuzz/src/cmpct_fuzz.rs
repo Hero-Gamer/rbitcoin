@@ -23,7 +23,10 @@ use tokio::sync::mpsc;
 
 use rbitcoin_primitives::hex_encode;
 
-use crate::block_diff::{same_hash_merkle_mutant, BlockOracle, CompareOne, OracleReply};
+use crate::block_diff::{
+    same_hash_merkle_mutant, verdict_from_core_reply, BlockOracle, CompareOne, DiffVerdict,
+    OracleReply,
+};
 
 /// BIP324 application contents for `cmpctblock`.
 pub fn encode_cmpctblock_v2(hsi: &HeaderAndShortIds) -> Result<Vec<u8>, NetError> {
@@ -183,8 +186,31 @@ fn drain_one(hub: &ChainHub, block: bitcoin::Block) -> Result<(), NetError> {
     drain_pending_now(hub, &tx, &mut pending, &mut headers, &mut requested, true)
 }
 
+fn follow_core_verdict(oracle: &dyn BlockOracle, hex: &str) -> Result<DiffVerdict, CompareOne> {
+    let reply = oracle.submitblock_hex(hex);
+    if matches!(reply, OracleReply::Dead)
+        || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
+    {
+        return Err(CompareOne::Harness("oracle dead"));
+    }
+    let reason = match &reply {
+        OracleReply::Reason(s) => s.as_str(),
+        _ => "",
+    };
+    // `duplicate` means Core already has this body. `duplicate-invalid` is a
+    // reject, including the reply after `invalidateblock`.
+    if matches!(reply, OracleReply::NullAccept) || reason == "duplicate" {
+        return Ok(DiffVerdict::Accept);
+    }
+    if reason == "duplicate-invalid" {
+        return Ok(DiffVerdict::Reject);
+    }
+    Ok(verdict_from_core_reply(&reply))
+}
+
 /// Mutated compact body, then the honest block for that header, both through
-/// `drain_pending_now`. The second drain must leave the hub on that block.
+/// `drain_pending_now`. Core sees the honest body only. A tip that stays put
+/// is a hub reject, scored against Core's `submitblock` of that body.
 pub fn follow_invalid_cmpct(
     hub: &ChainHub,
     oracle: &dyn BlockOracle,
@@ -193,13 +219,7 @@ pub fn follow_invalid_cmpct(
 ) -> CompareOne {
     let succ_hash = successor.block_hash();
     if let Err(e) = drain_one(hub, mutated) {
-        return if cmpct_drain_disconnects(&e) {
-            CompareOne::Disagreed {
-                ours: false,
-                core: true,
-                hex: String::new(),
-            }
-        } else if cmpct_drain_harness(&e) {
+        return if cmpct_drain_harness(&e) {
             CompareOne::Harness("drain")
         } else {
             CompareOne::Disagreed {
@@ -210,33 +230,38 @@ pub fn follow_invalid_cmpct(
         };
     }
     if let Err(e) = drain_one(hub, successor.clone()) {
-        return if cmpct_drain_harness(&e) {
-            CompareOne::Harness("drain successor")
-        } else {
-            CompareOne::Disagreed {
+        if cmpct_drain_harness(&e) {
+            return CompareOne::Harness("drain successor");
+        }
+        if cmpct_drain_disconnects(&e) {
+            return CompareOne::Disagreed {
                 ours: false,
                 core: true,
                 hex: String::new(),
-            }
-        };
-    }
-    if hub.tip_hash() != Some(succ_hash) || hub.is_block_invalid(&succ_hash) {
-        return CompareOne::Disagreed {
-            ours: false,
-            core: true,
-            hex: succ_hash.to_string(),
-        };
+            };
+        }
     }
     let hex = hex_encode(serialize(&successor));
-    let reply = oracle.submitblock_hex(&hex);
-    if !matches!(reply, OracleReply::NullAccept) {
-        return CompareOne::Disagreed {
+    let core = match follow_core_verdict(oracle, &hex) {
+        Ok(v) => v,
+        Err(fate) => return fate,
+    };
+    let hub_accept = hub.tip_hash() == Some(succ_hash) && !hub.is_block_invalid(&succ_hash);
+    match (hub_accept, core) {
+        (true, DiffVerdict::Accept) => CompareOne::Agreed { accept: true },
+        (false, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
+        (true, DiffVerdict::Reject) => CompareOne::Disagreed {
             ours: true,
             core: false,
             hex,
-        };
+        },
+        (false, DiffVerdict::Accept) => CompareOne::Disagreed {
+            ours: false,
+            core: true,
+            hex,
+        },
+        (_, DiffVerdict::Skip) => CompareOne::Skipped,
     }
-    CompareOne::Agreed { accept: true }
 }
 
 /// When this compact case reconstructs locally, drain a same-hash mutant and
@@ -430,6 +455,62 @@ mod tests {
         );
         assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
         assert!(!hub.is_block_invalid(&honest.block_hash()));
+        assert_eq!(oracle.n.get(), 1);
+    }
+
+    #[test]
+    fn honest_body_both_reject_is_not_a_core_accept() {
+        use std::cell::Cell;
+
+        use rbitcoin_consensus::{genesis_block, mine_regtest_paying, Milestone};
+        use rbitcoin_net::ChainHub;
+
+        struct Rejects {
+            n: Cell<u32>,
+        }
+        impl BlockOracle for Rejects {
+            fn submitblock_hex(&self, _hex: &str) -> OracleReply {
+                self.n.set(self.n.get() + 1);
+                OracleReply::Reason("bad-txns-inputs-missingorspent".into())
+            }
+            fn liveness_ok(&self) -> bool {
+                true
+            }
+            fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_reconsider_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+        }
+
+        let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("cmpct-follow-reject");
+        let params = crate::block_diff::diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let genesis = genesis_block(&params);
+        let mix = sha256::Hash::hash(b"no-connect");
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![cmpct_fuzz_dummy_tx(mix, 0)],
+        );
+        let mutated = same_hash_merkle_mutant(&honest).expect("mutant");
+        let oracle = Rejects { n: Cell::new(0) };
+        let fate = follow_invalid_cmpct(&hub, &oracle, mutated, honest.clone());
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: false }),
+            "{fate:?}"
+        );
+        assert_ne!(hub.tip_hash(), Some(honest.block_hash()));
         assert_eq!(oracle.n.get(), 1);
     }
 

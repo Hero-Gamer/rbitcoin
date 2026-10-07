@@ -224,8 +224,8 @@ fn send_one(b: &Base, data: &[u8]) -> SendOutcome {
             SendOutcome::Compared
         }
         Ok(None) if ours.is_empty() => {
-            let hash = case.hsi.header.block_hash().to_string();
-            let _ = b.core.rpc.core_invalidate_hash(&hash);
+            // Do not invalidate before submitblock. Core would answer
+            // `duplicate-invalid` and the honest body would look like a split.
             if let Some(fate) = follow_reconstructed_cmpct(&b.hub, &b.core.rpc, &case) {
                 match fate {
                     CompareOne::Harness(msg) => harness_failure(msg),
