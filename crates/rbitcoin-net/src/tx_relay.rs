@@ -639,9 +639,12 @@ pub struct MempoolHub {
     /// about 8 MiB at 100k txs) so a 256-entry scan reads the oldest accepts
     /// and does not walk `wtxid_by_txid`.
     expiry_order: Mutex<BTreeMap<(u64, Wtxid), Txid>>,
-    /// Min-relay overlay (sat/kvB). Session FeeFilter reads this
-    /// without taking `inner`.
+    /// Min-relay overlay (sat/kvB). Readers avoid `inner`.
     min_relay_sat_kvb: AtomicU64,
+    /// Enforced admission floor (sat/kvB): configured min, the near-full
+    /// bump, and the decaying eviction floor. Handshake FeeFilter and
+    /// Electrum read this without taking `inner`.
+    fee_floor_sat_kvb: AtomicU64,
     /// Age-INV log: `(due_secs, accept_gen) → (txid, wtxid)`. Not `inner`.
     age_inv: Mutex<BTreeMap<(u64, u64), (Txid, Wtxid)>>,
     /// Min live `accept_at` (`u64::MAX` if empty).
@@ -803,6 +806,9 @@ impl MempoolHub {
             min_relay_sat_kvb: AtomicU64::new(
                 rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
             ),
+            fee_floor_sat_kvb: AtomicU64::new(
+                rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB,
+            ),
             fee_deltas: Mutex::new(HashMap::new()),
             template_updates: AtomicU64::new(0),
             age_inv: Mutex::new(BTreeMap::new()),
@@ -818,6 +824,7 @@ impl MempoolHub {
             u.retain(|t| hub.contains(t));
         }
         hub.reindex_live_scripthashes();
+        hub.publish_fee_floor();
         Ok(Arc::new(hub))
     }
 
@@ -1238,16 +1245,22 @@ impl MempoolHub {
                 }
             }
         }
-        let mut n = 0usize;
-        let mut g = self.lock_write();
-        for t in kill.iter().rev() {
-            if g.graph.get(t).is_some() && g.remove_txid(t).is_ok() {
-                self.unindex_txid(t);
-                n += 1;
+        let n = {
+            let mut n = 0usize;
+            let mut g = self.lock_write();
+            for t in kill.iter().rev() {
+                if g.graph.get(t).is_some() && g.remove_txid(t).is_ok() {
+                    self.unindex_txid(t);
+                    n += 1;
+                }
             }
-        }
+            if n > 0 {
+                self.note_template_update();
+            }
+            n
+        };
         if n > 0 {
-            self.note_template_update();
+            self.publish_fee_floor();
         }
         n
     }
@@ -1848,9 +1861,15 @@ impl MempoolHub {
                 self.meter_accept_wall(us, true);
                 self.publish_admitted(tx, &r, &prevouts, utxo);
                 let _ = self.expire_stale();
+                self.publish_fee_floor();
                 Ok(r)
             }
-            Err(e) => self.finish_accept_err(us, e),
+            Err(e) => {
+                // Eviction inside the commit may have raised the rolling floor
+                // before the error returned. The write guard is already gone.
+                self.publish_fee_floor();
+                self.finish_accept_err(us, e)
+            }
         }
     }
 
@@ -1883,9 +1902,16 @@ impl MempoolHub {
         // Parent is live until the child commits (or we roll it back). A
         // concurrent spender of the parent that lands in this window survives
         // `remove_txid(parent)` if the child then fails.
-        let parent_res = {
+        let parent_commit = {
             let mut g = self.lock_write();
-            g.commit_after_script(&parent, prep_p).ok()?
+            g.commit_after_script(&parent, prep_p)
+        };
+        let parent_res = match parent_commit {
+            Ok(r) => r,
+            Err(_) => {
+                self.publish_fee_floor();
+                return None;
+            }
         };
         let spec_c = AdmitSpec {
             report_orphans: false,
@@ -1912,10 +1938,12 @@ impl MempoolHub {
                 self.publish_admitted(&parent, &parent_res, &prevouts_p, utxo);
                 self.publish_admitted(child, &r, &prevouts_c, utxo);
                 let _ = self.expire_stale();
+                self.publish_fee_floor();
                 Some(r)
             }
             Err(_) => {
                 self.rollback_1p1c_parent(&parent_res.txid);
+                self.publish_fee_floor();
                 None
             }
         }
@@ -1959,6 +1987,8 @@ impl MempoolHub {
             self.unindex_txid(tid);
             deltas.remove(tid);
         }
+        drop(deltas);
+        self.publish_fee_floor();
     }
 
     fn note_if_accept_failure(&self, tx: &Transaction, e: &AcceptError) {
@@ -2381,6 +2411,9 @@ impl MempoolHub {
                 }
                 Err(e) => {
                     self.rollback_package_accepted(&accepted);
+                    // The first member can evict and fail with nothing to roll
+                    // back, so the rollback publish does not run.
+                    self.publish_fee_floor();
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());
@@ -2417,6 +2450,7 @@ impl MempoolHub {
             self.promote_orphans_staged(r.txid, &utxo);
         }
         self.note_template_update();
+        self.publish_fee_floor();
         Ok(accepted)
     }
 
@@ -2797,6 +2831,7 @@ impl MempoolHub {
                 break;
             }
         }
+        self.publish_fee_floor();
     }
 
     /// This node's own block budget (GBT / `generate`): template weight and
@@ -2871,7 +2906,24 @@ impl MempoolHub {
     }
 
     pub fn mempool_min_fee_sat_kvb(&self) -> u64 {
-        self.lock_read().mempool_min_fee_sat_kvb()
+        self.publish_fee_floor()
+    }
+
+    /// Reactor-safe load of the last published admission floor (sat/kvB).
+    pub fn fee_floor_sat_kvb(&self) -> u64 {
+        self.fee_floor_sat_kvb.load(Ordering::Acquire)
+    }
+
+    /// Recompute the admission floor and publish it. Takes `inner` read,
+    /// so callers must be off the reactor and must not already hold `inner`.
+    ///
+    /// The guard stays alive across the store. Dropping it first lets a
+    /// slower publisher write the snapshot it read before this one.
+    pub fn publish_fee_floor(&self) -> u64 {
+        let g = self.lock_read();
+        let floor = g.mempool_min_fee_sat_kvb();
+        self.fee_floor_sat_kvb.store(floor, Ordering::Release);
+        floor
     }
 
     /// Live txid + fee + weight **without** cloning bodies (RPC/Esplora stats).
@@ -3116,6 +3168,7 @@ impl MempoolHub {
     pub fn set_min_relay_sat_kvb(&self, sat_kvb: u64) {
         self.min_relay_sat_kvb.store(sat_kvb, Ordering::Release);
         self.lock_write().set_min_relay_sat_kvb(sat_kvb);
+        self.publish_fee_floor();
     }
 
     pub fn min_relay_sat_kvb(&self) -> u64 {
@@ -5703,6 +5756,79 @@ mod tests {
         assert!(hub.tx_inv_due(&poor.compute_wtxid()));
         assert!(hub.tx_inv_due(&sponsored.compute_wtxid()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A commit that evicts and then returns `mempool full` has already raised
+    /// the rolling floor. The published atomic is what peers and Electrum read.
+    #[test]
+    fn failed_commit_publishes_raised_fee_floor() {
+        let (_store, owned_q, owned_cbs) = pad_cbs(3);
+        let q = &owned_q;
+        let cbs = owned_cbs.as_slice();
+        for package in [false, true] {
+            let dir = tmp();
+            let hub = MempoolHub::open_with_weight(&dir, Arc::clone(q), 50_000).unwrap();
+            hub.set_relay_enabled(true);
+            // 520-byte pushes stay within the script element cap. Nineteen of
+            // them plus a small child exceed a 50_000 WU budget; the parent
+            // script is still spendable with an empty signature.
+            let mut fat = Vec::with_capacity(10_000);
+            for _ in 0..19 {
+                fat.push(0x4d);
+                fat.extend_from_slice(&520u16.to_le_bytes());
+                fat.extend(std::iter::repeat_n(0u8, 520));
+                fat.push(0x75);
+            }
+            fat.push(0x51);
+            let parent = spend_true(cbs[0], 100_000, ScriptBuf::from_bytes(fat));
+            assert!(
+                hub.accept_tx(&parent).is_ok(),
+                "package={package}: parent must fit"
+            );
+            let advertised = hub.fee_floor_sat_kvb();
+            let child = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent.compute_txid(),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(50_0000_0000 - 100_000 - 200_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51; 9_000]),
+                }],
+            };
+            let err = if package {
+                hub.accept_package(std::slice::from_ref(&child)).map(|_| ())
+            } else {
+                hub.accept_tx(&child).map(|_| ())
+            };
+            assert!(
+                matches!(err, Err(AcceptError::Policy("mempool full"))),
+                "package={package}: child must be evicted with its parent, got {err:?}"
+            );
+            assert!(!hub.try_contains(&child.compute_txid()));
+            assert!(
+                !hub.try_contains(&parent.compute_txid()),
+                "package={package}: parent chunk must have been evicted"
+            );
+            let enforced = hub.lock_read().mempool_min_fee_sat_kvb();
+            assert!(
+                enforced > advertised,
+                "package={package}: eviction must raise the floor ({advertised} -> {enforced})"
+            );
+            assert_eq!(
+                hub.fee_floor_sat_kvb(),
+                enforced,
+                "package={package}: failed commit must publish the raised floor, still {advertised}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

@@ -546,6 +546,20 @@ fn getmempoolinfo_permitbaremultisig_is_always_true() {
         serde_json::to_string(&mem["total_fee"]).unwrap(),
         "0.00000000"
     );
+    ctx.mempool.as_ref().unwrap().set_min_relay_sat_kvb(2_500);
+    let raised = dispatch(&ctx, "getmempoolinfo", vec![]).unwrap();
+    assert_eq!(
+        serde_json::to_string(&raised["minrelaytxfee"]).unwrap(),
+        "0.00002500"
+    );
+    assert_eq!(
+        serde_json::to_string(&raised["incrementalrelayfee"]).unwrap(),
+        "0.00000100"
+    );
+    assert_eq!(
+        serde_json::to_string(&raised["mempoolminfee"]).unwrap(),
+        "0.00002500"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

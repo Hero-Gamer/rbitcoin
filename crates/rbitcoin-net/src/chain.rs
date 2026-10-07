@@ -698,13 +698,15 @@ impl ChainHub {
         u64::from(best.time).saturating_sub(u64::from(hdr.time)) < STALE_RELAY_AGE_LIMIT_SECS
     }
 
-    /// BIP133 feefilter we advertise: rounded MAX_MONEY while IBD, else minrelay.
+    /// BIP133 feefilter we advertise: rounded MAX_MONEY while IBD, else the
+    /// published admission floor (configured min, near-full bump, or rolling
+    /// eviction). The floor is an atomic so this stays off `inner`.
     pub fn feefilter_sat_kvb(&self) -> u64 {
         if self.in_ibd() {
             return IBD_FEEFILTER_SAT_KVB;
         }
         self.mempool()
-            .map(|m| m.min_relay_sat_kvb())
+            .map(|m| m.fee_floor_sat_kvb())
             .unwrap_or(rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB)
     }
 
@@ -4055,6 +4057,31 @@ mod tests {
             hub.feefilter_sat_kvb(),
             rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn feefilter_sat_kvb_tracks_enforced_floor() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let gen = hub.tip_hash().unwrap();
+        let now = 1_700_000_000u32;
+        hub.clock.set_mock(i64::from(now));
+        hub.accept_block(mine(gen, now, 1)).unwrap();
+        assert!(!hub.in_ibd());
+        let mp = crate::tx_relay::MempoolHub::open_with_weight(
+            dir.path().join("mp"),
+            Arc::clone(&hub.query),
+            0,
+        )
+        .unwrap();
+        assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+        let min = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
+        // A zero weight cap is within one standard tx of full, so the floor
+        // is min relay plus one incremental step.
+        assert_eq!(hub.feefilter_sat_kvb(), min + min);
+        mp.set_min_relay_sat_kvb(1_000);
+        assert_eq!(hub.feefilter_sat_kvb(), 1_100);
         let _ = std::fs::remove_dir_all(dir);
     }
 

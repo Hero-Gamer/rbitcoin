@@ -9,7 +9,9 @@ use bitcoin::{BlockHash, Wtxid};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use tokio::sync::mpsc;
 
@@ -338,6 +340,8 @@ pub struct LivePeer {
     last_block: AtomicU64,
     last_transaction: AtomicU64,
     minfeefilter_sat_kvb: AtomicU64,
+    /// Last BIP133 feefilter we sent (`-1` = none yet).
+    sent_feefilter_sat_kvb: AtomicI64,
     /// Shared with the TCP reader so split-header bytes count (`p2p_invalid_messages`).
     wire_recv: Mutex<Option<std::sync::Arc<AtomicU64>>>,
     wire_sent: Mutex<Option<std::sync::Arc<AtomicU64>>>,
@@ -995,6 +999,15 @@ impl LivePeer {
 
     pub fn minfeefilter_sat_kvb(&self) -> u64 {
         self.minfeefilter_sat_kvb.load(Ordering::Relaxed)
+    }
+
+    pub fn note_sent_feefilter(&self, sat_kvb: i64) {
+        self.sent_feefilter_sat_kvb
+            .store(sat_kvb, Ordering::Relaxed);
+    }
+
+    pub fn sent_feefilter_sat_kvb(&self) -> i64 {
+        self.sent_feefilter_sat_kvb.load(Ordering::Relaxed)
     }
 
     pub fn clock_now(&self) -> u64 {
@@ -2291,6 +2304,7 @@ impl PeerHub {
             last_block: AtomicU64::new(0),
             last_transaction: AtomicU64::new(0),
             minfeefilter_sat_kvb: AtomicU64::new(0),
+            sent_feefilter_sat_kvb: AtomicI64::new(-1),
             wire_recv: Mutex::new(None),
             wire_sent: Mutex::new(None),
             failed_cmpct: Mutex::new(HashSet::new()),
@@ -2358,7 +2372,12 @@ impl PeerHub {
                 continue;
             }
             if let Some(tx) = s.writer() {
-                let _ = tx.send(PeerOut::Msg(NetworkMessage::FeeFilter(sat_kvb)));
+                if tx
+                    .send(PeerOut::Msg(NetworkMessage::FeeFilter(sat_kvb)))
+                    .is_ok()
+                {
+                    s.note_sent_feefilter(sat_kvb);
+                }
             }
         }
     }

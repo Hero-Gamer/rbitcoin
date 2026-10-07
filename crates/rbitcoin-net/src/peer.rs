@@ -1267,6 +1267,7 @@ async fn on_heartbeat(
     let Some(s) = session else {
         return Ok(());
     };
+    maybe_queue_feefilter(hub, out_tx, s);
     if addrfetch_timed_out(s) {
         rbitcoin_log::debug!("addrfetch connection timeout");
         s.request_disconnect();
@@ -1605,7 +1606,14 @@ pub async fn peer_session_with(
         let _ = write_v2_msg(&mut writer, NetworkMessage::Ping(n)).await;
     }
     if let Some(fee_sat) = outbound_feefilter_sats(&hub, meta.session.as_deref()) {
-        let _ = write_v2_msg(&mut writer, NetworkMessage::FeeFilter(fee_sat)).await;
+        if write_v2_msg(&mut writer, NetworkMessage::FeeFilter(fee_sat))
+            .await
+            .is_ok()
+        {
+            if let Some(s) = meta.session.as_ref() {
+                s.note_sent_feefilter(fee_sat);
+            }
+        }
     }
 
     let (out_tx, out_rx) = mpsc::unbounded_channel::<PeerOut>();
@@ -4920,6 +4928,23 @@ fn compact_claimed_height(hub: &ChainHub, header: &bitcoin::block::Header) -> Op
 /// Compact whose claimed chain work is below the 144-block anti-DoS buffer.
 fn compact_header_low_work(hub: &ChainHub, header: &bitcoin::block::Header) -> bool {
     hub.header_below_anti_dos(header)
+}
+
+/// Resend BIP133 feefilter when the published floor moved since the last send.
+fn maybe_queue_feefilter(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    session: &crate::peers::LivePeer,
+) {
+    let Some(fee) = outbound_feefilter_sats(hub, Some(session)) else {
+        return;
+    };
+    if session.sent_feefilter_sat_kvb() == fee {
+        return;
+    }
+    if queue_out(out_tx, NetworkMessage::FeeFilter(fee)).is_ok() {
+        session.note_sent_feefilter(fee);
+    }
 }
 
 /// BIP133 feefilter to send after handshake. None = do not send (blocksonly,

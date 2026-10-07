@@ -1997,12 +1997,18 @@ fn dispatch_pinned(
         "blockchain.transaction.broadcast" => broadcast_raw_tx(params, config, mempool),
         "blockchain.transaction.broadcast_package" => broadcast_package(params, config, mempool),
         "mempool.get_info" => {
-            let min = MempoolHub::relay_fee_btc_per_kb();
+            let inc = MempoolHub::relay_fee_btc_per_kb();
+            let min_relay = mempool
+                .map(|m| m.min_relay_sat_kvb() as f64 / 100_000_000.0)
+                .unwrap_or(inc);
+            let floor = mempool
+                .map(|m| m.fee_floor_sat_kvb() as f64 / 100_000_000.0)
+                .unwrap_or(inc);
             let unbroadcast = mempool.map(|m| m.unbroadcast_count()).unwrap_or(0);
             Ok(json!({
-                "minrelaytxfee": min,
-                "mempoolminfee": min,
-                "incrementalrelayfee": min,
+                "minrelaytxfee": min_relay,
+                "mempoolminfee": floor,
+                "incrementalrelayfee": inc,
                 "unbroadcastcount": unbroadcast,
             }))
         }
@@ -2038,7 +2044,10 @@ fn dispatch_pinned(
             Ok(json!(fee))
         }
         "blockchain.relayfee" => {
-            let fee = MempoolHub::relay_fee_btc_per_kb();
+            let inc = MempoolHub::relay_fee_btc_per_kb();
+            let fee = mempool
+                .map(|m| m.fee_floor_sat_kvb() as f64 / 100_000_000.0)
+                .unwrap_or(inc);
             Ok(json!(fee))
         }
         "mempool.get_fee_histogram" => {
