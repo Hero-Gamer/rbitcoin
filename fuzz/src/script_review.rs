@@ -375,14 +375,6 @@ pub fn compare_at_height(
     height: u32,
     block_hash: &[u8; 32],
     spend_tx: (Vec<TxOut>, Transaction),
-) -> KernelCmp {
-    compare_at_height_prefixed(height, block_hash, spend_tx, &[])
-}
-
-fn compare_at_height_prefixed(
-    height: u32,
-    block_hash: &[u8; 32],
-    spend_tx: (Vec<TxOut>, Transaction),
     prefix: &[u8],
 ) -> KernelCmp {
     let params = ChainParams::mainnet();
@@ -490,10 +482,10 @@ fn compare_structured(data: &[u8], input: &[u8]) -> Option<KernelCmp> {
         SHAPE_V0 => compare_v0_at_payload_height(payload, input),
         SHAPE_DERSIG => {
             let height = payload_height(payload);
-            compare_at_height_prefixed(height, &[0x11; 32], nullfail_spend(), input)
+            compare_at_height(height, &[0x11; 32], nullfail_spend(), input)
         }
         SHAPE_BIP16 => {
-            compare_at_height_prefixed(170_060, &BIP16_EXCEPTION_MAINNET, bip16_bare_spend(), input)
+            compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, bip16_bare_spend(), input)
         }
         SHAPE_SIGNET => {
             let challenge = if payload.is_empty() {
@@ -529,7 +521,7 @@ fn compare_v0_at_payload_height(payload: &[u8], prefix: &[u8]) -> KernelCmp {
     if !ChainParams::mainnet().segwit_active_at(height) {
         return KernelCmp::Skip;
     }
-    compare_at_height_prefixed(height, &[0x11; 32], v0_program_spend(), prefix)
+    compare_at_height(height, &[0x11; 32], v0_program_spend(), prefix)
 }
 
 fn payload_height(payload: &[u8]) -> u32 {
@@ -656,7 +648,7 @@ mod tests {
         assert_eq!(ours, core, "for_block and GetBlockScriptFlags diverge");
         assert!(!core, "empty v0 witness rejects once WITNESS is on");
         assert!(matches!(
-            compare_at_height(height, &hash, (prev, tx)),
+            compare_at_height(height, &hash, (prev, tx), &[]),
             KernelCmp::Agree { accept: false }
         ));
 
@@ -729,7 +721,7 @@ mod tests {
         let ours_flags =
             ScriptVerifyFlags::for_block(&params, 170_060, &BIP16_EXCEPTION_MAINNET, 0);
         let ours = verify_tx_scripts_with_flags(prev.clone(), tx.clone(), ours_flags).is_ok();
-        match compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, (prev, tx)) {
+        match compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, (prev, tx), &[]) {
             KernelCmp::Agree { accept } if accept == ours && ours == core => {}
             KernelCmp::Disagree { ours: o, core: c } if o == ours && c == core && ours != core => {}
             other => panic!("bip16 ours={ours} core={core}: {other:?}"),

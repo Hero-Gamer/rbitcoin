@@ -2,7 +2,7 @@
 
 use bitcoin::absolute::LockTime;
 use bitcoin::bip152::{HeaderAndShortIds, ShortId};
-use bitcoin::consensus::encode::deserialize;
+use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::GetHeadersMessage;
@@ -14,8 +14,16 @@ use bitcoin::{
 use rbitcoin_consensus::{
     genesis_block, grind_regtest_pow, mine_regtest_paying, ChainParams, REGTEST_BLOCK_SPACING,
 };
-use rbitcoin_net::{encode_v2_contents, shortid_map_from_txs, try_reconstruct, NetError};
-use std::collections::HashSet;
+use rbitcoin_net::{
+    drain_pending_now, encode_v2_contents, shortid_map_from_txs, try_reconstruct, ChainHub,
+    NetError, PendingBlocks,
+};
+use std::collections::{HashMap, HashSet};
+use tokio::sync::mpsc;
+
+use rbitcoin_primitives::hex_encode;
+
+use crate::block_diff::{same_hash_merkle_mutant, BlockOracle, CompareOne, OracleReply};
 
 /// BIP324 application contents for `cmpctblock`.
 pub fn encode_cmpctblock_v2(hsi: &HeaderAndShortIds) -> Result<Vec<u8>, NetError> {
@@ -115,6 +123,115 @@ pub fn prepare_cmpct_fuzz_case(data: &[u8]) -> Option<CmpctFuzzCase> {
 /// missing ring, not a split. Omitting a Core index disagrees.
 pub fn cmpct_getblocktxn_agrees(ours: &[u64], core: &[u64]) -> bool {
     core.iter().all(|i| ours.contains(i))
+}
+
+/// A drain error that drops the peer. That is a disagreement, not a skip.
+pub fn cmpct_drain_disconnects(err: &NetError) -> bool {
+    matches!(
+        err,
+        NetError::Disconnected
+            | NetError::Protocol(_)
+            | NetError::V1Peer
+            | NetError::Bip324(_)
+            | NetError::MessageTooLarge(_)
+    )
+}
+
+fn cmpct_drain_harness(err: &NetError) -> bool {
+    matches!(
+        err,
+        NetError::Io(_)
+            | NetError::Timeout
+            | NetError::Store(_)
+            | NetError::Cancelled
+            | NetError::Encode(_)
+    )
+}
+
+/// Full local reconstruct, when the compact case has one.
+pub fn reconstructed_cmpct_block(case: &CmpctFuzzCase) -> Option<bitcoin::Block> {
+    if !rbitcoin_net::prefilled_indexes_ok(&case.hsi) {
+        return None;
+    }
+    let avail = shortid_map_from_txs(&case.hsi.header, case.hsi.nonce, 2, &case.fill_txs);
+    try_reconstruct(&case.hsi, &avail, 2).ok()
+}
+
+fn drain_one(hub: &ChainHub, block: bitcoin::Block) -> Result<(), NetError> {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut pending = PendingBlocks::new();
+    pending.insert(block.block_hash(), block);
+    let mut headers = HashMap::new();
+    let mut requested = HashSet::new();
+    drain_pending_now(hub, &tx, &mut pending, &mut headers, &mut requested, true)
+}
+
+/// Mutated compact body, then the honest block for that header, both through
+/// `drain_pending_now`. The second drain must leave the hub on that block.
+pub fn follow_invalid_cmpct(
+    hub: &ChainHub,
+    oracle: &dyn BlockOracle,
+    mutated: bitcoin::Block,
+    successor: bitcoin::Block,
+) -> CompareOne {
+    let succ_hash = successor.block_hash();
+    if let Err(e) = drain_one(hub, mutated) {
+        return if cmpct_drain_disconnects(&e) {
+            CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            }
+        } else if cmpct_drain_harness(&e) {
+            CompareOne::Harness("drain")
+        } else {
+            CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            }
+        };
+    }
+    if let Err(e) = drain_one(hub, successor.clone()) {
+        return if cmpct_drain_harness(&e) {
+            CompareOne::Harness("drain successor")
+        } else {
+            CompareOne::Disagreed {
+                ours: false,
+                core: true,
+                hex: String::new(),
+            }
+        };
+    }
+    if hub.tip_hash() != Some(succ_hash) || hub.is_block_invalid(&succ_hash) {
+        return CompareOne::Disagreed {
+            ours: false,
+            core: true,
+            hex: succ_hash.to_string(),
+        };
+    }
+    let hex = hex_encode(serialize(&successor));
+    let reply = oracle.submitblock_hex(&hex);
+    if !matches!(reply, OracleReply::NullAccept) {
+        return CompareOne::Disagreed {
+            ours: true,
+            core: false,
+            hex,
+        };
+    }
+    CompareOne::Agreed { accept: true }
+}
+
+/// When this compact case reconstructs locally, drain a same-hash mutant and
+/// then the honest body. `None` means there is no local body to replay.
+pub fn follow_reconstructed_cmpct(
+    hub: &ChainHub,
+    oracle: &dyn BlockOracle,
+    case: &CmpctFuzzCase,
+) -> Option<CompareOne> {
+    let block = reconstructed_cmpct_block(case)?;
+    let mutated = same_hash_merkle_mutant(&block)?;
+    Some(follow_invalid_cmpct(hub, oracle, mutated, block))
 }
 
 /// Missing indexes using the case fill set (empty = mempool-cold).
@@ -234,6 +351,69 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures")
             .join(name)
+    }
+
+    #[test]
+    fn drain_disconnect_is_a_disagreement() {
+        let err = NetError::Disconnected;
+        assert!(cmpct_drain_disconnects(&err));
+        assert!(!cmpct_drain_disconnects(&NetError::Timeout));
+    }
+
+    #[test]
+    fn invalid_compact_then_honest_body_advances_the_tip() {
+        use std::cell::Cell;
+
+        use rbitcoin_consensus::{genesis_block, mine_regtest_paying, Milestone};
+        use rbitcoin_net::ChainHub;
+
+        struct Accepts {
+            n: Cell<u32>,
+        }
+        impl BlockOracle for Accepts {
+            fn submitblock_hex(&self, _hex: &str) -> OracleReply {
+                self.n.set(self.n.get() + 1);
+                OracleReply::NullAccept
+            }
+            fn liveness_ok(&self) -> bool {
+                true
+            }
+            fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_reconsider_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+                Ok(())
+            }
+        }
+
+        let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("cmpct-follow");
+        let params = crate::block_diff::diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let genesis = genesis_block(&params);
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+        );
+        let mutated = same_hash_merkle_mutant(&honest).expect("mutant");
+        let oracle = Accepts { n: Cell::new(0) };
+        let fate = follow_invalid_cmpct(&hub, &oracle, mutated, honest.clone());
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: true }),
+            "{fate:?}"
+        );
+        assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
+        assert!(!hub.is_block_invalid(&honest.block_hash()));
+        assert_eq!(oracle.n.get(), 1);
     }
 
     #[test]

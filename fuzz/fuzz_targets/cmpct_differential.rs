@@ -7,21 +7,26 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use libfuzzer_sys::fuzz_target;
+use rbitcoin_consensus::Milestone;
 use rbitcoin_fuzz::{
-    cmpct_getblocktxn_agrees, cmpct_missing_for_case, encode_cmpctblock_v2, encode_pong_v2,
-    encode_sendcmpct_hb_v2, encode_tx_v2, prepare_cmpct_fuzz_case, BlockOracle,
+    cmpct_getblocktxn_agrees, cmpct_missing_for_case, diff_regtest_params, encode_cmpctblock_v2,
+    encode_pong_v2, encode_sendcmpct_hb_v2, encode_tx_v2, follow_reconstructed_cmpct,
+    prepare_cmpct_fuzz_case, BlockOracle, CompareOne,
 };
 use rbitcoin_fuzz::{spawn_bitcoind_p2p, tmp_dir, CoreChild};
 use rbitcoin_net::{classify_v2_cmpct_peer, CmpctPeerFrame, NetError, V2PlainSession};
+use rbitcoin_query::Query;
 use tokio::net::TcpStream;
 use tokio::runtime::{Builder, Runtime};
 
 struct Base {
     core: CoreChild,
+    hub: rbitcoin_net::ChainHub,
     p2p: SocketAddr,
     rt: Runtime,
     session: Mutex<Option<V2PlainSession>>,
     _datadir: PathBuf,
+    _store: PathBuf,
 }
 
 static BASE: OnceLock<Base> = OnceLock::new();
@@ -56,8 +61,16 @@ fn base() -> &'static Base {
             harness_failure("RBITCOIN_CORE_BITCOIND unset");
         }
         let datadir = tmp_dir("rbtc-cmpct-core");
+        let store = tmp_dir("rbtc-cmpct-store");
         let (core, p2p) = spawn_bitcoind_p2p(std::path::Path::new(&bin), &datadir)
             .unwrap_or_else(|e| harness_failure(&e));
+        let q = Query::open_or_create_tiny(store.join("store")).unwrap_or_else(|e| {
+            harness_failure(&format!("query open: {e}"));
+        });
+        let params = diff_regtest_params();
+        let hub = rbitcoin_net::ChainHub::new(q, params, Milestone::NONE);
+        hub.ensure_genesis()
+            .unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
         let rt = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -67,10 +80,12 @@ fn base() -> &'static Base {
             .unwrap_or_else(|e| harness_failure(&format!("initial handshake: {e}")));
         Base {
             core,
+            hub,
             p2p,
             rt,
             session: Mutex::new(Some(session)),
             _datadir: datadir,
+            _store: store,
         }
     })
 }
@@ -211,6 +226,23 @@ fn send_one(b: &Base, data: &[u8]) -> SendOutcome {
         Ok(None) if ours.is_empty() => {
             let hash = case.hsi.header.block_hash().to_string();
             let _ = b.core.rpc.core_invalidate_hash(&hash);
+            if let Some(fate) = follow_reconstructed_cmpct(&b.hub, &b.core.rpc, &case) {
+                match fate {
+                    CompareOne::Harness(msg) => harness_failure(msg),
+                    CompareOne::Disagreed { ours, core, hex } => {
+                        panic!("cmpct follow split ours={ours} core={core} hex={hex}");
+                    }
+                    CompareOne::Agreed { accept: true } => {
+                        if b.hub.rewind_to_height(0).is_err() {
+                            harness_failure("cmpct follow rewind");
+                        }
+                        if b.core.rpc.core_rewind_to_height(0).is_err() {
+                            harness_failure("cmpct follow core rewind");
+                        }
+                    }
+                    _ => {}
+                }
+            }
             SendOutcome::Compared
         }
         Ok(None) => SendOutcome::Live,
