@@ -114,6 +114,19 @@ pub fn header_sequence_agrees(
     returned.iter().all(|hash| known.contains(hash))
 }
 
+/// `None` is an empty Core answer. Both sides are at genesis, and that is
+/// not a comparison. `Some(false)` is a hash the hub does not have.
+pub fn header_answer_counts(
+    returned: &[bitcoin::BlockHash],
+    known: &[bitcoin::BlockHash],
+) -> Option<bool> {
+    if returned.is_empty() {
+        None
+    } else {
+        Some(header_sequence_agrees(returned, known))
+    }
+}
+
 pub fn p2p_sequence_ping_comparisons(data: &[u8]) -> u32 {
     parse_p2p_sequence(data)
         .iter()
@@ -171,6 +184,9 @@ mod tests {
         assert!(header_sequence_agrees(&[], &[known]));
         assert!(header_sequence_agrees(&[known], &[known]));
         assert!(!header_sequence_agrees(&[other], &[known]));
+        assert_eq!(header_answer_counts(&[], &[known]), None);
+        assert_eq!(header_answer_counts(&[known], &[known]), Some(true));
+        assert_eq!(header_answer_counts(&[other], &[known]), Some(false));
     }
 
     #[test]

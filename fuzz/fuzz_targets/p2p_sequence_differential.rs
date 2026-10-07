@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use bitcoin::hashes::Hash;
@@ -14,13 +14,13 @@ use rbitcoin_fuzz::{
     check_diff_env, cmpct_getblocktxn_agrees, cmpct_missing_for_case, compare_one,
     compare_tx_bytes, diff_regtest_params, encode_cmpctblock_v2, encode_feefilter_payload,
     encode_getheaders_empty_v2, encode_getheaders_v2, encode_inv_payload, encode_ping_v2,
-    encode_pong_v2, encode_tx_v2, genesis_diff_tip, header_sequence_agrees, parse_p2p_sequence,
+    encode_pong_v2, encode_tx_v2, genesis_diff_tip, header_answer_counts, parse_p2p_sequence,
     prepare_cmpct_fuzz_case, spawn_bitcoind_p2p, tmp_dir, BlockOracle, CompareOne, CoreChild,
     DiffTip, P2pSeqKind,
 };
 use rbitcoin_net::{
-    classify_v2_cmpct_peer, v2_header_hashes, ChainHub, CmpctPeerFrame, NetError, P2PNode,
-    V2PlainSession,
+    classify_v2_cmpct_peer, v2_header_hashes, ChainHub, CmpctPeerFrame, MempoolHub, NetError,
+    P2PNode, V2PlainSession,
 };
 use rbitcoin_query::Query;
 use tokio::net::TcpStream;
@@ -31,6 +31,7 @@ struct Base {
     core: CoreChild,
     tip: std::sync::Mutex<DiffTip>,
     rt: Runtime,
+    p2p: SocketAddr,
     session: Mutex<Option<V2PlainSession>>,
     node: Mutex<P2PNode>,
     _store: PathBuf,
@@ -77,6 +78,12 @@ fn base() -> &'static Base {
         let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
         hub.ensure_genesis()
             .unwrap_or_else(|e| harness_failure(&format!("genesis: {e}")));
+        let mp = MempoolHub::open(store.join("mp"), Arc::clone(&hub.query))
+            .unwrap_or_else(|e| harness_failure(&format!("mempool: {e}")));
+        mp.set_relay_enabled(true);
+        if hub.attach_mempool(mp).is_err() {
+            harness_failure("attach mempool");
+        }
         let (core, p2p) = spawn_bitcoind_p2p(std::path::Path::new(&bin), &core_dir)
             .unwrap_or_else(|e| harness_failure(&e));
         let rt = Builder::new_current_thread()
@@ -102,6 +109,7 @@ fn base() -> &'static Base {
             core,
             tip: std::sync::Mutex::new(genesis_diff_tip(&params)),
             rt,
+            p2p,
             session: Mutex::new(Some(session)),
             node: Mutex::new(node),
             _store: store,
@@ -146,15 +154,45 @@ async fn ping_session(sess: &mut V2PlainSession) -> bool {
     false
 }
 
+fn ensure_session(b: &Base) -> bool {
+    let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_some() {
+        return true;
+    }
+    match b.rt.block_on(connect_session(b.p2p)) {
+        Ok(s) => {
+            *slot = Some(s);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn close_session(slot: &mut Option<V2PlainSession>) {
+    if let Some(mut dead) = slot.take() {
+        dead.close();
+    }
+}
+
 fn ping_compare(b: &Base) -> bool {
+    if !ensure_session(b) {
+        return false;
+    }
     let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(sess) = slot.as_mut() else {
         return false;
     };
-    b.rt.block_on(ping_session(sess))
+    let ok = b.rt.block_on(ping_session(sess));
+    if !ok {
+        close_session(&mut slot);
+    }
+    ok
 }
 
 fn headers_live(b: &Base) -> bool {
+    if !ensure_session(b) {
+        return false;
+    }
     let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(sess) = slot.as_mut() else {
         return false;
@@ -162,8 +200,13 @@ fn headers_live(b: &Base) -> bool {
     let Ok(frame) = encode_getheaders_empty_v2() else {
         return false;
     };
-    b.rt.block_on(async { sess.write_contents(&frame).await.ok() })
-        .is_some()
+    let ok =
+        b.rt.block_on(async { sess.write_contents(&frame).await.ok() })
+            .is_some();
+    if !ok {
+        close_session(&mut slot);
+    }
+    ok
 }
 
 enum StepFate {
@@ -215,6 +258,9 @@ fn getheaders_step(b: &Base) -> StepFate {
     ) else {
         return StepFate::Skip;
     };
+    if !ensure_session(b) {
+        return StepFate::Skip;
+    }
     let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(sess) = slot.as_mut() else {
         return StepFate::Skip;
@@ -230,7 +276,7 @@ fn getheaders_step(b: &Base) -> StepFate {
                 Err(_) | Ok(Err(_)) => return None,
                 Ok(Ok(contents)) => {
                     if let Some(hashes) = v2_header_hashes(&contents) {
-                        return Some(header_sequence_agrees(&hashes, &known));
+                        return Some(header_answer_counts(&hashes, &known));
                     }
                     if !answer_ping(sess, &contents).await {
                         return None;
@@ -241,9 +287,13 @@ fn getheaders_step(b: &Base) -> StepFate {
         None
     });
     match agreed {
-        Some(true) => StepFate::Compared,
-        Some(false) => StepFate::Disagree("header sequence left the hub".into()),
-        None => StepFate::Skip,
+        Some(Some(true)) => StepFate::Compared,
+        Some(Some(false)) => StepFate::Disagree("header sequence left the hub".into()),
+        Some(None) => StepFate::Skip,
+        None => {
+            close_session(&mut slot);
+            StepFate::Skip
+        }
     }
 }
 
@@ -257,6 +307,9 @@ fn compact_step(b: &Base, payload: &[u8]) -> StepFate {
     let Ok(frame) = encode_cmpctblock_v2(&case.hsi) else {
         return StepFate::Skip;
     };
+    if !ensure_session(b) {
+        return StepFate::Skip;
+    }
     let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(sess) = slot.as_mut() else {
         return StepFate::Skip;
@@ -299,7 +352,11 @@ fn compact_step(b: &Base, payload: &[u8]) -> StepFate {
             let _ = b.core.rpc.core_invalidate_hash(&hash);
             StepFate::Compared
         }
-        _ => StepFate::Skip,
+        Err(_) => {
+            close_session(&mut slot);
+            StepFate::Skip
+        }
+        Ok(None) => StepFate::Skip,
     }
 }
 
@@ -321,25 +378,6 @@ fn local_send_and_ping(b: &Base, frame: &[u8]) -> bool {
     })
 }
 
-fn core_send_and_ping(b: &Base, frame: &[u8]) -> Option<bool> {
-    let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(sess) = slot.as_mut() else {
-        return None;
-    };
-    let up = b.rt.block_on(async {
-        if sess.write_contents(frame).await.is_err() {
-            return false;
-        }
-        ping_session(sess).await
-    });
-    if !up {
-        if let Some(mut dead) = slot.take() {
-            dead.close();
-        }
-    }
-    Some(up)
-}
-
 fn relay_step(b: &Base, payload: &[u8], fee: bool) -> StepFate {
     let Some(frame) = (if fee {
         encode_feefilter_payload(payload)
@@ -348,14 +386,13 @@ fn relay_step(b: &Base, payload: &[u8], fee: bool) -> StepFate {
     }) else {
         return StepFate::Skip;
     };
-    let local_up = local_send_and_ping(b, &frame);
-    let Some(core_up) = core_send_and_ping(b, &frame) else {
-        return StepFate::Skip;
-    };
-    if local_up == core_up {
-        StepFate::Compared
+    // Core is whitelisted, so it does not disconnect this peer. The encoded
+    // payload is a real feefilter or inv. This checks that our node stays up.
+    // It is not a Core comparison.
+    if local_send_and_ping(b, &frame) {
+        StepFate::Skip
     } else {
-        StepFate::Disagree(format!("local_up={local_up} core_up={core_up}"))
+        StepFate::Disagree("local node dropped feefilter or inv".into())
     }
 }
 
