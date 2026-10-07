@@ -57,7 +57,7 @@ into `AGENTS.md`.
 | [`quality.md`](./quality.md) | Living quality roadmap (Open + Won't-fix + Parked + Protect). |
 | [`road-to-1.0.md`](./road-to-1.0.md) | 1.0 product gates and milestone sequence. |
 | [`reproducible-builds.md`](./reproducible-builds.md) | Pinned Nix / musl byte-identity. |
-| [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | Workarounds where rust-bitcoin is not Core-faithful. |
+| [`rust-bitcoin-limitations.md`](./rust-bitcoin-limitations.md) | rust-bitcoin workarounds, and the upstream issue queue (user-facing bugs, node-only gaps, performance). |
 | [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) | Fee estimator notes. |
 | [`errata.md`](./errata.md) | Known one-off store/confirm quirks. Retired confirm dual-path names. |
 | [`peer-clients.md`](./peer-clients.md) | Hornet Node and satd: what to steal (tests/ideas) and what not to copy. Ranked items stay here; do not copy into quality.md. |
