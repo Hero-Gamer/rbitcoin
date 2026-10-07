@@ -274,8 +274,8 @@ assert_ok "spend-differential dry-run timeout 180" \
 out="$(FUZZ_DRY_RUN=1 FUZZ_WEEKDAY=7 "$RUN" block_spend_differential)"
 assert_ok "sunday spend dry-run sanitizer address" \
   grep -qx "FUZZ_SANITIZER=address" <<<"$out"
-assert_ok "sunday spend dry-run timeout 30" \
-  grep -qx "FUZZ_TIMEOUT=30" <<<"$out"
+assert_ok "sunday spend dry-run timeout 90" \
+  grep -qx "FUZZ_TIMEOUT=90" <<<"$out"
 
 out="$(FUZZ_DRY_RUN=1 "$RUN" script_differential)"
 assert_ok "script-differential dry-run bin" \

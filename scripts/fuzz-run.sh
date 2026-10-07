@@ -139,7 +139,7 @@ elif [[ "$BIN" == "block_spend_differential" ]]; then
   weekday="${FUZZ_WEEKDAY:-$(date +%u)}"
   if [[ "$weekday" == "7" ]]; then
     sanitizer="address"
-    timeout=30
+    timeout=90
   else
     sanitizer="none"
     timeout=180
