@@ -45,7 +45,7 @@ wire / body-queue
   → load / pin (BatchParents outs by known txout range only;
             IO: txout.body — NEVER head / loc / txid.body / seqsigwit)
   → scripts (pure CPU — NEVER any store IO)
-  → Class A commit (if ArchiveWritePlan present; encode plan packed ins filled at stamp)
+  → Class A commit (if ArchiveWritePlan present; wire seqsigwit encoded at write)
   → ensure abs (holes only: same-batch after Class A / missing stamp; post-condition: every spend has abs)
   → structural spentness (pin abs bulk pread of spent.body; multi-list protocol cold only)
   → Class C tip
@@ -65,10 +65,11 @@ puts parent P on the load-batch skeleton, load stamp of a child spending P has
 **zero** leftover TipOnly for P (`head_need_n=0`). Pack stays on load; do not
 move `plan_batch` onto lookup.
 
-IBD stamp does not build `TxApply`. Packed ins are filled from the same plan
-edge walk (`archive_plan_batch_from_wire`). Empty ins at Class A commit is
-`Corrupt("invariant: packed ins empty at write")` — write does not refill from
-wire. SpendEdges + CreatePin survive freeze. Write encodes Class A
+IBD stamp does not build `TxApply`. Wire rows may leave packed `ins` empty.
+Write encodes seqsigwit from the wire transaction and SpendEdges. A records
+row with empty ins is `Corrupt("invariant: packed ins empty at write")`.
+Prune mode materializes `InputRecord`s from the wire tx into the RAM window
+at commit only. SpendEdges + CreatePin survive freeze. Write encodes Class A
 outs from `Arc<Block>` + those edges (no plan-time `scriptPubKey` copy). In-flight keeps
 the Wire CreatePin (`Arc<Block>` + tx index). Load still does not head/idx.
 

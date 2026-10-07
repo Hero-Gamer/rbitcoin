@@ -33,6 +33,36 @@ pub use rbitcoin_store::{FkMap, FkSet, U32Map, U64Map, U64Set};
 /// Relative offset sentinel: layout unknown for this out.
 pub const SPENDER_REL_UNKNOWN: u32 = u32::MAX;
 
+/// Script bytes a confirm job can hold after the pin map is dropped.
+///
+/// `Wire` is `(tx_index, vout)` inside the job's wire block. The job already
+/// holds that `Arc<Block>`, so the prevout does not clone it. `Pinned` is one
+/// vout inside the pin's outs `Arc` (records `Vec` or range-fill
+/// `OutputRecord`), not a second copy.
+#[derive(Clone, Debug)]
+pub enum SharedPrevoutScript {
+    Wire { tx_index: u32, vout: u32 },
+    Pinned(PinnedOuts),
+}
+
+/// One vout of a published pin-outs snapshot.
+#[derive(Clone, Debug)]
+pub struct PinnedOuts {
+    outs: Arc<PinOuts>,
+    vout: u32,
+}
+
+impl SharedPrevoutScript {
+    /// Amount and script for a pinned vout. `None` for [`Self::Wire`] (the
+    /// block lives on the script job) and when the vout is absent.
+    pub fn parts(&self) -> Option<(i64, &[u8])> {
+        match self {
+            Self::Wire { .. } => None,
+            Self::Pinned(p) => p.outs.get_parts(p.vout),
+        }
+    }
+}
+
 const CB_UNKNOWN: u8 = 0;
 const CB_FALSE: u8 = 1;
 const CB_TRUE: u8 = 2;
@@ -657,6 +687,18 @@ impl BatchParents {
         Some((e.tx.clone(), OutputRecord::unspent(value, script.to_vec())))
     }
 
+    /// Pin outs `Arc` for `vout`, plus the parent txid.
+    ///
+    /// Uses the sticky outs cache. The script bytes stay in that snapshot.
+    pub fn share_parent_prevout(
+        &self,
+        fk: Fk,
+        vout: u32,
+    ) -> Option<(SharedPrevoutScript, [u8; 32])> {
+        let (outs, txid) = self.load_parent_outs(fk, vout, true)?;
+        Some((SharedPrevoutScript::Pinned(PinnedOuts { outs, vout }), txid))
+    }
+
     /// Assemble hot path: value + borrowed script bytes + parent txid.
     ///
     /// Sticky: multi-input spends of the same create reuse one outs Arc without
@@ -684,6 +726,35 @@ impl BatchParents {
     }
 
     #[inline]
+    fn load_parent_outs(
+        &self,
+        fk: Fk,
+        vout: u32,
+        use_sticky: bool,
+    ) -> Option<(Arc<PinOuts>, [u8; 32])> {
+        let id = fk.get()?;
+        let e = self.pins.get(&id)?;
+        let txid = e.tx.txid;
+        if use_sticky {
+            {
+                let st = self.sticky_outs.borrow();
+                if let Some((sid, snap)) = st.as_ref() {
+                    if *sid == id && snap.get_parts(vout).is_some() {
+                        return Some((Arc::clone(snap), txid));
+                    }
+                }
+            }
+            let snap = e.load_outs();
+            snap.get_parts(vout)?;
+            *self.sticky_outs.borrow_mut() = Some((id, Arc::clone(&snap)));
+            return Some((snap, txid));
+        }
+        let outs = e.load_outs();
+        outs.get_parts(vout)?;
+        Some((outs, txid))
+    }
+
+    #[inline]
     fn parent_txout_parts_inner<R>(
         &self,
         fk: Fk,
@@ -699,16 +770,16 @@ impl BatchParents {
                 let st = self.sticky_outs.borrow();
                 if let Some((sid, snap)) = st.as_ref() {
                     if *sid == id {
-                        let (value, script) = snap.get_parts(vout)?;
-                        return Some(f(value, script, txid));
+                        if let Some((value, script)) = snap.get_parts(vout) {
+                            return Some(f(value, script, txid));
+                        }
                     }
                 }
             }
             let snap = e.load_outs();
             let (value, script) = snap.get_parts(vout)?;
-            let r = f(value, script, txid);
             *self.sticky_outs.borrow_mut() = Some((id, Arc::clone(&snap)));
-            return Some(r);
+            return Some(f(value, script, txid));
         }
         let outs = e.load_outs();
         let (value, script) = outs.get_parts(vout)?;

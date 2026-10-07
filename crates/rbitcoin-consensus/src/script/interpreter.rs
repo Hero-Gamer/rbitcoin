@@ -308,13 +308,13 @@ impl<'a> EvalContext<'a> {
         input_index: usize,
         script_code: &'a Script,
         sig_version: SigVersion,
-    ) -> Self {
-        let amount = job
-            .prevouts
-            .get(input_index)
-            .map(|p| p.value)
-            .unwrap_or(Amount::ZERO);
-        Self::from_eval_parts(
+    ) -> Result<Self, ConsensusError> {
+        let amount = if input_index < job.prevouts.len() {
+            job.prevout_amount(input_index)?
+        } else {
+            Amount::ZERO
+        };
+        Ok(Self::from_eval_parts(
             tx,
             input_index,
             amount,
@@ -325,7 +325,7 @@ impl<'a> EvalContext<'a> {
             job.bip66_active,
             Cow::Borrowed(job.pre()),
         )
-        .apply_job_flags(job)
+        .apply_job_flags(job))
     }
 }
 

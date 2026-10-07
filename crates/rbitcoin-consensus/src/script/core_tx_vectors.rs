@@ -223,7 +223,7 @@ fn fill_implied(f: &mut TxFlags) {
 fn flags_to_job(tx: Transaction, prevouts: Vec<TxOut>, flags: &TxFlags) -> ScriptCheckJob {
     ScriptCheckJob {
         txid: tx.compute_txid().to_byte_array(),
-        prevouts,
+        prevouts: crate::block::JobPrevouts::owned(prevouts),
         tx: JobTx::owned(tx),
         flags: crate::block::ScriptVerifyFlags {
             bip65_active: flags.cltv,

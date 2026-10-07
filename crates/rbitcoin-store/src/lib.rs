@@ -80,6 +80,7 @@ pub use height_fence::HeightFence;
 pub(crate) use idx_body_pipeline::run_idx_body_pipeline;
 pub use idx_body_pipeline::{BodyMode as IdxBodyMode, IdxBodyJob};
 pub use index_build_uring::{read_index_window, IndexBlock, IndexHeight, IndexWindow};
+pub use input::InputEdge;
 pub use int_map::{FkMap, FkSet, U32Map, U64IdentityHasher, U64Map, U64Set};
 pub use integrity::{
     merkle_branch, merkle_root_from_branch, merkle_root_from_txids, merkle_root_mutated,
@@ -113,8 +114,8 @@ pub use tx_table::{
     decode_packed_tx_outs_with_spender_rels, decode_packed_tx_outs_with_spender_rels_secret,
     decode_packed_tx_with_spender_rels_secret, decode_seqsigwit_secret, encode_packed_tx,
     encode_packed_tx_with_secret, encode_seqsigwit_with_secret, encode_txout_meta_and_outs,
-    encode_unspent_output_into_secret, spend_meta_backend, spent_abs, InputRecord, OutputRecord,
-    PackedCreate, TxRecord,
+    encode_unspent_output_into_secret, encode_wire_seqsigwit_input, seqsigwit_input_len_upper,
+    spend_meta_backend, spent_abs, InputRecord, OutputRecord, PackedCreate, TxRecord,
 };
 pub use txstat::TxStatRow;
 pub(crate) use uring_session::IoCtx;

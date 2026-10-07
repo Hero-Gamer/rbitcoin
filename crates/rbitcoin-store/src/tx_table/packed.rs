@@ -142,31 +142,12 @@ impl InputRecord {
     }
 
     pub fn encode_into(&self, out: &mut Vec<u8>) {
-        let mut flags = input_flags::PREV_ON_INPUTS;
-        if self.sequence == u32::MAX {
-            flags |= input_flags::SEQ_FINAL;
-        }
-        if self.script_sig.is_empty() {
-            flags |= input_flags::EMPTY_SCRIPT;
-        }
-        if self.witness.is_empty() {
-            flags |= input_flags::EMPTY_WITNESS;
-        }
-        out.push(flags);
-        if flags & input_flags::SEQ_FINAL == 0 {
-            out.extend_from_slice(&self.sequence.to_le_bytes());
-        }
-        if flags & input_flags::EMPTY_SCRIPT == 0 {
-            write_compact_size(out, self.script_sig.len() as u64);
-            out.extend_from_slice(&self.script_sig);
-        }
-        if flags & input_flags::EMPTY_WITNESS == 0 {
-            write_compact_size(out, self.witness.len() as u64);
-            for item in &self.witness {
-                write_compact_size(out, item.len() as u64);
-                out.extend_from_slice(item);
-            }
-        }
+        encode_seqsigwit_input(
+            self.sequence,
+            &self.script_sig,
+            self.witness.iter().map(Vec::as_slice),
+            out,
+        );
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -274,13 +255,7 @@ impl InputRecord {
 
     /// Capacity upper bound for encode buffers (not byte-exact).
     pub fn encoded_len(&self) -> usize {
-        1 + 8
-            + 9
-            + 4
-            + 9
-            + self.script_sig.len()
-            + 9
-            + self.witness.iter().map(|i| 9 + i.len()).sum::<usize>()
+        seqsigwit_input_len_upper(self.script_sig.len(), self.witness.iter().map(|i| i.len()))
     }
 
     /// Exact on-wire length matching [`Self::encode_into`] (for denserels layout).
@@ -301,6 +276,63 @@ impl InputRecord {
             }
         }
         n
+    }
+}
+
+/// Same flags and payload as [`InputRecord::encode_into`].
+fn encode_seqsigwit_input<'a>(
+    sequence: u32,
+    script_sig: &[u8],
+    witness: impl ExactSizeIterator<Item = &'a [u8]>,
+    out: &mut Vec<u8>,
+) {
+    let mut flags = input_flags::PREV_ON_INPUTS;
+    if sequence == u32::MAX {
+        flags |= input_flags::SEQ_FINAL;
+    }
+    if script_sig.is_empty() {
+        flags |= input_flags::EMPTY_SCRIPT;
+    }
+    if witness.len() == 0 {
+        flags |= input_flags::EMPTY_WITNESS;
+    }
+    out.push(flags);
+    if flags & input_flags::SEQ_FINAL == 0 {
+        out.extend_from_slice(&sequence.to_le_bytes());
+    }
+    if flags & input_flags::EMPTY_SCRIPT == 0 {
+        write_compact_size(out, script_sig.len() as u64);
+        out.extend_from_slice(script_sig);
+    }
+    if flags & input_flags::EMPTY_WITNESS == 0 {
+        write_compact_size(out, witness.len() as u64);
+        for item in witness {
+            write_compact_size(out, item.len() as u64);
+            out.extend_from_slice(item);
+        }
+    }
+}
+
+/// Capacity upper bound matching [`InputRecord::encoded_len`] (not byte-exact).
+pub fn seqsigwit_input_len_upper(
+    script_len: usize,
+    witness_item_lens: impl Iterator<Item = usize>,
+) -> usize {
+    1 + 8 + 9 + 4 + 9 + script_len + 9 + witness_item_lens.map(|n| 9 + n).sum::<usize>()
+}
+
+/// One `seqsigwit` input from wire slices, XOR included when `secret` is set.
+pub fn encode_wire_seqsigwit_input<'a>(
+    sequence: u32,
+    script_sig: &[u8],
+    witness: impl ExactSizeIterator<Item = &'a [u8]>,
+    out: &mut Vec<u8>,
+    secret: Option<&crate::store_secret::StoreSecret>,
+) {
+    let start = out.len();
+    encode_seqsigwit_input(sequence, script_sig, witness, out);
+    if let Some(sec) = secret {
+        xor_script_regions_in_input(out, start, sec);
     }
 }
 
@@ -1217,5 +1249,69 @@ mod scan_p2tr_tests {
         let mut via_secret = Vec::new();
         encode_unspent_output_into_secret(rec.value, &rec.script, &mut via_secret, None);
         assert_eq!(from_rec, via_secret);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_input_encode_tests {
+    use super::*;
+
+    fn witness_refs(items: &[Vec<u8>]) -> Vec<&[u8]> {
+        items.iter().map(|i| i.as_slice()).collect()
+    }
+
+    fn assert_matches(rec: &InputRecord, secret: Option<&crate::store_secret::StoreSecret>) {
+        let wit = witness_refs(&rec.witness);
+        let mut owned = Vec::new();
+        encode_seqsigwit_with_secret(std::slice::from_ref(rec), &mut owned, secret);
+        let mut from_wire = Vec::new();
+        encode_wire_seqsigwit_input(
+            rec.sequence,
+            rec.script_sig.as_slice(),
+            wit.iter().copied(),
+            &mut from_wire,
+            secret,
+        );
+        assert_eq!(owned, from_wire);
+        let upper = seqsigwit_input_len_upper(rec.script_sig.len(), wit.iter().map(|i| i.len()));
+        assert!(upper >= rec.encoded_len_exact());
+        assert_eq!(upper, rec.encoded_len());
+    }
+
+    #[test]
+    fn borrowed_input_encode_matches_record() {
+        let secret = crate::store_secret::StoreSecret::from_bytes([0x5au8; 32]);
+        let cases = [
+            InputRecord::coinbase(u32::MAX, vec![0x01, 0x02], vec![]),
+            InputRecord::coinbase(1, vec![], vec![vec![0x00; 32]]),
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(9),
+                prev_index: 3,
+                sequence: 0xffff_fffe,
+                script_sig: vec![0xab; 40],
+                witness: vec![],
+            },
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(9),
+                prev_index: 1,
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![vec![0x30; 70], vec![0x21; 33]],
+            },
+            InputRecord {
+                prev_txid: [0u8; 32],
+                create_fk: Fk(4),
+                prev_index: 0,
+                sequence: 7,
+                script_sig: vec![0x16, 0x00, 0x14],
+                witness: vec![vec![0x30; 71], vec![0x21; 33], vec![0x51]],
+            },
+        ];
+        for rec in &cases {
+            assert_matches(rec, None);
+            assert_matches(rec, Some(&secret));
+        }
     }
 }

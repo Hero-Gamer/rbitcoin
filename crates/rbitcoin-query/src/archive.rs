@@ -14,7 +14,10 @@
 //! prior plan that is still queued/committing (not yet in head).
 
 use super::*;
-use rbitcoin_store::{encode_txout_meta_and_outs, encode_unspent_output_into_secret, PackedCreate};
+use rbitcoin_store::{
+    encode_seqsigwit_with_secret, encode_txout_meta_and_outs, encode_unspent_output_into_secret,
+    encode_wire_seqsigwit_input, seqsigwit_input_len_upper, InputEdge, PackedCreate,
+};
 use std::sync::Arc;
 
 /// Shared immutable create pin: tx meta + outs (records or wire).
@@ -283,16 +286,16 @@ pub fn create_pin_approx_bytes(pin: &CreatePin) -> usize {
 #[derive(Debug)]
 pub struct ArchiveWritePlan {
     /// Body-append rows: shared [`CreatePin`] (tx + outs) + inputs.
-    /// IBD wire planner fills ins from the stamp edge walk. Empty ins at
-    /// commit is Corrupt (write does not refill from wire).
-    /// Outs live once in the pin Arc (not duplicated alongside inputs).
+    /// Wire pins leave `ins` empty; commit encodes `seqsigwit` from the wire
+    /// tx and [`Self::edges`]. A records pin (no wire tx) with empty ins is
+    /// Corrupt. Outs live once in the pin Arc.
     pub packed: Vec<(CreatePin, Vec<InputRecord>)>,
     pub planned_fks: Vec<Fk>,
     pub per_header_ranges: Vec<(Fk, Fk, u32)>,
     /// Empty. Block size and weight are summed from `txstat`, not stored here.
     pub per_header_sw: Vec<(u32, u32)>,
-    /// Pin-time spend edges (create_fk stamped). Survives freeze; packed ins
-    /// are the commit payload (filled at plan).
+    /// Pin-time spend edges (create_fk stamped). Survives freeze. Wire commit
+    /// reads `input.loc` from these edges and script bytes from the wire tx.
     pub edges: crate::SpendEdges,
     /// Creates from **this** batch only (txid→fk for in-flight / publish).
     pub batch_creates: Vec<([u8; 32], Fk)>,
@@ -422,12 +425,14 @@ impl ArchiveWritePlan {
         self.external_parent_vouts.shrink_to_fit();
     }
 
-    /// Freeze plan for write batch: drop pin-staging maps and `batch_creates`.
+    /// Drop stamp staging before pin.
     ///
-    /// After this, the plan is a **commit payload** only (`packed` / `planned_fks`
-    /// / headers / `batch_pin`). In-flight still binds from `batch_pin`.
-    /// Prep must call this (or [`Self::clear_external_parent_outs`]) before
-    /// enqueue to scripts/write so batch-merge never mutates growing stamp maps.
+    /// Load calls this before pin. Pin does not read `external_parents` or
+    /// `batch_creates`. After this, the plan is a commit payload (`packed` /
+    /// `planned_fks` / headers / `batch_pin`). Wire packed `ins` stay empty;
+    /// commit encodes seqsigwit from the wire transaction. Prep must call this
+    /// (or [`Self::clear_external_parent_outs`]) before enqueue to scripts/write
+    /// so batch-merge never mutates growing stamp maps.
     pub fn freeze_after_pin(&mut self) {
         self.clear_external_parent_outs();
         self.batch_creates.clear();
@@ -627,9 +632,7 @@ pub fn input_records_from_wire(
                 "invariant: write encode spend_fk mismatch",
             ));
         }
-        let is_cb = inp.previous_output.is_null()
-            || (inp.previous_output.txid.to_byte_array() == [0u8; 32]
-                && inp.previous_output.vout == u32::MAX);
+        let is_cb = inp.previous_output.is_null();
         if is_cb {
             out.push(InputRecord::coinbase(
                 inp.sequence.to_consensus_u32(),
@@ -662,11 +665,59 @@ pub fn input_records_from_wire(
     Ok(out)
 }
 
+fn wire_input_is_coinbase(inp: &bitcoin::TxIn) -> bool {
+    inp.previous_output.is_null()
+}
+
+/// Edge/wire agreement without copying script or witness bytes.
+fn wire_edges_match(
+    tx: &bitcoin::Transaction,
+    spend_fk: Fk,
+    edges: &[crate::SpendEdge],
+) -> Result<(), StoreError> {
+    if tx.input.len() != edges.len() {
+        return Err(StoreError::Corrupt(
+            "invariant: write encode spends/tx input mismatch",
+        ));
+    }
+    for (inp, e) in tx.input.iter().zip(edges.iter()) {
+        if e.spend_fk != spend_fk {
+            return Err(StoreError::Corrupt(
+                "invariant: write encode spend_fk mismatch",
+            ));
+        }
+        if wire_input_is_coinbase(inp) {
+            continue;
+        }
+        if e.create_fk.is_null() {
+            return Err(StoreError::Corrupt(
+                "invariant: write encode missing create_fk",
+            ));
+        }
+        if e.prev_txid != inp.previous_output.txid.to_byte_array()
+            || e.vout != inp.previous_output.vout
+        {
+            return Err(StoreError::Corrupt(
+                "invariant: write encode edge/wire prevout mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn wire_seqsigwit_upper(tx: &bitcoin::Transaction) -> u64 {
+    tx.input
+        .iter()
+        .map(|inp| {
+            seqsigwit_input_len_upper(inp.script_sig.len(), inp.witness.iter().map(|w| w.len()))
+                as u64
+        })
+        .sum()
+}
+
 fn plan_in_from_txin(inp: &bitcoin::TxIn) -> PlanIn {
     use bitcoin::hashes::Hash;
-    let is_coinbase = inp.previous_output.is_null()
-        || (inp.previous_output.txid.to_byte_array() == [0u8; 32]
-            && inp.previous_output.vout == u32::MAX);
+    let is_coinbase = inp.previous_output.is_null();
     PlanIn {
         prev_txid: inp.previous_output.txid.to_byte_array(),
         prev_index: if is_coinbase {
@@ -709,8 +760,8 @@ fn stamp_txstat_rows(
         }
     }
     let mut out = Vec::with_capacity(packed.len());
-    for (pin, ins) in packed {
-        out.push(stamp_one_txstat(query, packed, &idx, parents, pin, ins)?);
+    for i in 0..packed.len() {
+        out.push(stamp_one_txstat(query, plan, &idx, parents, i)?);
     }
     Ok(out)
 }
@@ -739,24 +790,49 @@ fn stamp_txstat_from_fees(
 
 fn stamp_one_txstat(
     query: &Query,
-    packed: &[(CreatePin, Vec<InputRecord>)],
+    plan: &ArchiveWritePlan,
     idx: &crate::U64Map<usize>,
     parents: Option<&crate::BatchParents>,
-    pin: &CreatePin,
-    ins: &[InputRecord],
+    i: usize,
 ) -> Result<rbitcoin_store::TxStatRow, QueryError> {
+    let packed = &plan.packed;
+    let (pin, ins) = &packed[i];
     let Some(tx) = pin.wire_tx() else {
         return Ok(txstat_placeholder_query(pin.tx().input_count));
     };
     let in_sum = if tx.is_coinbase() {
         None
+    } else if ins.is_empty() {
+        let sid = plan
+            .planned_fks
+            .get(i)
+            .and_then(|fk| fk.get())
+            .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+        let eds = plan
+            .edges
+            .get(&sid)
+            .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+        if eds.len() != tx.input.len() {
+            return Err(StoreError::Corrupt("invariant: wire plan edges missing"));
+        }
+        let mut in_sum = 0u64;
+        for e in eds {
+            if e.create_fk.is_null() {
+                return Err(StoreError::Corrupt("invariant: spend missing create_fk"));
+            }
+            let val = prevout_value_at(query, packed, idx, parents, e.create_fk, e.vout)?;
+            in_sum = in_sum
+                .checked_add(val)
+                .ok_or(StoreError::Corrupt("txstat in_sum overflow"))?;
+        }
+        Some(in_sum)
     } else {
         let mut in_sum = 0u64;
         for inp in ins {
             if inp.is_coinbase() {
                 return Err(StoreError::Corrupt("invariant: mixed coinbase vin"));
             }
-            let val = prevout_value(query, packed, idx, parents, inp)?;
+            let val = prevout_value_at(query, packed, idx, parents, inp.create_fk, inp.prev_index)?;
             in_sum = in_sum
                 .checked_add(val)
                 .ok_or(StoreError::Corrupt("txstat in_sum overflow"))?;
@@ -807,20 +883,21 @@ fn txstat_placeholder_query(_n_in: u32) -> rbitcoin_store::TxStatRow {
     }
 }
 
-fn prevout_value(
+fn prevout_value_at(
     query: &Query,
     packed: &[(CreatePin, Vec<InputRecord>)],
     idx: &crate::U64Map<usize>,
     parents: Option<&crate::BatchParents>,
-    inp: &InputRecord,
+    create_fk: Fk,
+    vout: u32,
 ) -> Result<u64, QueryError> {
-    let Some(cid) = inp.create_fk.get() else {
+    let Some(cid) = create_fk.get() else {
         return Err(StoreError::Corrupt("invariant: spend missing create_fk"));
     };
     if let Some(&i) = idx.get(&cid) {
         let (val, _) = packed[i]
             .0
-            .out_parts(inp.prev_index)
+            .out_parts(vout)
             .ok_or(StoreError::Corrupt("invariant: same-batch prevout"))?;
         if val < 0 {
             return Err(StoreError::Corrupt("txstat prevout negative"));
@@ -828,7 +905,7 @@ fn prevout_value(
         return Ok(val as u64);
     }
     if let Some(p) = parents {
-        if let Some(val) = p.get_parent_txout_parts(inp.create_fk, inp.prev_index, |v, _, _| v) {
+        if let Some(val) = p.get_parent_txout_parts(create_fk, vout, |v, _, _| v) {
             if val < 0 {
                 return Err(StoreError::Corrupt("txstat prevout negative"));
             }
@@ -836,11 +913,136 @@ fn prevout_value(
         }
         return Err(StoreError::Corrupt("txstat parent not pinned"));
     }
-    let o = query.tx_output_at_fk(inp.create_fk, inp.prev_index)?;
+    let o = query.tx_output_at_fk(create_fk, vout)?;
     if o.value < 0 {
         return Err(StoreError::Corrupt("txstat prevout negative"));
     }
     Ok(o.value as u64)
+}
+
+fn edge_of(parent: Fk, vout: u32) -> InputEdge {
+    if parent.is_null() {
+        InputEdge::coinbase()
+    } else {
+        InputEdge { parent, vout }
+    }
+}
+
+fn commit_input_edge_rows(plan: &ArchiveWritePlan) -> Result<Vec<Vec<InputEdge>>, StoreError> {
+    let mut rows = Vec::with_capacity(plan.packed.len());
+    for (i, (pin, ins)) in plan.packed.iter().enumerate() {
+        if pin.wire_tx().is_some() {
+            let fk = plan
+                .planned_fks
+                .get(i)
+                .copied()
+                .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+            let sid = fk
+                .get()
+                .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+            let eds = plan
+                .edges
+                .get(&sid)
+                .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+            let n_in = pin
+                .wire_tx()
+                .map(|tx| tx.input.len())
+                .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+            if eds.len() != n_in {
+                return Err(StoreError::Corrupt("invariant: wire plan edges missing"));
+            }
+            rows.push(eds.iter().map(|e| edge_of(e.create_fk, e.vout)).collect());
+        } else if ins.is_empty() {
+            return Err(StoreError::Corrupt("invariant: packed ins empty at write"));
+        } else {
+            rows.push(
+                ins.iter()
+                    .map(|inp| {
+                        if inp.is_coinbase() {
+                            InputEdge::coinbase()
+                        } else {
+                            edge_of(inp.create_fk, inp.prev_index)
+                        }
+                    })
+                    .collect(),
+            );
+        }
+    }
+    Ok(rows)
+}
+
+fn seqsigwit_append_est(plan: &ArchiveWritePlan) -> usize {
+    let mut n = 0usize;
+    for (pin, ins) in &plan.packed {
+        n = n.saturating_add(16);
+        if let Some(tx) = pin.wire_tx() {
+            n = n.saturating_add(wire_seqsigwit_upper(tx) as usize);
+        } else {
+            n = n.saturating_add(ins.iter().map(|i| i.encoded_len()).sum());
+        }
+    }
+    n
+}
+
+fn encode_plan_row_seqsigwit(
+    plan: &ArchiveWritePlan,
+    i: usize,
+    buf: &mut Vec<u8>,
+    secret: &rbitcoin_store::StoreSecret,
+) {
+    let (pin, ins) = &plan.packed[i];
+    let Some(tx) = pin.wire_tx() else {
+        encode_seqsigwit_with_secret(ins, buf, Some(secret));
+        return;
+    };
+    for inp in &tx.input {
+        encode_wire_seqsigwit_input(
+            inp.sequence.to_consensus_u32(),
+            inp.script_sig.as_bytes(),
+            inp.witness.iter(),
+            buf,
+            Some(secret),
+        );
+    }
+}
+
+/// Owned `seqsigwit` rows for the prune RAM window.
+///
+/// Wire pins keep `packed` ins empty. Prune mode is the only path that still
+/// needs those bytes after the block `Arc` drops, so it builds them here from
+/// the wire tx and the spend edges. A records pin contributes its ins. An
+/// empty records pin is Corrupt (the caller must not cache an empty vector).
+fn seqsigwit_rows_for_prune(
+    plan: &mut ArchiveWritePlan,
+) -> Result<Vec<Vec<InputRecord>>, StoreError> {
+    let mut rows = Vec::with_capacity(plan.packed.len());
+    for i in 0..plan.packed.len() {
+        if !plan.packed[i].1.is_empty() {
+            rows.push(std::mem::take(&mut plan.packed[i].1));
+            continue;
+        }
+        let fk = plan
+            .planned_fks
+            .get(i)
+            .copied()
+            .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+        let sid = fk
+            .get()
+            .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+        let recs = {
+            let (pin, _) = &plan.packed[i];
+            let tx = pin.wire_tx().ok_or(StoreError::Corrupt(
+                "invariant: prune seqsigwit missing inputs",
+            ))?;
+            let eds = plan
+                .edges
+                .get(&sid)
+                .ok_or(StoreError::Corrupt("invariant: wire plan edges missing"))?;
+            input_records_from_wire(tx, fk, eds)?
+        };
+        rows.push(recs);
+    }
+    Ok(rows)
 }
 
 impl Query {
@@ -887,8 +1089,9 @@ impl Query {
         Ok(need)
     }
 
-    /// IBD stamp: CreatePin + SpendEdges from wire txs. Packed ins filled from
-    /// the same edge walk. Empty ins at Class A commit is Corrupt.
+    /// IBD stamp: CreatePin + SpendEdges from wire txs. Packed ins stay empty.
+    /// Class A encodes `seqsigwit` from the wire tx. A records row with empty
+    /// ins at commit is Corrupt.
     ///
     /// Does not build [`TxApply`]. `body_est` uses packed encoded lengths.
     /// Same txid in one block is Corrupt. Same txid across headers in the wave
@@ -1073,19 +1276,19 @@ impl Query {
                 .txdata
                 .get(tx_index as usize)
                 .ok_or(StoreError::Corrupt("invariant: plan tx_index"))?;
-            let packed_ins = input_records_from_wire(tx_wire, tx_fk, &tx_edges)?;
+            wire_edges_match(tx_wire, tx_fk, &tx_edges)?;
             if let Some(sid) = tx_fk.get() {
                 edges.insert(sid, tx_edges);
             }
             planned_fks.push(tx_fk);
-            let ins_bytes: u64 = packed_ins.iter().map(|x| x.encoded_len() as u64).sum();
+            let ins_bytes = wire_seqsigwit_upper(tx_wire);
             let pin = CreatePinInner::wire(block, tx_index, tx);
             body_est = body_est
                 .saturating_add((1 + TxRecord::ENCODED_LEN) as u64)
                 .saturating_add(ins_bytes)
                 .saturating_add(pin.packed_outs_est() as u64);
             batch_pin.push(std::sync::Arc::clone(&pin));
-            packed.push((pin, packed_ins));
+            packed.push((pin, Vec::new()));
         }
         let stamp_ns = t_stamp.elapsed().as_nanos() as u64;
         for vouts in external_parent_vouts.values_mut() {
@@ -1175,9 +1378,8 @@ impl Query {
         if !plan.retain_headers_needing_body(|hfk| self.store.header_txs.has_body(hfk))? {
             return Ok((false, Vec::new()));
         }
-        if plan.packed.iter().any(|(_, ins)| ins.is_empty()) {
-            return Err(StoreError::Corrupt("invariant: packed ins empty at write"));
-        }
+        let edge_rows = commit_input_edge_rows(&plan)?;
+        let seqsigwit_est = seqsigwit_append_est(&plan);
         let t0 = Instant::now();
         let n_blocks = plan.per_header_ranges.len() as u64;
 
@@ -1194,12 +1396,17 @@ impl Query {
         self.confirm_stats().note_write_txstat(txstat_ns);
 
         let t = Instant::now();
-        let (got_tx_fks, loc) = self.store.put_tx_full_batch_from_pins_with_txstat(
-            &plan.packed,
+        let secret = self.store.txs.store_secret().clone();
+        let pins: Vec<&CreatePin> = plan.packed.iter().map(|(pin, _)| pin).collect();
+        let (got_tx_fks, loc) = self.store.put_tx_pins_encoded(
+            &pins,
             /*index=*/ false,
             &overlay,
             &txstat,
             &plan.per_header_ranges,
+            &edge_rows,
+            seqsigwit_est,
+            |i, buf| encode_plan_row_seqsigwit(&plan, i, buf, &secret),
         )?;
         let body_ns = t.elapsed().as_nanos() as u64;
         if got_tx_fks.len() != plan.packed.len() {
@@ -1214,11 +1421,7 @@ impl Query {
             ));
         }
         if self.prune_seqsigwit() {
-            let ins: Vec<Vec<rbitcoin_store::InputRecord>> = plan
-                .packed
-                .iter_mut()
-                .map(|(_, v)| std::mem::take(v))
-                .collect();
+            let ins = seqsigwit_rows_for_prune(&mut plan)?;
             self.note_appended_seqsigwit_inputs(&got_tx_fks, ins);
         }
         for ((pin, _), pair) in plan.packed.iter().zip(loc.iter()) {
@@ -1307,6 +1510,11 @@ mod tests {
 
     fn temp_query(label: &str) -> (crate::testutil::TempDir, Query) {
         crate::testutil::tiny_query_labeled(label)
+    }
+
+    fn first_edge_create(plan: &crate::ArchiveWritePlan) -> Fk {
+        let id = plan.planned_fks[0].get().expect("spend fk");
+        plan.edges.get(&id).expect("spend edges")[0].create_fk
     }
 
     #[test]
@@ -1655,7 +1863,8 @@ mod tests {
             plan_applies(&q, &need_b, 2, &inflight, None).expect("inflight parent resolve");
         assert_eq!(plan_b.planned_fks, vec![Fk(2)]);
         assert_eq!(
-            plan_b.packed[0].1[0].create_fk, parent_fk,
+            first_edge_create(&plan_b),
+            parent_fk,
             "child input must stamp prior planned create_fk"
         );
 
@@ -1714,7 +1923,7 @@ mod tests {
         let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xef)])];
         let plan_b = plan_applies(&q, &need_b, 2, &log, None)
             .expect("in-flight must stamp n−1 without leftover");
-        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        assert_eq!(first_edge_create(&plan_b), parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1757,7 +1966,7 @@ mod tests {
         let need_b = vec![(Fk(2), vec![child])];
         let plan_b = plan_applies(&q, &need_b, 2, &empty, None)
             .expect("height-1 child must bind prev pack after drain HWM");
-        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        assert_eq!(first_edge_create(&plan_b), parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1832,7 +2041,7 @@ mod tests {
         let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xee)])];
         let plan_b = plan_applies(&q, &need_b, 2, &log, None)
             .expect("in-flight binds after drain, before fence");
-        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        assert_eq!(first_edge_create(&plan_b), parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1887,7 +2096,7 @@ mod tests {
         let need_b = vec![(Fk(2), vec![child_spend(parent_txid, 0xec)])];
         let plan_b = plan_applies(&q, &need_b, 2, &log, None)
             .expect("in-flight binds after fence, before drain");
-        assert_eq!(plan_b.packed[0].1[0].create_fk, parent_fk);
+        assert_eq!(first_edge_create(&plan_b), parent_fk);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1952,7 +2161,7 @@ mod tests {
             let need = vec![(Fk(2), vec![child_spend(parent_txid, 0xcd)])];
             let plan =
                 plan_applies(&q, &need, 2, &crate::InFlight::new(), None).expect("parent via head");
-            assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+            assert_eq!(first_edge_create(&plan), Fk(1));
             assert!(plan
                 .external_parents
                 .get(&1)
@@ -1997,7 +2206,7 @@ mod tests {
         let need = vec![(Fk(2), vec![child])];
         let plan =
             plan_applies(&q, &need, 2, &crate::InFlight::new(), None).expect("prestamp parent");
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(first_edge_create(&plan), Fk(1));
         assert!(
             plan.external_parents
                 .get(&1)
@@ -2037,7 +2246,7 @@ mod tests {
         let skel = crate::BatchParentIds::default();
         let plan = plan_applies(&q, &need, 2, &log, Some(&skel))
             .expect("inflight + empty skeleton with loc on disk");
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(first_edge_create(&plan), Fk(1));
         assert_eq!(
             plan.external_parents.get(&1).and_then(|p| p.spent),
             None,
@@ -2103,7 +2312,7 @@ mod tests {
         let need = vec![(Fk(2), vec![child])];
         let plan =
             plan_applies(&q, &need, 2, ifo, None).expect("parent via creates-only in_flight");
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(first_edge_create(&plan), Fk(1));
         assert!(
             plan.external_parents
                 .get(&1)
@@ -2154,7 +2363,7 @@ mod tests {
         let skel = crate::BatchParentIds::default();
         let plan = plan_applies(&q, &need, 2, &log, Some(&skel))
             .expect("creates-only identity with empty skeleton");
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(1));
+        assert_eq!(first_edge_create(&plan), Fk(1));
         assert_eq!(
             plan.external_parents.get(&1).and_then(|p| p.body),
             None,
@@ -2258,6 +2467,7 @@ mod tests {
         };
         let parent_txid = parent.compute_txid();
         let script_sig = vec![0xab; 10_000];
+        let wit_push = vec![0x21; 33];
         let child = Transaction {
             version: TxVersion::ONE,
             lock_time: LockTime::ZERO,
@@ -2268,7 +2478,7 @@ mod tests {
                 },
                 script_sig: ScriptBuf::from_bytes(script_sig.clone()),
                 sequence: Sequence::MAX,
-                witness: Witness::new(),
+                witness: Witness::from_slice(&[b"wit-item-1".as_slice(), wit_push.as_slice()]),
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(1),
@@ -2346,11 +2556,10 @@ mod tests {
             )
             .expect("wire plan");
         assert_eq!(plan.planned_fks, vec![Fk(1), Fk(2)]);
-        assert_eq!(
-            plan.packed[1].1[0].script_sig, script_sig,
-            "wire planner fills packed ins from stamp edges"
+        assert!(
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "wire plan must not retain scriptSig or witness"
         );
-        assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(
             plan.batch_pin[0]
                 .out_parts(0)
@@ -2369,8 +2578,6 @@ mod tests {
             child_ptr,
             "plan must not copy scriptPubKey"
         );
-        assert_eq!(plan.packed[1].1[0].script_sig, script_sig);
-        assert_eq!(plan.packed[1].1[0].create_fk, Fk(1));
         assert_eq!(plan.batch_pin.len(), 2);
         assert_eq!(plan.batch_pin[0].out_parts(0).unwrap().1, parent_spk);
         assert_eq!(plan.batch_pin[1].out_parts(0).unwrap().1, child_spk);
@@ -2388,6 +2595,51 @@ mod tests {
             "body_est must count wire ins, got {}",
             plan.body_est
         );
+        q.archive_commit_plan(plan).expect("commit from wire");
+        let (_tx, ins, _outs) = q.store().get_tx_full(Fk(2)).unwrap();
+        assert_eq!(ins[0].script_sig, script_sig);
+        assert_eq!(ins[0].witness, vec![b"wit-item-1".to_vec(), vec![0x21; 33]]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Prune mode serves confirmed script bytes from the append cache.
+    /// A wire commit must fill that cache. Falling through to `get_tx_full`
+    /// re-reads every transaction during IBD.
+    #[test]
+    fn pruned_wire_commit_serves_seqsigwit_without_reread() {
+        use rbitcoin_primitives::Height;
+        use std::sync::Arc;
+        let (dir, q) = temp_query("prune-wire-seqsigwit");
+        q.set_prune_seqsigwit(true).unwrap();
+        q.set_seqsigwit_ram_threshold_bytes(1 << 20).unwrap();
+        let (block, txids, script_sig) = wire_parent_child_big_script_sig();
+        let block = Arc::new(block);
+        let plan = q
+            .archive_plan_batch_from_wire(
+                &[(Fk(1), &block, txids.as_slice())],
+                1,
+                &crate::InFlight::new(),
+                None,
+                None,
+            )
+            .expect("wire plan");
+        let fks = plan.planned_fks.clone();
+        assert!(plan.packed.iter().all(|(_, ins)| ins.is_empty()));
+        q.archive_commit_plan(plan).expect("commit");
+        q.store().reset_tx_full_gets();
+        q.note_seqsigwit_ram_for_confirmed(Height(1), &fks)
+            .expect("ram window from append cache");
+        assert!(
+            q.store().tx_full_gets().is_empty(),
+            "prune connect must not re-read seqsigwit, got {:?}",
+            q.store().tx_full_gets()
+        );
+        let cached = q
+            .seqsigwit_cached_inputs(Fk(2), 1)
+            .expect("cache")
+            .expect("child inputs");
+        assert_eq!(cached[0].script_sig, script_sig);
+        assert!(!cached[0].witness.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2397,7 +2649,7 @@ mod tests {
         let (dir, q) = temp_query("commit-empty-packed-ins");
         let (block, txids, _) = wire_parent_child_big_script_sig();
         let block = Arc::new(block);
-        let mut plan = q
+        let plan = q
             .archive_plan_batch_from_wire(
                 &[(Fk(1), &block, txids.as_slice())],
                 1,
@@ -2407,18 +2659,53 @@ mod tests {
             )
             .expect("wire plan");
         assert!(
-            plan.packed.iter().all(|(_, ins)| !ins.is_empty()),
-            "stamp must fill packed ins"
+            plan.packed.iter().all(|(_, ins)| ins.is_empty()),
+            "wire plan leaves packed ins empty"
         );
-        for (_, ins) in plan.packed.iter_mut() {
-            ins.clear();
+        q.archive_commit_plan(plan)
+            .expect("wire edges encode seqsigwit");
+        let (_tx, ins, _outs) = q.store().get_tx_full(Fk(2)).unwrap();
+        assert_eq!(ins[0].script_sig.len(), 10_000);
+
+        let mut missing = q
+            .archive_plan_batch_from_wire(
+                &[(Fk(3), &block, txids.as_slice())],
+                3,
+                &crate::InFlight::new(),
+                None,
+                None,
+            )
+            .expect("second wire plan");
+        missing.edges.clear();
+        match q.archive_commit_plan(missing) {
+            Err(e) => {
+                let s = e.to_string();
+                assert!(s.contains("invariant: wire plan edges missing"), "{s}");
+            }
+            Ok(_) => panic!("missing edges must be corrupt"),
         }
-        match q.archive_commit_plan(plan) {
+
+        let pin = crate::CreatePinInner::records(
+            TxRecord {
+                txid: [9u8; 32],
+                version: 1,
+                locktime: 0,
+                input_start_fk: Fk::NULL,
+                input_count: 1,
+                output_start_fk: Fk::NULL,
+                output_count: 1,
+            },
+            vec![OutputRecord::unspent(1, vec![0x51])],
+        );
+        let mut records = crate::ArchiveWritePlan::empty();
+        records.packed.push((pin, Vec::new()));
+        records.planned_fks.push(Fk(9));
+        match q.archive_commit_plan(records) {
             Err(e) => {
                 let s = e.to_string();
                 assert!(s.contains("invariant: packed ins empty at write"), "{s}");
             }
-            Ok(_) => panic!("commit must not encode empty packed ins"),
+            Ok(_) => panic!("records pin with empty ins must be corrupt"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2541,7 +2828,7 @@ mod tests {
             let _ = q.confirm_stats().take_window();
             let plan = plan_applies(&q, &need, 1, &crate::InFlight::new(), Some(&skel))
                 .expect("skeleton stamp");
-            assert_eq!(plan.packed[0].1[0].create_fk, Fk(66));
+            assert_eq!(first_edge_create(&plan), Fk(66));
             assert_eq!(
                 plan.external_parents.get(&66).and_then(|p| p.body),
                 Some((3000, 24))
@@ -2646,7 +2933,7 @@ mod tests {
         let need = vec![(Fk(1), vec![child])];
         let plan =
             plan_applies(&q, &need, 1, &crate::InFlight::new(), Some(&skel)).expect("S0 plan");
-        assert_eq!(plan.packed[0].1[0].create_fk, Fk(88));
+        assert_eq!(first_edge_create(&plan), Fk(88));
         assert_eq!(
             plan.external_parents.get(&88).and_then(|p| p.body),
             helper.idents.get(&88).and_then(|p| p.body)
@@ -2704,7 +2991,7 @@ mod tests {
             let child = child_spend(parent_txid, 0x94);
             let need = vec![(Fk(1), vec![child])];
             let plan = plan_applies(&q, &need, 1, ifo, None).expect("S0 inflight");
-            assert_eq!(plan.packed[0].1[0].create_fk, Fk(93));
+            assert_eq!(first_edge_create(&plan), Fk(93));
             let mix = q.confirm_stats().take_window();
             assert_eq!(mix.head_need, 0, "plan path must skip leftover too");
         }

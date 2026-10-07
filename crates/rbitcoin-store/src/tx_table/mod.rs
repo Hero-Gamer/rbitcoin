@@ -2336,23 +2336,81 @@ impl TxTable {
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        if items.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        if txstat.len() != items.len() {
-            return Err(StoreError::Corrupt("txstat batch length"));
-        }
-        if !spent_overlay.is_empty() && spent_overlay.len() != items.len() {
-            return Err(StoreError::Corrupt("spent overlay length"));
-        }
-        let est_out: usize = items.iter().map(|(pin, _ins)| pin.packed_outs_est()).sum();
+        let pins: Vec<&P> = items.iter().map(|(pin, _)| pin).collect();
+        let edges: Vec<Vec<crate::input::InputEdge>> =
+            items.iter().map(|(_, ins)| input_edges(ins)).collect();
         let est_seqsigwit: usize = items
             .iter()
-            .map(|(_pin, ins)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
+            .map(|(_, ins)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
-        let est_spent: usize = items
+        let secret = self.secret.clone();
+        self.put_pins_with_edges(
+            &pins,
+            index,
+            spent_overlay,
+            txstat,
+            header_ranges,
+            &edges,
+            est_seqsigwit,
+            |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&secret)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // same wave as append_stems_one_wave
+    /// Class A append from pins. `input_edges[i]` is `(parent_fk, vout)` per vin.
+    /// A null parent is coinbase (`vout` ignored). `encode_in` writes that row's
+    /// `seqsigwit` bytes, XOR included when a secret applies.
+    pub fn put_pins_encoded<P: PackedCreate>(
+        &self,
+        pins: &[&P],
+        index: bool,
+        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        txstat: &[crate::txstat::TxStatRow],
+        header_ranges: &[(Fk, Fk, u32)],
+        input_edges: &[Vec<crate::input::InputEdge>],
+        est_seqsigwit: usize,
+        encode_in: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
+        self.put_pins_with_edges(
+            pins,
+            index,
+            spent_overlay,
+            txstat,
+            header_ranges,
+            input_edges,
+            est_seqsigwit,
+            encode_in,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // same wave as append_stems_one_wave
+    fn put_pins_with_edges<P: PackedCreate>(
+        &self,
+        pins: &[&P],
+        index: bool,
+        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        txstat: &[crate::txstat::TxStatRow],
+        header_ranges: &[(Fk, Fk, u32)],
+        input_edges: &[Vec<crate::input::InputEdge>],
+        est_seqsigwit: usize,
+        encode_in: impl FnMut(usize, &mut Vec<u8>),
+    ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
+        if pins.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if txstat.len() != pins.len() {
+            return Err(StoreError::Corrupt("txstat batch length"));
+        }
+        if input_edges.len() != pins.len() {
+            return Err(StoreError::Corrupt("input edge batch length"));
+        }
+        if !spent_overlay.is_empty() && spent_overlay.len() != pins.len() {
+            return Err(StoreError::Corrupt("spent overlay length"));
+        }
+        let est_out: usize = pins.iter().map(|pin| pin.packed_outs_est()).sum();
+        let est_spent: usize = pins
             .iter()
-            .map(|(pin, _ins)| 16 + spent_record_len(pin.packed_n_out()) as usize)
+            .map(|pin| 16 + spent_record_len(pin.packed_n_out()) as usize)
             .sum();
         let base = self.body.count();
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
@@ -2362,7 +2420,7 @@ impl TxTable {
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
-        for (i, (pin, _)) in items.iter().enumerate() {
+        for (i, pin) in pins.iter().enumerate() {
             let n_out = pin.packed_n_out();
             if n_out == 0 {
                 return Err(StoreError::Corrupt("invariant: create n_out"));
@@ -2378,36 +2436,34 @@ impl TxTable {
                 encode_spent_slot(0, fk, vin)?;
             }
         }
-        let n_outs: Vec<u32> = items.iter().map(|(pin, _)| pin.packed_n_out()).collect();
+        let n_outs: Vec<u32> = pins.iter().map(|pin| pin.packed_n_out()).collect();
         let (fks, loc) = self.append_stems_one_wave(
-            items.len(),
+            pins.len(),
             est_out,
             est_seqsigwit,
             est_spent,
             &n_outs,
             |i, buf| {
-                items[i].0.encode_txout_body(buf, Some(&self.secret));
+                pins[i].encode_txout_body(buf, Some(&self.secret));
             },
-            |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
+            encode_in,
             |i, buf| {
-                let n_out = items[i].0.packed_n_out();
+                let n_out = pins[i].packed_n_out();
                 let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
                 encode_spent_slots(n_out, pairs, buf).expect("spent overlay prechecked");
             },
         )?;
-        let ids: Vec<[u8; 32]> = items.iter().map(|(pin, _)| pin.packed_txid()).collect();
+        let ids: Vec<[u8; 32]> = pins.iter().map(|pin| pin.packed_txid()).collect();
         self.txids.append_batch(base, &ids)?;
         let tails = self.txstat.append_batch(base, txstat)?;
         self.txstat
             .put_overflows_for_headers(header_ranges, &tails)?;
-        let edges: Vec<Vec<crate::input::InputEdge>> =
-            items.iter().map(|(_, ins)| input_edges(ins)).collect();
-        self.input.append(&edges)?;
+        self.input.append(input_edges)?;
         if index {
-            let heads: Vec<([u8; 32], Fk)> = items
+            let heads: Vec<([u8; 32], Fk)> = pins
                 .iter()
                 .zip(fks.iter())
-                .map(|((pin, _), fk)| (pin.packed_txid(), *fk))
+                .map(|(pin, fk)| (pin.packed_txid(), *fk))
                 .collect();
             self.head_insert_many(&heads)?;
         }

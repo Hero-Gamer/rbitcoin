@@ -16,7 +16,7 @@ pub(crate) fn verify(
     cache: &mut SighashCache<&Transaction>,
 ) -> Result<(), ConsensusError> {
     let _ = tx;
-    let spk = job.prevouts[input_index].script_pubkey.as_bytes();
+    let spk = job.prevout_script(input_index)?;
     debug_assert!(spk.len() == 25);
     let keyhash = &spk[3..23];
 
@@ -31,7 +31,7 @@ pub(crate) fn verify(
     let (sig, sighash_ty) = crypto::parse_der_sig(&sig_raw, job.bip66_active)?;
     let pubkey = crypto::parse_pubkey(&pubkey_raw)?;
 
-    let script_code = job.prevouts[input_index].script_pubkey.as_script();
+    let script_code = Script::from_bytes(job.prevout_script(input_index)?);
     // Raw hashtype byte (may be 0 — must not normalize to SIGHASH_ALL).
     let sighash = cache
         .legacy_signature_hash(input_index, script_code, sighash_ty)
@@ -115,10 +115,10 @@ mod tests {
         };
         let job = ScriptCheckJob {
             txid: [0u8; 32],
-            prevouts: vec![TxOut {
+            prevouts: crate::block::JobPrevouts::owned(vec![TxOut {
                 value: Amount::from_sat(10),
                 script_pubkey: ScriptBuf::from_bytes(spk),
-            }],
+            }]),
             tx: crate::block::JobTx::owned(tx.clone()),
             flags: crate::block::ScriptVerifyFlags {
                 bip65_active: true,

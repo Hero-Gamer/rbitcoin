@@ -298,7 +298,7 @@ fn class_a_header_and_txids(
 /// Class A only (no tip / Class C). Crash and `plan=None` tests.
 ///
 /// Not a production IBD API — confirm write uses `archive_plan_batch_from_wire`
-/// + commit (packed ins already filled at plan).
+/// + commit (wire `seqsigwit` is encoded from the block and plan edges).
 pub fn commit_class_a_block(
     query: &Query,
     params: &ChainParams,

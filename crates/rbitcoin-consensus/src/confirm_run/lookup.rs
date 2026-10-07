@@ -311,6 +311,9 @@ pub fn confirm_wire_load_from_plan(
     } = stamped;
 
     let ifo = pipeline.map(|p| p.in_flight);
+    if let Some(ref mut p) = plan {
+        p.freeze_after_pin();
+    }
     let (batch_parents, spend_edges) = pin_for_wire_batch(
         query,
         plan.as_ref(),
@@ -319,9 +322,6 @@ pub fn confirm_wire_load_from_plan(
         &wire_blocks,
         ifo,
     )?;
-    if let Some(ref mut p) = plan {
-        p.freeze_after_pin();
-    }
 
     rbitcoin_query::note_confirm(
         &query.confirm_stats().load_ns,
@@ -927,14 +927,13 @@ mod tests {
         assert_eq!(stamped.metas[0].pres[0].txid, pres[0].txid);
         let plan = stamped.plan.as_ref().expect("new body plans");
         assert_eq!(plan.packed.len(), 1);
-        assert_eq!(
-            plan.packed[0].1.len(),
-            1,
-            "wire planner fills packed ins from stamp edges"
+        assert!(
+            plan.packed[0].1.is_empty(),
+            "wire plan must not retain scriptSig or witness"
         );
-        assert_eq!(
-            plan.packed[0].1[0].script_sig,
-            items[0].1.txdata[0].input[0].script_sig.to_bytes()
+        assert!(
+            !plan.edges.is_empty(),
+            "wire plan keeps spend edges for commit"
         );
         let want = items[0].1.txdata[0].output[0].script_pubkey.as_bytes();
         assert_eq!(

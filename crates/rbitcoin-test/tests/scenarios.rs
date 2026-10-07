@@ -3220,8 +3220,12 @@ fn pin_wire_prep_ahead_cross_batch(
     }
     let cb_fk = q.tx_fk_by_txid_tip(cb.as_byte_array()).unwrap().unwrap();
     let spend_fk = plan_a.planned_fks[1];
+    assert!(
+        plan_a.packed[1].1.is_empty(),
+        "wire plan must not retain scriptSig or witness"
+    );
     assert_eq!(
-        plan_a.packed[1].1[0].create_fk, cb_fk,
+        plan_a.edges[&spend_fk.0][0].create_fk, cb_fk,
         "a head-resolved parent is stamped by fk"
     );
     let edge = plan_a.edges[&spend_fk.0][0];
