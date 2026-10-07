@@ -287,6 +287,40 @@ pub(super) fn stamp_parent_pin_archived(
     Ok(stamp)
 }
 
+/// A txid that `block` spends, does not create, and the connected chain
+/// does not hold. One TipOnly `tx.head` read, with no in-flight plan and no
+/// load-batch skeleton: the tip path's read. The miss is the block's fault
+/// only when the block extends the tip and [`Query::head_covers_fence`]
+/// held across the read.
+pub fn parent_missing_from_chain(
+    query: &Query,
+    block: &Block,
+) -> Result<Option<[u8; 32]>, ConsensusError> {
+    let created: rbitcoin_query::TxidSet = block
+        .txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect();
+    let mut need: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .flat_map(|tx| &tx.input)
+        .filter(|inp| !inp.previous_output.is_null())
+        .map(|inp| inp.previous_output.txid.to_byte_array())
+        .filter(|txid| !created.contains(txid))
+        .collect();
+    need.sort_unstable();
+    need.dedup();
+    let hits: rbitcoin_query::TxidSet = query
+        .store()
+        .get_fk_by_txid_batch(&need)
+        .map_err(ConsensusError::from)?
+        .into_iter()
+        .filter_map(|(txid, row)| row.map(|_| txid))
+        .collect();
+    Ok(need.into_iter().find(|txid| !hits.contains(txid)))
+}
+
 /// IBD **load** after lookup stamp: pin + assemble.
 ///
 /// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.

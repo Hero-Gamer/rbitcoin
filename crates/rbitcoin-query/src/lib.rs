@@ -1127,6 +1127,14 @@ impl Query {
             .drain_and_fence_hi(self.head_drain_fk())
     }
 
+    /// `tx.head` holds every connected create: the drain has passed the
+    /// highest create fk on the fence. Every fk at or below the drain was
+    /// queued before it and inserted, since a failed drain re-queues its
+    /// batch and does not move the drain.
+    pub fn head_covers_fence(&self) -> bool {
+        self.head_drain_fk() >= self.store.fence_max_connected_fk()
+    }
+
     /// Record a tip shrink so load can drop in-flight layers for that height.
     pub(crate) fn note_disconnect_height(&self, height: u32) {
         self.disconnect_height

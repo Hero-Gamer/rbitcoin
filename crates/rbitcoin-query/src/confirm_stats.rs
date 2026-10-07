@@ -297,6 +297,7 @@ confirm_window! {
     thr_load_pin_ns,
     thr_load_asm_ns,
     thr_load_prune_ns,
+    thr_load_reject_ns,
     thr_load_send_wait_ns,
     thr_script_recv_wait_ns,
     thr_script_work_ns,
