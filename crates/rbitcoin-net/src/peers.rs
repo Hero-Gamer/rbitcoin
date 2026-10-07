@@ -38,7 +38,7 @@ pub(crate) fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
 
 pub(crate) fn outbound_queued_bytes(out: &PeerOut) -> usize {
     match out {
-        PeerOut::Msg(m) => outbound_msg_bytes(m),
+        PeerOut::Msg(m) | PeerOut::Served(m) => outbound_msg_bytes(m),
         PeerOut::Encoded(b) => b.len(),
     }
 }
@@ -47,14 +47,24 @@ pub(crate) fn outbound_queued_bytes(out: &PeerOut) -> usize {
 #[derive(Debug)]
 pub enum PeerOut {
     Msg(NetworkMessage),
+    /// A getdata witness block, pre-encoded. Holds one serve slot.
     Encoded(Vec<u8>),
+    /// A getdata `block` or `cmpctblock`. Holds one serve slot.
+    Served(NetworkMessage),
 }
 
 impl PeerOut {
+    /// A getdata body that holds one [`LivePeer::serve_inflight`] slot
+    /// until the writer is done with it. A tip announce or a `getblocktxn`
+    /// block is a [`PeerOut::Msg`] and holds none.
+    pub(crate) fn holds_serve_slot(&self) -> bool {
+        matches!(self, PeerOut::Encoded(_) | PeerOut::Served(_))
+    }
+
     #[cfg(test)]
     pub(crate) fn expect_msg(self) -> NetworkMessage {
         match self {
-            PeerOut::Msg(m) => m,
+            PeerOut::Msg(m) | PeerOut::Served(m) => m,
             PeerOut::Encoded(_) => panic!("expected application message, got encoded block"),
         }
     }
@@ -453,6 +463,7 @@ impl LivePeer {
 
     pub fn request_disconnect(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        self.send_resume.notify_waiters();
     }
 
     pub fn mark_handshake_complete(&self) {
@@ -871,6 +882,25 @@ impl LivePeer {
         }
     }
 
+    /// The writer is done with one queued message of `bytes`. The serve slot
+    /// is freed before the bytes: [`Self::note_send_written`] wakes a paused
+    /// getdata tail, which must see the slot.
+    pub(crate) fn note_out_written(&self, serve_slot: bool, bytes: usize) {
+        if serve_slot {
+            self.free_serve_slot();
+        }
+        self.note_send_written(bytes);
+    }
+
+    /// Saturating, so a double free cannot wrap to `usize::MAX`.
+    pub(crate) fn free_serve_slot(&self) {
+        let _ = self
+            .serve_inflight
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
     /// Reader pause. Registers the waiter before the budget check.
     pub(crate) async fn wait_send_budget(&self) {
         loop {
@@ -879,6 +909,34 @@ impl LivePeer {
                 return;
             }
             notified.await;
+        }
+    }
+
+    /// Room for the next getdata item: the writer is under
+    /// [`PEER_SEND_BUDGET`] and holds fewer than [`crate::MAX_SERVE_BLOCKS`]
+    /// served bodies. The session reader is the only task that queues
+    /// served bodies, so room seen here still holds when it queues.
+    pub(crate) fn has_serve_room(&self) -> bool {
+        !self.send_over_budget()
+            && self.serve_inflight.load(Ordering::SeqCst) < crate::MAX_SERVE_BLOCKS
+    }
+
+    /// Getdata pause, Core `fPauseSend`: a paused getdata tail resumes once
+    /// [`Self::has_serve_room`]. `false` once the session is told to
+    /// disconnect or its writer (`out`'s receiver) is gone.
+    pub(crate) async fn wait_serve_room(&self, out: &mpsc::UnboundedSender<PeerOut>) -> bool {
+        loop {
+            let notified = self.send_resume.notified();
+            if self.stop.load(Ordering::SeqCst) {
+                return false;
+            }
+            if self.has_serve_room() {
+                return true;
+            }
+            tokio::select! {
+                () = notified => {}
+                () = out.closed() => return false,
+            }
         }
     }
 
