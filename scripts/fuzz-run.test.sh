@@ -84,6 +84,8 @@ assert_ok "script_kernel dry-run dict" \
   grep -qx "FUZZ_DICT=fuzz/dict/script.dict" <<<"$out"
 assert_ok "script_kernel dry-run max_len 2000" \
   grep -qx "FUZZ_MAX_LEN=2000" <<<"$out"
+assert_ok "script_kernel dry-run timeout 1" \
+  grep -qx "FUZZ_TIMEOUT=1" <<<"$out"
 assert_ok "script_kernel listed in fuzz Cargo.toml" \
   grep -q 'name = "script_kernel_differential"' "$ROOT/fuzz/Cargo.toml"
 assert_ok "script_kernel listed in fuzz.yml matrix" \

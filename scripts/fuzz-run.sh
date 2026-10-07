@@ -145,7 +145,7 @@ elif [[ "$BIN" == "store_reorg" ]]; then
   timeout=30
 elif [[ "$BIN" == "script_kernel_differential" ]]; then
   sanitizer="address"
-  timeout=10
+  timeout=1
 elif [[ "$BIN" == "p2p_sequence_differential" || "$BIN" == "chain_review_differential" ]]; then
   sanitizer="none"
   timeout=180

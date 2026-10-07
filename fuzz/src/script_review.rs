@@ -8,6 +8,8 @@
 //! A different verdict is [`KernelCmp::Disagree`] even when our word is
 //! stricter than Core's.
 
+use std::time::{Duration, Instant};
+
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
 use bitcoin::consensus::encode::serialize;
@@ -54,6 +56,26 @@ const SHAPE_V0: u8 = 5;
 const SHAPE_DERSIG: u8 = 6;
 const SHAPE_BIP16: u8 = 7;
 const SHAPE_SIGNET: u8 = 8;
+
+/// Wall time for the two verify calls on an ASan nightly. libFuzzer
+/// `-timeout=1` is the hang backstop; this bound is what fails a quadratic
+/// script. Do not start looser.
+pub const SCRIPT_KERNEL_VERIFY_BUDGET: Duration = Duration::from_millis(100);
+
+pub fn verify_budget_exceeded(elapsed: Duration) -> bool {
+    elapsed > SCRIPT_KERNEL_VERIFY_BUDGET
+}
+
+fn enforce_verify_budget(started: Instant, prefix: &[u8]) {
+    let elapsed = started.elapsed();
+    if verify_budget_exceeded(elapsed) {
+        let n = prefix.len().min(8);
+        panic!(
+            "script-kernel verify budget elapsed={elapsed:?} prefix={:02x?}",
+            &prefix[..n]
+        );
+    }
+}
 
 /// Core `GetBlockScriptFlags` (validation.cpp): P2SH|WITNESS|TAPROOT from
 /// genesis, replaced only by the two exception hashes, then the height-gated
@@ -152,17 +174,29 @@ fn classify(ours: bool, core: bool) -> KernelCmp {
 
 /// Run the shipped verifier and `bitcoinconsensus` on one spend.
 pub fn compare_spend(prevouts: Vec<TxOut>, tx: Transaction, flags: u32) -> KernelCmp {
+    compare_spend_prefixed(prevouts, tx, flags, &[])
+}
+
+fn compare_spend_prefixed(
+    prevouts: Vec<TxOut>,
+    tx: Transaction,
+    flags: u32,
+    prefix: &[u8],
+) -> KernelCmp {
     if flags_abort_libconsensus(flags) {
         return KernelCmp::Skip;
     }
     debug_assert_eq!(UNMAPPED_POLICY & (VERIFY_P2SH | VERIFY_WITNESS), 0);
+    let started = Instant::now();
     let ours =
         verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), flags_to_ours(flags)).is_ok();
-    match core_script_verdict(&prevouts, &tx, flags) {
+    let cmp = match core_script_verdict(&prevouts, &tx, flags) {
         Ok(core) => classify(ours, core),
         Err(Error::ERR_INVALID_FLAGS) => KernelCmp::Skip,
         Err(_) => classify(ours, false),
-    }
+    };
+    enforce_verify_budget(started, prefix);
+    cmp
 }
 
 fn spend(
@@ -342,6 +376,15 @@ pub fn compare_at_height(
     block_hash: &[u8; 32],
     spend_tx: (Vec<TxOut>, Transaction),
 ) -> KernelCmp {
+    compare_at_height_prefixed(height, block_hash, spend_tx, &[])
+}
+
+fn compare_at_height_prefixed(
+    height: u32,
+    block_hash: &[u8; 32],
+    spend_tx: (Vec<TxOut>, Transaction),
+    prefix: &[u8],
+) -> KernelCmp {
     let params = ChainParams::mainnet();
     let core_flags = core_block_script_flags(&params, height, block_hash);
     if flags_abort_libconsensus(core_flags) {
@@ -349,24 +392,34 @@ pub fn compare_at_height(
     }
     let ours_flags = ScriptVerifyFlags::for_block(&params, height, block_hash, 0);
     let (prevouts, tx) = spend_tx;
+    let started = Instant::now();
     let ours = verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), ours_flags).is_ok();
     let core = core_accept(&prevouts, &tx, core_flags);
-    classify(ours, core)
+    let cmp = classify(ours, core);
+    enforce_verify_budget(started, prefix);
+    cmp
 }
 
 pub fn compare_signet_empty(challenge: &[u8]) -> KernelCmp {
+    compare_signet_empty_prefixed(challenge, &[])
+}
+
+fn compare_signet_empty_prefixed(challenge: &[u8], prefix: &[u8]) -> KernelCmp {
     if challenge.is_empty() || challenge.len() > 10_000 {
         return KernelCmp::Skip;
     }
     let block = signet_block_bare_commitment();
     let script = Script::from_bytes(challenge);
-    let ours = validate_signet_block_solution(&block, script).is_ok();
     let Ok((to_spend, to_sign)) = signet_challenge_transactions(&block, script) else {
         return KernelCmp::Skip;
     };
     let core_flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DERSIG | VERIFY_NULLDUMMY;
+    let started = Instant::now();
+    let ours = validate_signet_block_solution(&block, script).is_ok();
     let core = core_accept(&to_spend.output, &to_sign, core_flags);
-    classify(ours, core)
+    let cmp = classify(ours, core);
+    enforce_verify_budget(started, prefix);
+    cmp
 }
 
 fn signet_block_bare_commitment() -> Block {
@@ -403,10 +456,10 @@ pub fn compare_kernel_bytes(data: &[u8]) -> Option<KernelCmp> {
     if data.first().copied() != Some(STRUCTURED) {
         return None;
     }
-    compare_structured(&data[1..])
+    compare_structured(&data[1..], data)
 }
 
-fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
+fn compare_structured(data: &[u8], input: &[u8]) -> Option<KernelCmp> {
     if data.len() < 5 {
         return None;
     }
@@ -416,33 +469,51 @@ fn compare_structured(data: &[u8]) -> Option<KernelCmp> {
     Some(match shape {
         SHAPE_RAW => {
             let (prev, tx) = raw_spend(payload)?;
-            compare_spend(prev, tx, flags)
+            compare_spend_prefixed(prev, tx, flags, input)
         }
-        SHAPE_CMS => compare_spend_pair(cms_empty_sig_spend(), flags),
-        SHAPE_DER => compare_spend_pair(witness_der_spend(), flags),
-        SHAPE_P2PKH => compare_spend_pair(typed_p2pkh_spend(), flags),
-        SHAPE_P2WPKH => compare_spend_pair(typed_p2wpkh_spend(), flags),
-        SHAPE_V0 => compare_v0_at_payload_height(payload),
+        SHAPE_CMS => {
+            let pair = cms_empty_sig_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_DER => {
+            let pair = witness_der_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_P2PKH => {
+            let pair = typed_p2pkh_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_P2WPKH => {
+            let pair = typed_p2wpkh_spend();
+            compare_spend_pair_prefixed(pair, flags, input)
+        }
+        SHAPE_V0 => compare_v0_at_payload_height(payload, input),
         SHAPE_DERSIG => {
             let height = payload_height(payload);
-            compare_at_height(height, &[0x11; 32], nullfail_spend())
+            compare_at_height_prefixed(height, &[0x11; 32], nullfail_spend(), input)
         }
-        SHAPE_BIP16 => compare_at_height(170_060, &BIP16_EXCEPTION_MAINNET, bip16_bare_spend()),
+        SHAPE_BIP16 => {
+            compare_at_height_prefixed(170_060, &BIP16_EXCEPTION_MAINNET, bip16_bare_spend(), input)
+        }
         SHAPE_SIGNET => {
             let challenge = if payload.is_empty() {
                 vec![0x52]
             } else {
                 payload.to_vec()
             };
-            compare_signet_empty(&challenge)
+            compare_signet_empty_prefixed(&challenge, input)
         }
         _ => return None,
     })
 }
 
-fn compare_spend_pair(pair: (Vec<TxOut>, Transaction), flags: u32) -> KernelCmp {
+fn compare_spend_pair_prefixed(
+    pair: (Vec<TxOut>, Transaction),
+    flags: u32,
+    prefix: &[u8],
+) -> KernelCmp {
     let (prev, tx) = pair;
-    compare_spend(prev, tx, flags)
+    compare_spend_prefixed(prev, tx, flags, prefix)
 }
 
 /// v0 program vs `for_block` only once segwit is active.
@@ -450,7 +521,7 @@ fn compare_spend_pair(pair: (Vec<TxOut>, Transaction), flags: u32) -> KernelCmp 
 /// Below that height `for_block` leaves WITNESS off, so this program is a
 /// true bare script, while `GetBlockScriptFlags` has had WITNESS on since
 /// genesis. A missing height is not treated as 1000.
-fn compare_v0_at_payload_height(payload: &[u8]) -> KernelCmp {
+fn compare_v0_at_payload_height(payload: &[u8], prefix: &[u8]) -> KernelCmp {
     if payload.len() < 4 {
         return KernelCmp::Skip;
     }
@@ -458,7 +529,7 @@ fn compare_v0_at_payload_height(payload: &[u8]) -> KernelCmp {
     if !ChainParams::mainnet().segwit_active_at(height) {
         return KernelCmp::Skip;
     }
-    compare_at_height(height, &[0x11; 32], v0_program_spend())
+    compare_at_height_prefixed(height, &[0x11; 32], v0_program_spend(), prefix)
 }
 
 fn payload_height(payload: &[u8]) -> u32 {
@@ -481,6 +552,8 @@ fn bip16_bare_spend() -> (Vec<TxOut>, Transaction) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use rbitcoin_consensus::verify_tx_scripts_with_flags;
 
@@ -673,6 +746,13 @@ mod tests {
             compare_kernel_bytes(&raw),
             Some(KernelCmp::Agree { .. } | KernelCmp::Disagree { .. })
         ));
+    }
+
+    #[test]
+    fn verify_budget_rejects_only_past_one_hundred_milliseconds() {
+        assert!(!verify_budget_exceeded(Duration::from_millis(0)));
+        assert!(!verify_budget_exceeded(Duration::from_millis(100)));
+        assert!(verify_budget_exceeded(Duration::from_millis(101)));
     }
 
     #[test]
