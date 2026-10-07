@@ -1875,8 +1875,14 @@ fn finish_reorg_compare(
     }
 }
 
-/// Same header as `honest`, with the last transaction repeated. The block
-/// hash matches. `check_merkle_root` does not.
+/// Same header as `honest`, with the last transaction repeated.
+///
+/// The block hash matches. The computed merkle root also matches when
+/// `honest` has an odd transaction count of at least 3, because that last
+/// leaf is already duplicated inside the tree. A 1-tx or 2-tx block, or any
+/// even count, changes the computed root, so `check_merkle_root` fails
+/// (`bad-txnmrklroot`). A count that keeps the root still fails consensus as
+/// a duplicate transaction. Both shapes are submitted.
 pub fn same_hash_merkle_mutant(honest: &Block) -> Option<Block> {
     let last = honest.txdata.last()?.clone();
     let mut txdata = honest.txdata.clone();
@@ -2005,7 +2011,12 @@ fn compare_prepared_twin(
     if honest.block_hash() != offered_hash || honest.txdata.len() == offered_len {
         return prior;
     }
-    replay_honest_twin(hub, tip, oracle, honest)
+    // Replay only after both sides reject the mutant. An accept, a skip, or
+    // a split is the result; submitting the honest body would hide it.
+    match prior {
+        CompareOne::Agreed { accept: false } => replay_honest_twin(hub, tip, oracle, honest),
+        other => other,
+    }
 }
 
 fn compare_offered(
@@ -2298,6 +2309,71 @@ mod tests {
         assert_eq!(mock.submits.get(), 2, "honest submit follows the mutant");
         assert!(!hub.is_block_invalid(&honest.block_hash()));
         assert_eq!(hub.tip_height(), Some(0));
+    }
+
+    #[test]
+    fn core_accept_of_a_rejected_mutant_is_not_replayed_away() {
+        let (_dir, hub, tip) = tmp_diff_hub();
+        let honest = {
+            let raw = different_height1();
+            deserialize::<Block>(&raw).unwrap()
+        };
+        let mutant = same_hash_merkle_mutant(&honest).expect("duplicate tail");
+        assert!(!mutant.check_merkle_root());
+        let mock = MockOracle::new(OracleReply::NullAccept);
+        let cmp = compare_prepared_twin(&hub, &tip, &mock, mutant, Some(honest));
+        assert_eq!(mock.submits.get(), 1, "honest replay must not hide the split");
+        assert!(
+            matches!(
+                cmp,
+                CompareOne::Disagreed {
+                    ours: false,
+                    core: true,
+                    ..
+                }
+            ),
+            "{cmp:?}"
+        );
+    }
+
+    #[test]
+    fn odd_count_duplicate_keeps_the_merkle_root() {
+        use bitcoin::hashes::Hash;
+        use rbitcoin_consensus::genesis_block;
+        let params = diff_regtest_params();
+        let genesis = genesis_block(&params);
+        let mut extras = Vec::new();
+        for n in 1u8..=2 {
+            extras.push(Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: Txid::from_byte_array([n; 32]),
+                        vout: 0,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            });
+        }
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time.saturating_add(REGTEST_BLOCK_SPACING),
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            extras,
+        );
+        assert_eq!(honest.txdata.len(), 3);
+        let mutant = same_hash_merkle_mutant(&honest).expect("duplicate tail");
+        assert_eq!(mutant.block_hash(), honest.block_hash());
+        assert!(mutant.check_merkle_root());
+        assert_eq!(mutant.txdata.len(), 4);
     }
 
     #[test]
