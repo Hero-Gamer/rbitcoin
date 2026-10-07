@@ -455,6 +455,9 @@ impl Query {
             (None, 0)
         };
         let (ph, prune_on) = Self::load_pruneheight(&store_path)?;
+        // Open rebuilt or backfilled `tx.head` through every Class A create,
+        // and nothing is queued: the drain starts there.
+        let head_drained = store.txs.head_last_inserted_fk();
         let q = Self {
             store,
             spend_index: std::sync::atomic::AtomicBool::new(true),
@@ -488,7 +491,7 @@ impl Query {
             reconstruct_archived: AtomicU64::new(0),
             max_sh_creates: AtomicU32::new(DEFAULT_MAX_SH_CREATES),
             thin_tweak_body_bytes: AtomicU64::new(0),
-            head_drain_fk: AtomicU64::new(0),
+            head_drain_fk: AtomicU64::new(head_drained),
             disconnect_height: AtomicU32::new(0),
             disconnect_gen: AtomicU64::new(0),
             confirm_stats: Arc::new(ConfirmStats::default()),
@@ -1126,6 +1129,14 @@ impl Query {
         self.store
             .height_fence_snapshot()
             .drain_and_fence_hi(self.head_drain_fk())
+    }
+
+    /// `tx.head` holds every connected create: the drain has passed the
+    /// highest create fk on the fence. Every fk at or below the drain was
+    /// queued before it and inserted, since a failed drain re-queues its
+    /// batch and does not move the drain.
+    pub fn head_covers_fence(&self) -> bool {
+        self.head_drain_fk() >= self.store.fence_max_connected_fk()
     }
 
     /// Record a tip shrink so load can drop in-flight layers for that height.

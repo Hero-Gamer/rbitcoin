@@ -341,7 +341,7 @@ impl Store {
         Self::create_layout_with_head(layout, head)
     }
 
-    fn create_layout_with_head(
+    pub(crate) fn create_layout_with_head(
         layout: StoreLayout,
         head: crate::address_head::HeadLayout,
     ) -> Result<Self, StoreError> {
@@ -548,6 +548,52 @@ impl Store {
         }
         self.mtp_write().set_window(tip.0, &times);
         Ok(())
+    }
+
+    /// First fk whose `tx.head` row may sit in slot pages a power loss left
+    /// with holes ([`crate::segmented_head::SegmentedTxHead::unsynced_first_fk`]).
+    /// It never falls, so a value read before a head read bounds every
+    /// segment that read probed.
+    pub fn head_unsynced_first_fk(&self) -> u64 {
+        self.txs.head_unsynced_first_fk()
+    }
+
+    /// Txids of `sorted` that `txid.body` holds at a connected fk at or
+    /// above `from_fk` ([`Self::head_unsynced_first_fk`], read before the
+    /// head read that missed them). After a power loss the head can miss a
+    /// connected create there while its synced count still covers it; open
+    /// does not see that. `stop` is polled before each chunk: a stopped scan
+    /// is `Cancelled`, never a result.
+    ///
+    /// IO: a sequential `txid.body` read from `from_fk` to the last create:
+    /// the open tail, plus the previous segment while its seal is in flight
+    /// (up to about 54 M txids, 1.7 GiB, on mainnet). RAM: one 2 MiB chunk at
+    /// a time. Only a reject path pays this.
+    pub fn connected_in_unsynced_head(
+        &self,
+        from_fk: u64,
+        sorted: &[[u8; 32]],
+        stop: impl Fn() -> bool,
+    ) -> Result<Vec<[u8; 32]>, StoreError> {
+        const CHUNK: u64 = 65_536;
+        debug_assert!(sorted.is_sorted(), "binary_search needs a sorted slice");
+        let fence = self.height_fence_snapshot();
+        let last = self.txs.count();
+        let mut cur = from_fk.max(1);
+        let mut out = Vec::new();
+        while cur <= last {
+            if stop() {
+                return Err(StoreError::Cancelled("tx.head unsynced scan"));
+            }
+            let end = cur.saturating_add(CHUNK - 1).min(last);
+            for (fk, txid) in (cur..=end).zip(self.txs.body_txid_range(cur, end)?) {
+                if sorted.binary_search(&txid).is_ok() && fence.height_of(Fk(fk)).is_some() {
+                    out.push(txid);
+                }
+            }
+            cur = end + 1;
+        }
+        Ok(out)
     }
 
     /// Highest create_fk in a connected fence run (`0` if empty).

@@ -92,3 +92,45 @@ pub fn tiny_store_labeled(label: &str) -> (TempDir, Store) {
     let store = Store::create_tiny(dir.path()).expect("create tiny store");
     (dir, store)
 }
+
+/// Tiny store at `dir` whose `tx.head` segments have `2^bits` slots, so a
+/// few hundred creates fill one and roll it.
+pub fn create_tiny_with_head_bits(dir: &Path, bits: u32) -> Store {
+    let head = crate::address_head::HeadLayout::new(bits).expect("head bits in range");
+    Store::create_layout_with_head(crate::StoreLayout::tiny(dir.to_path_buf()), head)
+        .expect("create tiny store")
+}
+
+/// Zero the slot pages of every unsealed `tx.head` segment under `root`,
+/// keeping each file's length, its trailing layout footer, and the synced
+/// `meta`. A power loss leaves this when `meta` was synced after an insert
+/// and the page writes were not.
+pub fn drop_unsynced_tx_head_pages(root: &Path) {
+    fn find_head(dir: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|e| {
+            let p = e.path();
+            if !p.is_dir() {
+                return None;
+            }
+            if p.file_name()? == "tx.head" {
+                Some(p)
+            } else {
+                find_head(&p)
+            }
+        })
+    }
+    let head = find_head(root).expect("tx.head under root");
+    for e in std::fs::read_dir(&head).expect("read tx.head").flatten() {
+        let p = e.path();
+        if p.extension().is_some() || p.file_name().is_some_and(|n| n == "meta") {
+            continue;
+        }
+        let len = std::fs::metadata(&p).expect("segment len").len();
+        let slots = len.saturating_sub(crate::file::TRAILING_FOOTER_LEN as u64);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .expect("open segment");
+        std::io::Write::write_all(&mut f, &vec![0u8; slots as usize]).expect("zero slot pages");
+    }
+}

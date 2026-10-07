@@ -29,7 +29,12 @@
 //!   load OS-thread wall. Load thread also does pack decode, leftover stamp
 //!   (plan=None / S0 only), clone, post-stamp prune on a marked last load
 //!   batch, and a stamp or pin reject's rewind of the wave
-//!   (`load_thr pack/stamp/pin/asm/prune`).
+//!   (`load_thr pack/stamp/pin/asm/prune`). `reject=` is a lone block's
+//!   missing-parent check after a stamp miss: the wait for its parent to be
+//!   the tip with `tx.head` holding every connected create, one TipOnly
+//!   read, and on a miss a `txid.body` scan of every unsealed `tx.head`
+//!   segment that stops with confirm. It can hold the load thread for
+//!   seconds, so it stays out of `prune=`.
 //! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
 //!   `ibd-confirm`; excludes head-of-line wait for write handoff and `idx_asm=`).
 //!   `idx_asm=` is filter and tweak assemble after that verify. `thr script work`
@@ -339,6 +344,8 @@ pub(crate) struct IbdPerfSample {
     pub thr_load_pin_ms: u64,
     pub thr_load_asm_ms: u64,
     pub thr_load_prune_ms: u64,
+    /// A lone block's missing-parent check after its load stamp missed.
+    pub thr_load_reject_ms: u64,
     pub thr_load_send_wait_ms: u64,
     pub script_jobs: u64,
     pub script_skip: u64,
@@ -584,6 +591,7 @@ impl Default for IbdPerfSample {
             thr_load_pin_ms: 0,
             thr_load_asm_ms: 0,
             thr_load_prune_ms: 0,
+            thr_load_reject_ms: 0,
             thr_load_send_wait_ms: 0,
             script_jobs: 0,
             script_skip: 0,
@@ -1102,6 +1110,7 @@ pub(crate) fn sample(
         thr_load_pin_ms: ns_ms(w.thr_load_pin_ns),
         thr_load_asm_ms: ns_ms(w.thr_load_asm_ns),
         thr_load_prune_ms: ns_ms(w.thr_load_prune_ns),
+        thr_load_reject_ms: ns_ms(w.thr_load_reject_ns),
         thr_load_send_wait_ms: ns_ms(w.thr_load_send_wait_ns),
         script_jobs,
         script_skip,
@@ -1308,7 +1317,8 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         .saturating_add(s.thr_load_stamp_ms)
         .saturating_add(s.thr_load_pin_ms)
         .saturating_add(s.thr_load_asm_ms)
-        .saturating_add(s.thr_load_prune_ms);
+        .saturating_add(s.thr_load_prune_ms)
+        .saturating_add(s.thr_load_reject_ms);
     let thr_load_wait = s
         .thr_load_recv_wait_ms
         .saturating_add(s.thr_load_send_wait_ms);
@@ -1320,7 +1330,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
     out.push_str(&format!(
         " | conf blks={} lookup={}ms load={}ms script={}ms(jobs={} skip={}) idx_asm={}ms write={}ms \
          lookup_thr busy={}ms(claim={}ms wave={}ms(decode={}ms precompute={}ms collect={}ms head={}ms(probe={}ms io={}ms preads={}) loc={}ms) other={}ms send_w={}ms) \
-         load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms(pack={}ms head={}ms) pin={}ms asm={}ms prune={}ms send_w={}ms) \
+         load_thr busy/wait={}/{}ms(pack={}ms clone={}ms stamp={}ms(pack={}ms head={}ms) pin={}ms asm={}ms prune={}ms reject={}ms send_w={}ms) \
          thr script={}/{}ms write={}/{}ms \
          ready={} scriptq_hwm={}/{} writeq_hwm={}/{}",
         s.phase_blks.max(s.plan_blks),
@@ -1354,6 +1364,7 @@ pub(crate) fn format_info(s: &IbdPerfSample) -> String {
         s.thr_load_pin_ms,
         s.thr_load_asm_ms,
         s.thr_load_prune_ms,
+        s.thr_load_reject_ms,
         s.thr_load_send_wait_ms,
         s.thr_script_work_ms,
         thr_script_wait,
@@ -2065,7 +2076,7 @@ mod tests {
         assert!(line.contains("script=20ms(jobs=0 skip=0)"), "{line}");
         assert!(line.contains("load_thr busy/wait="), "{line}");
         assert!(line.contains("pack=0ms"), "{line}");
-        assert!(line.contains("prune=0ms"), "{line}");
+        assert!(line.contains("prune=0ms reject=0ms"), "{line}");
         s.thr_load_pack_ms = 100;
         s.thr_load_stamp_ms = 1700;
         s.thr_load_pin_ms = 700;
@@ -2088,6 +2099,17 @@ mod tests {
         );
         assert!(split.contains("pin=700ms"), "{split}");
         assert!(split.contains("prune=50ms"), "{split}");
+        s.thr_load_reject_ms = 10_000;
+        let parent_check = format_info(&s);
+        assert!(
+            parent_check.contains("load_thr busy/wait=12550/200ms"),
+            "{parent_check}"
+        );
+        assert!(
+            parent_check.contains("prune=50ms reject=10000ms"),
+            "{parent_check}"
+        );
+        s.thr_load_reject_ms = 0;
         assert!(split.contains("script=20ms(jobs=12 skip=3)"), "{split}");
         s.thr_load_clone_ms = 75;
         let with_clone = format_info(&s);

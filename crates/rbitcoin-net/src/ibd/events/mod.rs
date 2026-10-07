@@ -828,11 +828,8 @@ pub(crate) fn apply_confirm_reject(
         warn!("ibd: confirm reject ignored zero-hash @{height}: {err}");
         return;
     }
-    let class = if err.contains("parent create_fk unresolved")
-        || err.contains("spend annotate missing pin denserels")
-    {
-        ConfirmRejectClass::EngineFault
-    } else if class == ConfirmRejectClass::ConsensusInvalid {
+    let sent = class;
+    let class = if class == ConfirmRejectClass::ConsensusInvalid {
         if let Some(h) = hub {
             class.trust_consensus(h, hash)
         } else {
@@ -859,6 +856,9 @@ pub(crate) fn apply_confirm_reject(
         ConfirmRejectClass::SoftWire => {}
         ConfirmRejectClass::Cascade => {
             apply_cascade_reject(st, height, hash, err, hub);
+            if sent == ConfirmRejectClass::ConsensusInvalid && batch_len == 1 {
+                reget_dropped_verdict_body(st, hash);
+            }
         }
         ConfirmRejectClass::EngineFault => {
             apply_engine_fault_reject(st, height, hash, err, query);
@@ -999,6 +999,14 @@ fn apply_cascade_reject(
     }
     note_confirm_stuck(st);
     warn!("ibd: confirm reject cascade @{height} {hash}: {err} (requeue, not blacklisted)");
+}
+
+/// Load, scripts, and write each drop the body of a lone block they judge
+/// invalid. When apply no longer trusts that verdict (the block's parent is
+/// not the tip now), no stage holds the body: ask for it again.
+fn reget_dropped_verdict_body(st: &mut IbdWorkState, hash: BlockHash) {
+    st.body.mark_missing(hash);
+    st.reopen_for_densify(&[hash]);
 }
 
 fn apply_engine_fault_reject(

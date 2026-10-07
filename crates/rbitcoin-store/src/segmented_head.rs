@@ -238,6 +238,24 @@ impl SegmentedTxHead {
             .sum()
     }
 
+    /// First fk of the oldest unsealed segment. Probes read every row at or
+    /// above it from open-address slot pages, which a power loss can leave
+    /// with holes under a synced `meta` count: insert syncs `meta` but not
+    /// the pages. A roll syncs the pages it closes, but a hole already in
+    /// them stays there until that segment's seal publishes, and the open tail
+    /// and the in-flight seal are both unsealed. A seal rebuilds its rows from
+    /// `txid.body` and syncs its files before `meta` names it sealed, so rows
+    /// below this fk are complete. Never falls: a publish seals the oldest
+    /// unsealed segment, and a roll opens past the last create. Past the last
+    /// create when every segment is sealed.
+    pub fn unsynced_first_fk(&self) -> u64 {
+        let segs = self.segments_snapshot();
+        match segs.iter().find(|s| !s.sealed) {
+            Some(s) => s.first_fk,
+            None => self.last_inserted_fk().saturating_add(1),
+        }
+    }
+
     /// Highest create_fk present in any segment (0 if empty).
     pub fn last_inserted_fk(&self) -> u64 {
         let segs = self.segments_snapshot();

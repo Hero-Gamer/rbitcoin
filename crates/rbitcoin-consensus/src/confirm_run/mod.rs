@@ -63,8 +63,8 @@ use lookup::confirm_archive_kind;
 #[cfg(test)]
 use lookup::ConfirmArchiveKind;
 pub use lookup::{
-    confirm_wire_load_from_plan, confirm_wire_lookup_stamp, ParentPinStamp, PlanStampOutcome,
-    WireBlockIn,
+    confirm_wire_load_from_plan, confirm_wire_lookup_stamp, parent_missing_from_chain,
+    ParentPinStamp, PlanStampOutcome, WireBlockIn,
 };
 use phases::{assemble_run, Assembled};
 #[cfg(test)]

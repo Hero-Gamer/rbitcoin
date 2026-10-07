@@ -603,14 +603,30 @@ fn rearm_after_reject(
     true
 }
 
+/// The class a load reject of `wave` is rewound and sent with. A lone
+/// block's verdict holds only while its parent is the tip; otherwise it is
+/// a cascade. This is load's one tip sample: the rewind and the event both
+/// use it, so a lone `ConsensusInvalid` event always means load dropped the
+/// body.
+fn load_reject_class(
+    hub: &ChainHub,
+    class: ConfirmRejectClass,
+    wave: &[OfferBack<'_>],
+) -> ConfirmRejectClass {
+    match wave {
+        [(_, hash, _, _)] => class.trust_consensus(hub, *hash),
+        _ => class,
+    }
+}
+
 /// Stamp/pin fail: drop speculative fks, bump the feed epoch, re-offer to BQ.
 /// A one-block verdict drops its failing block; a one-block cascade (a stale
-/// plan, or a consensus reject against a parent that is not the tip) goes
-/// back for a retry. A batched reject names the first hash but may be any
-/// block's fault, so every block goes back and the retry runs one block at
-/// a time. An engine fault is no block's fault: every block goes back and
-/// the retry is not isolated. Same order as [`rearm_after_reject`]:
-/// serialize, isolate, re-arm, insert.
+/// plan, or a consensus reject against a parent that is not the tip, see
+/// [`load_reject_class`]) goes back for a retry. A batched reject names the
+/// first hash but may be any block's fault, so every block goes back and
+/// the retry runs one block at a time. An engine fault is no block's fault:
+/// every block goes back and the retry is not isolated. Same order as
+/// [`rearm_after_reject`]: serialize, isolate, re-arm, insert.
 fn load_fail_rewind_wave(
     feed: &ConfirmFeed,
     hub: &ChainHub,
@@ -620,12 +636,7 @@ fn load_fail_rewind_wave(
     wave: &[OfferBack<'_>],
 ) {
     let fault = class == ConfirmRejectClass::EngineFault;
-    let drop_head = match wave {
-        [(_, hash, _, _)] => {
-            !fault && class.trust_consensus(hub, *hash) != ConfirmRejectClass::Cascade
-        }
-        _ => false,
-    };
+    let drop_head = wave.len() == 1 && !fault && class != ConfirmRejectClass::Cascade;
     let prepared = prepare_offer_back(hub, wave[usize::from(drop_head)..].iter().copied());
     lookup_ahead.clear_all(hub);
     feed.finish(std::iter::once(first_h));
@@ -1317,6 +1328,76 @@ pub(crate) fn format_stamp_reject_missing_prevout(
     s
 }
 
+/// Longest a stamp miss waits for its block's parent to be the tip, with
+/// `tx.head` holding every connected create. The parent was stamped just
+/// before, and scripts and write never wait on load.
+const PARENT_CHECK_WAIT: Duration = Duration::from_secs(10);
+
+/// A fresh read of a lone block's parents after its load stamp missed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentCheck {
+    /// The connected chain does not hold this parent: the block's verdict.
+    Missing([u8; 32]),
+    /// The block's parent is not the tip, the chain moved during the read,
+    /// or confirm is stopping: retry the block.
+    OffTip,
+    /// The chain holds every parent, or the read could not be trusted: the
+    /// pipeline missed it.
+    Engine,
+}
+
+/// The stamp reads the pipeline's own view (in-flight and load-batch
+/// skeleton), and a miss there has blacklisted valid blocks before. A
+/// verdict needs the tip path's read: the block extends the tip, `tx.head`
+/// holds every connected create, a fresh TipOnly read still misses, and no
+/// disconnect ran from the wait through the read.
+fn check_missing_parent(hub: &ChainHub, feed: &ConfirmFeed, block: &bitcoin::Block) -> ParentCheck {
+    let prev = block.header.prev_blockhash;
+    let mut disconnects = 0u64;
+    let _ = hub.query.take_disconnect(&mut disconnects);
+    let on_tip = || hub.tip_hash() == Some(prev);
+    let ready = || on_tip() && hub.query.head_covers_fence();
+    let stop = || feed.stopped() || hub.query.confirm_cancelled();
+    let deadline = Instant::now() + PARENT_CHECK_WAIT;
+    while !ready() {
+        if stop() || Instant::now() >= deadline {
+            return if on_tip() && !feed.stopped() {
+                ParentCheck::Engine
+            } else {
+                ParentCheck::OffTip
+            };
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let read = rbitcoin_consensus::parent_missing_from_chain(&hub.query, block, stop);
+    if stop() || !ready() || hub.query.take_disconnect(&mut disconnects).is_some() {
+        return ParentCheck::OffTip;
+    }
+    match read {
+        Ok(Some(txid)) => ParentCheck::Missing(txid),
+        Ok(None) => ParentCheck::Engine,
+        Err(e) => {
+            warn!("ibd: missing-parent read for {}: {e}", block.block_hash());
+            ParentCheck::Engine
+        }
+    }
+}
+
+/// A batched stamp miss keeps its consensus class, which isolates the retry
+/// to one block at a time. A lone block's miss takes the class of its
+/// [`ParentCheck`]; an engine fault goes back once, and a repeat halts IBD.
+fn stamp_reject_class(
+    e: &rbitcoin_consensus::ConsensusError,
+    check: Option<ParentCheck>,
+) -> ConfirmRejectClass {
+    match check {
+        Some(ParentCheck::Missing(_)) => ConfirmRejectClass::ConsensusInvalid,
+        Some(ParentCheck::OffTip) => ConfirmRejectClass::Cascade,
+        Some(ParentCheck::Engine) => ConfirmRejectClass::EngineFault,
+        None => ConfirmRejectClass::from_consensus(e),
+    }
+}
+
 pub(crate) fn stamp_reject_operator_msg(err: &str, stats: &rbitcoin_query::ConfirmStats) -> String {
     if err == "missing prevout" {
         let last = stats.last_plan_batch();
@@ -1443,6 +1524,10 @@ pub(crate) mod confirm_thr_stats {
     #[inline]
     pub fn add_load_prune(stats: &rbitcoin_query::ConfirmStats, d: Duration) {
         rbitcoin_query::note_confirm_dur(&stats.thr_load_prune_ns, d);
+    }
+    #[inline]
+    pub fn add_load_reject(stats: &rbitcoin_query::ConfirmStats, d: Duration) {
+        rbitcoin_query::note_confirm_dur(&stats.thr_load_reject_ns, d);
     }
     #[inline]
     pub fn add_load_send_wait(stats: &rbitcoin_query::ConfirmStats, d: Duration) {
@@ -2103,16 +2188,32 @@ pub(crate) fn spawn_confirm_engine(
                             return;
                         }
                         let session_fault = e.is_uring_session_fault();
+                        let parent_check = match (&e, wire_batch.as_slice()) {
+                            (
+                                rbitcoin_consensus::ConsensusError::MissingPrevout,
+                                [(_, _, w)],
+                            ) => {
+                                let t_check = Instant::now();
+                                let check = check_missing_parent(&hub_load, &feed_load, &w.block);
+                                confirm_thr_stats::add_load_reject(&stats, t_check.elapsed());
+                                Some(check)
+                            }
+                            _ => None,
+                        };
                         let t_rewind = Instant::now();
                         if session_fault {
                             hub_load.query.uring_recover_or_abort("ibd-confirm-load");
                         }
                         let first_hash = wire_batch[0].1;
                         let sender = wire_sender(&wire_batch[0].2);
+                        let wave = wire_batch
+                            .iter()
+                            .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
+                            .collect::<Vec<_>>();
                         let class = if session_fault {
                             ConfirmRejectClass::EngineFault
                         } else {
-                            ConfirmRejectClass::from_consensus(&e)
+                            load_reject_class(&hub_load, stamp_reject_class(&e, parent_check), &wave)
                         };
                         load_fail_rewind_wave(
                             &feed_load,
@@ -2120,10 +2221,7 @@ pub(crate) fn spawn_confirm_engine(
                             &mut lookup_ahead,
                             expect_h,
                             class,
-                            &wire_batch
-                                .iter()
-                                .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
-                                .collect::<Vec<_>>(),
+                            &wave,
                         );
                         confirm_thr_stats::add_load_prune(&stats, t_rewind.elapsed());
                         if session_fault {
@@ -2135,7 +2233,18 @@ pub(crate) fn spawn_confirm_engine(
                         loop_stats_load
                             .confirm_reject_stops
                             .fetch_add(1, Ordering::Relaxed);
-                        let log_msg = stamp_reject_operator_msg(&msg, &stats);
+                        let log_msg = match parent_check {
+                            Some(ParentCheck::Missing(txid)) => format!(
+                                "missing prevout: parent {} is not on the connected chain",
+                                bitcoin::Txid::from_byte_array(txid)
+                            ),
+                            Some(ParentCheck::OffTip) => {
+                                "missing prevout before its parent block is the tip (retry)".into()
+                            }
+                            Some(ParentCheck::Engine) | None => {
+                                stamp_reject_operator_msg(&msg, &stats)
+                            }
+                        };
                         let (if_l, if_n, _) = lookup_ahead.in_flight.size_snapshot();
                         let drain_fk = hub_load.query.head_drain_fk();
                         let fence_h = hub_load.query.fence_tip_height();
@@ -2273,10 +2382,14 @@ pub(crate) fn spawn_confirm_engine(
                         if session_fault {
                             hub_load.query.uring_recover_or_abort("ibd-confirm-load");
                         }
+                        let wave = wire_batch
+                            .iter()
+                            .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
+                            .collect::<Vec<_>>();
                         let class = if session_fault {
                             ConfirmRejectClass::EngineFault
                         } else {
-                            ConfirmRejectClass::from_net(&e)
+                            load_reject_class(&hub_load, ConfirmRejectClass::from_net(&e), &wave)
                         };
                         let sender = wire_sender(&wire_batch[0].2);
                         // A pin-stage invariant miss can be a stale-fk plan
@@ -2293,10 +2406,7 @@ pub(crate) fn spawn_confirm_engine(
                             &mut lookup_ahead,
                             expect_h,
                             rewind,
-                            &wire_batch
-                                .iter()
-                                .map(|(h, ha, w)| (*h, *ha, w.block.as_ref(), w.sender))
-                                .collect::<Vec<_>>(),
+                            &wave,
                         );
                         confirm_thr_stats::add_load_prune(&stats, t_rewind.elapsed());
                         if session_fault {

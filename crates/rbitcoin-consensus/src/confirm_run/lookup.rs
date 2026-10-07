@@ -287,6 +287,59 @@ pub(super) fn stamp_parent_pin_archived(
     Ok(stamp)
 }
 
+/// A txid that `block` spends, does not create, and the connected chain
+/// does not hold. One TipOnly `tx.head` read, with no in-flight plan and no
+/// load-batch skeleton: the tip path's read. The miss is the block's fault
+/// only when the block extends the tip and [`Query::head_covers_fence`]
+/// held across the read.
+///
+/// A miss that `txid.body` holds at a connected fk where the head's slot
+/// pages may be unsynced is a lost head row, not the block's fault:
+/// `Corrupt("invariant: …")`. `stop` ends that scan early as `Cancelled`.
+pub fn parent_missing_from_chain(
+    query: &Query,
+    block: &Block,
+    stop: impl Fn() -> bool,
+) -> Result<Option<[u8; 32]>, ConsensusError> {
+    let created: rbitcoin_query::TxidSet = block
+        .txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect();
+    let mut need: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .flat_map(|tx| &tx.input)
+        .filter(|inp| !inp.previous_output.is_null())
+        .map(|inp| inp.previous_output.txid.to_byte_array())
+        .filter(|txid| !created.contains(txid))
+        .collect();
+    need.sort_unstable();
+    need.dedup();
+    let unsynced_from = query.store().head_unsynced_first_fk();
+    let hits: rbitcoin_query::TxidSet = query
+        .store()
+        .get_fk_by_txid_batch(&need)
+        .map_err(ConsensusError::from)?
+        .into_iter()
+        .filter_map(|(txid, row)| row.map(|_| txid))
+        .collect();
+    need.retain(|txid| !hits.contains(txid));
+    if need.is_empty() {
+        return Ok(None);
+    }
+    if !query
+        .store()
+        .connected_in_unsynced_head(unsynced_from, &need, stop)?
+        .is_empty()
+    {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: tx.head misses a connected create",
+        )));
+    }
+    Ok(need.first().copied())
+}
+
 /// IBD **load** after lookup stamp: pin + assemble.
 ///
 /// Uses the owned stamped plan — does **not** re-run plan_batch / head resolve.

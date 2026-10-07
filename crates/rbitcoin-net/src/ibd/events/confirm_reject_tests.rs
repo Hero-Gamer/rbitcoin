@@ -1846,7 +1846,6 @@ fn wire_pad() -> &'static WirePad {
 
 impl WireRig {
     fn new(label: &str, peers: usize) -> Self {
-        use super::super::assign::tests::dummy_slot;
         use rbitcoin_consensus::ChainParams;
         let pad = wire_pad();
         let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect("wire copy");
@@ -1863,7 +1862,52 @@ impl WireRig {
         assert_eq!(hub.tip_hash(), Some(pad.tip));
         assert_eq!(hub.tip_height(), Some(pad.t));
         assert!(hub.query.index_mode().is_direct());
-        let (tip, tip_time, t, cbs) = (pad.tip, pad.tip_time, pad.t, pad.cbs.clone());
+        Self::over(dir, hub, peers, (pad.tip, pad.tip_time, pad.cbs.clone()))
+    }
+
+    /// A fresh regtest pad like [`wire_pad`], on a store whose `tx.head`
+    /// segments roll every 204 creates.
+    fn new_small_head(label: &str, peers: usize) -> Self {
+        use rbitcoin_consensus::{pad_empty_from, ChainParams};
+        let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect("small-head dir");
+        drop(rbitcoin_store::testutil::create_tiny_with_head_bits(
+            dir.path(),
+            8,
+        ));
+        let q = Query::open_or_create_tiny(dir.path()).unwrap();
+        q.enter_direct_index_mode().unwrap();
+        let params = ChainParams::regtest();
+        let hub = std::sync::Arc::new(crate::chain::ChainHub::new(
+            q,
+            params.clone(),
+            rbitcoin_consensus::Milestone::NONE,
+        ));
+        hub.ensure_genesis().unwrap();
+        let gen_time = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .time;
+        let pad = pad_empty_from(
+            &hub.query,
+            &params,
+            hub.tip_hash().unwrap(),
+            gen_time,
+            1,
+            params.coinbase_maturity() + 2,
+            2,
+        );
+        hub.query.flush().unwrap();
+        Self::over(dir, hub, peers, pad)
+    }
+
+    /// IBD work state and a confirm feed over `hub`, whose tip is `tip`.
+    fn over(
+        dir: rbitcoin_query::testutil::TempDir,
+        hub: std::sync::Arc<crate::chain::ChainHub>,
+        peers: usize,
+        (tip, tip_time, cbs): (BlockHash, u32, Vec<bitcoin::Txid>),
+    ) -> Self {
+        use super::super::assign::tests::dummy_slot;
+        let t = hub.tip_height().unwrap();
         let mut st = IbdWorkState::new((1..=peers).map(dummy_slot).collect(), Some(tip), Some(t));
         let feed = std::sync::Arc::new(super::super::confirm::ConfirmFeed::new());
         st.confirm_feed = Some(std::sync::Arc::clone(&feed));
@@ -1884,6 +1928,30 @@ impl WireRig {
             t,
             cbs,
         }
+    }
+
+    /// Flush, drop the hub, run `edit` on the datadir, and open the store
+    /// again, as a process restart does. `tip` and `tip_time` must name the
+    /// store tip. Call before the engine starts.
+    fn restart(self, edit: impl FnOnce(&std::path::Path)) -> Self {
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        assert!(self.engine.is_none(), "restart before the engine starts");
+        self.hub.query.flush().unwrap();
+        let peers = self.st.slots.len();
+        let Self {
+            dir,
+            hub,
+            tip,
+            tip_time,
+            cbs,
+            ..
+        } = self;
+        drop(std::sync::Arc::into_inner(hub).expect("the rig holds the only hub"));
+        edit(dir.path());
+        let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).unwrap();
+        let hub = crate::chain::ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+        hub.query.enter_direct_index_mode().unwrap();
+        Self::over(dir, std::sync::Arc::new(hub), peers, (tip, tip_time, cbs))
     }
 
     /// A tx spending output 0 of `prev` to OP_TRUE.
@@ -2476,8 +2544,9 @@ fn batched_write_reject_offers_the_wave_back() {
 
 /// tip+1 spends an output that tip+2 creates, and both write in one
 /// batch. Core connects one block at a time, so tip+1's input is missing.
-/// The batch reject is isolated, and tip+1 alone is rejected again: the
-/// parent is not on the chain, and tip+1 never connects.
+/// The batch reject is isolated. tip+1 alone fails its load stamp, and a
+/// fresh read at the tip finds the parent off the connected chain (tip+2
+/// is archived, not connected): tip+1 is invalid, and tip+2 is not judged.
 #[test]
 fn batched_spend_of_a_later_block_is_rejected_alone() {
     use super::super::assign::tests::lock_default_assign_stop;
@@ -2499,7 +2568,7 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
         spk,
         vec![parent],
     );
-    let h1 = b1.block_hash();
+    let (h1, h2) = (b1.block_hash(), b2.block_hash());
     rig.plant(&[&b1, &b2]);
     for (peer, body) in [(1, &b1), (2, &b2)] {
         let hash = body.block_hash();
@@ -2511,7 +2580,7 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
 
     let rejects = rig.pump(
         |_, hash| if hash == h1 { b1.clone() } else { b2.clone() },
-        |_, _, seen| seen.len() == 2,
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(h1.to_byte_array()),
     );
     assert_eq!(
         rejects,
@@ -2519,35 +2588,12 @@ fn batched_spend_of_a_later_block_is_rejected_alone() {
             (h1, ConfirmRejectClass::Cascade, 2),
             (h1, ConfirmRejectClass::ConsensusInvalid, 1)
         ],
-        "the batch event is a cascade; the one-block event is still ConsensusInvalid"
+        "the batch event is a cascade; the one-block event is the verdict"
     );
-    // Apply reads the load-stamp line (`parent create_fk unresolved` inside
-    // the rewritten missing-prevout text) as an engine fault. The event
-    // class stays ConsensusInvalid. The first fault requeues and does not
-    // blacklist. The same line again halts, and the hash stays off the
-    // invalid set. Finding 087.
-    let err = rig
-        .last_reject_err
-        .clone()
-        .expect("the one-block retry has an operator line");
-    assert!(
-        err.contains("parent create_fk unresolved"),
-        "load-stamp miss must be the engine-fault line, got {err}"
-    );
-    assert!(rig.st.engine_fault_seen.contains(&h1));
-    assert!(!rig.st.body.is_rejected(&h1));
-    assert!(rig.st.halt.is_none(), "the first engine fault requeues");
-    apply_confirm_reject(
-        &mut rig.st,
-        t + 1,
-        h1,
-        &err,
-        Some(rig.hub.query.as_ref()),
-        Some(&rig.hub),
-    );
-    assert!(rig.st.halt.is_some(), "the second engine fault halts IBD");
-    assert!(!rig.st.body.is_rejected(&h1));
-    assert!(!rig.st.reorg.invalid.contains(h1.to_byte_array()));
+    assert_eq!(rig.st.halt, None);
+    assert!(rig.st.body.is_rejected(&h1));
+    assert!(!rig.st.engine_fault_seen.contains(&h1));
+    assert!(!rig.st.reorg.invalid.contains(h2.to_byte_array()));
     assert_eq!(rig.hub.tip_height(), Some(t));
     rig.finish();
 }
@@ -3120,6 +3166,366 @@ fn ibd_flag_zero_tx_block_is_consensus_invalid() {
     assert_eq!(hub.tip_hash(), Some(gen));
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// tip+1 spends a txid no block created. Its body matches its header, so
+/// the missing parent is the block's own fault (Core
+/// `bad-txns-inputs-missingorspent`): the hash is marked invalid, IBD does
+/// not halt, and it follows the other valid tip+1.
+#[test]
+fn ibd_spend_of_an_unknown_txid_is_invalid() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("unknown-parent", 2);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let ghost = WireRig::spend(bitcoin::Txid::from_byte_array([0xab; 32]));
+    let bad = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![ghost]);
+    let good = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 900,
+        t + 1,
+        spk,
+        vec![WireRig::spend(cbs[0])],
+    );
+    let (hb, hg) = (bad.block_hash(), good.block_hash());
+    rig.plant(&[&bad]);
+    rig.st.hash_height.insert(hg, t + 1);
+    rig.st.known_headers.insert(hg);
+    rig.hub.ensure_header_fk(&good.header).unwrap();
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, hash| {
+            if hash == hb {
+                bad.clone()
+            } else {
+                good.clone()
+            }
+        },
+        |st, hub, _| st.halt.is_some() || hub.tip_hash() == Some(hg),
+    );
+    assert_eq!(rejects, [(hb, ConfirmRejectClass::ConsensusInvalid, 1)]);
+    assert_eq!(rig.st.halt, None);
+    assert!(rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    assert!(rig.st.body.is_rejected(&hb));
+    assert_eq!(rig.hub.tip_hash(), Some(hg), "IBD follows the valid tip+1");
+    rig.finish();
+}
+
+/// The node restarts with the tip right below a block that spends an
+/// unknown txid. Open leaves `tx.head` holding every connected create, so
+/// the first block after the restart gets the tip path's read and is
+/// marked invalid, as it would be without the restart.
+#[test]
+fn spend_of_an_unknown_txid_after_restart_is_invalid() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("unknown-parent-restart", 1).restart(|_| {});
+    let t = rig.t;
+    let ghost = WireRig::spend(bitcoin::Txid::from_byte_array([0xcd; 32]));
+    let bad = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![ghost],
+    );
+    let hb = bad.block_hash();
+    rig.plant(&[&bad]);
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, _| bad.clone(),
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(hb.to_byte_array()),
+    );
+    assert_eq!(rejects, [(hb, ConfirmRejectClass::ConsensusInvalid, 1)]);
+    assert_eq!(rig.st.halt, None);
+    assert!(rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    rig.finish();
+}
+
+/// tip+1 creates a tx and tip+2 spends it, each confirmed alone. tip+2 is
+/// stamped as soon as tip+1 is the tip, while tip+1's `tx.head` insert may
+/// still be draining. The parent is on the chain, so tip+2 connects.
+#[test]
+fn lone_spend_of_the_block_just_written_connects() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::state::InflightReq;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("spend-just-written", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let child = WireRig::spend(parent.compute_txid());
+    let b1 = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        spk.clone(),
+        vec![parent],
+    );
+    let b2 = mine_regtest_paying(
+        b1.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk,
+        vec![child],
+    );
+    let (h1, h2) = (b1.block_hash(), b2.block_hash());
+    rig.plant(&[&b1, &b2]);
+    for b in [&b1, &b2] {
+        rig.st.slots[0].in_flight.insert(b.block_hash());
+        rig.st.inflight.insert(b.block_hash(), InflightReq::new(1));
+        rig.deliver(1, b);
+    }
+    rig.feed.request_single_block(u32::MAX - 1);
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, hash| if hash == h1 { b1.clone() } else { b2.clone() },
+        |st, hub, _| st.halt.is_some() || hub.tip_hash() == Some(h2),
+    );
+    assert!(rejects.is_empty(), "{rejects:?}");
+    assert_eq!(rig.hub.tip_hash(), Some(h2));
+    rig.finish();
+}
+
+/// A tx exists only in a block that a reorg left. It stays archived and in
+/// `tx.head`, but its outputs are not coins on the new chain (Core's UTXO
+/// view), so the new chain's block that spends it is invalid.
+#[test]
+fn spend_of_a_reorged_out_tx_is_invalid() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::reorg::maybe_rewind_to_best_work;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("reorged-parent", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let left = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        spk.clone(),
+        vec![parent.clone()],
+    );
+    let m = mine_regtest_paying(rig.tip, rig.tip_time + 900, t + 1, spk.clone(), vec![]);
+    let b = mine_regtest_paying(
+        m.block_hash(),
+        rig.tip_time + 1500,
+        t + 2,
+        spk,
+        vec![WireRig::spend(parent.compute_txid())],
+    );
+    let (hm, hb) = (m.block_hash(), b.block_hash());
+    rig.plant(&[&m, &b]);
+    rig.hub.accept_block(left.clone()).unwrap();
+    assert_eq!(rig.hub.tip_hash(), Some(left.block_hash()));
+    rig.st
+        .reorg
+        .register_explore(std::iter::empty::<BlockHash>(), Some(hb));
+    assert!(maybe_rewind_to_best_work(&mut rig.st, &rig.hub).unwrap());
+    assert_eq!(
+        rig.hub.tip_hash(),
+        Some(rig.tip),
+        "rewound to the fork point"
+    );
+    // The IBD loop drains events after a rewind, which quiesces the feed.
+    rig.apply_held(&std::sync::mpsc::channel().1);
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, hash| if hash == hm { m.clone() } else { b.clone() },
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(hb.to_byte_array()),
+    );
+    assert_eq!(rig.st.halt, None, "{rejects:?}");
+    assert!(rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    assert_eq!(rig.hub.tip_hash(), Some(hm));
+    rig.finish();
+}
+
+/// Load drops the body of a lone block it judges invalid, then sends the
+/// reject. Here the IBD thread disconnects the block's parent before it
+/// applies that reject, so apply cannot trust the verdict and treats it as
+/// a cascade. The body is gone from the queue, so apply must ask for it
+/// again: once the parent is the tip again, the block is judged and marked
+/// invalid without waiting for its pending mark to go stale.
+#[test]
+fn verdict_applied_after_the_tip_moved_asks_for_the_body_again() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::reorg::apply_header_rewind;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("verdict-tip-moved", 1);
+    let t = rig.t;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let ghost = WireRig::spend(bitcoin::Txid::from_byte_array([0xef; 32]));
+    let p = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![]);
+    let bad = mine_regtest_paying(p.block_hash(), rig.tip_time + 1200, t + 2, spk, vec![ghost]);
+    let (hp, hb) = (p.block_hash(), bad.block_hash());
+    rig.plant(&[&p, &bad]);
+    rig.start_engine();
+    let serve = |_, hash| if hash == hp { p.clone() } else { bad.clone() };
+    rig.pump(serve, |_, hub, _| hub.tip_hash() == Some(hp));
+    let ((got, class, n), held) = rig.first_reject();
+    assert_eq!(
+        (got, class, n),
+        (hb, ConfirmRejectClass::ConsensusInvalid, 1)
+    );
+
+    assert!(apply_header_rewind(&mut rig.st, &rig.hub, &[hp, hb]).unwrap());
+    assert_eq!(rig.hub.tip_hash(), Some(rig.tip), "p is disconnected");
+    rig.apply_held(&held);
+    assert!(!rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    assert!(!rig.st.body.is_rejected(&hb));
+    rig.hub.accept_block(p.clone()).unwrap();
+
+    let rejects = rig.pump(serve, |st, _, _| {
+        st.halt.is_some() || st.reorg.invalid.contains(hb.to_byte_array())
+    });
+    assert_eq!(rig.st.halt, None, "{rejects:?}");
+    assert!(rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    assert_eq!(rig.hub.tip_hash(), Some(hp));
+    rig.finish();
+}
+
+/// A power loss can drop `tx.head` slot pages that the head's synced count
+/// still covers. tip+2 spends a tx whose head row was lost that way. The
+/// stamp and the fresh read both miss it, but `txid.body` holds it on the
+/// connected chain: a store fault, so IBD halts and the hash stays valid.
+#[test]
+fn spend_of_a_create_the_head_lost_is_not_invalid() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("lost-head-row", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let b1 = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        spk.clone(),
+        vec![parent.clone()],
+    );
+    rig.hub.accept_block(b1.clone()).unwrap();
+    (rig.tip, rig.tip_time) = (b1.block_hash(), b1.header.time);
+    let mut rig = rig.restart(rbitcoin_store::testutil::drop_unsynced_tx_head_pages);
+    let b2 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 2, spk.clone(), vec![]);
+    let b3 = mine_regtest_paying(
+        b2.block_hash(),
+        rig.tip_time + 1200,
+        t + 3,
+        spk,
+        vec![WireRig::spend(parent.compute_txid())],
+    );
+    let (h2, h3) = (b2.block_hash(), b3.block_hash());
+    rig.plant(&[&b2, &b3]);
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, hash| if hash == h2 { b2.clone() } else { b3.clone() },
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(h3.to_byte_array()),
+    );
+    assert!(rig.st.halt.is_some(), "{rejects:?}");
+    assert!(!rig.st.reorg.invalid.contains(h3.to_byte_array()));
+    assert!(!rig.st.body.is_rejected(&h3));
+    assert_eq!(rig.hub.tip_hash(), Some(h2));
+    rig.finish();
+}
+
+/// A power loss drops the open `tx.head` tail's slot pages. After the
+/// restart, new creates fill that segment and roll it. Until its background
+/// seal publishes, the head still reads its rows from the wiped pages, so a
+/// spend of a create there misses. `txid.body` holds the create on the
+/// connected chain: a store fault, so the block is not marked invalid.
+#[test]
+fn spend_of_a_create_the_head_lost_before_a_roll_is_not_invalid() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::{mine_empty_regtest, mine_regtest_paying};
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new_small_head("lost-head-row-roll", 1);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let b1 = mine_regtest_paying(
+        rig.tip,
+        rig.tip_time + 600,
+        t + 1,
+        spk.clone(),
+        vec![parent.clone()],
+    );
+    rig.hub.accept_block(b1.clone()).unwrap();
+    (rig.tip, rig.tip_time) = (b1.block_hash(), b1.header.time);
+    let rig = rig.restart(rbitcoin_store::testutil::drop_unsynced_tx_head_pages);
+    let WireRig {
+        dir,
+        hub,
+        mut tip,
+        mut tip_time,
+        cbs,
+        ..
+    } = rig;
+    let segs = || hub.query.store().txs.head_first_fks_snapshot().len();
+    let wiped_segs = segs();
+    let mut ht = t + 1;
+    while segs() == wiped_segs {
+        assert!(ht < t + 400, "the wiped tail never rolled");
+        ht += 1;
+        let b = mine_empty_regtest(tip, tip_time + 600, ht);
+        hub.accept_block(b.clone()).unwrap();
+        (tip, tip_time) = (b.block_hash(), b.header.time);
+    }
+    let store = hub.query.store();
+    let lost = [parent.compute_txid().to_byte_array()];
+    assert!(
+        matches!(
+            store.connected_in_unsynced_head(store.head_unsynced_first_fk(), &lost, || true),
+            Err(rbitcoin_store::StoreError::Cancelled(_))
+        ),
+        "IBD exit stops the scan, and a stopped scan is not a clear result"
+    );
+    let mut rig = WireRig::over(dir, hub, 1, (tip, tip_time, cbs));
+    let bad = mine_regtest_paying(
+        tip,
+        tip_time + 600,
+        ht + 1,
+        spk,
+        vec![WireRig::spend(parent.compute_txid())],
+    );
+    let hb = bad.block_hash();
+    rig.plant(&[&bad]);
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, _| bad.clone(),
+        |st, _, _| st.halt.is_some() || st.reorg.invalid.contains(hb.to_byte_array()),
+    );
+    assert!(rig.st.halt.is_some(), "{rejects:?}");
+    assert!(!rig.st.reorg.invalid.contains(hb.to_byte_array()));
+    assert!(!rig.st.body.is_rejected(&hb));
+    assert_eq!(rig.hub.tip_hash(), Some(tip));
+    rig.finish();
 }
 
 /// Densify walks past a height once its body is requested or queued. A body
