@@ -212,6 +212,7 @@ fn readiness(s: &ReadySnapshot) -> Result<(), String> {
 
 /// Bound health listener. Dropping it stops serving.
 pub(crate) struct HealthHandle {
+    pub(crate) local_addr: SocketAddr,
     task: JoinHandle<()>,
 }
 
@@ -247,7 +248,7 @@ pub(crate) async fn run_health(
         }
     });
     info!("health HTTP on {local_addr}");
-    Ok(HealthHandle { task })
+    Ok(HealthHandle { local_addr, task })
 }
 
 /// Router state: the node's status and the gates on blocking work.

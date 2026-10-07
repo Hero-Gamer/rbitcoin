@@ -32,6 +32,29 @@ fn ephemeral_addr() -> SocketAddr {
     addr
 }
 
+// Kernel-assigned port. A bind-then-drop reserve races another test onto the
+// same port, and wait_listeners then talks to that other listener.
+async fn published_listener(datadir: &std::path::Path, name: &str) -> SocketAddr {
+    let path = datadir.join("run").join(format!("{name}.addr"));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(addr) = text.trim().parse::<SocketAddr>() {
+                if addr.port() != 0 {
+                    return addr;
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "bound {name} address was not published at {}",
+                path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_listeners(addrs: &[SocketAddr]) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -1284,10 +1307,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         )
     };
 
-    let electrum_addr = ephemeral_addr();
-    let esplora_addr = ephemeral_addr();
-    let rpc_addr = ephemeral_addr();
-    let health_addr = ephemeral_addr();
+    let unbound: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     let mut cfg = NodeConfig::default()
         .with_datadir(td.path())
@@ -1298,11 +1318,11 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.listen.connect.clear();
     cfg.shindex = true;
     cfg.block_filter_index = true;
-    cfg.listen.electrum = Some(electrum_addr);
-    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
-    cfg.rpc.listen = Some(rpc_addr);
+    cfg.listen.electrum = Some(unbound);
+    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(unbound));
+    cfg.rpc.listen = Some(unbound);
     cfg.rpc.rest = true;
-    cfg.listen.health = Some(health_addr);
+    cfg.listen.health = Some(unbound);
     cfg.metrics = true;
     // mempool's CORE_RPC.SOCKET_PATH reaches the node from another user.
     let rpc_sock = td.path().join("run").join("rpc.sock");
@@ -1312,6 +1332,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     cfg.max_run_secs = Some(90);
 
     let node = tokio::spawn(run_p2p(cfg));
+    let electrum_addr = published_listener(&td.path(), "electrum").await;
+    let esplora_addr = published_listener(&td.path(), "esplora").await;
+    let rpc_addr = published_listener(&td.path(), "rpc").await;
+    let health_addr = published_listener(&td.path(), "health").await;
     wait_listeners(&[electrum_addr, esplora_addr, rpc_addr, health_addr]).await;
     pin_healthz(health_addr).await;
     pin_address_prefix_404(esplora_addr).await;
@@ -2352,6 +2376,39 @@ async fn node_listen_and_exit() {
     let stopped = tokio::time::timeout(Duration::from_secs(30), node).await;
     assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
     drop((held_electrum, held_rpc));
+
+    // RPC is up, so the tip loop wakes on its stop tick. A failed Electrum
+    // or Esplora bind stays failed when the other process releases the port.
+    let held_electrum = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let held_esplora = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let electrum_addr = held_electrum.local_addr().unwrap();
+    let esplora_addr = held_esplora.local_addr().unwrap();
+    let (rpc_addr, health_addr) = (ephemeral_addr(), ephemeral_addr());
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.shindex = true;
+    cfg.listen.electrum = Some(electrum_addr);
+    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
+    cfg.rpc.listen = Some(rpc_addr);
+    cfg.listen.health = Some(health_addr);
+    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    cfg.max_run_secs = Some(30);
+    let node = spawn_run_p2p(cfg);
+    wait_listeners(&[rpc_addr, health_addr]).await;
+    assert_eq!(
+        readyz_after_startup(health_addr).await,
+        (503, "not ready: electrum, esplora not listening".into())
+    );
+    drop((held_electrum, held_esplora));
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        std::net::TcpListener::bind(electrum_addr).is_ok(),
+        "electrum bind failure is not retried on the tip loop"
+    );
+    assert!(
+        std::net::TcpListener::bind(esplora_addr).is_ok(),
+        "esplora bind failure is not retried on the tip loop"
+    );
+    stop_run_p2p(rpc_addr, node).await;
 
     // Without `--connect` and with seeds on: regtest resolves none, the one
     // saved peer still refuses, and the node exits short of tip mode.
