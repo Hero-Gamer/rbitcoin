@@ -36,11 +36,8 @@ fn llvm_cov_wall(default_secs: u64, llvm_secs: u64) -> Duration {
     }
 }
 
-fn reserve_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+fn any_port() -> SocketAddr {
+    "127.0.0.1:0".parse().unwrap()
 }
 
 fn spend_to(prev: Txid, value: Amount, script: Vec<u8>) -> Transaction {
@@ -99,9 +96,9 @@ fn fixture_chain() -> (Vec<bitcoin::Block>, BTreeSet<String>, BTreeSet<String>) 
     (blocks, script_a, script_b)
 }
 
-async fn start_miner(dir: &Path, addr: SocketAddr) -> P2PNode {
+async fn start_miner(dir: &Path) -> P2PNode {
     let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
-    P2PNode::start(addr, query, ChainParams::regtest(), Milestone::NONE)
+    P2PNode::start(any_port(), query, ChainParams::regtest(), Milestone::NONE)
         .await
         .expect("miner listen")
 }
@@ -114,33 +111,63 @@ fn load_chain(miner: &P2PNode, blocks: &[bitcoin::Block]) {
     }
 }
 
-fn syncer_cfg(dir: &Path, miner: SocketAddr, rpc: SocketAddr, electrum: SocketAddr) -> NodeConfig {
-    syncer_cfg_sh(dir, miner, rpc, electrum, true)
+fn syncer_cfg(dir: &Path, miner: SocketAddr) -> NodeConfig {
+    syncer_cfg_sh(dir, miner, true)
 }
 
-fn syncer_cfg_sh(
-    dir: &Path,
-    miner: SocketAddr,
-    rpc: SocketAddr,
-    electrum: SocketAddr,
-    shindex: bool,
-) -> NodeConfig {
+// Every listener binds port 0. A bind-then-drop reserve raced the node's
+// own P2P bind onto the RPC port, and the test then spoke HTTP to P2P.
+fn syncer_cfg_sh(dir: &Path, miner: SocketAddr, shindex: bool) -> NodeConfig {
     let mut cfg = NodeConfig::default()
         .with_datadir(dir)
         .with_network(Network::Regtest)
-        .with_p2p_listen("127.0.0.1:0".parse().unwrap())
+        .with_p2p_listen(any_port())
         .with_tiny_heads();
     cfg.listen.connect = vec![NetAddr::Ip(miner)];
     cfg.listen.use_seeds = false;
-    cfg.listen.electrum = Some(electrum);
+    cfg.listen.electrum = Some(any_port());
     cfg.shindex = shindex;
-    cfg.rpc.listen = Some(rpc);
+    cfg.rpc.listen = Some(any_port());
     cfg.max_tip_age_secs = Some(u64::MAX);
     std::fs::write(dir.join("rpc.token"), "pass").unwrap();
     cfg
 }
 
+fn published_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join("run").join(format!("{name}.addr"))
+}
+
+/// The address `run_p2p` bound for `name`, from `{datadir}/run/{name}.addr`.
+async fn published_listener(dir: &Path, name: &str, wait: Duration) -> SocketAddr {
+    let path = published_path(dir, name);
+    let deadline = Instant::now() + wait;
+    loop {
+        let bound = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<SocketAddr>().ok());
+        if let Some(addr) = bound {
+            return addr;
+        }
+        if Instant::now() >= deadline {
+            panic!("{name} listener not up at {}", path.display());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_listeners(dir: &Path) -> (SocketAddr, SocketAddr) {
+    let rpc = published_listener(dir, "rpc", Duration::from_secs(30)).await;
+    let electrum = published_listener(dir, "electrum", Duration::from_secs(30)).await;
+    (rpc, electrum)
+}
+
+/// A restart on the same datadir publishes fresh addresses; drop the last run's.
 fn spawn_run_p2p(cfg: NodeConfig) -> tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>> {
+    match std::fs::remove_dir_all(cfg.datadir.path().join("run")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("clear published listeners: {e}"),
+    }
     tokio::task::spawn_blocking(move || {
         let _block = rbitcoin_net::BlockingRegion::enter();
         tokio::runtime::Handle::current().block_on(run_p2p(cfg))
@@ -148,19 +175,26 @@ fn spawn_run_p2p(cfg: NodeConfig) -> tokio::task::JoinHandle<Result<(), rbitcoin
 }
 
 async fn jsonrpc(addr: SocketAddr, method: &str, params: Value) -> Value {
+    try_jsonrpc(addr, method, params)
+        .await
+        .unwrap_or_else(|e| panic!("rpc {method} connect: {e}"))
+}
+
+/// `Err` only when the TCP connect fails, so a poll can retry it.
+async fn try_jsonrpc(addr: SocketAddr, method: &str, params: Value) -> std::io::Result<Value> {
     let body = json!({"jsonrpc":"1.0","id":"test","method":method,"params":params}).to_string();
     let req = format!(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {RPC_BEARER}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    let mut stream = TcpStream::connect(addr).await.expect("rpc connect");
+    let mut stream = TcpStream::connect(addr).await?;
     stream.write_all(req.as_bytes()).await.unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf);
     let json_body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
-    serde_json::from_str(json_body)
-        .unwrap_or_else(|e| panic!("rpc {method} json: {e} body={json_body}"))
+    Ok(serde_json::from_str(json_body)
+        .unwrap_or_else(|e| panic!("rpc {method} json: {e} body={json_body}")))
 }
 
 async fn history_txids(electrum: SocketAddr, script: &[u8]) -> BTreeSet<String> {
@@ -191,26 +225,6 @@ async fn history_txids(electrum: SocketAddr, script: &[u8]) -> BTreeSet<String> 
                 .to_string()
         })
         .collect()
-}
-
-async fn wait_listeners(addrs: &[SocketAddr]) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mut missing = None;
-        for addr in addrs {
-            if TcpStream::connect(*addr).await.is_err() {
-                missing = Some(*addr);
-                break;
-            }
-        }
-        if missing.is_none() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            panic!("listeners not up ({missing:?}): {addrs:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 async fn stop_run_p2p(
@@ -354,12 +368,13 @@ async fn stop_ibd_below_tip(dir: &Path, miner: SocketAddr, miner_tip: u32) -> u3
 
 async fn expect_process_exit_without_electrum(
     node: tokio::task::JoinHandle<Result<(), rbitcoin_node::NodeError>>,
-    electrum: SocketAddr,
+    dir: &Path,
 ) {
+    let electrum = published_path(dir, "electrum");
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         assert!(
-            TcpStream::connect(electrum).await.is_err(),
+            !electrum.exists(),
             "Electrum listened before the chain was complete"
         );
         if node.is_finished() {
@@ -429,15 +444,9 @@ struct Synced {
 
 async fn ibd_then_restart(miner: P2PNode, miner_addr: SocketAddr, synced: &mut Synced) {
     let syncer_dir = TestDatadir::new().unwrap();
-    let rpc = reserve_addr();
-    let electrum = reserve_addr();
-    let node = spawn_run_p2p(syncer_cfg(
-        syncer_dir.path().as_path(),
-        miner_addr,
-        rpc,
-        electrum,
-    ));
-    wait_listeners(&[rpc, electrum]).await;
+    let dir = syncer_dir.path();
+    let node = spawn_run_p2p(syncer_cfg(dir.as_path(), miner_addr));
+    let (rpc, electrum) = wait_listeners(dir.as_path()).await;
     wait_caught_up(
         rpc,
         electrum,
@@ -460,13 +469,8 @@ async fn ibd_then_restart(miner: P2PNode, miner_addr: SocketAddr, synced: &mut S
     assert!(!store.join("scripthash.unsorted").is_dir());
     stop_run_p2p(rpc, node).await;
 
-    let node = spawn_run_p2p(syncer_cfg(
-        syncer_dir.path().as_path(),
-        miner_addr,
-        rpc,
-        electrum,
-    ));
-    wait_listeners(&[rpc, electrum]).await;
+    let node = spawn_run_p2p(syncer_cfg(dir.as_path(), miner_addr));
+    let (rpc, electrum) = wait_listeners(dir.as_path()).await;
     wait_caught_up(
         rpc,
         electrum,
@@ -497,10 +501,8 @@ async fn ibd_then_restart(miner: P2PNode, miner_addr: SocketAddr, synced: &mut S
 }
 
 async fn finish_partial(dir: &Path, miner: SocketAddr, synced: &Synced) {
-    let rpc = reserve_addr();
-    let electrum = reserve_addr();
-    let node = spawn_run_p2p(syncer_cfg(dir, miner, rpc, electrum));
-    wait_listeners(&[rpc, electrum]).await;
+    let node = spawn_run_p2p(syncer_cfg(dir, miner));
+    let (rpc, electrum) = wait_listeners(dir).await;
     wait_caught_up(
         rpc,
         electrum,
@@ -514,8 +516,9 @@ async fn finish_partial(dir: &Path, miner: SocketAddr, synced: &Synced) {
     stop_run_p2p(rpc, node).await;
 }
 
-async fn partial_with_miner_down(miner_dir: &Path, miner_addr: SocketAddr, synced: &Synced) {
-    let miner = start_miner(miner_dir, miner_addr).await;
+async fn partial_with_miner_down(miner_dir: &Path, synced: &Synced) {
+    let miner = start_miner(miner_dir).await;
+    let miner_addr = miner.local_addr;
     assert_eq!(miner.tip_height().unwrap(), synced.height);
     assert_eq!(miner.hub.tip_hash().unwrap().to_string(), synced.hash);
 
@@ -526,15 +529,8 @@ async fn partial_with_miner_down(miner_dir: &Path, miner_addr: SocketAddr, synce
     copy_dir(&partial_dir.store_path(), &held_dir.store_path());
 
     miner.shutdown().await;
-    let held_rpc = reserve_addr();
-    let held_el = reserve_addr();
-    let held = spawn_run_p2p(syncer_cfg(
-        held_dir.path().as_path(),
-        miner_addr,
-        held_rpc,
-        held_el,
-    ));
-    expect_process_exit_without_electrum(held, held_el).await;
+    let held = spawn_run_p2p(syncer_cfg(held_dir.path().as_path(), miner_addr));
+    expect_process_exit_without_electrum(held, held_dir.path().as_path()).await;
     let held_tip = store_tip(&held_dir.store_path());
     assert!(
         held_tip > 0 && held_tip < synced.height,
@@ -542,17 +538,17 @@ async fn partial_with_miner_down(miner_dir: &Path, miner_addr: SocketAddr, synce
         synced.height
     );
 
-    let miner = start_miner(miner_dir, miner_addr).await;
-    finish_partial(partial_dir.path().as_path(), miner_addr, synced).await;
-    finish_partial(held_dir.path().as_path(), miner_addr, synced).await;
+    let miner = start_miner(miner_dir).await;
+    finish_partial(partial_dir.path().as_path(), miner.local_addr, synced).await;
+    finish_partial(held_dir.path().as_path(), miner.local_addr, synced).await;
     miner.shutdown().await;
 }
 
 async fn follow_journey() {
     let (blocks, script_a, script_b) = fixture_chain();
     let miner_dir = TestDatadir::new().unwrap();
-    let miner_addr = reserve_addr();
-    let miner = start_miner(miner_dir.path().as_path(), miner_addr).await;
+    let miner = start_miner(miner_dir.path().as_path()).await;
+    let miner_addr = miner.local_addr;
     load_chain(&miner, &blocks);
     let mut synced = Synced {
         height: miner.tip_height().unwrap(),
@@ -563,7 +559,7 @@ async fn follow_journey() {
     assert_eq!(synced.height as usize, blocks.len() - 1);
 
     ibd_then_restart(miner, miner_addr, &mut synced).await;
-    partial_with_miner_down(miner_dir.path().as_path(), miner_addr, &synced).await;
+    partial_with_miner_down(miner_dir.path().as_path(), &synced).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -577,9 +573,9 @@ async fn end_of_ibd_sh_interrupt() {
 async fn wait_tip(rpc: SocketAddr, height: u32, hash: &str) {
     let deadline = Instant::now() + Duration::from_secs(40);
     loop {
-        if TcpStream::connect(rpc).await.is_ok() {
-            let count = jsonrpc(rpc, "getblockcount", json!([])).await;
-            let best = jsonrpc(rpc, "getbestblockhash", json!([])).await;
+        let count = try_jsonrpc(rpc, "getblockcount", json!([])).await;
+        let best = try_jsonrpc(rpc, "getbestblockhash", json!([])).await;
+        if let (Ok(count), Ok(best)) = (count, best) {
             if count["result"].as_u64() == Some(u64::from(height))
                 && best["result"].as_str() == Some(hash)
             {
@@ -594,9 +590,8 @@ async fn wait_tip(rpc: SocketAddr, height: u32, hash: &str) {
 }
 
 async fn catch_without_index(dir: &Path, miner: SocketAddr, height: u32, hash: &str) {
-    let rpc = reserve_addr();
-    let electrum = reserve_addr();
-    let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, rpc, electrum, false));
+    let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, false));
+    let rpc = published_listener(dir, "rpc", Duration::from_secs(40)).await;
     wait_tip(rpc, height, hash).await;
     stop_run_p2p(rpc, node).await;
 }
@@ -632,37 +627,28 @@ async fn resume_until_history(
     script_a: &BTreeSet<String>,
     script_b: &BTreeSet<String>,
 ) -> Resume {
-    let rpc = reserve_addr();
-    let electrum = reserve_addr();
-    let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, rpc, electrum, true));
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if TcpStream::connect(electrum).await.is_ok() {
-            let hist_a = history_txids(electrum, &[0x51]).await;
-            let hist_b = history_txids(electrum, &[0x52]).await;
-            assert_eq!(
-                &hist_a, script_a,
-                "Electrum opened before script A history was complete"
-            );
-            assert_eq!(
-                &hist_b, script_b,
-                "Electrum opened before script B history was complete"
-            );
-            let count = jsonrpc(rpc, "getblockcount", json!([])).await;
-            let best = jsonrpc(rpc, "getbestblockhash", json!([])).await;
-            assert_eq!(count["result"].as_u64(), Some(u64::from(height)), "{count}");
-            assert_eq!(best["result"].as_str(), Some(hash), "{best}");
-            assert_tip_view(rpc, height, hash).await;
-            return Resume {
-                node,
-                rpc,
-                electrum,
-            };
-        }
-        if Instant::now() >= deadline {
-            panic!("pass-1 resume never served Electrum at {height} {hash}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let node = spawn_run_p2p(syncer_cfg_sh(dir, miner, true));
+    let electrum = published_listener(dir, "electrum", Duration::from_secs(60)).await;
+    let rpc = published_listener(dir, "rpc", Duration::from_secs(30)).await;
+    let hist_a = history_txids(electrum, &[0x51]).await;
+    let hist_b = history_txids(electrum, &[0x52]).await;
+    assert_eq!(
+        &hist_a, script_a,
+        "Electrum opened before script A history was complete"
+    );
+    assert_eq!(
+        &hist_b, script_b,
+        "Electrum opened before script B history was complete"
+    );
+    let count = jsonrpc(rpc, "getblockcount", json!([])).await;
+    let best = jsonrpc(rpc, "getbestblockhash", json!([])).await;
+    assert_eq!(count["result"].as_u64(), Some(u64::from(height)), "{count}");
+    assert_eq!(best["result"].as_str(), Some(hash), "{best}");
+    assert_tip_view(rpc, height, hash).await;
+    Resume {
+        node,
+        rpc,
+        electrum,
     }
 }
 
@@ -755,8 +741,8 @@ async fn contaminate_writebehind(dir: &Path, miner: &P2PNode, height: u32) {
 async fn sh_interrupt_journey() {
     let (blocks, script_a, script_b) = fixture_chain();
     let miner_dir = TestDatadir::new().unwrap();
-    let miner_addr = reserve_addr();
-    let miner = start_miner(miner_dir.path().as_path(), miner_addr).await;
+    let miner = start_miner(miner_dir.path().as_path()).await;
+    let miner_addr = miner.local_addr;
     load_chain(&miner, &blocks);
     let height = miner.tip_height().unwrap();
     let hash = miner.hub.tip_hash().unwrap().to_string();
@@ -893,9 +879,9 @@ fn build_forks(params: &ChainParams) -> (Vec<bitcoin::Block>, Vec<bitcoin::Block
     (heavy, light)
 }
 
-async fn start_node(dir: &Path, addr: SocketAddr, params: ChainParams) -> P2PNode {
+async fn start_node(dir: &Path, params: ChainParams) -> P2PNode {
     let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
-    let node = P2PNode::start(addr, query, params, Milestone::NONE)
+    let node = P2PNode::start(any_port(), query, params, Milestone::NONE)
         .await
         .expect("listen");
     node.hub.set_max_tip_age_secs(u64::MAX);
@@ -909,7 +895,7 @@ async fn sync_heavy(
     height: u32,
     hash: BlockHash,
 ) {
-    let node = start_node(dir, reserve_addr(), params).await;
+    let node = start_node(dir, params).await;
     node.sync(
         &[NetAddr::Ip(peers[0]), NetAddr::Ip(peers[1])],
         IbdConfig::for_test(),
@@ -939,10 +925,8 @@ async fn work_fork_journey() {
 
     let heavy_dir = TestDatadir::new().unwrap();
     let light_dir = TestDatadir::new().unwrap();
-    let heavy_addr = reserve_addr();
-    let light_addr = reserve_addr();
-    let heavy = start_node(heavy_dir.path().as_path(), heavy_addr, params.clone()).await;
-    let light = start_node(light_dir.path().as_path(), light_addr, params.clone()).await;
+    let heavy = start_node(heavy_dir.path().as_path(), params.clone()).await;
+    let light = start_node(light_dir.path().as_path(), params.clone()).await;
     load_chain(&heavy, &heavy_blocks);
     load_chain(&light, &light_blocks);
     assert!(
@@ -951,7 +935,7 @@ async fn work_fork_journey() {
     );
     let heavy_hash = heavy.hub.tip_hash().unwrap();
     let syncer = TestDatadir::new().unwrap();
-    let peers = [heavy_addr, light_addr];
+    let peers = [heavy.local_addr, light.local_addr];
     sync_heavy(
         syncer.path().as_path(),
         params.clone(),
