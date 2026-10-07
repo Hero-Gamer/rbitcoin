@@ -8,7 +8,7 @@
 //! A different verdict is [`KernelCmp::Disagree`] even when our word is
 //! stricter than Core's.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version};
@@ -57,24 +57,75 @@ const SHAPE_DERSIG: u8 = 6;
 const SHAPE_BIP16: u8 = 7;
 const SHAPE_SIGNET: u8 = 8;
 
-/// Wall time for the two verify calls on an ASan nightly. libFuzzer
-/// `-timeout=1` is the hang backstop; this bound is what fails a quadratic
-/// script. Do not start looser.
+/// Thread CPU time for our verifier. libFuzzer `-timeout=1` is the hang
+/// backstop; this bound is what fails a quadratic script. Do not start looser.
+/// A single sample over the bound is run once more. Panic only when both
+/// samples exceed it, so a scheduler stall is not a finding.
 pub const SCRIPT_KERNEL_VERIFY_BUDGET: Duration = Duration::from_millis(100);
 
 pub fn verify_budget_exceeded(elapsed: Duration) -> bool {
     elapsed > SCRIPT_KERNEL_VERIFY_BUDGET
 }
 
-fn enforce_verify_budget(started: Instant, prefix: &[u8]) {
-    let elapsed = started.elapsed();
-    if verify_budget_exceeded(elapsed) {
+/// Both samples have to be over the budget. A missing clock does not panic.
+pub fn verify_budget_confirmed(first: Option<Duration>, second: Option<Duration>) -> bool {
+    match (first, second) {
+        (Some(a), Some(b)) => verify_budget_exceeded(a) && verify_budget_exceeded(b),
+        _ => false,
+    }
+}
+
+#[repr(C)]
+struct TimeSpec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+fn thread_cpu_now() -> Option<Duration> {
+    const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
+    extern "C" {
+        fn clock_gettime(clk_id: i32, tp: *mut TimeSpec) -> i32;
+    }
+    let mut ts = TimeSpec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a timespec this function owns. `clock_gettime` writes
+    // that object and does not retain the pointer. Clock 3 is
+    // CLOCK_THREAD_CPUTIME_ID on Linux.
+    if unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    Some(
+        Duration::from_secs(ts.tv_sec.max(0) as u64)
+            + Duration::from_nanos(ts.tv_nsec.max(0) as u64),
+    )
+}
+
+fn sample_cpu<T>(verify: &mut dyn FnMut() -> T) -> (T, Option<Duration>) {
+    let start = thread_cpu_now();
+    let value = verify();
+    let elapsed = match (start, thread_cpu_now()) {
+        (Some(a), Some(b)) => Some(b.saturating_sub(a)),
+        _ => None,
+    };
+    (value, elapsed)
+}
+
+fn our_verify_within_budget<T>(prefix: &[u8], mut verify: impl FnMut() -> T) -> T {
+    let (value, first) = sample_cpu(&mut verify);
+    if !first.is_some_and(verify_budget_exceeded) {
+        return value;
+    }
+    let (value, second) = sample_cpu(&mut verify);
+    if verify_budget_confirmed(first, second) {
         let n = prefix.len().min(8);
         panic!(
-            "script-kernel verify budget elapsed={elapsed:?} prefix={:02x?}",
+            "script-kernel verify budget first={first:?} second={second:?} prefix={:02x?}",
             &prefix[..n]
         );
     }
+    value
 }
 
 /// Core `GetBlockScriptFlags` (validation.cpp): P2SH|WITNESS|TAPROOT from
@@ -187,16 +238,14 @@ fn compare_spend_prefixed(
         return KernelCmp::Skip;
     }
     debug_assert_eq!(UNMAPPED_POLICY & (VERIFY_P2SH | VERIFY_WITNESS), 0);
-    let started = Instant::now();
-    let ours =
-        verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), flags_to_ours(flags)).is_ok();
-    let cmp = match core_script_verdict(&prevouts, &tx, flags) {
+    let ours = our_verify_within_budget(prefix, || {
+        verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), flags_to_ours(flags)).is_ok()
+    });
+    match core_script_verdict(&prevouts, &tx, flags) {
         Ok(core) => classify(ours, core),
         Err(Error::ERR_INVALID_FLAGS) => KernelCmp::Skip,
         Err(_) => classify(ours, false),
-    };
-    enforce_verify_budget(started, prefix);
-    cmp
+    }
 }
 
 fn spend(
@@ -384,12 +433,11 @@ pub fn compare_at_height(
     }
     let ours_flags = ScriptVerifyFlags::for_block(&params, height, block_hash, 0);
     let (prevouts, tx) = spend_tx;
-    let started = Instant::now();
-    let ours = verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), ours_flags).is_ok();
+    let ours = our_verify_within_budget(prefix, || {
+        verify_tx_scripts_with_flags(prevouts.clone(), tx.clone(), ours_flags).is_ok()
+    });
     let core = core_accept(&prevouts, &tx, core_flags);
-    let cmp = classify(ours, core);
-    enforce_verify_budget(started, prefix);
-    cmp
+    classify(ours, core)
 }
 
 pub fn compare_signet_empty(challenge: &[u8]) -> KernelCmp {
@@ -406,12 +454,11 @@ fn compare_signet_empty_prefixed(challenge: &[u8], prefix: &[u8]) -> KernelCmp {
         return KernelCmp::Skip;
     };
     let core_flags = VERIFY_P2SH | VERIFY_WITNESS | VERIFY_DERSIG | VERIFY_NULLDUMMY;
-    let started = Instant::now();
-    let ours = validate_signet_block_solution(&block, script).is_ok();
+    let ours = our_verify_within_budget(prefix, || {
+        validate_signet_block_solution(&block, script).is_ok()
+    });
     let core = core_accept(&to_spend.output, &to_sign, core_flags);
-    let cmp = classify(ours, core);
-    enforce_verify_budget(started, prefix);
-    cmp
+    classify(ours, core)
 }
 
 fn signet_block_bare_commitment() -> Block {
@@ -745,6 +792,18 @@ mod tests {
         assert!(!verify_budget_exceeded(Duration::from_millis(0)));
         assert!(!verify_budget_exceeded(Duration::from_millis(100)));
         assert!(verify_budget_exceeded(Duration::from_millis(101)));
+        assert!(!verify_budget_confirmed(
+            Some(Duration::from_millis(101)),
+            Some(Duration::from_millis(1)),
+        ));
+        assert!(verify_budget_confirmed(
+            Some(Duration::from_millis(101)),
+            Some(Duration::from_millis(101)),
+        ));
+        assert!(!verify_budget_confirmed(
+            None,
+            Some(Duration::from_millis(101))
+        ));
     }
 
     #[test]
