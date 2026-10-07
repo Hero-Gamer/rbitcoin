@@ -60,6 +60,19 @@ pub fn encode_getheaders_empty_v2() -> Result<Vec<u8>, NetError> {
     encode_getheaders_v2(Vec::new(), BlockHash::from_byte_array([0; 32]))
 }
 
+/// BIP324 `feefilter` when `payload` is an 8-byte little-endian fee.
+pub fn encode_feefilter_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let bytes: [u8; 8] = payload.try_into().ok()?;
+    let amt = i64::from_le_bytes(bytes);
+    encode_v2_contents(NetworkMessage::FeeFilter(amt)).ok()
+}
+
+/// BIP324 `inv` when `payload` is a consensus-encoded inventory vector.
+pub fn encode_inv_payload(payload: &[u8]) -> Option<Vec<u8>> {
+    let inv = deserialize::<Vec<bitcoin::p2p::message_blockdata::Inventory>>(payload).ok()?;
+    encode_v2_contents(NetworkMessage::Inv(inv)).ok()
+}
+
 /// BIP324 `getheaders` for a locator and stop hash.
 pub fn encode_getheaders_v2(locator: Vec<BlockHash>, stop: BlockHash) -> Result<Vec<u8>, NetError> {
     encode_v2_contents(NetworkMessage::GetHeaders(GetHeadersMessage::new(

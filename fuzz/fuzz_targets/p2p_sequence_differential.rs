@@ -12,13 +12,15 @@ use libfuzzer_sys::fuzz_target;
 use rbitcoin_consensus::Milestone;
 use rbitcoin_fuzz::{
     check_diff_env, cmpct_getblocktxn_agrees, cmpct_missing_for_case, compare_one,
-    compare_tx_bytes, diff_regtest_params, encode_cmpctblock_v2, encode_getheaders_empty_v2,
-    encode_getheaders_v2, encode_ping_v2, encode_pong_v2, encode_tx_v2, genesis_diff_tip,
-    header_sequence_agrees, parse_p2p_sequence, prepare_cmpct_fuzz_case, spawn_bitcoind_p2p,
-    tmp_dir, BlockOracle, CompareOne, CoreChild, DiffTip, P2pSeqKind,
+    compare_tx_bytes, diff_regtest_params, encode_cmpctblock_v2, encode_feefilter_payload,
+    encode_getheaders_empty_v2, encode_getheaders_v2, encode_inv_payload, encode_ping_v2,
+    encode_pong_v2, encode_tx_v2, genesis_diff_tip, header_sequence_agrees, parse_p2p_sequence,
+    prepare_cmpct_fuzz_case, spawn_bitcoind_p2p, tmp_dir, BlockOracle, CompareOne, CoreChild,
+    DiffTip, P2pSeqKind,
 };
 use rbitcoin_net::{
-    classify_v2_cmpct_peer, v2_header_hashes, ChainHub, CmpctPeerFrame, NetError, V2PlainSession,
+    classify_v2_cmpct_peer, v2_header_hashes, ChainHub, CmpctPeerFrame, NetError, P2PNode,
+    V2PlainSession,
 };
 use rbitcoin_query::Query;
 use tokio::net::TcpStream;
@@ -30,6 +32,7 @@ struct Base {
     tip: std::sync::Mutex<DiffTip>,
     rt: Runtime,
     session: Mutex<Option<V2PlainSession>>,
+    node: Mutex<P2PNode>,
     _store: PathBuf,
 }
 
@@ -83,12 +86,24 @@ fn base() -> &'static Base {
         let session = rt
             .block_on(connect_session(p2p))
             .unwrap_or_else(|e| harness_failure(&format!("initial handshake: {e}")));
+        let listen_q = Query::open_or_create_tiny(store.join("listen")).unwrap_or_else(|e| {
+            harness_failure(&format!("listen query: {e}"));
+        });
+        let node = rt
+            .block_on(P2PNode::start(
+                "127.0.0.1:0".parse().unwrap(),
+                listen_q,
+                params.clone(),
+                Milestone::NONE,
+            ))
+            .unwrap_or_else(|e| harness_failure(&format!("p2p listen: {e}")));
         Base {
             hub,
             core,
             tip: std::sync::Mutex::new(genesis_diff_tip(&params)),
             rt,
             session: Mutex::new(Some(session)),
+            node: Mutex::new(node),
             _store: store,
         }
     })
@@ -101,41 +116,42 @@ async fn connect_session(p2p: SocketAddr) -> Result<V2PlainSession, String> {
         .map_err(|e| format!("handshake: {e}"))
 }
 
+async fn ping_session(sess: &mut V2PlainSession) -> bool {
+    let nonce = PING_SEQ.fetch_add(1, Ordering::Relaxed);
+    let Ok(ping) = encode_ping_v2(nonce) else {
+        return false;
+    };
+    if sess.write_contents(&ping).await.is_err() {
+        return false;
+    }
+    let deadline = tokio::time::Instant::now() + READ_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, sess.read_contents()).await {
+            Err(_) | Ok(Err(_)) => return false,
+            Ok(Ok(contents)) => match classify_v2_cmpct_peer(&contents) {
+                CmpctPeerFrame::Pong(n) if n == nonce => return true,
+                CmpctPeerFrame::Ping(n) => {
+                    let Ok(pong) = encode_pong_v2(n) else {
+                        return false;
+                    };
+                    if sess.write_contents(&pong).await.is_err() {
+                        return false;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    false
+}
+
 fn ping_compare(b: &Base) -> bool {
     let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
     let Some(sess) = slot.as_mut() else {
         return false;
     };
-    let nonce = PING_SEQ.fetch_add(1, Ordering::Relaxed);
-    let Ok(ping) = encode_ping_v2(nonce) else {
-        return false;
-    };
-    b.rt.block_on(async {
-        if sess.write_contents(&ping).await.is_err() {
-            return false;
-        }
-        let deadline = tokio::time::Instant::now() + READ_WAIT;
-        while tokio::time::Instant::now() < deadline {
-            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(left, sess.read_contents()).await {
-                Err(_) => return false,
-                Ok(Err(_)) => return false,
-                Ok(Ok(contents)) => match classify_v2_cmpct_peer(&contents) {
-                    CmpctPeerFrame::Pong(n) if n == nonce => return true,
-                    CmpctPeerFrame::Ping(n) => {
-                        let Ok(pong) = encode_pong_v2(n) else {
-                            return false;
-                        };
-                        if sess.write_contents(&pong).await.is_err() {
-                            return false;
-                        }
-                    }
-                    _ => {}
-                },
-            }
-        }
-        false
-    })
+    b.rt.block_on(ping_session(sess))
 }
 
 fn headers_live(b: &Base) -> bool {
@@ -287,6 +303,62 @@ fn compact_step(b: &Base, payload: &[u8]) -> StepFate {
     }
 }
 
+fn local_send_and_ping(b: &Base, frame: &[u8]) -> bool {
+    let addr = b.node.lock().unwrap_or_else(|e| e.into_inner()).local_addr;
+    b.rt.block_on(async {
+        let Ok(stream) = TcpStream::connect(addr).await else {
+            return false;
+        };
+        let Ok(mut sess) =
+            V2PlainSession::outbound_regtest(stream, "/rbitcoin:fuzz/", HANDSHAKE_LIMIT).await
+        else {
+            return false;
+        };
+        if sess.write_contents(frame).await.is_err() {
+            return false;
+        }
+        ping_session(&mut sess).await
+    })
+}
+
+fn core_send_and_ping(b: &Base, frame: &[u8]) -> Option<bool> {
+    let mut slot = b.session.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(sess) = slot.as_mut() else {
+        return None;
+    };
+    let up = b.rt.block_on(async {
+        if sess.write_contents(frame).await.is_err() {
+            return false;
+        }
+        ping_session(sess).await
+    });
+    if !up {
+        if let Some(mut dead) = slot.take() {
+            dead.close();
+        }
+    }
+    Some(up)
+}
+
+fn relay_step(b: &Base, payload: &[u8], fee: bool) -> StepFate {
+    let Some(frame) = (if fee {
+        encode_feefilter_payload(payload)
+    } else {
+        encode_inv_payload(payload)
+    }) else {
+        return StepFate::Skip;
+    };
+    let local_up = local_send_and_ping(b, &frame);
+    let Some(core_up) = core_send_and_ping(b, &frame) else {
+        return StepFate::Skip;
+    };
+    if local_up == core_up {
+        StepFate::Compared
+    } else {
+        StepFate::Disagree(format!("local_up={local_up} core_up={core_up}"))
+    }
+}
+
 fn finish_step(fate: StepFate, what: &str) {
     match fate {
         StepFate::Compared => note_comparison(),
@@ -341,7 +413,8 @@ fuzz_target!(|data: &[u8]| {
             P2pSeqKind::Cmpct | P2pSeqKind::Blocktxn => {
                 finish_step(compact_step(b, &step.payload), "cmpct");
             }
-            P2pSeqKind::FeeFilter | P2pSeqKind::Inv => {}
+            P2pSeqKind::FeeFilter => finish_step(relay_step(b, &step.payload, true), "feefilter"),
+            P2pSeqKind::Inv => finish_step(relay_step(b, &step.payload, false), "inv"),
         }
     }
 });

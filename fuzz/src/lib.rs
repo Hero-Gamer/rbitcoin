@@ -20,9 +20,10 @@ pub use block_diff::{
 pub use chain_review::{compare_chain_plan, plan_chain_shape, ChainReview, PlannedSubmit};
 pub use cmpct_fuzz::{
     cmpct_drain_disconnects, cmpct_getblocktxn_agrees, cmpct_missing_for_case,
-    encode_cmpctblock_v2, encode_getheaders_empty_v2, encode_getheaders_v2, encode_ping_v2,
-    encode_pong_v2, encode_sendcmpct_hb_v2, encode_tx_v2, encode_verack_v2,
-    follow_reconstructed_cmpct, prepare_cmpct_fuzz_case, prepare_cmpct_fuzz_hsi, CmpctFuzzCase,
+    encode_cmpctblock_v2, encode_feefilter_payload, encode_getheaders_empty_v2,
+    encode_getheaders_v2, encode_inv_payload, encode_ping_v2, encode_pong_v2,
+    encode_sendcmpct_hb_v2, encode_tx_v2, encode_verack_v2, follow_reconstructed_cmpct,
+    prepare_cmpct_fuzz_case, prepare_cmpct_fuzz_hsi, CmpctFuzzCase,
 };
 pub use p2p_seq::{
     header_sequence_agrees, p2p_sequence_ping_comparisons, parse_p2p_sequence, P2pSeqKind,

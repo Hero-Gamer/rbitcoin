@@ -174,6 +174,69 @@ mod tests {
     }
 
     #[test]
+    fn tagged_inv_payload_stays_inside_the_u16() {
+        let raw = [P2P_SEQ_IR, 8, 2, 0, 0x11, 0x22];
+        let steps = parse_p2p_sequence(&raw);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].kind, P2pSeqKind::Inv);
+        assert_eq!(steps[0].payload, vec![0x11, 0x22]);
+    }
+
+    #[test]
+    fn feefilter_then_ping_still_pongs() {
+        use std::time::Duration;
+
+        use bitcoin::p2p::message::NetworkMessage;
+        use rbitcoin_consensus::{ChainParams, Milestone};
+        use rbitcoin_net::{encode_v2_contents, P2PNode, V2PlainSession};
+        use rbitcoin_query::Query;
+        use tokio::net::TcpStream;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = crate::tmp_dir("p2p-feefilter");
+            let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
+            let node = P2PNode::start(
+                "127.0.0.1:0".parse().unwrap(),
+                q,
+                ChainParams::regtest(),
+                Milestone::NONE,
+            )
+            .await
+            .unwrap();
+            let stream = TcpStream::connect(node.local_addr).await.unwrap();
+            let mut sess =
+                V2PlainSession::outbound_regtest(stream, "/rbitcoin:fuzz/", Duration::from_secs(5))
+                    .await
+                    .unwrap();
+            let fee = encode_v2_contents(NetworkMessage::FeeFilter(1)).unwrap();
+            sess.write_contents(&fee).await.unwrap();
+            let ping = encode_v2_contents(NetworkMessage::Ping(9)).unwrap();
+            sess.write_contents(&ping).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut saw = false;
+            while tokio::time::Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let contents = tokio::time::timeout(left, sess.read_contents())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if rbitcoin_net::classify_v2_cmpct_peer(&contents)
+                    == rbitcoin_net::CmpctPeerFrame::Pong(9)
+                {
+                    saw = true;
+                    break;
+                }
+            }
+            node.shutdown().await;
+            assert!(saw, "pong after feefilter");
+        });
+    }
+
+    #[test]
     fn tagged_sequence_stops_at_eight() {
         let mut raw = vec![P2P_SEQ_IR];
         for _ in 0..10 {
