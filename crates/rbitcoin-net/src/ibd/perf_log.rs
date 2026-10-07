@@ -31,9 +31,10 @@
 //!   batch, and a stamp or pin reject's rewind of the wave
 //!   (`load_thr pack/stamp/pin/asm/prune`). `reject=` is a lone block's
 //!   missing-parent check after a stamp miss: the wait for its parent to be
-//!   the tip with `tx.head` holding every connected create, and one TipOnly
-//!   read. It can hold the load thread for seconds, so it stays out of
-//!   `prune=`.
+//!   the tip with `tx.head` holding every connected create, one TipOnly
+//!   read, and on a miss a `txid.body` scan of every unsealed `tx.head`
+//!   segment that stops with confirm. It can hold the load thread for
+//!   seconds, so it stays out of `prune=`.
 //! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
 //!   `ibd-confirm`; excludes head-of-line wait for write handoff and `idx_asm=`).
 //!   `idx_asm=` is filter and tweak assemble after that verify. `thr script work`

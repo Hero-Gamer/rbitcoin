@@ -2799,6 +2799,11 @@ impl TxTable {
         self.head.occupied()
     }
 
+    /// See [`crate::segmented_head::SegmentedTxHead::unsynced_first_fk`].
+    pub(crate) fn head_unsynced_first_fk(&self) -> u64 {
+        self.head.unsynced_first_fk()
+    }
+
     /// Per-segment first create_fk (winner-age stats).
     pub fn head_first_fks_snapshot(&self) -> Vec<u64> {
         self.head.first_fks_snapshot()

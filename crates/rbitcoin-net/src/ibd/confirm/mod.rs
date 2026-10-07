@@ -1338,8 +1338,8 @@ const PARENT_CHECK_WAIT: Duration = Duration::from_secs(10);
 enum ParentCheck {
     /// The connected chain does not hold this parent: the block's verdict.
     Missing([u8; 32]),
-    /// The block's parent is not the tip, or the chain moved during the
-    /// read: retry the block.
+    /// The block's parent is not the tip, the chain moved during the read,
+    /// or confirm is stopping: retry the block.
     OffTip,
     /// The chain holds every parent, or the read could not be trusted: the
     /// pipeline missed it.
@@ -1357,9 +1357,10 @@ fn check_missing_parent(hub: &ChainHub, feed: &ConfirmFeed, block: &bitcoin::Blo
     let _ = hub.query.take_disconnect(&mut disconnects);
     let on_tip = || hub.tip_hash() == Some(prev);
     let ready = || on_tip() && hub.query.head_covers_fence();
+    let stop = || feed.stopped() || hub.query.confirm_cancelled();
     let deadline = Instant::now() + PARENT_CHECK_WAIT;
     while !ready() {
-        if feed.stopped() || hub.query.confirm_cancelled() || Instant::now() >= deadline {
+        if stop() || Instant::now() >= deadline {
             return if on_tip() && !feed.stopped() {
                 ParentCheck::Engine
             } else {
@@ -1368,8 +1369,8 @@ fn check_missing_parent(hub: &ChainHub, feed: &ConfirmFeed, block: &bitcoin::Blo
         }
         std::thread::sleep(Duration::from_millis(2));
     }
-    let read = rbitcoin_consensus::parent_missing_from_chain(&hub.query, block);
-    if !ready() || hub.query.take_disconnect(&mut disconnects).is_some() {
+    let read = rbitcoin_consensus::parent_missing_from_chain(&hub.query, block, stop);
+    if stop() || !ready() || hub.query.take_disconnect(&mut disconnects).is_some() {
         return ParentCheck::OffTip;
     }
     match read {

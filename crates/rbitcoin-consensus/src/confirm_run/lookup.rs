@@ -292,9 +292,14 @@ pub(super) fn stamp_parent_pin_archived(
 /// load-batch skeleton: the tip path's read. The miss is the block's fault
 /// only when the block extends the tip and [`Query::head_covers_fence`]
 /// held across the read.
+///
+/// A miss that `txid.body` holds at a connected fk where the head's slot
+/// pages may be unsynced is a lost head row, not the block's fault:
+/// `Corrupt("invariant: …")`. `stop` ends that scan early as `Cancelled`.
 pub fn parent_missing_from_chain(
     query: &Query,
     block: &Block,
+    stop: impl Fn() -> bool,
 ) -> Result<Option<[u8; 32]>, ConsensusError> {
     let created: rbitcoin_query::TxidSet = block
         .txdata
@@ -311,6 +316,7 @@ pub fn parent_missing_from_chain(
         .collect();
     need.sort_unstable();
     need.dedup();
+    let unsynced_from = query.store().head_unsynced_first_fk();
     let hits: rbitcoin_query::TxidSet = query
         .store()
         .get_fk_by_txid_batch(&need)
@@ -318,7 +324,20 @@ pub fn parent_missing_from_chain(
         .into_iter()
         .filter_map(|(txid, row)| row.map(|_| txid))
         .collect();
-    Ok(need.into_iter().find(|txid| !hits.contains(txid)))
+    need.retain(|txid| !hits.contains(txid));
+    if need.is_empty() {
+        return Ok(None);
+    }
+    if !query
+        .store()
+        .connected_in_unsynced_head(unsynced_from, &need, stop)?
+        .is_empty()
+    {
+        return Err(ConsensusError::Store(StoreError::Corrupt(
+            "invariant: tx.head misses a connected create",
+        )));
+    }
+    Ok(need.first().copied())
 }
 
 /// IBD **load** after lookup stamp: pin + assemble.
