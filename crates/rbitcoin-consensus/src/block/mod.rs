@@ -901,34 +901,36 @@ pub(crate) enum JobPrevouts {
     Shared(Vec<rbitcoin_query::SharedPrevoutScript>),
 }
 
+fn shared_slot_eq(
+    left: &rbitcoin_query::SharedPrevoutScript,
+    right: &rbitcoin_query::SharedPrevoutScript,
+) -> bool {
+    use rbitcoin_query::SharedPrevoutScript::{Pinned, Wire};
+    match (left, right) {
+        (
+            Wire {
+                tx_index: t0,
+                vout: v0,
+            },
+            Wire {
+                tx_index: t1,
+                vout: v1,
+            },
+        ) => t0 == t1 && v0 == v1,
+        (Pinned(_), Pinned(_)) => left.parts() == right.parts(),
+        _ => false,
+    }
+}
+
 impl PartialEq for JobPrevouts {
     fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
         match (self, other) {
             (Self::Owned(a), Self::Owned(b)) => a == b,
             (Self::Shared(a), Self::Shared(b)) => {
                 a.len() == b.len()
                     && a.iter()
-                        .zip(b.iter())
-                        .all(|(left, right)| match (left, right) {
-                            (
-                                rbitcoin_query::SharedPrevoutScript::Wire {
-                                    tx_index: t0,
-                                    vout: v0,
-                                },
-                                rbitcoin_query::SharedPrevoutScript::Wire {
-                                    tx_index: t1,
-                                    vout: v1,
-                                },
-                            ) => t0 == t1 && v0 == v1,
-                            (
-                                rbitcoin_query::SharedPrevoutScript::Pinned(_),
-                                rbitcoin_query::SharedPrevoutScript::Pinned(_),
-                            ) => left.parts() == right.parts(),
-                            _ => false,
-                        })
+                        .zip(b)
+                        .all(|(left, right)| shared_slot_eq(left, right))
             }
             _ => false,
         }
