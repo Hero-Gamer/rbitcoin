@@ -11,7 +11,7 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
             assert_eq!(bytes.first().copied(), Some(2), "v2 block short id");
             bitcoin::consensus::encode::deserialize(&bytes[1..]).expect("served block payload")
         }
-        PeerOut::Msg(NetworkMessage::Block(b)) => b,
+        PeerOut::Served(NetworkMessage::Block(b)) => b,
         other => panic!("expected served block, got {other:?}"),
     }
 }
@@ -675,6 +675,7 @@ fn handle_peer_frame_control_and_inv_paths() {
             from_this_peer: CappedSet::new(),
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
+            getdata_tail: VecDeque::new(),
         };
 
         // SendHeaders / SendCmpct / WtxidRelay / Pong / GetAddr / Ping
@@ -1172,6 +1173,7 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
             from_this_peer: CappedSet::new(),
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
+            getdata_tail: VecDeque::new(),
         };
 
         let unknown_txid = bitcoin::Txid::from_byte_array([0x42; 32]);
@@ -1456,6 +1458,7 @@ fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
             from_this_peer: CappedSet::new(),
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
+            getdata_tail: VecDeque::new(),
         };
 
         rbitcoin_log::capture_logs(true);
@@ -1870,6 +1873,7 @@ fn inv_of_already_asked_block_does_not_getdata() {
             from_this_peer: CappedSet::new(),
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
+            getdata_tail: VecDeque::new(),
         };
 
         handle_peer_frame(
@@ -1942,6 +1946,7 @@ fn bloom_disabled_messages_request_disconnect() {
         from_this_peer: CappedSet::new(),
         requested_blocks: HashSet::new(),
         ban_score: 0,
+        getdata_tail: VecDeque::new(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2002,6 +2007,7 @@ fn oversize_locator_request_disconnect() {
         from_this_peer: CappedSet::new(),
         requested_blocks: HashSet::new(),
         ban_score: 0,
+        getdata_tail: VecDeque::new(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2192,18 +2198,6 @@ fn block_with_wire_len(n: usize) -> bitcoin::Block {
 }
 
 #[test]
-fn try_queue_served_block_false_at_cap() {
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-    let n = AtomicUsize::new(MAX_SERVE_BLOCKS);
-    let gen = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    let queued =
-        try_queue_served_block(None, &out_tx, Some(&n), NetworkMessage::Block(gen)).unwrap();
-    assert!(!queued);
-    assert!(out_rx.try_recv().is_err());
-    assert_eq!(n.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
-}
-
-#[test]
 fn encode_served_witness_block_panics_on_reactor() {
     let h = BlockHash::from_byte_array([0u8; 32]);
     let join = std::thread::Builder::new()
@@ -2266,99 +2260,497 @@ fn announced_tip_is_hopeless_less_and_288_behind() {
     assert!(!announced_tip_is_hopeless(964_000, 961_638, None));
 }
 
-#[test]
-fn getdata_skips_reconstruct_when_serve_inflight_at_cap() {
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::p2p::message_blockdata::Inventory;
-    use bitcoin::Network;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use tokio::runtime::Builder;
+struct ServeSession {
+    _dir: rbitcoin_query::testutil::TempDir,
+    hub: crate::chain::ChainHub,
+    hashes: Vec<BlockHash>,
+    _peers: std::sync::Arc<crate::peers::PeerHub>,
+    sess: std::sync::Arc<crate::peers::LivePeer>,
+}
 
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        FramedMessage {
-            magic,
-            command,
-            payload: full[24..].to_vec(),
+fn serve_session(label: &str, blocks: u32) -> ServeSession {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled(label);
+    hub.ensure_genesis().unwrap();
+    let hashes = hub
+        .generate_to_script(blocks, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    assert_eq!(hashes.len(), blocks as usize);
+    let peers = crate::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let sess = peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        crate::peers::PeerConnType::OutboundFullRelay,
+    );
+    ServeSession {
+        _dir: dir,
+        hub,
+        hashes,
+        _peers: peers,
+        sess,
+    }
+}
+
+fn getdata_frame(hashes: &[BlockHash]) -> FramedMessage {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message::RawNetworkMessage;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    let inv = hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
+    let magic = Magic::from(bitcoin::Network::Regtest);
+    let full = serialize(&RawNetworkMessage::new(magic, NetworkMessage::GetData(inv)));
+    FramedMessage {
+        magic,
+        command: full[4..16].try_into().unwrap(),
+        payload: full[24..].to_vec(),
+    }
+}
+
+/// Stand-in for the session writer: everything queued so far, with the
+/// `notfound` rows split from the served bodies.
+fn take_queued(
+    out_rx: &mut mpsc::UnboundedReceiver<PeerOut>,
+) -> (Vec<PeerOut>, Vec<Vec<Inventory>>) {
+    let mut bodies = Vec::new();
+    let mut notfound = Vec::new();
+    while let Ok(out) = out_rx.try_recv() {
+        match out {
+            PeerOut::Msg(NetworkMessage::NotFound(inv)) => notfound.push(inv),
+            body => bodies.push(body),
         }
     }
+    (bodies, notfound)
+}
 
-    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+/// What the session writer records after it wrote `out`.
+fn wrote(sess: &crate::peers::LivePeer, out: &PeerOut) {
+    sess.note_out_written(
+        out.holds_serve_slot(),
+        crate::peers::outbound_queued_bytes(out),
+    );
+}
+
+fn served_hashes(queued: Vec<PeerOut>) -> Vec<BlockHash> {
+    queued
+        .into_iter()
+        .map(|out| served_block(out).block_hash())
+        .collect()
+}
+
+/// Core `ProcessGetData` stops on a full send buffer, sends the `notfound`
+/// it collected, and returns to the message loop with the rest queued. A
+/// getdata past the served-body cap hands the reader back the same way.
+/// Once the writer drains, the rest is served in order and no hash is
+/// dropped. A silent drop held the requester's getdata until its 30 s
+/// stall kick.
+#[test]
+fn getdata_past_serve_cap_waits_for_writer() {
+    use std::time::Duration;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
-        let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("serve-inflight-cap");
-        hub.ensure_genesis().unwrap();
-        let hashes = hub
-            .generate_to_script(20, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
-        assert!(hashes.len() >= 20);
-
-        let peers = crate::peers::PeerHub::new();
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
-        let ver = bitcoin::p2p::message_network::VersionMessage {
-            version: 70016,
-            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
-            timestamp: 0,
-            receiver: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
-            sender: bitcoin::p2p::address::Address::new(&addr, ServiceFlags::NONE),
-            nonce: 1,
-            user_agent: "/rbitcoin:test/".into(),
-            start_height: 0,
-            relay: true,
-        };
-        let sess = peers.register(
-            addr,
-            addr,
-            &ver,
-            false,
-            crate::peers::PeerConnType::OutboundFullRelay,
-        );
+        let s = serve_session("serve-cap-waits", 20);
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: false,
-            send_cmpct: false,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
+        let mut follow = PeerFollowState::new();
+        let unknown = BlockHash::from_byte_array([7u8; 32]);
+        let ask: Vec<BlockHash> = std::iter::once(unknown).chain(s.hashes.clone()).collect();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            handle_peer_frame(
+                getdata_frame(&ask),
+                &s.hub,
+                &out_tx,
+                &mut follow,
+                Some(s.sess.as_ref()),
+            ),
+        )
+        .await
+        .expect("a getdata past the serve cap returns to the session loop")
+        .unwrap();
+        let (first, notfound) = take_queued(&mut out_rx);
+        assert_eq!(first.len(), MAX_SERVE_BLOCKS, "the 17th waits");
+        assert_eq!(
+            notfound,
+            vec![vec![Inventory::WitnessBlock(unknown)]],
+            "the notfound collected before the pause is sent"
+        );
+        assert_eq!(
+            s.sess.serve_inflight.load(Ordering::SeqCst),
+            MAX_SERVE_BLOCKS
+        );
+
+        for out in &first {
+            wrote(&s.sess, out);
+        }
+        serve_getdata_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
+            .await
+            .unwrap();
+        let (rest, notfound) = take_queued(&mut out_rx);
+        assert!(notfound.is_empty(), "no notfound for blocks we hold");
+        let served = first.into_iter().chain(rest).collect();
+        assert_eq!(
+            served_hashes(served),
+            s.hashes,
+            "every requested block is served once, in order"
+        );
+    });
+}
+
+/// A reply already past the send budget pauses the whole getdata. It does
+/// not drop it.
+#[test]
+fn getdata_over_send_budget_waits_for_writer() {
+    use std::time::Duration;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let s = serve_session("serve-budget-waits", 3);
+        let earlier = crate::peers::PEER_SEND_BUDGET + 1;
+        s.sess.note_send_queued(earlier);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            handle_peer_frame(
+                getdata_frame(&s.hashes),
+                &s.hub,
+                &out_tx,
+                &mut follow,
+                Some(s.sess.as_ref()),
+            ),
+        )
+        .await
+        .expect("a getdata past the send budget returns to the session loop")
+        .unwrap();
+        assert!(out_rx.try_recv().is_err(), "served past the send budget");
+        s.sess.note_send_written(earlier);
+        serve_getdata_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
+            .await
+            .unwrap();
+        let (got, notfound) = take_queued(&mut out_rx);
+        assert!(notfound.is_empty());
+        assert_eq!(served_hashes(got), s.hashes);
+    });
+}
+
+/// Only a getdata body holds a serve slot. A compact tip announce queued
+/// by another session and a deep `getblocktxn` full block share the writer
+/// queue but free no slot when written, so a paused getdata never has more
+/// than `MAX_SERVE_BLOCKS` bodies queued.
+#[test]
+fn uncounted_bodies_do_not_open_serve_slots() {
+    use bitcoin::bip152::BlockTransactionsRequest;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let s = serve_session("serve-slot-uncounted", 20);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        let tip = *s.hashes.last().unwrap();
+        for _ in 0..3 {
+            let announce = cmpct_announce_msg(&s.hub, &tip, 2).expect("cmpct announce");
+            queue_cmpct_tip_announce(&out_tx, announce).unwrap();
+        }
+        let deep = BlockTransactionsRequest {
+            block_hash: s.hashes[0],
+            indexes: vec![0],
         };
-        let inv: Vec<Inventory> = hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect();
-        handle_peer_frame(
-            frame_for(NetworkMessage::GetData(inv)),
-            &hub,
+        handle_peer_inventory_msg(
+            &NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request: deep }),
+            &s.hub,
             &out_tx,
             &mut follow,
-            Some(sess.as_ref()),
+            Some(s.sess.as_ref()),
+        )
+        .unwrap();
+        handle_peer_frame(
+            getdata_frame(&s.hashes),
+            &s.hub,
+            &out_tx,
+            &mut follow,
+            Some(s.sess.as_ref()),
         )
         .await
         .unwrap();
-        let mut n_block = 0usize;
-        while let Ok(msg) = out_rx.try_recv() {
-            match msg {
-                PeerOut::Encoded(_) | PeerOut::Msg(NetworkMessage::Block(_)) => n_block += 1,
+
+        let (queued, _) = take_queued(&mut out_rx);
+        let (bodies, uncounted): (Vec<_>, Vec<_>) = queued
+            .into_iter()
+            .partition(|out| matches!(out, PeerOut::Encoded(_)));
+        assert_eq!(
+            uncounted.len(),
+            4,
+            "three announces and one getblocktxn block"
+        );
+        for out in &uncounted {
+            wrote(&s.sess, out);
+        }
+        serve_getdata_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
+            .await
+            .unwrap();
+        let (more, _) = take_queued(&mut out_rx);
+        assert_eq!(
+            bodies.len() + more.len(),
+            MAX_SERVE_BLOCKS,
+            "an uncounted write let a getdata body past the serve cap"
+        );
+    });
+}
+
+/// The wait that resumes a paused getdata ends when the session is told
+/// to disconnect, or when its writer is gone.
+#[tokio::test]
+async fn paused_getdata_ends_on_disconnect_or_dead_writer() {
+    use std::time::Duration;
+    let s = serve_session("serve-pause-ends", 0);
+    s.sess
+        .serve_inflight
+        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let stop = async {
+        tokio::task::yield_now().await;
+        s.sess.request_disconnect();
+    };
+    let (room, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(s.sess.wait_serve_room(&out_tx), stop)
+    })
+    .await
+    .expect("disconnect must end a paused getdata");
+    assert!(!room);
+
+    let s = serve_session("serve-pause-dead-writer", 0);
+    s.sess
+        .serve_inflight
+        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
+    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let gone = async move {
+        tokio::task::yield_now().await;
+        drop(out_rx);
+    };
+    let (room, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(s.sess.wait_serve_room(&out_tx), gone)
+    })
+    .await
+    .expect("a dead writer must end a paused getdata");
+    assert!(!room);
+}
+
+/// A node with `blocks` mined and a raw BIP324 client for each `agents`
+/// entry, each paired with the node's session for it.
+struct PausedServe {
+    dir: std::path::PathBuf,
+    node: crate::P2PNode,
+    hashes: Vec<BlockHash>,
+    clients: Vec<(V2PlainSession, Arc<crate::peers::LivePeer>)>,
+}
+
+async fn paused_serve(label: &str, blocks: u32, agents: &[&str]) -> PausedServe {
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-{label}-{n}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let query = Query::open_or_create_tiny(dir.join("store")).unwrap();
+    let node = crate::P2PNode::start_with_agent(
+        "127.0.0.1:0".parse().unwrap(),
+        query,
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(serve)/".into(),
+        crate::DEFAULT_MAX_INBOUND,
+    )
+    .await
+    .unwrap();
+    let hashes = node
+        .hub
+        .generate_to_script(blocks, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    node.peers.set_mock_now(node.peers.now_secs());
+    let mut clients = Vec::new();
+    for agent in agents {
+        let stream = TcpStream::connect(node.local_addr).await.unwrap();
+        let raw = V2PlainSession::outbound_regtest(stream, agent, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let sess = loop {
+            let live = node.peers.live_peers();
+            if let Some(p) = live.into_iter().find(|p| p.subver == *agent) {
+                break p;
+            }
+            assert!(std::time::Instant::now() < deadline, "{agent} session");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        clients.push((raw, sess));
+    }
+    PausedServe {
+        dir,
+        node,
+        hashes,
+        clients,
+    }
+}
+
+async fn next_peer_msg(raw: &mut V2PlainSession) -> Result<NetworkMessage, NetError> {
+    let contents = raw.read_contents().await?;
+    let frame = crate::v2::parse_v2_contents(Magic::REGTEST, &contents)?;
+    Ok(frame.decode().payload().clone())
+}
+
+async fn write_peer_msg(raw: &mut V2PlainSession, msg: NetworkMessage) {
+    raw.write_contents(&crate::v2::encode_v2_contents(msg).unwrap())
+        .await
+        .unwrap();
+}
+
+fn getdata_msg(hashes: &[BlockHash]) -> NetworkMessage {
+    NetworkMessage::GetData(hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect())
+}
+
+async fn wait_session_read(node: &crate::P2PNode, sess: &crate::peers::LivePeer, cmd: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let read = node
+            .peers
+            .snapshot()
+            .into_iter()
+            .find(|p| p.id == sess.id)
+            .is_some_and(|p| p.bytesrecv_per_msg.contains_key(cmd));
+        if read {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session never read {cmd}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Core's ping timeout runs while `ProcessGetData` is paused on
+/// `fPauseSend`. A session paused on a getdata tail, or on its send budget,
+/// still runs the heartbeat: a peer that never reads hits the ping timeout
+/// and is disconnected. It is not held with no timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_session_still_times_out_a_silent_peer() {
+    let mut t = paused_serve(
+        "serve-pause-ping-timeout",
+        20,
+        &["/rbitcoin:test(slots)/", "/rbitcoin:test(budget)/"],
+    )
+    .await;
+    let (slots_raw, slots) = &mut t.clients[0];
+    slots
+        .serve_inflight
+        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
+    write_peer_msg(slots_raw, getdata_msg(&t.hashes)).await;
+    wait_session_read(&t.node, slots, "getdata").await;
+    let (_, budget) = &t.clients[1];
+    budget.note_send_queued(2 * crate::peers::PEER_SEND_BUDGET);
+    tokio::time::sleep(4 * SESSION_HEARTBEAT).await;
+
+    let now = t.node.peers.now_secs();
+    t.node.peers.set_mock_now(now + 20 * 60 + 61);
+    for (raw, sess) in &mut t.clients {
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match next_peer_msg(raw).await {
+                    Err(_) => return,
+                    Ok(NetworkMessage::Block(_)) => {
+                        panic!("{} was served while paused", sess.subver)
+                    }
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "{} was not dropped by the ping timeout",
+            sess.subver
+        );
+    }
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
+/// Core appends a second getdata behind the paused one and serves both in
+/// order. While the first is paused the session keeps pinging, and once
+/// the writer has room the tail is served before the next getdata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_getdata_tail_is_served_before_the_next_getdata() {
+    let mut t = paused_serve("serve-pause-order", 22, &["/rbitcoin:test(order)/"]).await;
+    let (raw, sess) = &mut t.clients[0];
+    let first_ping = loop {
+        if let NetworkMessage::Ping(n) = next_peer_msg(raw).await.unwrap() {
+            break n;
+        }
+    };
+    write_peer_msg(raw, NetworkMessage::Pong(first_ping)).await;
+    wait_session_read(&t.node, sess, "pong").await;
+
+    sess.serve_inflight
+        .store(MAX_SERVE_BLOCKS, Ordering::SeqCst);
+    let (a, b) = t.hashes.split_at(20);
+    write_peer_msg(raw, getdata_msg(a)).await;
+    write_peer_msg(raw, getdata_msg(b)).await;
+    wait_session_read(&t.node, sess, "getdata").await;
+
+    let now = t.node.peers.now_secs();
+    t.node.peers.set_mock_now(now + 121);
+    let pinged = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match next_peer_msg(raw).await.unwrap() {
+                NetworkMessage::Ping(_) => return,
+                NetworkMessage::Block(_) => {
+                    panic!("a block was served while the getdata was paused")
+                }
                 _ => {}
             }
         }
-        assert!(
-            n_block <= MAX_SERVE_BLOCKS,
-            "queued {n_block} blocks over cap {MAX_SERVE_BLOCKS}"
-        );
-        assert_eq!(hashes.len(), 20);
-        assert_eq!(n_block, MAX_SERVE_BLOCKS);
-        assert!(
-            n_block < hashes.len(),
-            "17th getdata hash must not queue a 17th body"
-        );
-        assert_eq!(sess.serve_inflight.load(Ordering::SeqCst), MAX_SERVE_BLOCKS);
-        let _ = std::fs::remove_dir_all(dir);
-    });
+    })
+    .await;
+    assert!(
+        pinged.is_ok(),
+        "the heartbeat pings while the getdata is paused"
+    );
+
+    sess.serve_inflight.store(0, Ordering::SeqCst);
+    sess.note_send_written(0);
+    let served = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut got = Vec::new();
+        while got.len() < t.hashes.len() {
+            if let NetworkMessage::Block(b) = next_peer_msg(raw).await.unwrap() {
+                got.push(b.block_hash());
+            }
+        }
+        got
+    })
+    .await
+    .expect("the paused tail and the next getdata are served");
+    assert_eq!(served, t.hashes, "tail first, then the next getdata");
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
 }
 
 #[tokio::test]
@@ -2949,7 +3341,7 @@ async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
     let tx = Inventory::WitnessTransaction(Txid::from_byte_array([0x22; 32]));
     let at_cap = vec![tx; MAX_INV_SIZE];
     let mut follow = PeerFollowState::new();
-    serve_getdata(&hub, &out_tx, &mut follow, None, &at_cap)
+    serve_getdata(&hub, &out_tx, &mut follow, None, at_cap.clone())
         .await
         .unwrap();
     assert_eq!(
@@ -2959,7 +3351,7 @@ async fn inv_and_getdata_at_cap_stay_one_past_disconnects() {
     let mut over = at_cap;
     over.push(tx);
     let mut follow = PeerFollowState::new();
-    serve_getdata(&hub, &out_tx, &mut follow, None, &over)
+    serve_getdata(&hub, &out_tx, &mut follow, None, over)
         .await
         .unwrap();
     assert!(
@@ -3456,33 +3848,6 @@ async fn full_parent_table_keeps_headers_and_collected_getdata() {
             .is_empty(),
         "a full table does not record the new announcement"
     );
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[tokio::test]
-async fn getdata_stops_when_send_budget_is_already_over() {
-    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("gd-budget");
-    hub.ensure_genesis().unwrap();
-    let peers = crate::peers::PeerHub::new();
-    let peer = inbound_peer(&peers);
-    peer.note_send_queued(crate::peers::PEER_SEND_BUDGET + 1);
-    let (out_tx, mut rx) = mpsc::unbounded_channel();
-    let mut follow = PeerFollowState::new();
-    let genesis = hub.tip_hash().unwrap();
-    serve_getdata(
-        &hub,
-        &out_tx,
-        &mut follow,
-        Some(&peer),
-        &[Inventory::WitnessBlock(genesis)],
-    )
-    .await
-    .unwrap();
-    assert!(
-        rx.try_recv().is_err(),
-        "a getdata must not queue another block once the send budget is over"
-    );
-    assert_eq!(peer.send_queued(), crate::peers::PEER_SEND_BUDGET + 1);
     let _ = std::fs::remove_dir_all(dir);
 }
 

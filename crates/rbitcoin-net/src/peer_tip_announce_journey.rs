@@ -466,7 +466,7 @@ async fn tip_announce_depth_and_fill_slot() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
-    serve_getdata(hub, &out_tx, &mut follow, None, &[Inventory::CompactBlock(near)])
+    serve_getdata(hub, &out_tx, &mut follow, None, vec![Inventory::CompactBlock(near)])
         .await
         .unwrap();
     assert!(
@@ -476,7 +476,7 @@ async fn tip_announce_depth_and_fill_slot() {
         ),
         "depth 5 is still a compact block"
     );
-    serve_getdata(hub, &out_tx, &mut follow, None, &[Inventory::CompactBlock(deep)])
+    serve_getdata(hub, &out_tx, &mut follow, None, vec![Inventory::CompactBlock(deep)])
         .await
         .unwrap();
     assert!(
@@ -512,9 +512,9 @@ async fn tip_announce_depth_and_fill_slot() {
     );
 }
 
-/// Tip announces do not `fetch_add` or `fetch_sub` `serve_inflight`. The
-/// writer still saturating-subs every `cmpctblock`, so an unpaired decrement
-/// must stay at zero and a burst must not fill the reconstruct cap.
+/// Tip announces take no `serve_inflight` slot and the writer frees none
+/// for them, so a burst must not fill the reconstruct cap. A double free
+/// of a getdata slot saturates at zero instead of wrapping.
 #[tokio::test]
 async fn tip_announce_serve_inflight_untouched() {
     let (_dir, hub) = open_tip_announce_hub("tip-serve-inflight-untouched");
@@ -525,15 +525,26 @@ async fn tip_announce_serve_inflight_untouched() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
 
     let wrap = live_peer(&peers, 18447, 4, false);
+    wrap.serve_inflight.store(1, Ordering::SeqCst);
     let msg = cmpct_announce_msg(hub, &hash, 2).expect("cmpct announce");
     queue_cmpct_tip_announce(&out_tx, msg).unwrap();
-    note_served_write(&wrap.serve_inflight);
+    let announce = out_rx.try_recv().unwrap();
+    wrap.note_out_written(
+        announce.holds_serve_slot(),
+        crate::peers::outbound_queued_bytes(&announce),
+    );
+    assert_eq!(
+        wrap.serve_inflight.load(Ordering::SeqCst),
+        1,
+        "a written announce frees no getdata slot"
+    );
+    wrap.free_serve_slot();
+    wrap.free_serve_slot();
     assert_eq!(
         wrap.serve_inflight.load(Ordering::SeqCst),
         0,
-        "unpaired announce write must saturating-sub, not wrap"
+        "a double free saturates, not wraps"
     );
-    while out_rx.try_recv().is_ok() {}
     let mut follow = hb_follow();
     handle_peer_frame(
         frame_for(NetworkMessage::GetData(vec![Inventory::CompactBlock(hash)])),

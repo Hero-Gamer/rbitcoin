@@ -137,10 +137,12 @@ Tip-follow pending cap is **128** (`MAX_PENDING_BLOCKS`) so a ≥99-block
 divergence can still be assembled. Catch-up `getdata` is windowed to
 **16** (`MAX_SERVE_BLOCKS`) so it matches per-session reconstruct serve;
 drain continues the header path after that window connects. An inbound
-`getdata` with more than 16 hashes drops the leftover (RAM cap; not Core
-`ProcessGetData`). Writer saturating-subs `serve_inflight` so unpaired
-compact tip announce cannot wrap the counter; announce itself is not
-counted on that cap.
+`getdata` serves until 16 bodies or 4 MiB sit in the writer queue (RAM
+cap). The rest stays on the session, which reads no new message until it
+is served, as Core `ProcessGetData` does on `fPauseSend`
+([090](./external_findings/090-getdata-serve-pause.md)). Only a getdata
+body takes a `serve_inflight` slot and only it frees one; a compact tip
+announce or a `getblocktxn` block is not counted.
 
 ```text
 # IBD

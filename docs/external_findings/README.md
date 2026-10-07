@@ -61,7 +61,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [054](./054-wtxid-getdata.md) | low | Wtxid follow-up is a wtxid getdata | fixed | `wtxid_followup_is_requested_as_wtx` |
 | [055](./055-decoy-rate.md) | high | Decoy packets count toward the rate window | fixed | `decoy_packet_is_handed_to_the_rate_hook` |
 | [056](./056-inv-getdata-budget.md) | medium | Inv getdata charges the send budget | fixed | `inv_getdata_charges_send_budget` |
-| [057](./057-block-getdata-budget.md) | medium | Block serving stops when the send budget is over | fixed | `getdata_stops_when_send_budget_is_already_over` |
+| [057](./057-block-getdata-budget.md) | medium | Block serving stops when the send budget is over | fixed | `getdata_over_send_budget_waits_for_writer` |
 | [058](./058-tx-inv-batch.md) | medium | Mempool announcements batch into one inv | fixed | `tx_inv_over_one_thousand_is_two_messages` |
 | [059](./059-rate-window-boundary.md) | low | Rate window keeps the previous second | fixed | `rate_limiter_boundary_does_not_grant_a_second_budget` |
 | [060](./060-evict-newest-netgroup.md) | high | Evict the newest inbound in the largest netgroup | fixed | `eviction_drops_the_newest_in_the_largest_netgroup` |
@@ -94,6 +94,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [087](./087-forward-spend-in-batch.md) | critical | Spend of a later block in one confirm batch accepted | fixed | `same_batch_spend_of_a_later_block_is_missing`, `batched_spend_of_a_later_block_is_rejected_alone`, `spender_below_its_create_height_is_corrupt` |
 | [088](./088-tip-chain-selection.md) | high | Tip-follow chain selection: total-work ranking, failed-branch prefix, sibling header check, reorg depth | partial (F3 reorg depth open) | `held_branch_with_more_total_work_beats_an_earlier_local_tie`, `failed_branch_tip_keeps_the_heavier_valid_prefix`, `sibling_claiming_more_work_with_wrong_bits_keeps_the_tip` |
 | [089](./089-missing-parent-verdict.md) | high | IBD halted on a block that spends an unknown txid; no verdict | fixed | `ibd_spend_of_an_unknown_txid_is_invalid`, `spend_of_a_create_the_head_lost_is_not_invalid`, `spend_of_an_unknown_txid_after_restart_is_invalid` |
+| [090](./090-getdata-serve-pause.md) | medium | Served getdata past the writer queue was dropped | fixed | `getdata_past_serve_cap_waits_for_writer`, `paused_session_still_times_out_a_silent_peer`, `paused_getdata_tail_is_served_before_the_next_getdata`, `uncounted_bodies_do_not_open_serve_slots` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

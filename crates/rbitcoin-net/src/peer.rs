@@ -1200,6 +1200,7 @@ fn outbound_write_rank(out: &PeerOut) -> u8 {
             NetworkMessage::Ping(_) | NetworkMessage::Pong(_) | NetworkMessage::SendCmpct(_),
         ) => 0,
         PeerOut::Encoded(_)
+        | PeerOut::Served(_)
         | PeerOut::Msg(NetworkMessage::Block(_))
         | PeerOut::Msg(NetworkMessage::NotFound(_))
         | PeerOut::Msg(NetworkMessage::CmpctBlock(_)) => 1,
@@ -1231,25 +1232,15 @@ async fn run_writer_task(
     while let Some(first) = out_rx.recv().await {
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let n = crate::peers::outbound_queued_bytes(&out);
-            let (full, err) = match out {
-                PeerOut::Msg(msg) => {
-                    let full = matches!(
-                        msg,
-                        NetworkMessage::Block(_) | NetworkMessage::CmpctBlock(_)
-                    );
-                    (full, write_v2_msg_offload(&mut writer, msg).await.is_err())
+            let serve_slot = out.holds_serve_slot();
+            let err = match out {
+                PeerOut::Msg(msg) | PeerOut::Served(msg) => {
+                    write_v2_msg_offload(&mut writer, msg).await.is_err()
                 }
-                PeerOut::Encoded(bytes) => {
-                    (true, write_v2_contents(&mut writer, bytes).await.is_err())
-                }
+                PeerOut::Encoded(bytes) => write_v2_contents(&mut writer, bytes).await.is_err(),
             };
             if let Some(s) = &writer_session {
-                s.note_send_written(n);
-            }
-            if full {
-                if let Some(s) = &writer_session {
-                    note_served_write(&s.serve_inflight);
-                }
+                s.note_out_written(serve_slot, n);
             }
             if err {
                 return;
@@ -1659,11 +1650,12 @@ pub async fn peer_session_with(
             {
                 return Ok(());
             }
-            if let Some(s) = session.as_ref() {
-                if s.send_over_budget() {
-                    s.wait_send_budget().await;
-                }
-            }
+            // Core `fPauseSend`: no inbound message is read while the writer
+            // is past the send budget or a getdata tail waits for serve room.
+            // Heartbeat (ping timeout, block-request expiry) still runs.
+            let over_budget = session.as_ref().is_some_and(|s| s.send_over_budget());
+            let tail_pending = !follow.getdata_tail.is_empty();
+            let reading = !over_budget && !tail_pending;
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
             decoy_score.store(follow.ban_score, Ordering::Relaxed);
             tokio::select! {
@@ -1690,7 +1682,7 @@ pub async fn peer_session_with(
                     } else {
                         Err(NetError::Protocol("peer misbehavior threshold"))
                     }
-                }) => {
+                }), if reading => {
                     follow.ban_score = decoy_score.load(Ordering::Relaxed);
                     let frame = match frame {
                         Ok(f) => f,
@@ -1791,7 +1783,7 @@ pub async fn peer_session_with(
                         return Err(threshold_disconnect(session.as_deref()));
                     }
                 }
-                tip = tip_rx.recv() => {
+                tip = tip_rx.recv(), if !over_budget => {
                     let mut tip = tip;
                     loop {
                         match tip_rx.try_recv() {
@@ -1815,7 +1807,7 @@ pub async fn peer_session_with(
                         return Ok(());
                     }
                 }
-                _ = headers_poll.tick() => {
+                _ = headers_poll.tick(), if !over_budget => {
                     on_headers_poll(hub.as_ref(), &out_tx, session.as_deref());
                 }
                 ann = async {
@@ -1825,7 +1817,7 @@ pub async fn peer_session_with(
                         std::future::pending::<()>().await;
                         None
                     }
-                } => {
+                }, if !over_budget => {
                     on_tx_announce(
                         hub.as_ref(),
                         &out_tx,
@@ -1841,7 +1833,7 @@ pub async fn peer_session_with(
                         std::future::pending::<()>().await;
                         None
                     }
-                } => {
+                }, if !over_budget => {
                     on_inv_flush(
                         hub.as_ref(),
                         &out_tx,
@@ -1864,6 +1856,25 @@ pub async fn peer_session_with(
                     .await?;
                     last_hb = std::time::Instant::now();
                     continue;
+                }
+                // After the heartbeat: a tail that keeps finding room must
+                // not starve the ping timeout.
+                () = async {
+                    if let Some(s) = session.as_deref() {
+                        s.wait_send_budget().await;
+                    }
+                }, if over_budget && !tail_pending => {}
+                room = async {
+                    match session.as_deref() {
+                        Some(s) => s.wait_serve_room(&out_tx).await,
+                        None => true,
+                    }
+                }, if tail_pending => {
+                    if !room {
+                        return Ok(());
+                    }
+                    serve_getdata_tail(hub.as_ref(), &out_tx, &mut follow, session.as_deref())
+                        .await?;
                 }
             }
         }
@@ -2476,6 +2487,12 @@ struct PeerFollowState {
     from_this_peer: CappedSet<bitcoin::Txid>,
     requested_blocks: HashSet<BlockHash>,
     ban_score: u32,
+    /// Unserved rest of an inbound `getdata` paused on the writer (Core
+    /// `m_getdata_requests`). The session reads no frame while it is
+    /// non-empty, so it holds at most one message: `MAX_INV_SIZE` items,
+    /// about 2 MB per session. That RAM keeps every hash served in order
+    /// instead of dropping the rest or holding the reader across items.
+    getdata_tail: VecDeque<Inventory>,
 }
 
 impl PeerFollowState {
@@ -2491,6 +2508,7 @@ impl PeerFollowState {
             from_this_peer: CappedSet::new(),
             requested_blocks: HashSet::new(),
             ban_score: 0,
+            getdata_tail: VecDeque::new(),
         }
     }
 }
@@ -2543,15 +2561,15 @@ async fn handle_decoded_peer_msg(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
-    match msg.payload() {
+    match msg.into_payload() {
         NetworkMessage::GetData(inv) => serve_getdata(hub, out_tx, follow, session, inv).await?,
-        NetworkMessage::Block(block) => on_block(hub, out_tx, follow, session, block).await?,
-        NetworkMessage::CmpctBlock(cb) => on_cmpctblock(hub, out_tx, follow, session, cb).await?,
+        NetworkMessage::Block(block) => on_block(hub, out_tx, follow, session, &block).await?,
+        NetworkMessage::CmpctBlock(cb) => on_cmpctblock(hub, out_tx, follow, session, &cb).await?,
         NetworkMessage::BlockTxn(BlockTxn { transactions: bt }) => {
-            on_blocktxn(hub, out_tx, follow, session, bt).await?
+            on_blocktxn(hub, out_tx, follow, session, &bt).await?
         }
-        NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, tx).await?,
-        other => handle_peer_sync_msg(other, hub, out_tx, follow, session)?,
+        NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, &tx).await?,
+        other => handle_peer_sync_msg(&other, hub, out_tx, follow, session)?,
     }
     Ok(())
 }
@@ -3026,19 +3044,32 @@ async fn serve_getdata(
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
-    inv: &[Inventory],
+    inv: Vec<Inventory>,
 ) -> Result<(), NetError> {
     if inv.len() > MAX_INV_SIZE {
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
-    let inflight = session.map(|s| &s.serve_inflight);
+    follow.getdata_tail.extend(inv);
+    serve_getdata_tail(hub, out_tx, follow, session).await
+}
+
+/// Core `ProcessGetData`: serve queued getdata items in order until the
+/// writer has no serve room (`fPauseSend`). The rest stays in
+/// `follow.getdata_tail` for the session loop to resume. The `notfound`
+/// collected so far is sent either way.
+async fn serve_getdata_tail(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
     let mut notfound: Vec<Inventory> = Vec::new();
-    for item in inv {
-        if session.is_some_and(|s| s.send_over_budget()) {
+    while session.is_none_or(|s| s.has_serve_room()) {
+        let Some(item) = follow.getdata_tail.pop_front() else {
             break;
-        }
-        match item {
+        };
+        match &item {
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
             // `knows_header` is the index check. `header_of` reconstructs
@@ -3046,21 +3077,21 @@ async fn serve_getdata(
             // the blocking encode.
             Inventory::Block(h) | Inventory::WitnessBlock(h)
                 if !hub.knows_header(h)
-                    || !serve_getdata_full_block(hub, out_tx, session, inflight, h).await? =>
+                    || !serve_getdata_full_block(hub, out_tx, session, h).await? =>
             {
-                notfound.push(*item);
+                notfound.push(item);
             }
             Inventory::CompactBlock(h) => {
-                serve_getdata_compact(hub, out_tx, follow, session, inflight, h)?;
+                serve_getdata_compact(hub, out_tx, follow, session, h)?;
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
                 if !serve_mempool_getdata(hub, out_tx, session, tx)? && hub.mempool().is_some() {
-                    notfound.push(*item);
+                    notfound.push(item);
                 }
             }
             Inventory::WTx(wtxid) => {
-                serve_getdata_wtx(hub, out_tx, session, *item, wtxid, &mut notfound)?;
+                serve_getdata_wtx(hub, out_tx, session, item, wtxid, &mut notfound)?;
             }
             _ => {}
         }
@@ -3075,12 +3106,8 @@ async fn serve_getdata_full_block(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     session: Option<&crate::peers::LivePeer>,
-    inflight: Option<&AtomicUsize>,
     h: &bitcoin::BlockHash,
 ) -> Result<bool, NetError> {
-    if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
-        return Ok(true);
-    }
     let query = Arc::clone(&hub.query);
     let cache = Arc::clone(&hub.cache);
     let hash = *h;
@@ -3099,7 +3126,7 @@ async fn serve_getdata_full_block(
     if !hub.stale_relay_allowed(h) {
         return Ok(true);
     }
-    let _ = try_queue_served_encoded(session, out_tx, inflight, bytes)?;
+    queue_served(session, out_tx, PeerOut::Encoded(bytes))?;
     Ok(true)
 }
 
@@ -3108,12 +3135,8 @@ fn serve_getdata_compact(
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
-    inflight: Option<&AtomicUsize>,
     h: &bitcoin::BlockHash,
 ) -> Result<(), NetError> {
-    if inflight.is_some_and(|n| n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS) {
-        return Ok(());
-    }
     let Some(block) = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)? else {
         return Ok(());
     };
@@ -3126,8 +3149,11 @@ fn serve_getdata_compact(
         .map(|ht| ht.0)
         .unwrap_or(0);
     if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
-        let _ = try_queue_served_block(session, out_tx, inflight, NetworkMessage::Block(block))?;
-        return Ok(());
+        return queue_served(
+            session,
+            out_tx,
+            PeerOut::Served(NetworkMessage::Block(block)),
+        );
     }
     let ver = follow.cmpct_version.clamp(1, 2);
     let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
@@ -3136,16 +3162,20 @@ fn serve_getdata_compact(
             "{}",
             crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
         );
-        let _ = try_queue_served_block(
+        queue_served(
             session,
             out_tx,
-            inflight,
-            NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
-        )?;
+            PeerOut::Served(NetworkMessage::CmpctBlock(CmpctBlock {
+                compact_block: hsi,
+            })),
+        )
     } else {
-        let _ = try_queue_served_block(session, out_tx, inflight, NetworkMessage::Block(block))?;
+        queue_served(
+            session,
+            out_tx,
+            PeerOut::Served(NetworkMessage::Block(block)),
+        )
     }
-    Ok(())
 }
 
 fn serve_getdata_wtx(
@@ -4935,22 +4965,16 @@ fn queue_accounted(
     out: &mpsc::UnboundedSender<PeerOut>,
     msg: NetworkMessage,
 ) -> Result<(), NetError> {
-    let n = crate::peers::outbound_msg_bytes(&msg);
-    out.send(PeerOut::Msg(msg))
-        .map_err(|_| NetError::Protocol("peer write half closed"))?;
-    if let Some(s) = session {
-        s.note_send_queued(n);
-    }
-    Ok(())
+    queue_charged(session, out, PeerOut::Msg(msg))
 }
 
-fn queue_encoded_for(
+fn queue_charged(
     session: Option<&crate::peers::LivePeer>,
     out: &mpsc::UnboundedSender<PeerOut>,
-    bytes: Vec<u8>,
+    item: PeerOut,
 ) -> Result<(), NetError> {
-    let n = bytes.len();
-    out.send(PeerOut::Encoded(bytes))
+    let n = crate::peers::outbound_queued_bytes(&item);
+    out.send(item)
         .map_err(|_| NetError::Protocol("peer write half closed"))?;
     if let Some(s) = session {
         s.note_send_queued(n);
@@ -4958,65 +4982,28 @@ fn queue_encoded_for(
     Ok(())
 }
 
-/// Queue a reconstructed `Block`/`CmpctBlock` if this session is under the serve cap.
-///
-/// `None` inflight (tests without a session) always queues.
-pub(crate) fn try_queue_served_block(
+/// Queue a getdata body ([`PeerOut::holds_serve_slot`]) and count it on
+/// `serve_inflight`. [`crate::peers::LivePeer::has_serve_room`] already
+/// held the getdata until the cap had room.
+fn queue_served(
     session: Option<&crate::peers::LivePeer>,
     out: &mpsc::UnboundedSender<PeerOut>,
-    inflight: Option<&AtomicUsize>,
-    msg: NetworkMessage,
-) -> Result<bool, NetError> {
-    if let Some(n) = inflight {
-        if n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS {
-            return Ok(false);
-        }
-        n.fetch_add(1, Ordering::SeqCst);
-        if let Err(e) = queue_accounted(session, out, msg) {
-            note_served_write(n);
-            return Err(e);
-        }
-        return Ok(true);
-    }
-    queue_accounted(session, out, msg)?;
-    Ok(true)
+    item: PeerOut,
+) -> Result<(), NetError> {
+    let Some(s) = session else {
+        return queue_charged(None, out, item);
+    };
+    s.serve_inflight.fetch_add(1, Ordering::SeqCst);
+    queue_charged(session, out, item).inspect_err(|_| s.free_serve_slot())
 }
 
-fn try_queue_served_encoded(
-    session: Option<&crate::peers::LivePeer>,
-    out: &mpsc::UnboundedSender<PeerOut>,
-    inflight: Option<&AtomicUsize>,
-    bytes: Vec<u8>,
-) -> Result<bool, NetError> {
-    if let Some(n) = inflight {
-        if n.load(Ordering::SeqCst) >= MAX_SERVE_BLOCKS {
-            return Ok(false);
-        }
-        n.fetch_add(1, Ordering::SeqCst);
-        if let Err(e) = queue_encoded_for(session, out, bytes) {
-            note_served_write(n);
-            return Err(e);
-        }
-        return Ok(true);
-    }
-    queue_encoded_for(session, out, bytes)?;
-    Ok(true)
-}
-
-/// BIP152 high-bandwidth tip announce. Does **not** count on
-/// `serve_inflight` (that cap is reconstruct getdata). Writer still
-/// saturating-subs every `CmpctBlock`, so an unpaired decrement cannot wrap.
+/// BIP152 high-bandwidth tip announce. Takes no `serve_inflight` slot
+/// (that cap is reconstruct getdata), and the writer frees none for it.
 fn queue_cmpct_tip_announce(
     out: &mpsc::UnboundedSender<PeerOut>,
     msg: NetworkMessage,
 ) -> Result<(), NetError> {
     queue_out(out, msg)
-}
-
-fn note_served_write(n: &AtomicUsize) {
-    let _ = n.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-        Some(v.saturating_sub(1))
-    });
 }
 
 fn pending_header_leaves(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {

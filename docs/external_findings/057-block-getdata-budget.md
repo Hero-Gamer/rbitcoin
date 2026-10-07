@@ -4,6 +4,6 @@
 **Status:** fixed
 **Found by:** Stephan Livera, 2026-10-02 (M1)
 
-Block getdata could queue more data after the per-peer send budget was already over. Serving stops once that budget is over.
+Block getdata could queue more data after the per-peer send budget was already over. Serving pauses once that budget is over and resumes when the writer drains ([090](./090-getdata-serve-pause.md)).
 
-**Regression:** `rbitcoin-net` `getdata_stops_when_send_budget_is_already_over`.
+**Regression:** `rbitcoin-net` `getdata_over_send_budget_waits_for_writer`.
