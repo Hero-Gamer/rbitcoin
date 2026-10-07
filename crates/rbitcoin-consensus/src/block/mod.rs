@@ -2036,7 +2036,9 @@ fn structural_apply_one_meta(
         .and_then(|fid| scratch.field_h_by_id.get(&fid).copied());
     if let (Some(ch), Some(sh)) = (create_h, spend_h) {
         if sh < ch {
-            return Ok(0);
+            return Err(ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: confirmed spender below its create height",
+            )));
         }
     }
     scratch.durable_spent.insert((id, vout));
@@ -2102,6 +2104,11 @@ fn structural_create_heights(
         let Some(&durable_h) = scratch.height_by_id.get(&id) else {
             return Err(ConsensusError::BadTx("bad-txns-inputs-missingorspent"));
         };
+        // Core connects a run one block at a time: a create from a later
+        // block of this batch is not yet a coin when this block spends it.
+        if durable_h > spend_height {
+            return Err(ConsensusError::MissingPrevout);
+        }
         let pin_cb = batch_parents.get_parent_coinbase(create_fk);
         let is_cb = match (pin_cb, run_create_height.create(create_fk)) {
             (Some(cb), _) => cb,

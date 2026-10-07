@@ -1769,6 +1769,8 @@ struct WireRig {
         std::thread::JoinHandle<()>,
         std::sync::mpsc::Receiver<super::super::confirm::ConfirmEvent>,
     )>,
+    /// Operator line of the last confirm reject `pump` applied.
+    last_reject_err: Option<String>,
     st: IbdWorkState,
     write_next: std::sync::atomic::AtomicU32,
     book: crate::seeds::AddrMan,
@@ -1812,6 +1814,7 @@ impl WireRig {
             hub,
             feed,
             engine: None,
+            last_reject_err: None,
             st,
             write_next: std::sync::atomic::AtomicU32::new(t + 1),
             book: crate::seeds::AddrMan::new(),
@@ -1927,10 +1930,12 @@ impl WireRig {
                     hash,
                     class,
                     batch_len,
+                    err,
                     ..
                 } = &ev
                 {
                     rejects.push((*hash, *class, *batch_len));
+                    self.last_reject_err = Some(err.clone());
                 }
                 let (tx, one) = std::sync::mpsc::channel();
                 tx.send(ev).unwrap();
@@ -2382,6 +2387,84 @@ fn batched_write_reject_offers_the_wave_back() {
         Some(&(h2, ConfirmRejectClass::ConsensusInvalid, 1))
     );
     assert_eq!(rig.hub.tip_hash(), Some(h1));
+    rig.finish();
+}
+
+/// tip+1 spends an output that tip+2 creates, and both write in one
+/// batch. Core connects one block at a time, so tip+1's input is missing.
+/// The batch reject is isolated, and tip+1 alone is rejected again: the
+/// parent is not on the chain, and tip+1 never connects.
+#[test]
+fn batched_spend_of_a_later_block_is_rejected_alone() {
+    use super::super::assign::tests::lock_default_assign_stop;
+    use super::super::state::InflightReq;
+    use bitcoin::ScriptBuf;
+    use rbitcoin_consensus::mine_regtest_paying;
+
+    let _env = lock_default_assign_stop();
+    let mut rig = WireRig::new("forward-spend", 2);
+    let (t, cbs) = (rig.t, rig.cbs.clone());
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = WireRig::spend(cbs[0]);
+    let child = WireRig::spend(parent.compute_txid());
+    let b1 = mine_regtest_paying(rig.tip, rig.tip_time + 600, t + 1, spk.clone(), vec![child]);
+    let b2 = mine_regtest_paying(
+        b1.block_hash(),
+        rig.tip_time + 1200,
+        t + 2,
+        spk,
+        vec![parent],
+    );
+    let h1 = b1.block_hash();
+    rig.plant(&[&b1, &b2]);
+    for (peer, body) in [(1, &b1), (2, &b2)] {
+        let hash = body.block_hash();
+        rig.st.slots[peer - 1].in_flight.insert(hash);
+        rig.st.inflight.insert(hash, InflightReq::new(peer));
+        rig.deliver(peer, body);
+    }
+    rig.start_engine();
+
+    let rejects = rig.pump(
+        |_, hash| if hash == h1 { b1.clone() } else { b2.clone() },
+        |_, _, seen| seen.len() == 2,
+    );
+    assert_eq!(
+        rejects,
+        [
+            (h1, ConfirmRejectClass::Cascade, 2),
+            (h1, ConfirmRejectClass::ConsensusInvalid, 1)
+        ],
+        "the batch event is a cascade; the one-block event is still ConsensusInvalid"
+    );
+    // Apply reads the load-stamp line (`parent create_fk unresolved` inside
+    // the rewritten missing-prevout text) as an engine fault. The event
+    // class stays ConsensusInvalid. The first fault requeues and does not
+    // blacklist. The same line again halts, and the hash stays off the
+    // invalid set. Finding 087.
+    let err = rig
+        .last_reject_err
+        .clone()
+        .expect("the one-block retry has an operator line");
+    assert!(
+        err.contains("parent create_fk unresolved"),
+        "load-stamp miss must be the engine-fault line, got {err}"
+    );
+    assert!(rig.st.engine_fault_seen.contains(&h1));
+    assert!(!rig.st.body.is_rejected(&h1));
+    assert!(rig.st.halt.is_none(), "the first engine fault requeues");
+    apply_confirm_reject(
+        &mut rig.st,
+        t + 1,
+        h1,
+        &err,
+        Some(rig.hub.query.as_ref()),
+        Some(&rig.hub),
+    );
+    assert!(rig.st.halt.is_some(), "the second engine fault halts IBD");
+    assert!(!rig.st.body.is_rejected(&h1));
+    assert!(!rig.st.reorg.invalid.contains(h1.to_byte_array()));
+    assert_eq!(rig.hub.tip_height(), Some(t));
     rig.finish();
 }
 

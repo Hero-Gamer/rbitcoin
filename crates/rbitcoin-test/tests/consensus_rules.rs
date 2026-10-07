@@ -264,6 +264,78 @@ fn coinbase_maturity_holds_inside_one_confirm_batch() {
     }
 }
 
+/// Core connects a run one block at a time, so a parent created in a later
+/// block of the same confirm batch is a missing input
+/// (`bad-txns-inputs-missingorspent`), not a batch pin hit.
+#[test]
+fn same_batch_spend_of_a_later_block_is_missing() {
+    let (_td, q, params) = regtest_q();
+    connect_genesis(&q, &params);
+    let g = regtest_genesis();
+    let b1 = mine_regtest_block(g.block_hash(), g.header.time + 600, 1, vec![]);
+    accept_and_connect_block(&q, &params, Height(1), &b1, Milestone::NONE).unwrap();
+    let (tip, time) = pad_empty_from(&q, &params, b1.block_hash(), b1.header.time, 2, 100);
+
+    let parent = spend_anyone_can_spend(
+        b1.txdata[0].compute_txid(),
+        0,
+        Amount::from_sat(49_0000_0000),
+    );
+    let parent_txid = parent.compute_txid();
+    let child = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(48_0000_0000));
+
+    let child_first = mine_regtest_block(tip, time + 600, 101, vec![child.clone()]);
+    let parent_second = mine_regtest_block(
+        child_first.block_hash(),
+        time + 1200,
+        102,
+        vec![parent.clone()],
+    );
+    let err = confirm_wire_run(
+        &q,
+        &params,
+        Milestone::NONE,
+        &[
+            (Height(101), child_first.clone()),
+            (Height(102), parent_second),
+        ],
+    );
+    assert!(
+        matches!(err, Err(ConsensusError::MissingPrevout)),
+        "spend of an output created one block later in the batch: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(100)));
+
+    // Both bodies are archived now, and the parent is not connected.
+    let err = confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(101), child_first)]);
+    assert!(
+        matches!(err, Err(ConsensusError::MissingPrevout)),
+        "the spending block retried alone: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(100)));
+
+    let b101 = mine_regtest_block(tip, time + 600, 101, vec![parent]);
+    let b102 = mine_regtest_block(b101.block_hash(), time + 1200, 102, vec![child]);
+    let b102_hash = b102.block_hash();
+    confirm_wire_run(
+        &q,
+        &params,
+        Milestone::NONE,
+        &[(Height(101), b101), (Height(102), b102)],
+    )
+    .expect("parent block before child block in one batch");
+    assert_eq!(q.tip_height(), Some(Height(102)));
+
+    let again = spend_anyone_can_spend(parent_txid, 0, Amount::from_sat(1));
+    let b103 = mine_regtest_block(b102_hash, time + 1800, 103, vec![again]);
+    let err = confirm_wire_run(&q, &params, Milestone::NONE, &[(Height(103), b103)]);
+    assert!(
+        matches!(err, Err(ConsensusError::PrevoutSpent)),
+        "second spend of the parent output: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height(102)));
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many boundary arms
 #[test]
 fn header_and_spending_boundaries() {
