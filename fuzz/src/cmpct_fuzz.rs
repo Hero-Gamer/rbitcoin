@@ -186,8 +186,35 @@ fn drain_one(hub: &ChainHub, block: bitcoin::Block) -> Result<(), NetError> {
     drain_pending_now(hub, &tx, &mut pending, &mut headers, &mut requested, true)
 }
 
-fn follow_core_verdict(oracle: &dyn BlockOracle, hex: &str) -> Result<DiffVerdict, CompareOne> {
+/// `invalidateblock` sticks for the life of this `bitcoind`. The next
+/// `submitblock` of that header is `duplicate-invalid` or
+/// `duplicate-inconclusive` until `reconsiderblock`.
+fn submit_clearing_invalidate(
+    oracle: &dyn BlockOracle,
+    hex: &str,
+    hash: &str,
+) -> Result<OracleReply, CompareOne> {
     let reply = oracle.submitblock_hex(hex);
+    let sticky = matches!(
+        &reply,
+        OracleReply::Reason(reason)
+            if reason == "duplicate-invalid" || reason == "duplicate-inconclusive"
+    );
+    if !sticky {
+        return Ok(reply);
+    }
+    oracle
+        .core_reconsider_block(hash)
+        .map_err(|_| CompareOne::Harness("reconsider"))?;
+    Ok(oracle.submitblock_hex(hex))
+}
+
+fn follow_core_verdict(
+    oracle: &dyn BlockOracle,
+    hex: &str,
+    hash: &str,
+) -> Result<DiffVerdict, CompareOne> {
+    let reply = submit_clearing_invalidate(oracle, hex, hash)?;
     if matches!(reply, OracleReply::Dead)
         || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
     {
@@ -197,12 +224,10 @@ fn follow_core_verdict(oracle: &dyn BlockOracle, hex: &str) -> Result<DiffVerdic
         OracleReply::Reason(s) => s.as_str(),
         _ => "",
     };
-    // `duplicate` means Core already has this body. `duplicate-invalid` is a
-    // reject, including the reply after `invalidateblock`.
     if matches!(reply, OracleReply::NullAccept) || reason == "duplicate" {
         return Ok(DiffVerdict::Accept);
     }
-    if reason == "duplicate-invalid" {
+    if reason == "duplicate-invalid" || reason == "duplicate-inconclusive" {
         return Ok(DiffVerdict::Reject);
     }
     Ok(verdict_from_core_reply(&reply))
@@ -241,8 +266,9 @@ pub fn follow_invalid_cmpct(
             };
         }
     }
+    let hash = succ_hash.to_string();
     let hex = hex_encode(serialize(&successor));
-    let core = match follow_core_verdict(oracle, &hex) {
+    let core = match follow_core_verdict(oracle, &hex, &hash) {
         Ok(v) => v,
         Err(fate) => return fate,
     };
@@ -512,6 +538,121 @@ mod tests {
         );
         assert_ne!(hub.tip_hash(), Some(honest.block_hash()));
         assert_eq!(oracle.n.get(), 1);
+    }
+
+    /// Core keeps `invalidateblock` on the header. The next honest submit of
+    /// that header is `duplicate-invalid` until `reconsiderblock`.
+    struct StickyInvalidate {
+        reconsidered: std::cell::Cell<bool>,
+        submits: std::cell::Cell<u32>,
+        before: &'static str,
+        after: OracleReply,
+    }
+
+    impl BlockOracle for StickyInvalidate {
+        fn submitblock_hex(&self, _hex: &str) -> OracleReply {
+            self.submits.set(self.submits.get() + 1);
+            if self.reconsidered.get() {
+                self.after.clone()
+            } else {
+                OracleReply::Reason(self.before.into())
+            }
+        }
+        fn liveness_ok(&self) -> bool {
+            true
+        }
+        fn core_rewind_to_height(&self, _keep: u32) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_reconsider_block(&self, hash: &str) -> Result<(), &'static str> {
+            assert_eq!(hash.len(), 64);
+            self.reconsidered.set(true);
+            Ok(())
+        }
+        fn core_invalidate_hash(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+        fn core_precious_block(&self, _hash: &str) -> Result<(), &'static str> {
+            Ok(())
+        }
+    }
+
+    fn follow_coinbase_only(label: &str, oracle: &StickyInvalidate) -> CompareOne {
+        use rbitcoin_consensus::{genesis_block, mine_regtest_paying, Milestone};
+        use rbitcoin_net::ChainHub;
+
+        let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+        let params = crate::block_diff::diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let genesis = genesis_block(&params);
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time + 600,
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+        );
+        let mutated = same_hash_merkle_mutant(&honest).expect("mutant");
+        follow_invalid_cmpct(&hub, oracle, mutated, honest)
+    }
+
+    #[test]
+    fn duplicate_invalid_after_reconsider_agrees() {
+        let oracle = StickyInvalidate {
+            reconsidered: std::cell::Cell::new(false),
+            submits: std::cell::Cell::new(0),
+            before: "duplicate-invalid",
+            after: OracleReply::Reason("duplicate".into()),
+        };
+        let fate = follow_coinbase_only("cmpct-follow-poison", &oracle);
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: true }),
+            "{fate:?}"
+        );
+        assert!(oracle.reconsidered.get());
+        assert_eq!(oracle.submits.get(), 2);
+    }
+
+    #[test]
+    fn real_reject_after_reconsider_stays_a_split() {
+        let oracle = StickyInvalidate {
+            reconsidered: std::cell::Cell::new(false),
+            submits: std::cell::Cell::new(0),
+            before: "duplicate-invalid",
+            after: OracleReply::Reason("bad-txnmrklroot".into()),
+        };
+        let fate = follow_coinbase_only("cmpct-follow-still-bad", &oracle);
+        assert!(
+            matches!(
+                fate,
+                CompareOne::Disagreed {
+                    ours: true,
+                    core: false,
+                    ..
+                }
+            ),
+            "{fate:?}"
+        );
+        assert!(oracle.reconsidered.get());
+        assert_eq!(oracle.submits.get(), 2);
+    }
+
+    #[test]
+    fn duplicate_inconclusive_after_reconsider_agrees() {
+        let oracle = StickyInvalidate {
+            reconsidered: std::cell::Cell::new(false),
+            submits: std::cell::Cell::new(0),
+            before: "duplicate-inconclusive",
+            after: OracleReply::NullAccept,
+        };
+        let fate = follow_coinbase_only("cmpct-follow-inconclusive", &oracle);
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: true }),
+            "{fate:?}"
+        );
+        assert!(oracle.reconsidered.get());
+        assert_eq!(oracle.submits.get(), 2);
     }
 
     #[test]
