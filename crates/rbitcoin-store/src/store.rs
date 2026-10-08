@@ -1807,7 +1807,12 @@ impl Store {
     /// coins can trust that read only when the stamp is unchanged afterward.
     pub fn hold_utxo_view(&self) -> UtxoViewGuard<'_> {
         use std::sync::atomic::Ordering;
-        self.utxo_view.fetch_add(1, Ordering::Release);
+        let prev = self.utxo_view.fetch_add(1, Ordering::AcqRel);
+        debug_assert_eq!(
+            prev & 1,
+            0,
+            "utxo view guards must not overlap; the counter would look stable"
+        );
         UtxoViewGuard {
             view: &self.utxo_view,
         }
