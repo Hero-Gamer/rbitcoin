@@ -3872,14 +3872,6 @@ async fn on_cmpctblock(
         persist_pending_header_path(hub, &follow.pending_headers, hash);
         return Ok(());
     }
-    // Claimed proof of work before any short-id walk. Once the tip meets
-    // minimum chain work the work-path walk does not check this header.
-    if !hub.header_claimed_pow_ok(&hsi.header) {
-        rbitcoin_log::info!("{}", crate::chain::accept_block_header_nodos_log(hash));
-        misbehaving(&mut follow.ban_score, session);
-        take_requested_block(hub, &mut follow.requested_blocks, &hash);
-        return Ok(());
-    }
     on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash).await
 }
 
@@ -3895,11 +3887,6 @@ fn on_cmpctblock_reject_early(
         misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
-    if let Some(s) = session {
-        s.note_block_from_peer(hash);
-        s.note_best_known(hash);
-        s.note_last_block();
-    }
     if !crate::compact::prefilled_indexes_ok(hsi) {
         rbitcoin_log::info!("p2p: invalid index in cmpctblock message");
         misbehaving(&mut follow.ban_score, session);
@@ -3913,6 +3900,19 @@ fn on_cmpctblock_reject_early(
     }
     if hub.is_block_invalid(&hash) {
         return Ok(true);
+    }
+    // Claimed proof of work before any peer or header-sync state. Once the
+    // tip meets minimum chain work the work-path walk does not check this header.
+    if !hub.header_claimed_pow_ok(&hsi.header) {
+        rbitcoin_log::info!("{}", crate::chain::accept_block_header_nodos_log(hash));
+        misbehaving(&mut follow.ban_score, session);
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        return Ok(true);
+    }
+    if let Some(s) = session {
+        s.note_block_from_peer(hash);
+        s.note_best_known(hash);
+        s.note_last_block();
     }
     Ok(false)
 }

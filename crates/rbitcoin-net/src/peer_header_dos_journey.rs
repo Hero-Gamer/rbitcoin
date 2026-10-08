@@ -267,7 +267,8 @@ async fn unknown_parent_bodies(
     let mut follow = PeerFollowState::new();
     follow.send_cmpct = true;
     follow.cmpct_version = 2;
-    let block = orphan_body(BlockHash::from_byte_array([0xcd; 32]), 0);
+    let mut block = orphan_body(BlockHash::from_byte_array([0xcd; 32]), 0);
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
     push(
         hub,
@@ -300,8 +301,8 @@ async fn unknown_parent_bodies(
     peer.note_awaiting_headers();
     let mut child = block.clone();
     child.header.prev_blockhash = block.block_hash();
-    child.header.nonce = 1;
     child.header.merkle_root = child.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut child.header);
     let child_hsi = HeaderAndShortIds::from_block(&child, 1, 2, &[0]).unwrap();
     push(
         hub,
@@ -1369,10 +1370,25 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
         "a plain peer is disconnected"
     );
     assert!(
-        !take_msgs(&mut out_rx)
+        follow.pending_headers.is_empty(),
+        "bad proof of work must not enter pending headers"
+    );
+    assert!(
+        plain.best_known().is_none(),
+        "bad proof of work must not update best known"
+    );
+    let rejected = take_msgs(&mut out_rx);
+    assert!(
+        !rejected
             .iter()
             .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_))),
         "a rejected compact must not ask for blocktxn"
+    );
+    assert!(
+        !rejected
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+        "a rejected compact must not ask for headers"
     );
 
     peers.set_noban(true);
