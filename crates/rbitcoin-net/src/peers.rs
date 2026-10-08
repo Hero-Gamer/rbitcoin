@@ -31,6 +31,9 @@ pub(crate) fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
         }
         NetworkMessage::Tx(tx) => tx.total_size(),
         NetworkMessage::Block(b) => b.total_size(),
+        NetworkMessage::BlockTxn(bt) => {
+            bitcoin::consensus::encode::serialize(&bt.transactions).len()
+        }
         NetworkMessage::Addr(a) => a.len().saturating_mul(30),
         NetworkMessage::AddrV2(a) => a.len().saturating_mul(61),
         NetworkMessage::CmpctBlock(_) => 1024,
@@ -56,9 +59,10 @@ pub enum PeerOut {
 }
 
 impl PeerOut {
-    /// A getdata body that holds one [`LivePeer::serve_inflight`] slot
-    /// until the writer is done with it. A tip announce or a `getblocktxn`
-    /// block is a [`PeerOut::Msg`] and holds none.
+    /// A getdata body or a `getblocktxn` reply (`blocktxn` or the deep
+    /// full block) that holds one [`LivePeer::serve_inflight`] slot until
+    /// the writer is done with it. A compact tip announce is a
+    /// [`PeerOut::Msg`] and holds none.
     pub(crate) fn holds_serve_slot(&self) -> bool {
         matches!(self, PeerOut::Encoded(_) | PeerOut::Served(_))
     }

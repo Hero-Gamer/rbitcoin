@@ -203,6 +203,18 @@ async fn hostile_peer_session() {
         })),
         1024
     );
+    let txns = bitcoin::bip152::BlockTransactions {
+        block_hash: block.block_hash(),
+        transactions: vec![block.txdata[0].clone()],
+    };
+    let blocktxn_n = bitcoin::consensus::encode::serialize(&txns).len();
+    assert!(blocktxn_n > 64, "a blocktxn is not the fallback size");
+    assert_eq!(
+        crate::peers::outbound_msg_bytes(&NetworkMessage::BlockTxn(
+            bitcoin::p2p::message_compact_blocks::BlockTxn { transactions: txns }
+        )),
+        blocktxn_n
+    );
     assert_eq!(crate::peers::PEER_SEND_BUDGET, 4 * 1024 * 1024);
     peer.note_send_written(peer.send_queued());
     peer.note_send_queued(crate::peers::PEER_SEND_BUDGET);

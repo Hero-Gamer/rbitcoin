@@ -140,9 +140,11 @@ drain continues the header path after that window connects. An inbound
 `getdata` serves until 16 bodies or 4 MiB sit in the writer queue (RAM
 cap). The rest stays on the session, which reads no new message until it
 is served, as Core `ProcessGetData` does on `fPauseSend`
-([090](./external_findings/090-getdata-serve-pause.md)). Only a getdata
-body takes a `serve_inflight` slot and only it frees one; a compact tip
-announce or a `getblocktxn` block is not counted.
+([090](./external_findings/090-getdata-serve-pause.md)). A getdata body
+and a `getblocktxn` reply each take a `serve_inflight` slot and each
+frees one; a compact tip announce is not counted. `blocktxn` is charged
+its serialized payload. Archive reconstruct for that reply runs on the
+blocking pool.
 
 ```text
 # IBD
