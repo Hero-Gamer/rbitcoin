@@ -718,6 +718,13 @@ fn thr_stats_add_is_local() {
         confirm_thr_stats::script_work_from_verify_ns(2_000),
         Duration::from_nanos(2_000)
     );
+    assert_eq!(confirm_thr_stats::stage_wall_ns(100, 180), 180);
+    assert_eq!(confirm_thr_stats::stage_wall_ns(180, 100), 180);
+    assert_ne!(
+        confirm_thr_stats::stage_wall_ns(100, 180),
+        100u64.saturating_add(180),
+        "stage wall is the later completion, not the sum"
+    );
 }
 
 #[test]

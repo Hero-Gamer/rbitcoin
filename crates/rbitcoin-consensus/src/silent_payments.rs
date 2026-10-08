@@ -396,7 +396,7 @@ fn taproot_outs(tx: &Transaction) -> Vec<TaprootOut> {
     out
 }
 
-fn is_p2tr(spk: &[u8]) -> bool {
+pub(crate) fn is_p2tr(spk: &[u8]) -> bool {
     spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
 }
 

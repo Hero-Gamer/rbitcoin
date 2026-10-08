@@ -1540,6 +1540,14 @@ pub(crate) mod confirm_thr_stats {
         Duration::from_nanos(work_ns)
     }
 
+    /// Time from batch start until both the script wave and the index wave
+    /// have finished. Both arguments are completion offsets from that start.
+    /// The sum double-counts when the waves overlap.
+    #[inline]
+    pub fn stage_wall_ns(script_done: u64, index_done: u64) -> u64 {
+        script_done.max(index_done)
+    }
+
     #[inline]
     pub fn add_script_recv_wait(stats: &rbitcoin_query::ConfirmStats, d: Duration) {
         rbitcoin_query::note_confirm_dur(&stats.thr_script_recv_wait_ns, d);
@@ -1896,15 +1904,16 @@ pub(crate) fn spawn_confirm_engine(
                     );
                 },
                 |outcome, meta| {
-                    loop_stats_sc.confirm_ns.fetch_add(
-                        outcome.work_ns.saturating_add(outcome.idx_asm_ns),
-                        Ordering::Relaxed,
+                    let stage_ns = confirm_thr_stats::stage_wall_ns(
+                        outcome.work_ns,
+                        outcome.index_done_ns,
                     );
+                    loop_stats_sc
+                        .confirm_ns
+                        .fetch_add(stage_ns, Ordering::Relaxed);
                     confirm_thr_stats::add_script_work(
                         &stats,
-                        confirm_thr_stats::script_work_from_verify_ns(
-                            outcome.work_ns.saturating_add(outcome.idx_asm_ns),
-                        ),
+                        confirm_thr_stats::script_work_from_verify_ns(stage_ns),
                     );
                     let script_ms = outcome.work_ns / 1_000_000;
                     let mat_ms = meta.mat_ns / 1_000_000;

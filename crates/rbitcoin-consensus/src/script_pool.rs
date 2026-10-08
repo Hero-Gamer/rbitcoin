@@ -23,7 +23,7 @@ use std::thread;
 
 /// Jobs claimed per steal. Amortizes `next` / `in_wave` / `Arc<Wave>` traffic
 /// without a megachunk on mixed P2WPKH/P2WSH waves.
-const STEAL_CHUNK: usize = 32;
+pub(crate) const STEAL_CHUNK: usize = 32;
 
 use crate::error::ConsensusError;
 
@@ -214,6 +214,8 @@ pub(crate) fn fg_has_unclaimed() -> bool {
 
 /// Run one steal chunk on the caller (not a steal worker). Used by the
 /// scripts stage thread to finish a wave tail instead of parking.
+///
+/// A one-job index claim can run on `ibd-confirm` when the workers are busy.
 pub(crate) fn help_steal() -> bool {
     if on_steal_worker() {
         return false;
@@ -294,6 +296,28 @@ pub(crate) fn start_for_each_owned_chunk<T: Sync>(
     f: fn(&T) -> Result<(), ConsensusError>,
     chunk: usize,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave(items, f, chunk, true)
+}
+
+/// Like [`start_for_each_owned`], but a single job is still published.
+///
+/// [`start_for_each_owned`] runs a single item on the caller. The index wave
+/// must not do that: one filter would block `ibd-confirm` inside `start`.
+/// `chunk` of 0 is treated as 1.
+pub(crate) fn start_for_each_pooled<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+    chunk: usize,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave(items, f, chunk, false)
+}
+
+fn start_wave<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+    chunk: usize,
+    inline_single: bool,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
     if on_steal_worker() {
         return Err(ConsensusError::BadBlock(
             "try_for_each from a script worker",
@@ -302,7 +326,7 @@ pub(crate) fn start_for_each_owned_chunk<T: Sync>(
     if items.is_empty() {
         return Ok(None);
     }
-    if items.len() == 1 {
+    if inline_single && items.len() == 1 {
         f(&items[0])?;
         return Ok(None);
     }
