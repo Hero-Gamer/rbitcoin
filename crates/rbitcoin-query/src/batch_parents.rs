@@ -487,6 +487,25 @@ impl SharedParentPin {
     }
 }
 
+/// Pin map shared with script-pool jobs. No sticky cache (`BatchParents` is
+/// not `Sync`).
+#[derive(Clone, Debug, Default)]
+pub struct ParentPinView {
+    pins: U64Map<Arc<SharedParentPin>>,
+}
+
+impl ParentPinView {
+    /// Value, script bytes, and parent txid. Always loads the outs `Arc`
+    /// (no sticky cache).
+    pub fn txout_parts(&self, fk: Fk, vout: u32) -> Option<(i64, Vec<u8>, [u8; 32])> {
+        let id = fk.get()?;
+        let pin = self.pins.get(&id)?;
+        let outs = pin.load_outs();
+        let (value, script) = outs.get_parts(vout)?;
+        Some((value, script.to_vec(), pin.tx.txid))
+    }
+}
+
 /// Per-batch handle map: `create_fk → Arc` shared pin (refcount only on clone).
 ///
 /// Assemble sticky (`sticky_outs`) is batch-local and not shared across clones.
@@ -711,6 +730,13 @@ impl BatchParents {
         f: impl FnOnce(i64, &[u8], [u8; 32]) -> R,
     ) -> Option<R> {
         self.parent_txout_parts_inner(fk, vout, true, f)
+    }
+
+    /// Clone the pin `Arc`s for script-pool jobs. The sticky cache stays here.
+    pub fn pin_view(&self) -> ParentPinView {
+        ParentPinView {
+            pins: self.pins.clone(),
+        }
     }
 
     /// Same as [`get_parent_txout_parts`] but **always** `load_outs` (no sticky).

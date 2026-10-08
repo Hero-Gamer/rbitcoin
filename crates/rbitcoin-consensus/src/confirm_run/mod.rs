@@ -8,7 +8,8 @@
 //!   structure + plan_batch (binds carried BQ keys) + pin denserels → assemble
 //!   (uses intake wire; **no Class-A wire rebuild**)
 //! SCRIPTS STAGE (`ibd-confirm` OS thread publishes waves; `rbtc-scripts-*` steal):
-//!   pure CPU verify — no Query, no disk. No coordinator threads.
+//!   script verify and live filter/tweak jobs on one wave. No Query, no disk.
+//!   No coordinator threads. The next batch starts when the wave is fully claimed.
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC.
 //!   `tx.head` write-behind drain runs on process-wide `ibd-confirm-head`
@@ -20,8 +21,9 @@
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is pure
 //! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD [`drive_script_waves_with`] publishes
-//! multiple waves from the stage thread when steal is empty, then writes in
-//! height order. Steal workers unpark the publisher when a wave completes.
+//! the next batch when the front wave has nothing left to claim, then writes
+//! in height order once that wave has finished. Steal workers unpark the
+//! publisher when a wave completes.
 
 use crate::block::{
     assemble_block_prevouts, block_has_witness_from_pres, structural_validate_spends,
@@ -429,5 +431,7 @@ impl ScriptOkBatch {
 
 #[cfg(test)]
 mod spend_durable_tests;
+#[cfg(test)]
+mod tweak_overlap_tests;
 #[cfg(test)]
 mod write_idempotent_tests;

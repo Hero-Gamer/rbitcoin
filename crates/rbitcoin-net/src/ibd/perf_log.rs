@@ -35,11 +35,14 @@
 //!   read, and on a miss a `txid.body` scan of every unsealed `tx.head`
 //!   segment that stops with confirm. It can hold the load thread for
 //!   seconds, so it stays out of `prune=`.
-//! - **script=** = `SCRIPT_NS` (publish → first `is_complete` per batch on
-//!   `ibd-confirm`; excludes head-of-line wait for write handoff and `idx_asm=`).
-//!   `idx_asm=` is filter and tweak assemble after that verify. `thr script work`
-//!   is `script=` plus `idx_asm=`. Recv/send are wait. Publisher parks; it does
-//!   not `wait_done` on steal workers.
+//! - **script=** = `SCRIPT_NS` (publish → script-verify complete per batch on
+//!   `ibd-confirm`; excludes head-of-line wait for write handoff).
+//!   `idx_asm=` is filter and tweak assemble from the same batch start.
+//!   The two clocks overlap; `idx_asm` is not inside `script=`. `thr script work`
+//!   is `script=` plus `idx_asm=` and can exceed the batch wall when they
+//!   overlap. Recv/send are wait. The next batch is published when the wave
+//!   has nothing left to claim. The publisher does not `wait_done` until the
+//!   front wave has finished executing.
 //! - **write** = Class A + ensure + structural + class_c + spend
 //!   + `pins=` / `head_sub=` / `drain_join=` / `dequeue=` / `idx_put=`.
 //!     `other=` is write-thread work minus that inventory.

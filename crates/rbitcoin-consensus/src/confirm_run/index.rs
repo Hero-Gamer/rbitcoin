@@ -1,22 +1,23 @@
 //! Live filter and tweak bytes for one confirm batch.
 //!
-//! Assemble runs only while [`Query::index_live`] is set, from the wire block
-//! and [`BatchParents`] (same-batch creates and pinned parents). No store read.
-//! The flag is set at startup, after a short restart gap is sealed, so load
-//! does not sample `next_height` (the previous batch can still be committing).
-//! A write that finds the watermark is not this batch is corrupt.
+//! Jobs run on the script steal pool: one tweak per eligible transaction, one
+//! filter per block. The scripts stage publishes them with the verify jobs.
+//! No store read. [`Query::index_live`] is set at startup, after a short
+//! restart gap is sealed, so load does not sample `next_height`. A write that
+//! finds the watermark is not this batch is corrupt.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use bitcoin::hashes::Hash;
-use bitcoin::{Amount, Block, ScriptBuf, TxOut};
+use bitcoin::{Amount, Block, ScriptBuf, Transaction, TxOut};
 use rbitcoin_primitives::{Fk, Height};
-use rbitcoin_query::Query;
+use rbitcoin_query::{ParentPinView, Query};
 use rbitcoin_store::StoreError;
 
-use crate::index_rows::{self, IndexHeightOut, IndexRows};
+use crate::index_rows::{self, IndexRows};
 use crate::silent_payments::tweak_from_tx;
 use crate::ConsensusError;
 
@@ -33,16 +34,92 @@ pub(super) struct IndexWant {
 /// One confirm batch of filter bytes and tweak vecs. Dropped with the batch.
 pub(super) type IndexSeal = IndexRows;
 
-struct LiveJob {
+/// Wall from batch start until every job of this kind has finished.
+pub(super) struct KindClock {
+    t0: Instant,
+    left: AtomicUsize,
+    ns: AtomicU64,
+    stamped: AtomicBool,
+}
+
+impl KindClock {
+    pub(super) fn new(t0: Instant, n: usize, empty_ns: u64) -> Arc<Self> {
+        Arc::new(Self {
+            t0,
+            left: AtomicUsize::new(n),
+            ns: AtomicU64::new(if n == 0 { empty_ns } else { 0 }),
+            stamped: AtomicBool::new(n == 0),
+        })
+    }
+
+    pub(super) fn job_done(&self) {
+        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.ns
+                .store(self.t0.elapsed().as_nanos() as u64, Ordering::Release);
+            self.stamped.store(true, Ordering::Release);
+        }
+    }
+
+    pub(super) fn ns(&self) -> u64 {
+        if self.stamped.load(Ordering::Acquire) {
+            self.ns.load(Ordering::Acquire)
+        } else {
+            self.t0.elapsed().as_nanos() as u64
+        }
+    }
+}
+
+enum Written<T> {
+    Pending,
+    Ready(T),
+}
+
+type TweakSlots = Arc<[Mutex<Written<Option<[u8; 33]>>>]>;
+
+#[derive(Clone, Copy)]
+struct SpendRef {
+    prev_txid: [u8; 32],
+    vout: u32,
+    create_fk: Fk,
+    vin: u32,
+}
+
+struct BlockWork {
     block: Arc<Block>,
     hash: [u8; 32],
+    parents: Arc<ParentPinView>,
+    /// Spends grouped by tx index. Parallel jobs read their own slot.
+    spends_by_tx: Arc<[Vec<SpendRef>]>,
+    tx_fks_len: usize,
+    same_block: OnceLock<HashMap<[u8; 32], usize>>,
+    tweaks: TweakSlots,
+    filter: Option<Arc<Mutex<Written<bitcoin::bip158::BlockFilter>>>>,
+}
+
+pub(super) struct HeightSlots {
     height: Height,
     header_fk: Fk,
-    /// Per tx. Empty for a coinbase. Non-coinbase length matches `tx.input`.
-    prevouts: Vec<Vec<TxOut>>,
-    want_filter: bool,
     want_tweaks: bool,
-    out: Arc<Mutex<Option<IndexHeightOut>>>,
+    tweaks: TweakSlots,
+    filter: Option<Arc<Mutex<Written<bitcoin::bip158::BlockFilter>>>>,
+}
+
+pub(super) struct TweakJob {
+    work: Arc<BlockWork>,
+    tx_index: usize,
+    clock: Arc<KindClock>,
+}
+
+pub(super) struct FilterJob {
+    work: Arc<BlockWork>,
+    clock: Arc<KindClock>,
+}
+
+pub(super) struct IndexJobs {
+    pub tweaks: Vec<TweakJob>,
+    pub filters: Vec<FilterJob>,
+    pub slots: Vec<HeightSlots>,
+    pub clock: Arc<KindClock>,
 }
 
 pub(super) fn index_want(query: &Query) -> IndexWant {
@@ -55,61 +132,185 @@ pub(super) fn index_want(query: &Query) -> IndexWant {
     }
 }
 
-pub(super) fn live_index_seal(batch: &LoadedBatch) -> Result<(IndexRows, u64), ConsensusError> {
+pub(super) fn prepare_index_jobs(
+    batch: &LoadedBatch,
+    t0: Instant,
+) -> Result<IndexJobs, ConsensusError> {
     let want = &batch.index_want;
     if !want.filters && want.tweak_origin.is_none() {
-        return Ok((IndexSeal::default(), 0));
+        return Ok(IndexJobs {
+            tweaks: Vec::new(),
+            filters: Vec::new(),
+            slots: Vec::new(),
+            clock: KindClock::new(t0, 0, 0),
+        });
     }
-    let t0 = Instant::now();
     if batch.prepared.len() != batch.wire_blocks.len() {
         return Err(corrupt("invariant: live index block count"));
     }
-    let mut slots = Vec::with_capacity(batch.prepared.len());
-    let mut jobs = Vec::new();
+    let parents = Arc::new(batch.batch_parents.pin_view());
+    let mut tweaks = Vec::new();
+    let mut filters = Vec::new();
+    let mut slots = Vec::new();
     for (prep, block) in batch.prepared.iter().zip(batch.wire_blocks.iter()) {
         let want_tweaks = want.tweak_origin.is_some_and(|o| prep.height.0 >= o);
-        let out = Arc::new(Mutex::new(None));
-        if want.filters || want_tweaks {
-            let prevouts = prevouts_for_block(prep, block, &batch.batch_parents)?;
-            jobs.push(LiveJob {
-                block: Arc::clone(block),
-                hash: prep.hash,
-                height: prep.height,
-                header_fk: prep.header_fk,
-                prevouts,
-                want_filter: want.filters,
-                want_tweaks,
-                out: Arc::clone(&out),
+        if !want.filters && !want_tweaks {
+            continue;
+        }
+        let spends_by_tx = group_spends(prep, block.txdata.len())?;
+        let tweak_cells: TweakSlots = block
+            .txdata
+            .iter()
+            .map(|tx| {
+                let ready = !want_tweaks || tx.is_coinbase() || !tx_has_taproot_out(tx);
+                Mutex::new(if ready {
+                    Written::Ready(None)
+                } else {
+                    Written::Pending
+                })
+            })
+            .collect::<Vec<_>>()
+            .into();
+        let filter = if want.filters {
+            Some(Arc::new(Mutex::new(Written::Pending)))
+        } else {
+            None
+        };
+        let work = Arc::new(BlockWork {
+            block: Arc::clone(block),
+            hash: prep.hash,
+            parents: Arc::clone(&parents),
+            spends_by_tx: spends_by_tx.into(),
+            tx_fks_len: prep.tx_fks.len(),
+            same_block: OnceLock::new(),
+            tweaks: Arc::clone(&tweak_cells),
+            filter: filter.clone(),
+        });
+        if want_tweaks {
+            for (ti, tx) in block.txdata.iter().enumerate() {
+                if tx.is_coinbase() || !tx_has_taproot_out(tx) {
+                    continue;
+                }
+                tweaks.push(TweakJob {
+                    work: Arc::clone(&work),
+                    tx_index: ti,
+                    clock: KindClock::new(t0, 0, 0),
+                });
+            }
+        }
+        if filter.is_some() {
+            filters.push(FilterJob {
+                work,
+                clock: KindClock::new(t0, 0, 0),
             });
         }
-        slots.push(out);
+        slots.push(HeightSlots {
+            height: prep.height,
+            header_fk: prep.header_fk,
+            want_tweaks,
+            tweaks: tweak_cells,
+            filter,
+        });
     }
-    index_rows::finish_wave(jobs, assemble_live_height)?;
-    let ns = t0.elapsed().as_nanos() as u64;
-    Ok((index_rows::rows_from_slots(&slots), ns))
+    let n_jobs = tweaks.len() + filters.len();
+    let clock = KindClock::new(t0, n_jobs, 0);
+    for job in &mut tweaks {
+        job.clock = Arc::clone(&clock);
+    }
+    for job in &mut filters {
+        job.clock = Arc::clone(&clock);
+    }
+    Ok(IndexJobs {
+        tweaks,
+        filters,
+        slots,
+        clock,
+    })
 }
 
-fn assemble_live_height(job: &LiveJob) -> Result<(), ConsensusError> {
-    let filter = if job.want_filter {
-        Some((
-            job.height,
-            basic_filter_from_wire(&job.hash, &job.block, &job.prevouts)?,
-            job.header_fk,
-        ))
-    } else {
-        None
-    };
-    let tweaks = if job.want_tweaks {
-        Some((
-            job.height,
-            job.header_fk,
-            tweaks_from_wire(&job.block, &job.prevouts),
-        ))
-    } else {
-        None
-    };
-    *job.out.lock().unwrap_or_else(|e| e.into_inner()) = Some(IndexHeightOut { filter, tweaks });
+pub(super) fn apply_tweak(job: &TweakJob) -> Result<(), ConsensusError> {
+    #[cfg(test)]
+    tweak_gate::enter();
+    let tx = &job.work.block.txdata[job.tx_index];
+    let prevouts = prevouts_for_tx(&job.work, job.tx_index, tx)?;
+    let tweak = tweak_from_tx(tx, &prevouts).map(|t| t.tweak);
+    *lock_written(&job.work.tweaks[job.tx_index]) = Written::Ready(tweak);
+    job.clock.job_done();
     Ok(())
+}
+
+pub(super) fn apply_filter(job: &FilterJob) -> Result<(), ConsensusError> {
+    let prevouts = prevouts_for_block(&job.work)?;
+    let filter = basic_filter_from_wire(&job.work.hash, &job.work.block, &prevouts)?;
+    let Some(slot) = job.work.filter.as_ref() else {
+        return Err(corrupt("invariant: filter job"));
+    };
+    *lock_written(slot) = Written::Ready(filter);
+    job.clock.job_done();
+    Ok(())
+}
+
+pub(super) fn rows_from_heights(slots: &[HeightSlots]) -> Result<IndexRows, ConsensusError> {
+    let mut rows = IndexRows::default();
+    for height in slots {
+        if let Some(slot) = &height.filter {
+            rows.filters
+                .push((height.height, take_written(slot)?, height.header_fk));
+        }
+        if !height.want_tweaks {
+            continue;
+        }
+        let mut tweaks = Vec::with_capacity(height.tweaks.len());
+        for cell in height.tweaks.iter() {
+            tweaks.push(take_written(cell)?);
+        }
+        rows.tweaks.push((height.height, height.header_fk, tweaks));
+    }
+    Ok(rows)
+}
+
+fn lock_written<T>(cell: &Mutex<Written<T>>) -> std::sync::MutexGuard<'_, Written<T>> {
+    cell.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn take_written<T>(cell: &Mutex<Written<T>>) -> Result<T, ConsensusError> {
+    match std::mem::replace(&mut *lock_written(cell), Written::Pending) {
+        Written::Ready(value) => Ok(value),
+        Written::Pending => Err(corrupt("invariant: index slot")),
+    }
+}
+
+fn tx_has_taproot_out(tx: &Transaction) -> bool {
+    tx.output.iter().any(|out| {
+        let spk = out.script_pubkey.as_bytes();
+        spk.len() == 34 && spk[0] == 0x51 && spk[1] == 0x20
+    })
+}
+
+fn group_spends(prep: &Prepared, n_tx: usize) -> Result<Vec<Vec<SpendRef>>, ConsensusError> {
+    let mut index_of: HashMap<Fk, usize> = HashMap::with_capacity(prep.tx_fks.len());
+    for (i, fk) in prep.tx_fks.iter().copied().enumerate() {
+        if i >= n_tx {
+            break;
+        }
+        index_of.entry(fk).or_insert(i);
+    }
+    let mut by_tx = vec![Vec::new(); n_tx];
+    for &(prev_txid, vout, spending_fk, create_fk, vin) in &prep.spends {
+        if spending_fk.is_null() {
+            return Err(corrupt("invariant: live index spend fk"));
+        }
+        let Some(&ti) = index_of.get(&spending_fk) else {
+            return Err(corrupt("invariant: live index tx fk"));
+        };
+        by_tx[ti].push(SpendRef {
+            prev_txid,
+            vout,
+            create_fk,
+            vin,
+        });
+    }
+    Ok(by_tx)
 }
 
 fn basic_filter_from_wire(
@@ -128,75 +329,127 @@ fn basic_filter_from_wire(
     rbitcoin_query::basic_filter_from_scripts(hash, outputs, spent).map_err(ConsensusError::from)
 }
 
-fn tweaks_from_wire(block: &Block, prevouts: &[Vec<TxOut>]) -> index_rows::HeightTweaks {
-    block
-        .txdata
-        .iter()
-        .zip(prevouts.iter())
-        .map(|(tx, prev)| tweak_from_tx(tx, prev).map(|t| t.tweak))
-        .collect()
+/// Test latch for a tweak job. Armed only by the overlap test.
+/// [`apply_tweak`] calls [`tweak_gate::enter`] under `cfg(test)`.
+#[cfg(test)]
+pub(in crate::confirm_run) mod tweak_gate {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static ENTERED: AtomicUsize = AtomicUsize::new(0);
+    static SCRIPT_WORKER: AtomicBool = AtomicBool::new(false);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+    static MU: Mutex<()> = Mutex::new(());
+    static CV: Condvar = Condvar::new();
+
+    pub(in crate::confirm_run) fn arm() {
+        ENTERED.store(0, Ordering::SeqCst);
+        SCRIPT_WORKER.store(false, Ordering::SeqCst);
+        RELEASED.store(false, Ordering::SeqCst);
+        ARMED.store(true, Ordering::SeqCst);
+    }
+
+    pub(in crate::confirm_run) fn enter() {
+        if !ARMED.load(Ordering::SeqCst) {
+            return;
+        }
+        let current = std::thread::current();
+        let name = current.name().unwrap_or("");
+        if name.starts_with("rbtc-scripts") {
+            SCRIPT_WORKER.store(true, Ordering::SeqCst);
+        }
+        ENTERED.fetch_add(1, Ordering::SeqCst);
+        CV.notify_all();
+        let mut guard = MU.lock().unwrap_or_else(|p| p.into_inner());
+        while !RELEASED.load(Ordering::SeqCst) {
+            let (next, _) = CV
+                .wait_timeout(guard, Duration::from_millis(20))
+                .unwrap_or_else(|p| p.into_inner());
+            guard = next;
+        }
+    }
+
+    pub(in crate::confirm_run) fn entered() -> usize {
+        ENTERED.load(Ordering::SeqCst)
+    }
+
+    pub(in crate::confirm_run) fn on_script_worker() -> bool {
+        SCRIPT_WORKER.load(Ordering::SeqCst)
+    }
+
+    pub(in crate::confirm_run) fn release() {
+        RELEASED.store(true, Ordering::SeqCst);
+        ARMED.store(false, Ordering::SeqCst);
+        CV.notify_all();
+    }
 }
 
-fn prevouts_for_block(
-    prep: &Prepared,
-    block: &Block,
-    parents: &rbitcoin_query::BatchParents,
-) -> Result<Vec<Vec<TxOut>>, ConsensusError> {
-    let mut same_block: HashMap<[u8; 32], usize> = HashMap::new();
-    for (i, tx) in block.txdata.iter().enumerate() {
-        same_block.insert(tx.compute_txid().to_byte_array(), i);
-    }
-    let mut by_tx: HashMap<Fk, Vec<(u32, TxOut)>> = HashMap::new();
-    for &(prev_txid, vout, spending_fk, create_fk, vin) in &prep.spends {
-        if spending_fk.is_null() {
-            return Err(corrupt("invariant: live index spend fk"));
-        }
-        let txout = if create_fk.is_null() {
-            let Some(&pi) = same_block.get(&prev_txid) else {
-                return Err(corrupt("invariant: blockfilter prevout missing"));
-            };
-            let Some(o) = block.txdata[pi].output.get(vout as usize) else {
-                return Err(corrupt("invariant: blockfilter prevout missing"));
-            };
-            o.clone()
-        } else {
-            let Some((value, script, txid)) =
-                parents.get_parent_txout_parts(create_fk, vout, |v, s, txid| (v, s.to_vec(), txid))
-            else {
-                return Err(corrupt("invariant: blockfilter prevout missing"));
-            };
-            if txid != prev_txid {
-                return Err(corrupt("invariant: live index prevout txid"));
-            }
-            if value < 0 {
-                return Err(corrupt("invariant: live index prevout value"));
-            }
-            TxOut {
-                value: Amount::from_sat(value as u64),
-                script_pubkey: ScriptBuf::from_bytes(script),
-            }
-        };
-        by_tx.entry(spending_fk).or_default().push((vin, txout));
-    }
-    let mut out = Vec::with_capacity(block.txdata.len());
-    for (ti, tx) in block.txdata.iter().enumerate() {
-        if tx.is_coinbase() {
-            out.push(Vec::new());
-            continue;
-        }
-        let fk = prep
-            .tx_fks
-            .get(ti)
-            .copied()
-            .ok_or_else(|| corrupt("invariant: live index tx fk"))?;
-        let mut rows = by_tx.remove(&fk).unwrap_or_default();
-        rows.sort_by_key(|(vin, _)| *vin);
-        if rows.len() != tx.input.len() {
-            return Err(corrupt("invariant: live index prevout count"));
-        }
-        out.push(rows.into_iter().map(|(_, o)| o).collect());
+fn prevouts_for_block(work: &BlockWork) -> Result<Vec<Vec<TxOut>>, ConsensusError> {
+    let mut out = Vec::with_capacity(work.block.txdata.len());
+    for (ti, tx) in work.block.txdata.iter().enumerate() {
+        out.push(prevouts_for_tx(work, ti, tx)?);
     }
     Ok(out)
+}
+
+fn prevouts_for_tx(
+    work: &BlockWork,
+    ti: usize,
+    tx: &Transaction,
+) -> Result<Vec<TxOut>, ConsensusError> {
+    if tx.is_coinbase() {
+        return Ok(Vec::new());
+    }
+    if ti >= work.tx_fks_len {
+        return Err(corrupt("invariant: live index tx fk"));
+    }
+    let Some(rows) = work.spends_by_tx.get(ti) else {
+        return Err(corrupt("invariant: live index tx fk"));
+    };
+    let mut rows = rows.clone();
+    rows.sort_by_key(|spend| spend.vin);
+    if rows.len() != tx.input.len() {
+        return Err(corrupt("invariant: live index prevout count"));
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for spend in &rows {
+        out.push(resolve_prevout(work, spend)?);
+    }
+    Ok(out)
+}
+
+fn resolve_prevout(work: &BlockWork, spend: &SpendRef) -> Result<TxOut, ConsensusError> {
+    if spend.create_fk.is_null() {
+        let same_block = work.same_block.get_or_init(|| {
+            let mut map = HashMap::with_capacity(work.block.txdata.len());
+            for (i, tx) in work.block.txdata.iter().enumerate() {
+                map.insert(tx.compute_txid().to_byte_array(), i);
+            }
+            map
+        });
+        let Some(&pi) = same_block.get(&spend.prev_txid) else {
+            return Err(corrupt("invariant: blockfilter prevout missing"));
+        };
+        let Some(out) = work.block.txdata[pi].output.get(spend.vout as usize) else {
+            return Err(corrupt("invariant: blockfilter prevout missing"));
+        };
+        return Ok(out.clone());
+    }
+    let Some((value, script, txid)) = work.parents.txout_parts(spend.create_fk, spend.vout) else {
+        return Err(corrupt("invariant: blockfilter prevout missing"));
+    };
+    if txid != spend.prev_txid {
+        return Err(corrupt("invariant: live index prevout txid"));
+    }
+    if value < 0 {
+        return Err(corrupt("invariant: live index prevout value"));
+    }
+    Ok(TxOut {
+        value: Amount::from_sat(value as u64),
+        script_pubkey: ScriptBuf::from_bytes(script),
+    })
 }
 
 /// After `confirmed[h]` is set: commit this batch. A watermark that is not
