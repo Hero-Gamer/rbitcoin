@@ -20,6 +20,7 @@ use rbitcoin_consensus::{
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -3177,6 +3178,9 @@ fn proposal_connect(
     let cb_txid = block.txdata[0].compute_txid();
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
+    // RAM: decoded outputs of this block's distinct confirmed parents.
+    // Dropped when the check returns.
+    let mut parents: HashMap<Txid, (Fk, Vec<TxOut>)> = HashMap::new();
     let mut fees = 0u64;
     for (i, tx) in block.txdata.iter().enumerate() {
         if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
@@ -3207,7 +3211,7 @@ fn proposal_connect(
             }
             let txout = if let Some(o) = created.get(&op) {
                 o.clone()
-            } else if let Some((fk, o)) = chain_txout(query, &op) {
+            } else if let Some((fk, o)) = chain_txout(query, &mut parents, &op) {
                 if coinbase_spend_is_immature(query, fk, height, maturity)? {
                     return Err("bad-txns-premature-spend-of-coinbase".into());
                 }
@@ -3236,28 +3240,41 @@ fn proposal_connect(
     Ok(fees)
 }
 
-fn chain_txout(query: &Query, op: &OutPoint) -> Option<(Fk, TxOut)> {
+/// `op`'s unspent confirmed output. `parents` holds each parent's create fk
+/// and decoded outputs for this one proposal check.
+fn chain_txout(
+    query: &Query,
+    parents: &mut HashMap<Txid, (Fk, Vec<TxOut>)>,
+    op: &OutPoint,
+) -> Option<(Fk, TxOut)> {
     let tid = op.txid.to_byte_array();
     if query.is_outpoint_spent(&tid, op.vout).ok()? {
         return None;
     }
-    let (fk, rec) = query.get_tx_by_txid(&tid).ok().flatten()?;
-    let out = query
-        .tx_output_at_fk(fk, op.vout)
-        .ok()
-        .or_else(|| query.tx_output(&rec, op.vout).ok())?;
-    let value = if out.value < 0 {
-        Amount::ZERO
-    } else {
-        Amount::from_sat(out.value as u64)
+    let slot = match parents.entry(op.txid) {
+        Entry::Occupied(e) => e.into_mut(),
+        Entry::Vacant(v) => v.insert(chain_tx_outputs(query, &tid)?),
     };
-    Some((
-        fk,
-        TxOut {
-            value,
+    let out = slot.1.get(op.vout as usize).cloned()?;
+    Some((slot.0, out))
+}
+
+/// Create fk and every output of a confirmed tx.
+fn chain_tx_outputs(query: &Query, txid: &[u8; 32]) -> Option<(Fk, Vec<TxOut>)> {
+    let fk = query.tx_fk_by_txid(txid).ok().flatten()?;
+    let (_, outs) = query.store().get_tx_meta_and_outputs(fk).ok()?;
+    let outs = outs
+        .into_iter()
+        .map(|out| TxOut {
+            value: if out.value < 0 {
+                Amount::ZERO
+            } else {
+                Amount::from_sat(out.value as u64)
+            },
             script_pubkey: ScriptBuf::from_bytes(out.script),
-        },
-    ))
+        })
+        .collect();
+    Some((fk, outs))
 }
 
 /// Core `CheckTxInputs`: the creating tx is the coinbase at its height and
@@ -6341,6 +6358,65 @@ mod tests {
         assert_eq!(
             hub.check_block_proposal(&block).unwrap_err(),
             "bad-txns-inputs-missingorspent"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fan-out parent is decoded once per proposal check, not once per
+    /// child. Output `i` carries a distinct value so the fee total also
+    /// pins vout indexing.
+    #[test]
+    fn check_block_proposal_decodes_each_parent_once() {
+        let (dir, hub) = tmp_hub();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(101, op_true.clone(), vec![])
+            .unwrap();
+        let payout = 98_000_000u64;
+        let parent_value = |vout: u32| payout + 1_000 * u64::from(vout + 1);
+        let mut parent = mature_spend_tx(&hub, 1);
+        parent.output = (0..50)
+            .map(|vout| TxOut {
+                value: Amount::from_sat(parent_value(vout)),
+                script_pubkey: op_true.clone(),
+            })
+            .collect();
+        let parent_txid = parent.compute_txid();
+        hub.generate_to_script(1, op_true.clone(), vec![parent])
+            .unwrap();
+        let children = (0..50)
+            .map(|vout| Transaction {
+                version: TxVersion::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint {
+                        txid: parent_txid,
+                        vout,
+                    },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(payout),
+                    script_pubkey: op_true.clone(),
+                }],
+            })
+            .collect();
+        let block = hub.assemble_block_to_script(op_true, children).unwrap();
+        let fees: u64 = (0..50).map(|vout| parent_value(vout) - payout).sum();
+        let store = hub.query.store();
+        let _ = store.sample_reset_tx_outs_decodes();
+        let _ = store.sample_reset_tx_gets();
+        assert_eq!(hub.check_block_proposal(&block), Ok(fees));
+        assert_eq!(
+            store.sample_reset_tx_outs_decodes(),
+            1,
+            "one packed outs decode per distinct parent"
+        );
+        assert_eq!(
+            store.sample_reset_tx_gets(),
+            0,
+            "the parent fk resolve does not decode the body"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
