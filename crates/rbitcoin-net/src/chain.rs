@@ -20,7 +20,6 @@ use rbitcoin_consensus::{
 use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -3261,6 +3260,12 @@ pub fn check_block_proposal_with(
 /// Resolves every spend against the block and the confirmed chain. `Ok` is
 /// the fee total and the prevouts already resolved for each non-coinbase tx.
 /// Caller has already passed [`rbitcoin_consensus::validate_block_structure`].
+///
+/// RAM: `created` holds this block's outputs and [`confirmed_parent_outputs`]
+/// only the parent outputs this block spends, O(block outputs + block
+/// inputs), dropped at return; the returned prevouts are those spent outputs
+/// in block order. CPU: each distinct parent's packed body is decoded once;
+/// spentness is still probed per input, never served from that map.
 fn proposal_connect(
     query: &Query,
     block: &Block,
@@ -3274,15 +3279,14 @@ fn proposal_connect(
     if !block.txdata[0].is_coinbase() {
         return Err("bad-cb-missing".into());
     }
-    let cb_txid = block.txdata[0].compute_txid();
+    let txids: Vec<Txid> = block.txdata.iter().map(|tx| tx.compute_txid()).collect();
+    let parents = confirmed_parent_outputs(query, block, &txids);
+    let cb_txid = txids[0];
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
-    // RAM: decoded outputs of this block's distinct confirmed parents.
-    // Dropped when the check returns. The fk resolve does not decode the body.
-    let mut parents: HashMap<Txid, (Fk, Vec<TxOut>)> = HashMap::new();
     let mut fees = 0u64;
     let mut prevouts = Vec::with_capacity(block.txdata.len().saturating_sub(1));
-    for (i, tx) in block.txdata.iter().enumerate() {
+    for (i, (tx, &txid)) in block.txdata.iter().zip(&txids).enumerate() {
         if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
             return Err("bad-txns-nonfinal".into());
         }
@@ -3290,7 +3294,7 @@ fn proposal_connect(
             for (vout, o) in tx.output.iter().enumerate() {
                 created.insert(
                     OutPoint {
-                        txid: cb_txid,
+                        txid,
                         vout: vout as u32,
                     },
                     o.clone(),
@@ -3312,11 +3316,11 @@ fn proposal_connect(
             }
             let txout = if let Some(o) = created.get(&op) {
                 o.clone()
-            } else if let Some((fk, o)) = chain_txout(query, &mut parents, &op) {
-                if coinbase_spend_is_immature(query, fk, height, maturity)? {
+            } else if let Some((fk, o)) = chain_txout(query, &parents, &op) {
+                if coinbase_spend_is_immature(query, *fk, height, maturity)? {
                     return Err("bad-txns-premature-spend-of-coinbase".into());
                 }
-                o
+                o.clone()
             } else {
                 return Err("bad-txns-inputs-missingorspent".into());
             };
@@ -3338,11 +3342,10 @@ fn proposal_connect(
             .checked_add(in_val - out_val)
             .ok_or("bad-txns-fee-outofrange")?;
         prevouts.push(tx_prevouts);
-        let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
             created.insert(
                 OutPoint {
-                    txid: tid,
+                    txid,
                     vout: vout as u32,
                 },
                 o.clone(),
@@ -3352,40 +3355,67 @@ fn proposal_connect(
     Ok((fees, prevouts))
 }
 
-/// `op`'s unspent confirmed output. `parents` holds each parent's create fk
-/// and decoded outputs for this one proposal check.
-fn chain_txout(
+/// `op`'s unspent confirmed output: a per-input spentness probe, then the
+/// pre-decoded entry in `parents`.
+fn chain_txout<'a>(
     query: &Query,
-    parents: &mut HashMap<Txid, (Fk, Vec<TxOut>)>,
+    parents: &'a HashMap<OutPoint, (Fk, TxOut)>,
     op: &OutPoint,
-) -> Option<(Fk, TxOut)> {
-    let tid = op.txid.to_byte_array();
-    if query.is_outpoint_spent(&tid, op.vout).ok()? {
+) -> Option<&'a (Fk, TxOut)> {
+    if query
+        .is_outpoint_spent(&op.txid.to_byte_array(), op.vout)
+        .ok()?
+    {
         return None;
     }
-    let slot = match parents.entry(op.txid) {
-        Entry::Occupied(e) => e.into_mut(),
-        Entry::Vacant(v) => v.insert(chain_tx_outputs(query, &tid)?),
-    };
-    let out = slot.1.get(op.vout as usize).cloned()?;
-    Some((slot.0, out))
+    parents.get(op)
 }
 
-/// Create fk, from an identity resolve, and every output of a confirmed tx.
-fn chain_tx_outputs(query: &Query, txid: &[u8; 32]) -> Option<(Fk, Vec<TxOut>)> {
-    let fk = query.tx_fk_by_txid(txid).ok().flatten()?;
+/// The confirmed-parent outputs `block` spends: one tip-only fk resolve and
+/// one packed body decode per distinct parent, keeping only the spent vouts.
+/// Spends of `txids` (created in the block) are left to the connect loop; a
+/// parent that does not resolve contributes nothing, so its spends reject in
+/// block order.
+fn confirmed_parent_outputs(
+    query: &Query,
+    block: &Block,
+    txids: &[Txid],
+) -> HashMap<OutPoint, (Fk, TxOut)> {
+    let in_block: HashSet<&Txid> = txids.iter().collect();
+    let mut vouts_by_parent: HashMap<Txid, Vec<u32>> = HashMap::new();
+    for inp in block.txdata.iter().skip(1).flat_map(|tx| &tx.input) {
+        let op = inp.previous_output;
+        if !in_block.contains(&op.txid) {
+            vouts_by_parent.entry(op.txid).or_default().push(op.vout);
+        }
+    }
+    let mut outs = HashMap::new();
+    for (txid, vouts) in vouts_by_parent {
+        let Some((fk, all)) = chain_tx_outputs(query, &txid.to_byte_array()) else {
+            continue;
+        };
+        for vout in vouts {
+            if let Some(out) = all.get(vout as usize) {
+                let txout = TxOut {
+                    value: Amount::from_sat(u64::try_from(out.value).unwrap_or(0)),
+                    script_pubkey: ScriptBuf::from_bytes(out.script.clone()),
+                };
+                outs.insert(OutPoint { txid, vout }, (fk, txout));
+            }
+        }
+    }
+    outs
+}
+
+/// Every output of a tx on the connected chain: one head resolve, one packed
+/// outs decode. A row that exists only in a reorged-out block is `None`, as
+/// in Core.
+fn chain_tx_outputs(
+    query: &Query,
+    txid: &[u8; 32],
+) -> Option<(Fk, Vec<rbitcoin_store::OutputRecord>)> {
+    let fk = query.tx_fk_by_txid_tip(txid).ok().flatten()?;
     let (_, outs) = query.store().get_tx_meta_and_outputs(fk).ok()?;
-    let outs = outs
-        .into_iter()
-        .map(|out| TxOut {
-            value: if out.value < 0 {
-                Amount::ZERO
-            } else {
-                Amount::from_sat(out.value as u64)
-            },
-            script_pubkey: ScriptBuf::from_bytes(out.script),
-        })
-        .collect();
     Some((fk, outs))
 }
 
@@ -6545,9 +6575,16 @@ mod tests {
         let block = hub
             .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x52]), vec![spend])
             .unwrap();
+        let store = hub.query.store();
+        let _ = store.txs.sample_reset_body_decodes();
         assert_eq!(
             hub.check_block_proposal(&block).unwrap_err(),
             "bad-txns-inputs-missingorspent"
+        );
+        assert_eq!(
+            store.txs.sample_reset_body_decodes(),
+            0,
+            "a row with no fence height is not decoded"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

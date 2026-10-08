@@ -1214,18 +1214,19 @@ impl Query {
     }
 
     /// Resolve txid → fk via durable `tx.head` (when the index is enabled).
+    /// Head probe plus `txid.body` verify; no packed body decode.
+    ///
+    /// `TipThenAny`: RPC / reconstruct may want a never-connected archive
+    /// row. A consensus-style check (confirm, spentness, proposal) wants
+    /// [`Self::tx_fk_by_txid_tip`].
     ///
     /// ConfirmParentCache is keyed by create fk only (no process-local txid map).
     /// IBD thin edges carry stamped create_fk; cold/soft paths use durable head.
     fn lookup_tx_fk(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
-        if self.tx_index_enabled() {
-            // body_txid verify only — avoid full packed decode on probe misses.
-            // TipThenAny: RPC / reconstruct may want a never-connected archive row.
-            if let Some(fk) = self.store.get_fk_by_txid(txid)? {
-                return Ok(Some(fk));
-            }
+        if !self.tx_index_enabled() {
+            return Ok(None);
         }
-        Ok(None)
+        self.store.get_fk_by_txid(txid)
     }
 
     /// Public resolve by txid (durable head when index enabled).
@@ -1233,7 +1234,8 @@ impl Query {
         self.lookup_tx_fk(txid)
     }
 
-    /// Confirm / spentness: connected instance only (height fence Some).
+    /// Confirm / spentness / block proposal: connected instance only (height
+    /// fence Some).
     pub fn tx_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, QueryError> {
         if self.tx_index_enabled() {
             return self.store.get_fk_by_txid_tip(txid);

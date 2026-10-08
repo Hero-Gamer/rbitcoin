@@ -8,3 +8,7 @@ Changed
   to its row, probing whether an output is spent, and recording a spend read
   the `txid.body` identity only; the packed decode runs only for a reader that
   needs the record.
+- **A block proposal keeps only the parent outputs it spends.** The check
+  resolves each confirmed parent on the connected chain, decodes it once, and
+  holds only the spent outputs until it returns; a row that exists only in a
+  reorged-out block is not an input.
