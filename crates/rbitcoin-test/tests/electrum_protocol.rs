@@ -1125,8 +1125,21 @@ async fn drain_lines(stream: &mut TcpStream, window: Duration) -> Vec<Value> {
 /// scripthashes. Funding the watched hash pushes its new status, and an RBF
 /// replacement that stops paying it must push again via replaced_scripthashes
 /// (the hash is no longer in the replacement's own scripthashes).
-#[tokio::test]
-async fn electrum_mempool_notify_follows_funding_and_rbf() {
+///
+/// The runtime names its threads `tokio-rt-worker`, matching the node.
+/// `#[tokio::test]` workers are `tokio-runtime-worker` and never trip
+/// `assert_not_reactor`.
+#[test]
+fn electrum_mempool_notify_follows_funding_and_rbf() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("tokio-rt-worker")
+        .build()
+        .expect("runtime");
+    rt.block_on(electrum_mempool_notify_follows_funding_and_rbf_on());
+}
+
+async fn electrum_mempool_notify_follows_funding_and_rbf_on() {
     use bitcoin::absolute::LockTime;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
