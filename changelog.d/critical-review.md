@@ -14,7 +14,8 @@ Security
   and a rolled-back package or one-parent package clear the scripthash,
   expiry, and wtxid maps for every transaction that left, including one
   the rolled-back member had evicted. A prioritisation delta stays until
-  the transaction is mined. A reorg removes a parent and its children
+  the transaction is mined, including when it had already left the mempool
+  and when relay is still off. A reorg removes a parent and its children
   before a template can select the child. A coin that is spent while its
   script is checked is not admitted. That recheck reads the coin before
   taking the mempool write lock, unless a block connect or disconnect is

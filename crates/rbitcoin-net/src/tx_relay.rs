@@ -2644,11 +2644,14 @@ impl MempoolHub {
     /// Samples removed entries' feerates into confirm-memory for the standard
     /// 10-minute fee estimate floor.
     ///
-    /// **No-op while relay is disabled** (IBD catch-up). Callers must not rely
-    /// on per-block strip until [`Self::set_relay_enabled`]`(true)` has run the
-    /// deferred [`Self::purge_confirmed_on_chain`].
+    /// **Strip is a no-op while relay is disabled** (IBD catch-up). Callers
+    /// must not rely on per-block strip until [`Self::set_relay_enabled`]`(true)`
+    /// has run the deferred [`Self::purge_confirmed_on_chain`]. Mined
+    /// prioritisation deltas still drop, including a tx that already left
+    /// the mempool and a block that removes nothing live.
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
         if !self.relay_enabled() {
+            self.drop_mined_fee_deltas(txids);
             return 0;
         }
         let utxo = self.utxo_provider();
@@ -2677,8 +2680,8 @@ impl MempoolHub {
         }
         if n > 0 {
             self.unindex_evicted(txids);
-            self.drop_mined_fee_deltas(txids);
         }
+        self.drop_mined_fee_deltas(txids);
         n
     }
 
@@ -5366,6 +5369,12 @@ mod tests {
         assert!(hub.remove_for_block(&[high_id]) >= 1);
         assert_eq!(hub.fee_delta(&high_id), 0);
         assert_eq!(hub.fee_delta(&low_id), 9);
+        assert_eq!(hub.remove_for_block(&[low_id]), 0);
+        assert_eq!(
+            hub.fee_delta(&low_id),
+            0,
+            "mining an evicted tx drops its prioritisation"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5517,8 +5526,14 @@ mod tests {
         let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
         assert!(!mp.relay_enabled());
         let dummy = Txid::from_byte_array([9u8; 32]);
-        // No-op while relay off (IBD catch-up must not strip per block).
+        mp.prioritise_tx(dummy, 3);
+        // Strip stays deferred while relay is off. The mined delta still drops.
         assert_eq!(mp.remove_for_block(&[dummy]), 0);
+        assert_eq!(
+            mp.fee_delta(&dummy),
+            0,
+            "a mined delta drops while relay is off"
+        );
         // Enabling relay runs purge (empty → 0) and arms per-block strip.
         mp.set_relay_enabled(true);
         assert!(mp.relay_enabled());
