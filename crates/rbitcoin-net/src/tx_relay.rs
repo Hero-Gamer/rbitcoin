@@ -1249,7 +1249,15 @@ impl MempoolHub {
             let mut n = 0usize;
             let mut g = self.lock_write();
             for t in kill.iter().rev() {
-                if g.graph.get(t).is_some() && g.remove_txid(t).is_ok() {
+                if g.graph.get(t).is_some() {
+                    if g.remove_txid(t).is_ok() {
+                        self.unindex_txid(t);
+                        n += 1;
+                    }
+                } else {
+                    // Already gone from the graph (fee or slot eviction that
+                    // did not unindex). Drop the relay maps so the scan can
+                    // move past it.
                     self.unindex_txid(t);
                     n += 1;
                 }
@@ -1841,7 +1849,7 @@ impl MempoolHub {
         };
 
         let prevouts = prep.prevouts.clone();
-        let result = {
+        let (result, failed_evict) = {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
@@ -1850,9 +1858,14 @@ impl MempoolHub {
             } else {
                 g.commit_after_script(tx, prep)
             };
+            let failed_evict = if r.is_err() {
+                g.take_failed_evictions()
+            } else {
+                Vec::new()
+            };
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
-            r
+            (r, failed_evict)
         };
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
@@ -1867,6 +1880,7 @@ impl MempoolHub {
             Err(e) => {
                 // Eviction inside the commit may have raised the rolling floor
                 // before the error returned. The write guard is already gone.
+                self.unindex_evicted(&failed_evict);
                 self.publish_fee_floor();
                 self.finish_accept_err(us, e)
             }
@@ -1902,13 +1916,20 @@ impl MempoolHub {
         // Parent is live until the child commits (or we roll it back). A
         // concurrent spender of the parent that lands in this window survives
         // `remove_txid(parent)` if the child then fails.
-        let parent_commit = {
+        let (parent_commit, parent_failed) = {
             let mut g = self.lock_write();
-            g.commit_after_script(&parent, prep_p)
+            let r = g.commit_after_script(&parent, prep_p);
+            let failed = if r.is_err() {
+                g.take_failed_evictions()
+            } else {
+                Vec::new()
+            };
+            (r, failed)
         };
         let parent_res = match parent_commit {
             Ok(r) => r,
             Err(_) => {
+                self.unindex_evicted(&parent_failed);
                 self.publish_fee_floor();
                 return None;
             }
@@ -1928,9 +1949,15 @@ impl MempoolHub {
             }
         };
         let prevouts_c = prep_c.prevouts.clone();
-        let child_res = {
+        let (child_res, child_failed) = {
             let mut g = self.lock_write();
-            g.commit_after_script(child, prep_c)
+            let r = g.commit_after_script(child, prep_c);
+            let failed = if r.is_err() {
+                g.take_failed_evictions()
+            } else {
+                Vec::new()
+            };
+            (r, failed)
         };
         self.meter_accept_stages(lock_us, stages);
         match child_res {
@@ -1942,6 +1969,7 @@ impl MempoolHub {
                 Some(r)
             }
             Err(_) => {
+                self.unindex_evicted(&child_failed);
                 self.rollback_1p1c_parent(&parent_res.txid);
                 self.publish_fee_floor();
                 None
@@ -2011,6 +2039,11 @@ impl MempoolHub {
         for old in &r.replaced {
             self.unindex_txid(old);
         }
+        debug_assert!(
+            !r.evicted.contains(&r.txid),
+            "a successful admit is not in its own eviction set"
+        );
+        self.unindex_evicted(&r.evicted);
         let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
         let w = tx.compute_wtxid();
         self.insert_relay_maps(r.txid, w, seq);
@@ -2396,12 +2429,17 @@ impl MempoolHub {
             };
             let prev = prep.prevouts.clone();
             let t_lock = Instant::now();
-            let commit = {
+            let (commit, failed_evict) = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
                 let r = g.commit_after_script(tx, prep);
+                let failed_evict = if r.is_err() {
+                    g.take_failed_evictions()
+                } else {
+                    Vec::new()
+                };
                 stages = g.last_accept_stages;
-                r
+                (r, failed_evict)
             };
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             match commit {
@@ -2410,6 +2448,7 @@ impl MempoolHub {
                     accepted.push(r);
                 }
                 Err(e) => {
+                    self.unindex_evicted(&failed_evict);
                     self.rollback_package_accepted(&accepted);
                     // The first member can evict and fail with nothing to roll
                     // back, so the rollback publish does not run.
@@ -2430,6 +2469,7 @@ impl MempoolHub {
             for old in &r.replaced {
                 self.unindex_txid(old);
             }
+            self.unindex_evicted(&r.evicted);
             // Same relay-age clock as an individual admit (`mempool_limit.py` INV).
             let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
             self.insert_relay_maps(r.txid, tx.compute_wtxid(), seq);
@@ -2744,9 +2784,22 @@ impl MempoolHub {
             Err(e) => return Err(e),
         };
         let prevouts = prep.prevouts.clone();
-        {
+        let committed = {
             let mut g = self.lock_write();
-            g.commit_after_script(tx, prep)?;
+            let r = g.commit_after_script(tx, prep);
+            let failed = if r.is_err() {
+                g.take_failed_evictions()
+            } else {
+                Vec::new()
+            };
+            (r, failed)
+        };
+        match committed {
+            (Ok(r), _) => self.unindex_evicted(&r.evicted),
+            (Err(e), failed) => {
+                self.unindex_evicted(&failed);
+                return Err(e);
+            }
         }
         self.promote_orphans_staged(tx.compute_txid(), utxo);
         Ok(prevouts)
@@ -3349,6 +3402,7 @@ impl MempoolHub {
             replaced: Vec::new(),
             replaced_scripthashes: Vec::new(),
             replaced_txs: Vec::new(),
+            evicted: Vec::new(),
         })
     }
 
@@ -4009,6 +4063,59 @@ mod tests {
         assert_eq!(hub.live_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Ghosts left in accept-time order by an earlier eviction occupy the
+    /// 256-entry scan. Unindexing them lets the next scan expire a live tx
+    /// that is already past the horizon.
+    #[test]
+    fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
+        const GHOSTS: usize = 256;
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.set_expiry_hours(1);
+        hub.note_mock_now(10_000);
+        let live = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        let live_id = live.compute_txid();
+        hub.accept_tx(&live).expect("admit live");
+        {
+            let mut by_tx = hub.wtxid_by_txid.lock().unwrap();
+            let mut ats = hub.accept_at.lock().unwrap();
+            let mut order = hub.expiry_order.lock().unwrap();
+            for i in 0..GHOSTS {
+                let mut raw = [0u8; 32];
+                raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
+                let txid = Txid::from_byte_array(raw);
+                raw[31] = 1;
+                let wtxid = Wtxid::from_byte_array(raw);
+                let at = (i as u64) + 1;
+                by_tx.insert(txid, wtxid);
+                ats.insert(wtxid, at);
+                order.insert((at, wtxid), txid);
+            }
+        }
+        hub.min_live_accept_at.store(1, Ordering::Relaxed);
+        hub.note_mock_now(10_000 + 3600 + 5);
+        assert!(
+            hub.expire_stale() >= GHOSTS,
+            "ghosts in front of the scan must leave the expiry index"
+        );
+        assert!(
+            hub.contains(&live_id),
+            "one scan still stops after 256 entries"
+        );
+        assert_eq!(hub.expire_stale(), 1);
+        assert!(!hub.contains(&live_id));
+        assert!(hub.wtxid_by_txid.lock().unwrap().get(&live_id).is_none());
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != live_id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4853,6 +4960,77 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// A full slot table evicts a live tx to admit the next one, and that
+    /// tx leaves the relay maps with the graph.
+    #[test]
+    fn slot_evict_unindexes_evicted_relay_maps() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let first = spend_true(cbs[0], 2_000, spk.clone());
+        let second = spend_true(cbs[1], 2_000, spk);
+        let first_id = first.compute_txid();
+        hub.accept_tx(&first).expect("first admit");
+        hub.lock_write().store.testing_pin_full_slot_table();
+        hub.accept_tx(&second)
+            .expect("second admit evicts for a slot");
+        assert!(!hub.contains(&first_id));
+        assert!(hub.contains(&second.compute_txid()));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&first_id),
+            "slot eviction must drop sh_index"
+        );
+        assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&first_id));
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != first_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single-tx admit that trims for the weight budget must drop the
+    /// evicted tx from the relay maps, not only the graph.
+    #[test]
+    fn admission_trim_unindexes_evicted_relay_maps() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let low = spend_true(cbs[0], 1_000, spk.clone());
+        let high = spend_true(cbs[1], 50_000, spk);
+        let budget = low.weight().to_wu();
+        let hub = MempoolHub::open_with_weight(&dir, q, budget).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let low_id = low.compute_txid();
+        let high_id = high.compute_txid();
+        hub.accept_tx(&low).expect("low feerate fits");
+        hub.accept_tx(&high)
+            .expect("higher feerate evicts the low one");
+        assert!(
+            !hub.contains(&low_id),
+            "the low feerate tx leaves the graph"
+        );
+        assert!(hub.contains(&high_id));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&low_id),
+            "fee eviction must leave sh_index"
+        );
+        assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&low_id));
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != low_id));
+        assert!(hub.sh_index.lock().unwrap().by_tx.contains_key(&high_id));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Confirm/RBF unindex must drop `relay_seq` / `accept_at` for the gone
