@@ -1,5 +1,10 @@
 # Client interfaces
 
+Which wallet or Lightning node to point here, and the server string it
+expects: [`docs/wallets.md`](../wallets.md) and
+[`docs/lightning.md`](../lightning.md). This file is the listener
+behavior.
+
 ## Electrum
 
 Internet-facing Electrum is supported as a **wallet-client backend** (Electrum,

@@ -8,6 +8,7 @@ Start with the task you need to do:
 | Try regtest, use the CLI, monitor the node (logs, health probes, metrics), configure relay and P2P | [Node operations](docs/operator/operations.md) |
 | Tune store IO and memory, upgrade the schema, manage optional indexes | [Storage and indexes](docs/operator/storage.md) |
 | Configure Electrum, Esplora, RPC, SV2 templates, or client benchmarking | [Client interfaces](docs/operator/interfaces.md) |
+| Point a wallet or Lightning node at this node | [Wallets](docs/wallets.md), [Lightning backends](docs/lightning.md) |
 | Run signet/mainnet, or tune a constrained host or uplink | [Labs and constrained hosts](docs/operator/field-notes.md) |
 
 Product compatibility: [`COMPAT.md`](COMPAT.md). Current on-disk format and

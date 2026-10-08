@@ -30,6 +30,7 @@ Before the first edit in a crate, read `crates/<name>/AGENTS.md` when that file 
 | `rearden-grok[bot]` operator VM (ignore unless that identity) | [`../rearden-vm-HOST.md`](../rearden-vm-HOST.md) |
 | Intentional Core / Electrum / Esplora differences | [`../COMPAT.md`](../COMPAT.md) |
 | JSON-RPC surface | [`rpc.md`](./rpc.md) |
+| Which wallet or Lightning node connects | [`wallets.md`](./wallets.md), [`lightning.md`](./lightning.md) |
 | Open, push, or poll a PR | [`../.agents/skills/ship-pr/SKILL.md`](../.agents/skills/ship-pr/SKILL.md) (one worktree; fail-fast `pr-checks-watch.sh`) |
 | Minor, patch, or major release | [`../.agents/skills/release/SKILL.md`](../.agents/skills/release/SKILL.md) |
 | Core functional harness | [`../.agents/skills/core-functional/SKILL.md`](../.agents/skills/core-functional/SKILL.md) |
