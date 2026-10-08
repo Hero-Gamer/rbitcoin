@@ -131,7 +131,7 @@ payloads and oversized pending-cmpct pressure; disconnects the peer.
 
 **BIP324 v2 only** — discovery is v2-filtered (`x809` DNS + `P2P_V2` gossip);
 see [`OPERATOR.md`](../OPERATOR.md) § P2P transport. Expect fewer usable
-peers than a dual-stack Core node (experimental user-agent still limits inbound).
+peers than a dual-stack Core node. The user-agent is `/rbitcoin:VERSION/`, which some peers still refuse.
 
 ## Ops risks
 
@@ -139,7 +139,7 @@ peers than a dual-stack Core node (experimental user-agent still limits inbound)
 |------|--------|
 | Disk / RAM | Multi‑100 GiB Class A; segmented 25-bit `tx.head.*` + mapped `.fuse8` (~1.5 GiB `RssFile`, heap `fuse8=0`); SH BDZ3 occ mapped (~150 MiB `file=` at ~1 B keys); sealed BDZ `g` FdOnly (not anon heap) |
 | `tx.head` seal | Segment roll builds fuse8 on seal (~27 M keys); watch seal begin/done logs — not a mono-head shadow fill |
-| Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). Experimental user-agent still limits inbound |
+| Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). `/rbitcoin:VERSION/` is not a Core user-agent, so some peers still refuse inbound |
 | Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB**; **scripts verified on accept** |
 | Confirm lookup/load | **Load** recvs load-sized batches (soft **8000** inputs / hard **144** blocks) from `loadq=14`. Dense mainnet is typically **a few blocks per batch**. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, in order from `path_lo`. Real queues loadq=14 · scriptq=4 · writeq=14 |
 | Not Core/Fulcrum | No production SLA; 0.7.99 is high-scrutiny 0.x; schema unstable until 1.0; occupied 0.6.x stores refuse (wipe + IBD) |

@@ -46,7 +46,7 @@ taking on for 1.0. `--prune-seqsigwit` is in (seqsigwit-window prune,
 - Wallet keys, GUI, Core block-file prune (`-prune` of `blk` files), ZMQ, IPC, plaintext v1 P2P
 - Explorer-search APIs (address-prefix), Liquid, in-binary `/api/v1/`
   catalogue. **0.8** is electrs HTTP drop-in (except prefix):
-  [`COMPAT.md`](../COMPAT.md) (**Q-68**)
+  [`COMPAT.md`](../COMPAT.md)
 - Every Bitcoin Core functional test (no wallet / prune / v1 scripts)
 - Matching Core `estimatesmartfee` numbers
 - Apple notarization
@@ -196,9 +196,9 @@ target (cold / after a fee spike) on a real mempool — not a soak badge
 When the rest is true, tag 1.0 so **every 1.x.x opens a 1.0.0 store**.
 Older-than-1.0 or corrupt files can still refuse with a one-line message.
 
-Do not freeze while Class C / sidecar / fuse8 can lose a `set` or index
-OOB (**Q-57**). Mempool persist writes body before LIVE slots (**Q-58**).
-Schema 21 is the current bytes; 0.x may still bump.
+The durable path is fail-closed (**Q-57** / **Q-58**). Live bytes are
+schema **26** ([`SCHEMA.md`](../SCHEMA.md)). 0.x may still bump; 1.0 is
+the freeze.
 
 | Done | Step |
 |:----:|------|
@@ -215,11 +215,11 @@ mempool.space Node+MariaDB+frontend can retire electrs. Core JSON-RPC for
 that stack is TCP plus an opt-in Core cookie (`--rpc-cookie-file`), so stock
 mempool `CORE_RPC` works unpatched; a unix-socket patch stays optional. Not
 their `/api/v1/` process. Not address-prefix.
-**Q-68**. Surface: [`COMPAT.md`](../COMPAT.md).
+Surface: [`COMPAT.md`](../COMPAT.md). (**Q-68** is the create.loc SIMD
+extract in [`TESTING.md`](../TESTING.md), not this drop-in.)
 
 | Done | Step |
 |:----:|------|
-| [x] | Q-68 parked (this row) |
 | [x] | Esplora unix + `/internal/*` + mempool tx-JSON snapshot |
 | [x] | Product docs claim the drop-in |
 

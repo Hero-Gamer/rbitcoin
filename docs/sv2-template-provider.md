@@ -591,10 +591,11 @@ No live pool/JDC, no mainnet datadir, no plaintext mode.
   `bad-diffbits` unless the sent bits were already the limit. A re-push cannot fix it: a same-hash `SetNewPrevHash`
   is outside §7.4, and a `NewTemplate` has no field for the bits. Not
   planned; mainnet and signet bits depend only on the prev hash.
-- Pre-existing, outside this plan: consensus does not enforce the BIP94
-  timewarp floor (testnet4). The first block of a retarget period may carry
-  a timestamp more than 600 s before its parent. Core rejects it
-  (`time-timewarp-attack`); when consensus gains the rule, the template
-  timestamp floor must include it.
+- Pre-existing, outside this plan: this binary has no testnet4 network.
+  If one is added, consensus does not yet enforce the BIP94 timewarp floor.
+  The first block of a retarget period may carry a timestamp more than 600 s
+  before its parent. Core rejects that (`time-timewarp-attack`); the template
+  timestamp floor must include the rule when consensus gains it. Mainnet,
+  testnet3, signet, and regtest do not use that rule.
 - After ship: JD-server mode, weak blocks, extension negotiation, per-IP
   connection limits → quality.md rows, not this roadmap.
