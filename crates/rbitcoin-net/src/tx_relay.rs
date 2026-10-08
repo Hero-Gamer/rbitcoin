@@ -1779,6 +1779,62 @@ impl MempoolHub {
         Ok(prep)
     }
 
+    /// Confirmed coins are read again under the write lock. A spend that lands
+    /// while scripts run must not commit from the prepare snapshot. An input
+    /// whose creator is still in the graph keeps its mempool parent
+    /// (`chain_coins` stays `None`).
+    fn recheck_chain_coins(
+        g: &ActiveMempool,
+        tx: &Transaction,
+        prep: &mut rbitcoin_mempool::PreparedAdmit,
+        utxo: &impl UtxoProvider,
+    ) -> Result<(), AcceptError> {
+        for (i, inp) in tx.input.iter().enumerate() {
+            let op = inp.previous_output;
+            if g.graph.creator(&op).is_some() {
+                continue;
+            }
+            let Some(coin) = utxo.get_coin(&op) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(prev) = prep.prevouts.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(slot) = prep.chain_coins.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            *prev = coin.txout.clone();
+            *slot = Some(coin);
+        }
+        Ok(())
+    }
+
+    /// Recheck, then commit. A miss does not take the previous admit's
+    /// eviction list: that admit already published it.
+    fn commit_rechecked(
+        g: &mut ActiveMempool,
+        tx: &Transaction,
+        mut prep: rbitcoin_mempool::PreparedAdmit,
+        utxo: &impl UtxoProvider,
+        defer_trim: bool,
+    ) -> (Result<AcceptResult, AcceptError>, Vec<Txid>, Vec<TxOut>) {
+        if let Err(e) = Self::recheck_chain_coins(g, tx, &mut prep, utxo) {
+            return (Err(e), Vec::new(), Vec::new());
+        }
+        let prevouts = prep.prevouts.clone();
+        let result = if defer_trim {
+            g.commit_after_script_defer_trim(tx, prep)
+        } else {
+            g.commit_after_script(tx, prep)
+        };
+        let failed = if result.is_err() {
+            g.take_failed_evictions()
+        } else {
+            Vec::new()
+        };
+        (result, failed, prevouts)
+    }
+
     fn accept_with_utxo(
         &self,
         tx: &Transaction,
@@ -1848,24 +1904,15 @@ impl MempoolHub {
             }
         };
 
-        let prevouts = prep.prevouts.clone();
-        let (result, failed_evict) = {
+        let (result, failed_evict, prevouts) = {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
-            let r = if defer_trim {
-                g.commit_after_script_defer_trim(tx, prep)
-            } else {
-                g.commit_after_script(tx, prep)
-            };
-            let failed_evict = if r.is_err() {
-                g.take_failed_evictions()
-            } else {
-                Vec::new()
-            };
+            let (r, failed_evict, prevouts) =
+                Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim);
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
-            (r, failed_evict)
+            (r, failed_evict, prevouts)
         };
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
@@ -1912,19 +1959,12 @@ impl MempoolHub {
                 return None;
             }
         };
-        let prevouts_p = prep_p.prevouts.clone();
         // Parent is live until the child commits (or we roll it back). A
         // concurrent spender of the parent that lands in this window survives
         // `remove_txid(parent)` if the child then fails.
-        let (parent_commit, parent_failed) = {
+        let (parent_commit, parent_failed, prevouts_p) = {
             let mut g = self.lock_write();
-            let r = g.commit_after_script(&parent, prep_p);
-            let failed = if r.is_err() {
-                g.take_failed_evictions()
-            } else {
-                Vec::new()
-            };
-            (r, failed)
+            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, false)
         };
         let parent_res = match parent_commit {
             Ok(r) => r,
@@ -1948,16 +1988,9 @@ impl MempoolHub {
                 return None;
             }
         };
-        let prevouts_c = prep_c.prevouts.clone();
-        let (child_res, child_failed) = {
+        let (child_res, child_failed, prevouts_c) = {
             let mut g = self.lock_write();
-            let r = g.commit_after_script(child, prep_c);
-            let failed = if r.is_err() {
-                g.take_failed_evictions()
-            } else {
-                Vec::new()
-            };
-            (r, failed)
+            Self::commit_rechecked(&mut g, child, prep_c, utxo, false)
         };
         self.meter_accept_stages(lock_us, stages);
         match child_res {
@@ -2427,19 +2460,13 @@ impl MempoolHub {
                     return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             };
-            let prev = prep.prevouts.clone();
             let t_lock = Instant::now();
-            let (commit, failed_evict) = {
+            let (commit, failed_evict, prev) = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
-                let r = g.commit_after_script(tx, prep);
-                let failed_evict = if r.is_err() {
-                    g.take_failed_evictions()
-                } else {
-                    Vec::new()
-                };
+                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, false);
                 stages = g.last_accept_stages;
-                (r, failed_evict)
+                committed
             };
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             match commit {
@@ -2783,20 +2810,13 @@ impl MempoolHub {
             }
             Err(e) => return Err(e),
         };
-        let prevouts = prep.prevouts.clone();
-        let committed = {
+        let (result, failed, prevouts) = {
             let mut g = self.lock_write();
-            let r = g.commit_after_script(tx, prep);
-            let failed = if r.is_err() {
-                g.take_failed_evictions()
-            } else {
-                Vec::new()
-            };
-            (r, failed)
+            Self::commit_rechecked(&mut g, tx, prep, utxo, false)
         };
-        match committed {
-            (Ok(r), _) => self.unindex_evicted(&r.evicted),
-            (Err(e), failed) => {
+        match result {
+            Ok(r) => self.unindex_evicted(&r.evicted),
+            Err(e) => {
                 self.unindex_evicted(&failed);
                 return Err(e);
             }
@@ -5031,6 +5051,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
+    /// A coin spent after prepare and before commit is not inserted.
+    #[test]
+    fn commit_refuses_a_coin_spent_during_script_check() {
+        use std::sync::atomic::AtomicUsize;
+        /// First `get_coin` returns the prepared coin. Later calls are spent.
+        struct Flip {
+            map: HashMap<OutPoint, Coin>,
+            hits: AtomicUsize,
+        }
+        impl UtxoProvider for Flip {
+            fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
+                let n = self.hits.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    self.map.get(op).cloned()
+                } else {
+                    None
+                }
+            }
+        }
+        let (_store, q, _cbs) = pad_cbs(3);
+        let mp = tmp();
+        let hub = MempoolHub::open(&mp, q).unwrap();
+        hub.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let coin = Coin {
+            txout: TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: spk.clone(),
+            },
+            create_height: 1,
+            create_mtp: 0,
+            is_coinbase: false,
+            create_fk: None,
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: spk,
+            }],
+        };
+        let utxo = Flip {
+            map: HashMap::from([(op, coin)]),
+            hits: AtomicUsize::new(0),
+        };
+        let err = hub.accept_with_utxo(&tx, &utxo, None, false).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::MissingPrevout(missing) if missing == op),
+            "coin spent during the script check must conflict, got {err}"
+        );
+        let id = tx.compute_txid();
+        assert!(!hub.contains(&id));
+        assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&id));
+        let _ = std::fs::remove_dir_all(&mp);
+    }
+
     /// A full slot table evicts a live tx to admit the next one, and that
     /// tx leaves the relay maps with the graph.
     #[test]
@@ -6950,8 +7037,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// Prepare resolves coins off the write lock. The commit re-reads each
+    /// confirmed input once while that lock is held.
     #[test]
-    fn accept_commit_does_not_query_under_write() {
+    fn accept_rechecks_confirmed_input_under_write() {
         let (_store, owned_q, owned_cbs) = pad_cbs(3);
         let q = &owned_q;
         let cbs = owned_cbs.as_slice();
@@ -6994,8 +7083,8 @@ mod tests {
             .expect("accept");
         assert_eq!(
             hits.load(Ordering::Relaxed),
-            0,
-            "QueryUtxoProvider must not run while inner write is held"
+            1,
+            "commit re-reads the confirmed input once under the write lock"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
     }
