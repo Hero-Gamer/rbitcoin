@@ -1774,9 +1774,9 @@ impl ChainHub {
         )
     }
 
-    /// Core `TestBlockValidity` for a `getblocktemplate` proposal or an SV2
-    /// job: no PoW, no UTXO write. `Ok` is the block fees in sat; `Err` is
-    /// Core's reject string.
+    /// Core `TestBlockValidity` for a `getblocktemplate` proposal: no PoW, no
+    /// UTXO write. `Ok` is the block fees in sat; `Err` is Core's reject
+    /// string.
     pub fn check_block_proposal(&self, block: &Block) -> Result<u64, String> {
         check_block_proposal_with(
             &self.query,
@@ -6356,26 +6356,196 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The block proposal check shared by `getblocktemplate` proposal mode
-    /// and the SV2 template provider: a child of the tip passes, a block on
-    /// any other parent is `inconclusive-not-best-prevblk`.
+    /// One regtest node at height 101 checking block proposals, the Core
+    /// `TestBlockValidity` path behind `getblocktemplate` proposal mode.
+    /// Regtest coinbase maturity is 100, so a mature spend needs a 101-block
+    /// chain and no smaller N reaches one; that one boot is what runs this
+    /// test past the two-second budget, and it serves every beat. The
+    /// tip-child, coinbase-amount, immature-coinbase, and mature-spend beats
+    /// do not observe each other; they ride this hub rather than a shared
+    /// fixture because they only read the 101-block tip the mutating beats
+    /// then build on (the parent mined at 102, its child confirmed at 103,
+    /// that block invalidated), so a second setup would add store copies and
+    /// test names without a new observation.
+    /// A tip child passes; a block on any other
+    /// parent is `inconclusive-not-best-prevblk`. Core prices the coinbase
+    /// in ConnectBlock, after CheckBlock: a coinbase over subsidy + fees is
+    /// `bad-cb-amount` once the structure checks pass, and a structure
+    /// reject on the same block still wins. An immature coinbase is not a
+    /// fee source: spending this block's coinbase, or one still inside the
+    /// maturity window, is `bad-txns-premature-spend-of-coinbase` before
+    /// fees are summed, even when that spend would cover an overpaying
+    /// coinbase. `Ok` carries the block fees, so a template provider can
+    /// price the coinbase at exactly subsidy + fees. A fan-out parent is
+    /// decoded once per check, not once per child
+    /// (`TxTable::sample_reset_body_decodes`); output `i` carries a distinct
+    /// value so the fee total also pins vout indexing. Spentness is probed
+    /// per input: with vout 0 confirmed spent, a proposal whose first sight
+    /// of the parent is the unspent vout 1 still rejects a fresh spend of
+    /// vout 0 (a fresh tx, so Core's answer is the same reject and not
+    /// `bad-txns-BIP30`).
+    /// Parents resolve on the connected chain only: after the block that
+    /// confirmed `child(0)` is invalidated, a spend of its output is
+    /// `bad-txns-inputs-missingorspent` and the stale row is not decoded.
     #[test]
-    fn check_block_proposal_accepts_tip_child_and_rejects_other_parent() {
+    fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
         let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(101, op_true.clone(), vec![])
+            .unwrap();
+
         let block = hub
-            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .assemble_block_to_script(op_true.clone(), vec![])
             .unwrap();
         assert_eq!(
             hub.check_block_proposal(&block),
             Ok(0),
             "no fees in a coinbase-only block"
         );
-        let mut off_tip = block;
+        let mut off_tip = block.clone();
         off_tip.header.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
         assert_eq!(
             hub.check_block_proposal(&off_tip).unwrap_err(),
             "inconclusive-not-best-prevblk"
+        );
+
+        let mut fat_cb = block;
+        let cb = &mut fat_cb.txdata[0].output[0].value;
+        *cb = Amount::from_sat(cb.to_sat() + 1);
+        let root_for_fat_cb = fat_cb.compute_merkle_root().unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&fat_cb).unwrap_err(),
+            "bad-txnmrklroot",
+            "structure checks run before the coinbase is priced"
+        );
+        fat_cb.header.merkle_root = root_for_fat_cb;
+        assert_eq!(
+            hub.check_block_proposal(&fat_cb).unwrap_err(),
+            "bad-cb-amount"
+        );
+
+        let cb_txid = fat_cb.txdata[0].compute_txid();
+        fat_cb.txdata.push(spend_out(cb_txid, 0));
+        assert_eq!(
+            hub.check_block_proposal(&fat_cb).unwrap_err(),
+            "bad-txnmrklroot",
+            "structure checks run before the immature spend"
+        );
+        fat_cb.header.merkle_root = fat_cb.compute_merkle_root().unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&fat_cb).unwrap_err(),
+            "bad-txns-premature-spend-of-coinbase",
+            "a same-block coinbase spend must not inflate fees"
+        );
+        let tip_cb = hub
+            .query
+            .reconstruct_block_at_height(Height(101))
+            .unwrap()
+            .txdata[0]
+            .clone();
+        let tip_cb_value = tip_cb.output[0].value.to_sat();
+        let immature = spend_out(tip_cb.compute_txid(), tip_cb_value - 1_000);
+        let block = hub
+            .assemble_block_to_script(op_true.clone(), vec![immature])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-premature-spend-of-coinbase"
+        );
+        let over = spend_out(tip_cb.compute_txid(), tip_cb_value + 1);
+        let block = hub
+            .assemble_block_to_script(op_true.clone(), vec![over])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-premature-spend-of-coinbase",
+            "maturity is reported before bad-txns-in-belowout"
+        );
+
+        let spend = mature_spend_tx(&hub, 1);
+        let mut block = hub
+            .assemble_block_to_script(op_true.clone(), vec![spend])
+            .unwrap();
+        assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
+        let subsidy = rbitcoin_consensus::block_subsidy(102, &hub.params) as u64;
+        block.txdata[0].output[0].value = Amount::from_sat(subsidy + 10_000);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
+
+        let payout = 98_000_000u64;
+        let parent_value = |vout: u32| payout + 1_000 * u64::from(vout + 1);
+        let mut parent = mature_spend_tx(&hub, 1);
+        parent.output = (0..50)
+            .map(|vout| TxOut {
+                value: Amount::from_sat(parent_value(vout)),
+                script_pubkey: op_true.clone(),
+            })
+            .collect();
+        let parent_txid = parent.compute_txid();
+        hub.generate_to_script(1, op_true.clone(), vec![parent])
+            .unwrap();
+        let child_paying = |vout: u32, value: u64| Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: op_true.clone(),
+            }],
+        };
+        let child = |vout: u32| child_paying(vout, payout);
+        let block = hub
+            .assemble_block_to_script(op_true.clone(), (0..50).map(child).collect())
+            .unwrap();
+        let fees: u64 = (0..50).map(|vout| parent_value(vout) - payout).sum();
+        let store = hub.query.store();
+        let _ = store.txs.sample_reset_body_decodes();
+        assert_eq!(hub.check_block_proposal(&block), Ok(fees));
+        assert_eq!(
+            store.txs.sample_reset_body_decodes(),
+            1,
+            "one packed body decode per distinct parent; the spentness probes and the fk resolve decode nothing"
+        );
+
+        hub.generate_to_script(1, op_true.clone(), vec![child(0)])
+            .unwrap();
+        let respend = child_paying(0, payout - 1_000);
+        let block = hub
+            .assemble_block_to_script(op_true.clone(), vec![child(1), respend])
+            .unwrap();
+        let _ = store.txs.sample_reset_body_decodes();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-inputs-missingorspent",
+            "spentness is probed per input; the parent seen first through unspent vout 1 does not vouch for vout 0"
+        );
+        assert_eq!(store.txs.sample_reset_body_decodes(), 1);
+
+        let stale = hub.tip_hash().unwrap();
+        hub.invalidate_block(stale).unwrap();
+        assert_eq!(hub.tip_height(), Some(102));
+        let grandchild = spend_out(child(0).compute_txid(), payout - 1_000);
+        let block = hub
+            .assemble_block_to_script(op_true, vec![grandchild])
+            .unwrap();
+        let _ = store.txs.sample_reset_body_decodes();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-inputs-missingorspent",
+            "an output that exists only in a reorged-out block is not spendable"
+        );
+        assert_eq!(
+            store.txs.sample_reset_body_decodes(),
+            0,
+            "a row with no fence height is not decoded"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6454,190 +6624,6 @@ mod tests {
         assert_eq!(
             hub.check_block_proposal(&block).unwrap_err(),
             "bad-blk-sigops"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// Core prices the coinbase in ConnectBlock, after CheckBlock: a coinbase
-    /// over subsidy + fees is `bad-cb-amount` once the structure checks pass,
-    /// and a structure reject on the same block still wins.
-    #[test]
-    fn check_block_proposal_rejects_bad_cb_amount_after_structure() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let mut block = hub
-            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
-        let cb = &mut block.txdata[0].output[0].value;
-        *cb = Amount::from_sat(cb.to_sat() + 1);
-        let root_for_fat_cb = block.compute_merkle_root().unwrap();
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-txnmrklroot",
-            "structure checks run before the coinbase is priced"
-        );
-        block.header.merkle_root = root_for_fat_cb;
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-cb-amount"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// `Ok` carries the block fees, so a template provider can price the
-    /// coinbase: a coinbase at exactly subsidy + fees passes.
-    #[test]
-    fn check_block_proposal_returns_the_block_fees() {
-        let (dir, hub) = tmp_hub();
-        let op_true = ScriptBuf::from_bytes(vec![0x51]);
-        hub.generate_to_script(101, op_true.clone(), vec![])
-            .unwrap();
-        let spend = mature_spend_tx(&hub, 1);
-        let mut block = hub.assemble_block_to_script(op_true, vec![spend]).unwrap();
-        assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
-        let subsidy = rbitcoin_consensus::block_subsidy(102, &hub.params) as u64;
-        block.txdata[0].output[0].value = Amount::from_sat(subsidy + 10_000);
-        block.header.merkle_root = block.compute_merkle_root().unwrap();
-        assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// An immature coinbase is not a fee source. Spending this block's
-    /// coinbase, or one still inside the maturity window, is Core's
-    /// `bad-txns-premature-spend-of-coinbase` even when that spend would
-    /// otherwise cover an overpaying coinbase. A bad merkle root still wins.
-    #[test]
-    fn check_block_proposal_rejects_immature_coinbase_before_fees() {
-        let (dir, hub) = tmp_hub();
-        hub.ensure_genesis().unwrap();
-        let op_true = ScriptBuf::from_bytes(vec![0x51]);
-        let mut block = hub
-            .assemble_block_to_script(op_true.clone(), vec![])
-            .unwrap();
-        let subsidy = block.txdata[0].output[0].value.to_sat();
-        block.txdata[0].output[0].value = Amount::from_sat(subsidy + 1);
-        let cb_txid = block.txdata[0].compute_txid();
-        block.txdata.push(spend_out(cb_txid, 0));
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-txnmrklroot",
-            "structure checks run before the immature spend"
-        );
-        block.header.merkle_root = block.compute_merkle_root().unwrap();
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-txns-premature-spend-of-coinbase",
-            "a same-block coinbase spend must not inflate fees"
-        );
-
-        hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
-        let prev = hub
-            .query
-            .reconstruct_block_at_height(Height(1))
-            .unwrap()
-            .txdata[0]
-            .clone();
-        let prev_value = prev.output[0].value.to_sat();
-        let immature = spend_out(prev.compute_txid(), prev_value - 1_000);
-        let block = hub
-            .assemble_block_to_script(op_true.clone(), vec![immature])
-            .unwrap();
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-txns-premature-spend-of-coinbase"
-        );
-        let over = spend_out(prev.compute_txid(), prev_value + 1);
-        let block = hub.assemble_block_to_script(op_true, vec![over]).unwrap();
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-txns-premature-spend-of-coinbase",
-            "maturity is reported before bad-txns-in-belowout"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A body that is still in the tx index after its block leaves the best
-    /// chain has no fence height. That is not a mature input.
-    #[test]
-    fn check_block_proposal_rejects_unconnected_prevout() {
-        let (dir, hub) = tmp_hub();
-        let op_true = ScriptBuf::from_bytes(vec![0x51]);
-        hub.generate_to_script(1, op_true, vec![]).unwrap();
-        let prev = hub
-            .query
-            .reconstruct_block_at_height(Height(1))
-            .unwrap()
-            .txdata[0]
-            .clone();
-        let value = prev.output[0].value.to_sat();
-        hub.rewind_to_height(0).unwrap();
-        let spend = spend_out(prev.compute_txid(), value - 1_000);
-        let block = hub
-            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x52]), vec![spend])
-            .unwrap();
-        let store = hub.query.store();
-        let _ = store.txs.sample_reset_body_decodes();
-        assert_eq!(
-            hub.check_block_proposal(&block).unwrap_err(),
-            "bad-txns-inputs-missingorspent"
-        );
-        assert_eq!(
-            store.txs.sample_reset_body_decodes(),
-            0,
-            "a row with no fence height is not decoded"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// A fan-out parent is decoded once per proposal check, not once per
-    /// child. Output `i` carries a distinct value so the fee total also
-    /// pins vout indexing.
-    #[test]
-    fn check_block_proposal_decodes_each_parent_once() {
-        let (dir, hub) = tmp_hub();
-        let op_true = ScriptBuf::from_bytes(vec![0x51]);
-        hub.generate_to_script(101, op_true.clone(), vec![])
-            .unwrap();
-        let payout = 98_000_000u64;
-        let parent_value = |vout: u32| payout + 1_000 * u64::from(vout + 1);
-        let mut parent = mature_spend_tx(&hub, 1);
-        parent.output = (0..50)
-            .map(|vout| TxOut {
-                value: Amount::from_sat(parent_value(vout)),
-                script_pubkey: op_true.clone(),
-            })
-            .collect();
-        let parent_txid = parent.compute_txid();
-        hub.generate_to_script(1, op_true.clone(), vec![parent])
-            .unwrap();
-        let children = (0..50)
-            .map(|vout| Transaction {
-                version: TxVersion::TWO,
-                lock_time: LockTime::ZERO,
-                input: vec![TxIn {
-                    previous_output: OutPoint {
-                        txid: parent_txid,
-                        vout,
-                    },
-                    script_sig: ScriptBuf::new(),
-                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                    witness: Witness::new(),
-                }],
-                output: vec![TxOut {
-                    value: Amount::from_sat(payout),
-                    script_pubkey: op_true.clone(),
-                }],
-            })
-            .collect();
-        let block = hub.assemble_block_to_script(op_true, children).unwrap();
-        let fees: u64 = (0..50).map(|vout| parent_value(vout) - payout).sum();
-        let store = hub.query.store();
-        let _ = store.txs.sample_reset_body_decodes();
-        assert_eq!(hub.check_block_proposal(&block), Ok(fees));
-        assert_eq!(
-            store.txs.sample_reset_body_decodes(),
-            1,
-            "one packed body decode per distinct parent; the spentness probes and the fk resolve decode nothing"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
