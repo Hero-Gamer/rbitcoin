@@ -351,6 +351,22 @@ pub struct ChainTipInfo {
     pub status: &'static str,
 }
 
+/// Equal total work prefers the precious tip, then the earlier held tip.
+/// A precious hash missing from the hold map has sequence `u64::MAX`; the
+/// precious bit wins before that comparison.
+fn held_branch_beats(
+    candidate: Work,
+    candidate_precious: bool,
+    candidate_seq: u64,
+    incumbent: Work,
+    incumbent_precious: bool,
+    incumbent_seq: u64,
+) -> bool {
+    let tie = !work_better(incumbent, candidate);
+    work_better(candidate, incumbent)
+        || (tie && !incumbent_precious && (candidate_precious || candidate_seq < incumbent_seq))
+}
+
 impl ChainHub {
     pub fn new(query: Query, params: ChainParams, milestone: Milestone) -> Self {
         let (tip_tx, _) = broadcast::channel(64);
@@ -1937,17 +1953,19 @@ impl ChainHub {
     }
 
     /// After invalidate, activate the remaining fork (held or archive) with
-    /// the most total chain work. Equal work keeps the first-seen held tip.
+    /// the most total chain work. Equal work prefers precious, then the
+    /// first-seen held tip.
     fn try_apply_after_invalidate(&self) -> Result<Option<AcceptOutcome>, NetError> {
         let inv = self.invalidated.set.read().unwrap().clone();
+        let precious = *self.precious.read().unwrap();
         let mut starts: Vec<BlockHash> = self.fork_tips.read().unwrap().iter().copied().collect();
         starts.extend(self.held_bodies.read().unwrap().keys());
-        if let Some(p) = *self.precious.read().unwrap() {
+        if let Some(p) = precious {
             if !starts.contains(&p) {
                 starts.push(p);
             }
         }
-        let mut best: Option<(bitcoin::Work, u64, Vec<Block>)> = None;
+        let mut best: Option<(bitcoin::Work, bool, u64, Vec<Block>)> = None;
         for start in starts {
             if inv.contains(&start) {
                 continue;
@@ -1962,18 +1980,17 @@ impl ChainHub {
             let Ok(w) = self.branch_chain_work(&branch) else {
                 continue;
             };
+            let is_p = Some(tip) == precious;
             let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, bseq, _)) => {
-                    work_better(w, *bw) || (w.to_be_bytes() == bw.to_be_bytes() && seq < *bseq)
-                }
+                Some((bw, was_p, bseq, _)) => held_branch_beats(w, is_p, seq, *bw, *was_p, *bseq),
             };
             if take {
-                best = Some((w, seq, branch));
+                best = Some((w, is_p, seq, branch));
             }
         }
-        let Some((_, _, branch)) = best else {
+        let Some((_, _, _, branch)) = best else {
             return Ok(None);
         };
         match self.accept_branch_inner(&branch) {
@@ -2825,10 +2842,7 @@ impl ChainHub {
             let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, was_p, bseq, _)) => {
-                    let tie = !work_better(*bw, w);
-                    work_better(w, *bw) || (tie && !*was_p && (is_p || seq < *bseq))
-                }
+                Some((bw, was_p, bseq, _)) => held_branch_beats(w, is_p, seq, *bw, *was_p, *bseq),
             };
             if take {
                 best = Some((w, is_p, seq, branch));

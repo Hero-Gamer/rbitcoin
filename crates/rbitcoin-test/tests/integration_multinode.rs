@@ -2509,6 +2509,65 @@ fn pin_precious_held_chaintips(hub: &rbitcoin_net::ChainHub, ext: bitcoin::Block
     assert!(err.to_string().contains("Block not found"), "{err}");
     let err = hub.reconsider_block(miss).unwrap_err();
     assert!(err.to_string().contains("Block not found"), "{err}");
+
+    // Tip has one more block, so the held siblings are weaker and precious
+    // does not activate yet. After that extra block is invalidated, more work
+    // still beats precious, and precious then beats the earlier equal sibling.
+    let top = mine_regtest_block(
+        sibling.block_hash(),
+        sibling.header.time.saturating_add(600),
+        tip_h + 1,
+        vec![],
+    );
+    match hub.accept_block(top.clone()).unwrap() {
+        AcceptOutcome::Accepted { height } => assert_eq!(height, tip_h + 1),
+        other => panic!("expected the extra tip block, got {other:?}"),
+    }
+    let later = mine_regtest_block(
+        p_prev_hash,
+        p_prev.timestamp.saturating_add(2_500),
+        tip_h,
+        vec![],
+    );
+    assert!(matches!(
+        hub.accept_received_block(later.clone()).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    ));
+    hub.precious_block(later.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        top.block_hash(),
+        "precious of less work must not activate"
+    );
+    let heavy_1 = mine_regtest_block(
+        p_prev_hash,
+        p_prev.timestamp.saturating_add(2_600),
+        tip_h,
+        vec![],
+    );
+    let heavy_2 = mine_regtest_block(
+        heavy_1.block_hash(),
+        heavy_1.header.time.saturating_add(600),
+        tip_h + 1,
+        vec![],
+    );
+    for b in [&heavy_1, &heavy_2] {
+        hub.accept_received_block(b.clone())
+            .unwrap_or_else(|e| panic!("heavier {}: {e}", b.block_hash()));
+    }
+    assert_eq!(hub.tip_hash().unwrap(), top.block_hash());
+    hub.invalidate_block(top.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        heavy_2.block_hash(),
+        "more work must beat precious after invalidate"
+    );
+    hub.invalidate_block(heavy_1.block_hash()).unwrap();
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        later.block_hash(),
+        "precious equal-work held tip must win after invalidate"
+    );
 }
 
 /// A lone side block is not a tip extend, a weaker branch is ignored, and an
