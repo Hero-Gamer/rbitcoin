@@ -1550,9 +1550,29 @@ fn chain_ops_proposal_spends(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     dispatch(ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
     dispatch(ctx, "generate", vec![json!(1)]).unwrap();
     assert_eq!(
-        propose(ctx, &proposal_on_tip(ctx, vec![spend])),
+        propose(ctx, &proposal_on_tip(ctx, vec![spend.clone()])),
         "bad-txns-inputs-missingorspent",
         "a coin a block spent is gone from the proposal view"
+    );
+
+    // Each output is MAX_MONEY, so CheckBlock's per-output gate passes, but
+    // the sum does not fit in u64. Proposal mode must not return success.
+    use bitcoin::TxOut;
+    const MAX_MONEY: u64 = 21_000_000 * 100_000_000;
+    let mut overflow = spend.clone();
+    overflow.output = (0..8785)
+        .map(|_| TxOut {
+            value: Amount::from_sat(MAX_MONEY),
+            script_pubkey: true_spk(),
+        })
+        .collect();
+    let got = propose(ctx, &proposal_on_tip(ctx, vec![overflow]));
+    let reason = got.as_str().unwrap_or("");
+    assert!(
+        reason == "bad-txns-inputvalues-outofrange"
+            || reason == "bad-txns-txouttotal-toolarge"
+            || reason == "bad-txns-fee-outofrange",
+        "overflowing output sum must not validate: {got}"
     );
 }
 

@@ -3210,11 +3210,14 @@ pub fn check_block_proposal_with(
     }
     let fees = proposal_connect(query, block, height, mtp, params.coinbase_maturity())?;
     let subsidy = rbitcoin_consensus::block_subsidy(height, params) as u64;
-    let coinbase_out = block.txdata[0]
-        .output
-        .iter()
-        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
-    if coinbase_out > subsidy.saturating_add(fees) {
+    let mut coinbase_out = 0u64;
+    for o in &block.txdata[0].output {
+        coinbase_out = coinbase_out
+            .checked_add(o.value.to_sat())
+            .ok_or("bad-txns-txouttotal-toolarge")?;
+    }
+    let allowed = subsidy.checked_add(fees).ok_or("bad-txns-fee-outofrange")?;
+    if coinbase_out > allowed {
         return Err("bad-cb-amount".into());
     }
     Ok(fees)
@@ -3280,13 +3283,22 @@ fn proposal_connect(
             } else {
                 return Err("bad-txns-inputs-missingorspent".into());
             };
-            in_val = in_val.saturating_add(txout.value.to_sat());
+            in_val = in_val
+                .checked_add(txout.value.to_sat())
+                .ok_or("bad-txns-inputvalues-outofrange")?;
         }
-        let out_val: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let mut out_val = 0u64;
+        for o in &tx.output {
+            out_val = out_val
+                .checked_add(o.value.to_sat())
+                .ok_or("bad-txns-txouttotal-toolarge")?;
+        }
         if out_val > in_val {
             return Err("bad-txns-in-belowout".into());
         }
-        fees = fees.saturating_add(in_val - out_val);
+        fees = fees
+            .checked_add(in_val - out_val)
+            .ok_or("bad-txns-fee-outofrange")?;
         let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
             created.insert(
