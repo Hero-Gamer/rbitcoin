@@ -238,6 +238,10 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .store(tx_has_bip68_time_lock(tx), Ordering::Relaxed);
     }
 
+    fn utxo_view_stamp(&self) -> Option<u64> {
+        self.query.store().utxo_view_stamp()
+    }
+
     fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
         match self.chain_prevout(op) {
             ChainPrevout::Unspent(c) => Some(c),
@@ -682,6 +686,14 @@ pub struct SubmitPackageRow {
     /// Remainder whose modified fees make up this tx's effective feerate.
     /// `None` when the tx was admitted on its own.
     pub fee_with: Option<Vec<Txid>>,
+}
+
+/// Confirmed coins sampled before the write lock. `stamp` is `None` when a
+/// confirm or disconnect is already changing spentness.
+struct SampledCoins {
+    stamp: Option<u64>,
+    creators: Vec<bool>,
+    coins: Vec<Option<rbitcoin_mempool::Coin>>,
 }
 
 impl MempoolHub {
@@ -1787,10 +1799,88 @@ impl MempoolHub {
         Ok(prep)
     }
 
-    /// Confirmed coins are read again under the write lock. A spend that lands
-    /// while scripts run must not commit from the prepare snapshot. An input
-    /// whose creator is still in the graph keeps its mempool parent
-    /// (`chain_coins` stays `None`).
+    /// Confirmed coins are read again before commit. A spend that lands while
+    /// scripts run must not commit from the prepare snapshot. An input whose
+    /// creator is still in the graph keeps its mempool parent (`chain_coins`
+    /// stays `None`). The read stays off the write lock when the UTXO view
+    /// stamp and the creator set are unchanged.
+    fn sample_chain_coins(&self, tx: &Transaction, utxo: &impl UtxoProvider) -> SampledCoins {
+        let Some(stamp) = utxo.utxo_view_stamp() else {
+            return SampledCoins {
+                stamp: None,
+                creators: Vec::new(),
+                coins: Vec::new(),
+            };
+        };
+        let creators: Vec<bool> = {
+            let g = self.lock_read();
+            tx.input
+                .iter()
+                .map(|inp| g.graph.creator(&inp.previous_output).is_some())
+                .collect()
+        };
+        let coins = tx
+            .input
+            .iter()
+            .zip(&creators)
+            .map(|(inp, had_creator)| {
+                if *had_creator {
+                    None
+                } else {
+                    utxo.get_coin(&inp.previous_output)
+                }
+            })
+            .collect();
+        SampledCoins {
+            stamp: Some(stamp),
+            creators,
+            coins,
+        }
+    }
+
+    fn sampled_coins_fresh(
+        g: &ActiveMempool,
+        tx: &Transaction,
+        utxo: &impl UtxoProvider,
+        sample: &SampledCoins,
+    ) -> bool {
+        let Some(stamp) = sample.stamp else {
+            return false;
+        };
+        if utxo.utxo_view_stamp() != Some(stamp) {
+            return false;
+        }
+        tx.input
+            .iter()
+            .zip(&sample.creators)
+            .all(|(inp, had)| g.graph.creator(&inp.previous_output).is_some() == *had)
+    }
+
+    fn apply_sampled_coins(
+        tx: &Transaction,
+        prep: &mut rbitcoin_mempool::PreparedAdmit,
+        sample: &SampledCoins,
+    ) -> Result<(), AcceptError> {
+        for (i, inp) in tx.input.iter().enumerate() {
+            if sample.creators.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let op = inp.previous_output;
+            let Some(coin) = sample.coins.get(i).and_then(|c| c.clone()) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(prev) = prep.prevouts.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(slot) = prep.chain_coins.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            *prev = coin.txout.clone();
+            *slot = Some(coin);
+        }
+        Ok(())
+    }
+
     fn recheck_chain_coins(
         g: &ActiveMempool,
         tx: &Transaction,
@@ -1825,8 +1915,14 @@ impl MempoolHub {
         mut prep: rbitcoin_mempool::PreparedAdmit,
         utxo: &impl UtxoProvider,
         defer_trim: bool,
+        sample: &SampledCoins,
     ) -> (Result<AcceptResult, AcceptError>, Vec<Txid>, Vec<TxOut>) {
-        if let Err(e) = Self::recheck_chain_coins(g, tx, &mut prep, utxo) {
+        let rechecked = if Self::sampled_coins_fresh(g, tx, utxo, sample) {
+            Self::apply_sampled_coins(tx, &mut prep, sample)
+        } else {
+            Self::recheck_chain_coins(g, tx, &mut prep, utxo)
+        };
+        if let Err(e) = rechecked {
             return (Err(e), Vec::new(), Vec::new());
         }
         let prevouts = prep.prevouts.clone();
@@ -1912,12 +2008,13 @@ impl MempoolHub {
             }
         };
 
+        let sample = self.sample_chain_coins(tx, utxo);
         let (result, failed_evict, prevouts) = {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
             let (r, failed_evict, prevouts) =
-                Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim);
+                Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim, &sample);
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             (r, failed_evict, prevouts)
@@ -1970,9 +2067,10 @@ impl MempoolHub {
         // Parent is live until the child commits (or we roll it back). A
         // concurrent spender of the parent that lands in this window survives
         // `remove_txid(parent)` if the child then fails.
+        let sample_p = self.sample_chain_coins(&parent, utxo);
         let (parent_commit, parent_failed, prevouts_p) = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, false)
+            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, false, &sample_p)
         };
         let parent_res = match parent_commit {
             Ok(r) => r,
@@ -1996,9 +2094,10 @@ impl MempoolHub {
                 return None;
             }
         };
+        let sample_c = self.sample_chain_coins(child, utxo);
         let (child_res, child_failed, prevouts_c) = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, child, prep_c, utxo, false)
+            Self::commit_rechecked(&mut g, child, prep_c, utxo, false, &sample_c)
         };
         self.meter_accept_stages(lock_us, stages);
         match child_res {
@@ -2477,11 +2576,12 @@ impl MempoolHub {
                     return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             };
+            let sample = self.sample_chain_coins(tx, &utxo);
             let t_lock = Instant::now();
             let (commit, failed_evict, prev) = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
-                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, false);
+                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, false, &sample);
                 stages = g.last_accept_stages;
                 committed
             };
@@ -2828,9 +2928,10 @@ impl MempoolHub {
             }
             Err(e) => return Err(e),
         };
+        let sample = self.sample_chain_coins(tx, utxo);
         let (result, failed, prevouts) = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, tx, prep, utxo, false)
+            Self::commit_rechecked(&mut g, tx, prep, utxo, false, &sample)
         };
         match result {
             Ok(r) => self.unindex_evicted(&r.evicted),
@@ -4888,7 +4989,7 @@ mod tests {
         let s = hub.sample_reset_perf();
         assert_eq!(
             s.get_coin, 2,
-            "prepare and the commit recheck each resolve the coin once (got {})",
+            "prepare and the pre-lock recheck each resolve the coin once (got {})",
             s.get_coin
         );
         assert_eq!(
@@ -7187,8 +7288,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    /// Prepare resolves coins off the write lock. The commit re-reads each
-    /// confirmed input once while that lock is held.
+    /// Prepare resolves coins off the write lock. A stable confirmed view
+    /// re-reads those coins before the commit takes the lock.
     #[test]
     fn accept_rechecks_confirmed_input_under_write() {
         let (_store, owned_q, owned_cbs) = pad_cbs(3);
@@ -7206,6 +7307,9 @@ mod tests {
         impl UtxoProvider for ProbeUtxo<'_> {
             fn note_spender(&self, tx: &Transaction) {
                 self.inner.note_spender(tx);
+            }
+            fn utxo_view_stamp(&self) -> Option<u64> {
+                self.inner.utxo_view_stamp()
             }
             fn get_coin(&self, op: &OutPoint) -> Option<rbitcoin_mempool::Coin> {
                 let h = Arc::clone(&self.hub);
@@ -7233,8 +7337,18 @@ mod tests {
             .expect("accept");
         assert_eq!(
             hits.load(Ordering::Relaxed),
+            0,
+            "a stable UTXO view re-reads the confirmed input off the write lock"
+        );
+        hits.store(0, Ordering::Relaxed);
+        let held = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x52]));
+        let _view = q.store().hold_utxo_view();
+        hub.accept_with_utxo(&held, &probe, None, false)
+            .expect("accept while the view is held");
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
             1,
-            "commit re-reads the confirmed input once under the write lock"
+            "a held UTXO view re-reads the confirmed input under the write lock"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
     }

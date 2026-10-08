@@ -289,12 +289,27 @@ pub struct Store {
     /// Disconnects since process start. A checkpoint publishes only when this
     /// word is unchanged across its `sync_data` window.
     spend_reorg_gen: std::sync::atomic::AtomicU64,
+    /// Even while confirmed spentness is stable. Odd while a confirm annotate
+    /// or a disconnect is publishing a change.
+    utxo_view: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
     txid_get_many_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
     spent_range_batch_log: std::sync::Mutex<Vec<u64>>,
+}
+
+/// Holds [`Store::utxo_view`] odd until drop.
+pub struct UtxoViewGuard<'a> {
+    view: &'a std::sync::atomic::AtomicU64,
+}
+
+impl Drop for UtxoViewGuard<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        self.view.fetch_add(1, Ordering::Release);
+    }
 }
 
 /// How txid → Class A fk picks among rows with the same txid.
@@ -379,6 +394,7 @@ impl Store {
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
+            utxo_view: std::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
@@ -443,6 +459,7 @@ impl Store {
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
+            utxo_view: std::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
@@ -1784,6 +1801,23 @@ impl Store {
                 return;
             }
         }
+    }
+
+    /// Odd for the guard's life. Callers who sample an even stamp and read
+    /// coins can trust that read only when the stamp is unchanged afterward.
+    pub fn hold_utxo_view(&self) -> UtxoViewGuard<'_> {
+        use std::sync::atomic::Ordering;
+        self.utxo_view.fetch_add(1, Ordering::Release);
+        UtxoViewGuard {
+            view: &self.utxo_view,
+        }
+    }
+
+    /// `Some` even generation, or `None` while [`Self::hold_utxo_view`] is held.
+    pub fn utxo_view_stamp(&self) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let v = self.utxo_view.load(Ordering::Acquire);
+        (v & 1 == 0).then_some(v)
     }
 
     pub fn spend_snapshot_height(&self) -> Option<u32> {

@@ -112,7 +112,10 @@ impl Query {
         if abs_edges.is_empty() {
             return Ok(());
         }
-        let cold = self.store.put_spend_batch_by_abs_meta(&abs_edges)?;
+        let cold = {
+            let _utxo_view = self.store.hold_utxo_view();
+            self.store.put_spend_batch_by_abs_meta(&abs_edges)?
+        };
         if !cold.is_empty() {
             return Err(StoreError::Corrupt(
                 "invariant: confirm_block spend annotate abs cold",
@@ -764,6 +767,7 @@ impl Query {
     }
 
     fn disconnect_tip_with(&self, drop_pending: bool) -> Result<(), QueryError> {
+        let _utxo_view = self.store.hold_utxo_view();
         let height = self
             .tip_height()
             .ok_or(StoreError::Corrupt("no tip to disconnect"))?;

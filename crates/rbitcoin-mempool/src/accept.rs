@@ -77,6 +77,12 @@ pub trait UtxoProvider {
 
     /// Spender about to resolve coins (BIP68 time-lock MTP only when needed).
     fn note_spender(&self, _tx: &Transaction) {}
+
+    /// Even stamp of the confirmed UTXO view. `None` while a confirm or
+    /// disconnect is publishing spentness. Map and test providers stay at 0.
+    fn utxo_view_stamp(&self) -> Option<u64> {
+        Some(0)
+    }
 }
 
 /// Confirmed-chain lookup for one prevout.
