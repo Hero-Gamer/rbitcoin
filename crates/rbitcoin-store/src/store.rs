@@ -1873,22 +1873,57 @@ impl Store {
         self.checkpoint_spend_through_between(height, |_| {})
     }
 
+    /// Sample the disconnect generation, then the snapshot height, then sync.
+    ///
+    /// A disconnect between those two reads must not publish the height that
+    /// was current before it, even when the replacement is annotated during
+    /// the sync.
+    pub fn checkpoint_observed_spend(&self) -> Result<(), StoreError> {
+        self.checkpoint_observed_spend_gap(|_| {}, |_| {})
+    }
+
+    /// [`Self::checkpoint_observed_spend`] with hooks around the two reads
+    /// and the sync. Test-only callers live in [`crate::testutil`].
+    pub(crate) fn checkpoint_observed_spend_gap(
+        &self,
+        after_first_read: impl FnOnce(&Self),
+        during_sync: impl FnOnce(&Self),
+    ) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        let gen = self.spend_reorg_gen.load(Ordering::Acquire);
+        after_first_read(self);
+        let Some(height) = self.spend_snapshot_height() else {
+            return Ok(());
+        };
+        self.sync_spend_checkpoint(height, gen, during_sync)
+    }
+
     /// [`Self::checkpoint_spend_through`] with `between` invoked after
     /// `sync_data` and before the marker publish.
     ///
     /// Appends above `height` do not bump the disconnect generation, so a
     /// block connected in `between` still allows the snapshot to publish.
     /// A disconnect in `between` does not.
-    pub fn checkpoint_spend_through_between(
+    pub(crate) fn checkpoint_spend_through_between(
         &self,
         height: u32,
         between: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         let gen = self.spend_reorg_gen.load(Ordering::Acquire);
+        self.sync_spend_checkpoint(height, gen, between)
+    }
+
+    fn sync_spend_checkpoint(
+        &self,
+        height: u32,
+        gen: u64,
+        during_sync: impl FnOnce(&Self),
+    ) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
-        between(self);
+        during_sync(self);
         if self.spend_reorg_gen.load(Ordering::Acquire) != gen {
             return Ok(());
         }

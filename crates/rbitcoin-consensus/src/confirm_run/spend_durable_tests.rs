@@ -810,6 +810,46 @@ fn chain_at_height(
 }
 
 #[test]
+fn checkpoint_disconnect_before_gen_sample_does_not_publish() {
+    let (dir, q) = chain_at_height("spend-gen-gap", 2);
+    q.store().checkpoint_spend_through(1).unwrap();
+    let parent = q.header_at_height(Height(1)).unwrap().unwrap().1;
+    let replacement = mine(
+        bitcoin::BlockHash::from_byte_array(parent.hash),
+        parent.timestamp + 600,
+        2,
+        Vec::new(),
+    );
+    let q = std::sync::Arc::new(q);
+    let on_disconnect = std::sync::Arc::clone(&q);
+    let on_sync = std::sync::Arc::clone(&q);
+    rbitcoin_store::testutil::checkpoint_observed_spend_gap(
+        q.store(),
+        move |_store| {
+            on_disconnect.disconnect_tip().unwrap();
+        },
+        move |_store| {
+            accept_and_connect_block(
+                &on_sync,
+                &ChainParams::regtest(),
+                Height(2),
+                &replacement,
+                Milestone::NONE,
+            )
+            .unwrap();
+        },
+    )
+    .unwrap();
+    let (ann, durable) = marker_heights(q.store().path()).unwrap();
+    assert_eq!(
+        ann, 1,
+        "a disconnect before the generation sample must not publish the replacement"
+    );
+    assert_eq!(durable, 1);
+    let _ = dir;
+}
+
+#[test]
 fn checkpoint_disconnect_inside_sync_does_not_publish() {
     let (dir, q) = chain_at_height("spend-gen-reorg", 2);
     q.store().checkpoint_spend_through(1).unwrap();
@@ -822,19 +862,18 @@ fn checkpoint_disconnect_inside_sync_does_not_publish() {
     );
     let q = std::sync::Arc::new(q);
     let during = std::sync::Arc::clone(&q);
-    q.store()
-        .checkpoint_spend_through_between(2, move |_store| {
-            during.disconnect_tip().unwrap();
-            accept_and_connect_block(
-                &during,
-                &ChainParams::regtest(),
-                Height(2),
-                &replacement,
-                Milestone::NONE,
-            )
-            .unwrap();
-        })
+    rbitcoin_store::testutil::checkpoint_spend_through_between(q.store(), 2, move |_store| {
+        during.disconnect_tip().unwrap();
+        accept_and_connect_block(
+            &during,
+            &ChainParams::regtest(),
+            Height(2),
+            &replacement,
+            Milestone::NONE,
+        )
         .unwrap();
+    })
+    .unwrap();
     let (ann, durable) = marker_heights(q.store().path()).unwrap();
     assert_eq!(ann, 1, "a reorg inside the sync window must not publish 2");
     assert_eq!(durable, 1);
@@ -855,18 +894,17 @@ fn checkpoint_append_above_snapshot_still_publishes() {
     );
     let q = std::sync::Arc::new(q);
     let during = std::sync::Arc::clone(&q);
-    q.store()
-        .checkpoint_spend_through_between(2, move |_store| {
-            accept_and_connect_block(
-                &during,
-                &ChainParams::regtest(),
-                Height(3),
-                &next,
-                Milestone::NONE,
-            )
-            .unwrap();
-        })
+    rbitcoin_store::testutil::checkpoint_spend_through_between(q.store(), 2, move |_store| {
+        accept_and_connect_block(
+            &during,
+            &ChainParams::regtest(),
+            Height(3),
+            &next,
+            Milestone::NONE,
+        )
         .unwrap();
+    })
+    .unwrap();
     let (ann, durable) = marker_heights(q.store().path()).unwrap();
     assert_eq!(ann, 2);
     assert_eq!(durable, 2);
