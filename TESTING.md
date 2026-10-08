@@ -44,7 +44,7 @@ When adding or folding a pin:
 |----|--------|
 | Extend an existing [catalog](#scenario-catalog) journey (same `/tmp` pad, more asserts) | A new skinny scenario that remine-pads the same chain |
 | Fold a twin unit once the journey hits the same shipped path | Twin unit + scenario for the same reject string |
-| Delete a lower test only in a commit where a surface journey already hits those lines, so the 92% ratio holds. When no surface can hit the lines, delete the production branch and the test that only painted it in that same commit | A new small test for a path a peer, client, or operator can already hit, or a private-helper test written to turn coverage or CRAP green. Handshake **format** needles, `decode_rpc_subset`, and BIP324 encode vectors stay only until the live v2 journey observes those bytes |
+| Delete a lower test only in a commit where a surface journey already hits those lines, so the 93% ratio holds. When no surface can hit the lines, delete the production branch and the test that only painted it in that same commit | A new small test for a path a peer, client, or operator can already hit, or a private-helper test written to turn coverage or CRAP green. Handshake **format** needles, `decode_rpc_subset`, and BIP324 encode vectors stay only until the live v2 journey observes those bytes |
 | Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
 | New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` |
 
@@ -199,7 +199,7 @@ absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 
 | Metric | Required |
 |--------|----------|
-| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **≥ 92%** (unrounded `LH*100 >= LF*92`). No never-falls ratchet — llvm-cov hit counts jitter tens of lines on the same tree. |
+| Line coverage | Production LCOV `LH`/`LF` from `./scripts/coverage.sh` **≥ 93%** (unrounded `LH*100 >= LF*93`). No never-falls ratchet — llvm-cov hit counts jitter tens of lines on the same tree. |
 | Branch coverage | **≥ 90%** when measured on nightly with `--branch`; on stable, region-partial lines in the text report may remain — still close large gaps via scenarios |
 
 Test modules (`*_tests.rs`, `/tests/`, `testutil.rs`, crate `rbitcoin-test`)
@@ -287,7 +287,7 @@ counts that line.
 5. The narrow pure-result case in [True journeys](#true-journeys): one unit
    on that shipped function, reason in the test. A reopened store that can
    show the result is case 3.
-6. Stop when the ratio is **≥ 92%**. Do not add a private-helper test to
+6. Stop when the ratio is **≥ 93%**. Do not add a private-helper test to
    get there.
 
 ## Structural lints, CRAP, Miri, mutants
@@ -304,7 +304,7 @@ matches scalar in default tests). Owner: [`docs/quality.md`](./docs/quality.md).
 |------|------------|----|
 | **ast-grep** | `./scripts/ast-grep.sh` (needs `ast-grep` on `PATH`; `nix-shell` / `nix develop` provide it). Fixture self-test: `./scripts/ast-grep.test.sh` | Step in required job `qc` |
 | **cargo-crap** | After LCOV, `./scripts/coverage.sh` calls `./scripts/coverage-crap.sh` (skip if `cargo-crap` missing). `--fail-above --threshold 30`; `.cargo-crap.toml` allowlists today's production CRAP>30 functions (remove a name when it scores ≤30). A new failure is answered by deleting branches until one path remains, or by extending the catalog journey that owns the feature so those branches run. Allowlist additions follow [`docs/code-shape.md`](docs/code-shape.md): do not split a Core-faithful opcode loop or an io_uring machine to beat a score. A test whose only effect is to change the CRAP input is not the fix. Dry-run: `CRAP_DRY_RUN=1 ./scripts/coverage-crap.sh`. Self-test: `./scripts/coverage-crap.test.sh` | Rides required `coverage`. No `--fail-regression` (llvm-cov coverage % jitters per function) |
-| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 92% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
+| **coverage ignore / badge** | `./scripts/coverage.test.sh` (filename ignore, Tier A IBD not skipped, 93% floor, Shields JSON). Publish dry-run: `BADGE_DRY_RUN=1 ./scripts/publish-coverage-badge.sh` | `test` job self-test; `coverage` job writes `coverage/badge.json` and, on green `master`, pushes `badges/coverage.json` |
 | **Miri** | `./scripts/miri.sh` → `cargo +nightly miri test -p rbitcoin-primitives`. Dry-run: `MIRI_DRY_RUN=1 ./scripts/miri.sh`. Self-test: `./scripts/miri.test.sh` | Nightly `miri.yml` (not required). Never `--workspace` |
 | **cargo-mutants** | Nightly, not a PR check. `./scripts/mutants-nightly.sh` lists `--workspace` mutants, runs new diff lines first, then walks a cursor through the rest. `rbitcoin-bench` is excluded (`.cargo/mutants.toml` and `--exclude` on both invocations; CLI replaces the config glob). `#[mutants::skip]` on an expression is the won't-test list; those mutants are omitted, not `MISSED`. Each mutant uses `--test-workspace=true` so a higher journey counts, `--baseline=skip`, `-j 1`, test binaries on tmpfs (runner above; the mutants copy stays on disk), 20 minute mutant timeout, 8 hour budget across two jobs of 4 hours (a hosted job dies at 6). While both the new queue and the backlog have mutants, a job starts new batches only until half of its own budget has elapsed, then walks the backlog. Time the new queue does not use goes to the backlog. The second job resumes the cursor and does not open another new window after that half is used. An empty side does not block the other. Cursor and `MISSED` lines are pushed to the `mutants-state` branch; that branch wins over the `mutants-cursor` artifact, which is still uploaded and expires after 14 days. Resume continues at the saved backlog mutant name, or at the saved index modulo the current backlog length when that name is gone. A failed push fails the run. `MISSED` is uploaded and does not fail the run. Each invocation passes `--file` for one source file and at most `MUTANTS_BATCH` queued names from that file (default 200). cargo-mutants 27.1.0 emits `..` struct-field deletes without applying `--re`; one file keeps that repeat inside the file under test instead of retesting every such delete in the workspace on every batch. The miss list is `missed.txt` on the `mutants-state` branch. | `mutants.yml` daily `47 0 * * *` (17:47 Pacific during PDT) and `workflow_dispatch`. Each job timeout 270 minutes. |
 
