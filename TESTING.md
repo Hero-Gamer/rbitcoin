@@ -185,7 +185,7 @@ test bytes are RAM.
 
 ### Test size contract
 
-Size by resource (Small/Medium/Large) is defined in [`docs/test-size.md`](docs/test-size.md) — that file owns the contract by what the test does, not which helper it calls. `TESTING.md` owns only the time budgets (≤3min warm) and points here. Small = pure/in-process no sleep/fs/net, Medium = repository-local integration that touches filesystem (TempDir/TestDatadir with bounded teardown) or localhost `:0` only — examples: `tiny_store`/`tiny_query`/`TestDatadir`, Large = tests requiring external processes, external networks/overlays, or Core differential; normally outside fast default feedback (e.g. `core-functional`, `overlay-functional`).
+Size by resource (Small/Medium/Large) is defined in [`docs/test-size.md`](docs/test-size.md) — that file owns the contract by what the test does, not which helper it calls. `TESTING.md` owns current testing policy and budgets; [`docs/test-size.md`](docs/test-size.md) owns the Small/Medium/Large classification contract. Small = pure/in-process no sleep/fs/net, Medium = repository-local integration that touches filesystem (TempDir/TestDatadir with bounded teardown) or localhost `:0` only — examples: `tiny_store`/`tiny_query`/`TestDatadir`, Large = tests requiring external processes, external networks/overlays, or Core differential; normally outside fast default feedback (e.g. `core-functional`, `overlay-functional`).
 
 
 ## Coverage
