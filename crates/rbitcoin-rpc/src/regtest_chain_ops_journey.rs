@@ -506,9 +506,23 @@ fn chain_ops_empty_template_and_proposals(ctx: &RpcContext) {
     assert!(propose(ctx, &next).is_null(), "valid proposal");
     let mut bad_cb = next.clone();
     bad_cb.txdata[0].input[0].previous_output.txid = Txid::from_byte_array([1u8; 32]);
+    assert_eq!(
+        propose(ctx, &bad_cb),
+        "bad-txnmrklroot",
+        "the header still commits to the coinbase txid"
+    );
+    bad_cb.header.merkle_root = bad_cb.compute_merkle_root().unwrap();
     assert_eq!(propose(ctx, &bad_cb), "bad-cb-missing");
     let mut empty = next.clone();
     empty.txdata.clear();
+    assert_eq!(
+        propose(ctx, &empty),
+        "bad-txnmrklroot",
+        "an empty body the header does not commit to"
+    );
+    empty.header.merkle_root = empty
+        .compute_merkle_root()
+        .unwrap_or_else(|| bitcoin::TxMerkleNode::from_byte_array([0; 32]));
     assert_eq!(propose(ctx, &empty), "bad-blk-length");
     let mut bits_bad = next.clone();
     bits_bad.header.bits = bitcoin::CompactTarget::from_consensus(469762303);
