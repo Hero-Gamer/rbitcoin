@@ -510,7 +510,13 @@ impl ActiveMempool {
     }
 
     /// Overlay Core `-minrelaytxfee` (sat/kvB). `0` admits any non-negative fee.
+    ///
+    /// The rolling floor starts equal to the configured minimum. Lowering
+    /// that minimum drops the seed. A floor already raised by eviction stays.
     pub fn set_min_relay_sat_kvb(&mut self, sat_kvb: u64) {
+        if self.rolling_min_sat_kvb <= self.min_relay_sat_kvb {
+            self.rolling_min_sat_kvb = sat_kvb;
+        }
         self.min_relay_sat_kvb = sat_kvb;
     }
 
@@ -2223,6 +2229,25 @@ mod tests {
         assert_eq!(mp.live_count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// The rolling floor starts at the configured minimum. A lower
+    /// `-minrelaytxfee` is the advertised floor. An eviction that already
+    /// raised the rolling floor stays above that new minimum.
+    #[test]
+    fn lowered_min_relay_is_the_fee_floor_until_eviction() {
+        let dir = tmp_dir();
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        assert_eq!(
+            mp.mempool_min_fee_sat_kvb(),
+            policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB
+        );
+        mp.set_min_relay_sat_kvb(10);
+        assert_eq!(mp.mempool_min_fee_sat_kvb(), 10);
+        mp.rolling_min_sat_kvb = 5_000;
+        mp.set_min_relay_sat_kvb(10);
+        assert_eq!(mp.mempool_min_fee_sat_kvb(), 5_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn mempool_under_pressure() {
         assert_eq!(decayed_relay_floor(5_000, 100, 0), 5_000);
