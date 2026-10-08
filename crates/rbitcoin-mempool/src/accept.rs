@@ -487,12 +487,20 @@ pub struct ActiveMempool {
     /// Ids removed by the latest `finish_commit` when that commit returns
     /// `Err` (the success path carries them on [`AcceptResult::evicted`]).
     last_evicted: Vec<Txid>,
+    /// Bodies removed for replacement when `finish_commit` later returns
+    /// `Err`. Success moves them onto [`AcceptResult::replaced_txs`].
+    undone_replacements: Vec<Transaction>,
 }
 
 impl ActiveMempool {
     /// Evictions from a commit that returned `Err`. Empty after a success.
     pub fn take_failed_evictions(&mut self) -> Vec<Txid> {
         std::mem::take(&mut self.last_evicted)
+    }
+
+    /// Conflicts a failed `finish_commit` already removed. Empty after a success.
+    pub fn take_undone_replacements(&mut self) -> Vec<Transaction> {
+        std::mem::take(&mut self.undone_replacements)
     }
 }
 
@@ -603,6 +611,7 @@ impl ActiveMempool {
             recent_invalid: HashSet::new(),
             extra_compact: VecDeque::new(),
             last_evicted: Vec::new(),
+            undone_replacements: Vec::new(),
         })
     }
 
@@ -751,6 +760,7 @@ impl ActiveMempool {
             }
             Err(AcceptError::Orphaned { missing, .. }) => Err(self.park_orphan(tx, missing)),
             Err(e) => {
+                self.restore_undone(utxos, tip);
                 self.note_accept_failure(tx, &e);
                 Err(e)
             }
@@ -1068,6 +1078,7 @@ impl ActiveMempool {
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
+        self.undone_replacements.clear();
         let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
         let txid = prep.txid;
         let weight = prep.weight;
@@ -1088,6 +1099,8 @@ impl ActiveMempool {
         replaced_scripthashes.sort_unstable();
         replaced_scripthashes.dedup();
 
+        // Kept until success so a later error can put these bodies back.
+        self.undone_replacements = replaced_txs;
         for c in conflict_set.iter().rev() {
             let _ = self.remove_txid(c);
         }
@@ -1152,6 +1165,7 @@ impl ActiveMempool {
             !evicted.contains(&txid),
             "a successful admit is not in its own eviction set"
         );
+        let replaced_txs = std::mem::take(&mut self.undone_replacements);
 
         Ok(AcceptResult {
             txid,
@@ -1283,6 +1297,8 @@ impl ActiveMempool {
         for child in children {
             if let Ok(r) = self.accept_tx_with(&child, utxos, tip, 0, true, None) {
                 self.promote_orphans_of(r.txid, utxos, tip);
+            } else {
+                self.restore_undone(utxos, tip);
             }
         }
     }
@@ -1525,6 +1541,7 @@ impl ActiveMempool {
                     accepted.push(r);
                 }
                 Err(e) => {
+                    self.restore_undone(utxos, tip);
                     self.rollback_accepted_package(&accepted, utxos, tip);
                     return Err(e);
                 }
@@ -1546,9 +1563,89 @@ impl ActiveMempool {
         for r in accepted.iter().rev() {
             let _ = self.remove_txid_tree(&r.txid);
         }
-        for tx in victims {
-            let _ = self.accept_tx(&tx, utxos, tip);
+        self.restore_victims(&victims, utxos, tip);
+    }
+
+    /// Parents before children, so a restored descendant can see its in-set parent.
+    pub fn ancestor_first_order(txs: &[Transaction]) -> Vec<usize> {
+        let n = txs.len();
+        let mut index = BTreeMap::new();
+        for (i, tx) in txs.iter().enumerate() {
+            index.insert(tx.compute_txid(), i);
         }
+        let mut children = vec![Vec::new(); n];
+        let mut indeg = vec![0u32; n];
+        for (i, tx) in txs.iter().enumerate() {
+            for inp in &tx.input {
+                let Some(&parent) = index.get(&inp.previous_output.txid) else {
+                    continue;
+                };
+                if parent == i {
+                    continue;
+                }
+                children[parent].push(i);
+                indeg[i] = indeg[i].saturating_add(1);
+            }
+        }
+        let mut ready: Vec<usize> = (0..n).filter(|&i| indeg[i] == 0).collect();
+        let mut out = Vec::with_capacity(n);
+        let mut q = 0;
+        while q < ready.len() {
+            let i = ready[q];
+            q += 1;
+            out.push(i);
+            for &child in &children[i] {
+                indeg[child] -= 1;
+                if indeg[child] == 0 {
+                    ready.push(child);
+                }
+            }
+        }
+        if out.len() != n {
+            for i in 0..n {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            }
+        }
+        out
+    }
+
+    /// Put an already-admitted body back. The fee floor does not apply again,
+    /// and a missing parent is not parked.
+    fn reaccept_already_admitted(
+        &mut self,
+        tx: &Transaction,
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) -> Result<AcceptResult, AcceptError> {
+        let prep = self.prepare_admit(tx, utxos, tip, 0, false, Some(0))?;
+        verify_tx_scripts(tx, prep.prevouts.clone())?;
+        self.commit_after_script(tx, prep)
+    }
+
+    fn restore_victims(
+        &mut self,
+        victims: &[Transaction],
+        utxos: &impl UtxoProvider,
+        tip: ChainTipCtx,
+    ) {
+        for i in Self::ancestor_first_order(victims) {
+            match self.reaccept_already_admitted(&victims[i], utxos, tip) {
+                Ok(r) => self.promote_orphans_of(r.txid, utxos, tip),
+                Err(_) => {
+                    if !self.undone_replacements.is_empty() {
+                        self.restore_undone(utxos, tip);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Re-accept conflicts a failed commit already removed.
+    fn restore_undone(&mut self, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
+        let victims = std::mem::take(&mut self.undone_replacements);
+        self.restore_victims(&victims, utxos, tip);
     }
 
     /// Durable remove one live tx (confirm / RBF / eviction).
@@ -3385,6 +3482,206 @@ mod tests {
         );
         child.output[0].value = Amount::from_sat(100_000 - 200 - 9);
         (parent, child)
+    }
+
+    /// Conflicts removed by a replacement that does not stay come back even
+    /// when the rolling floor now prices them out, including a CPFP parent
+    /// that cannot pay min relay alone.
+    #[test]
+    fn failed_replacement_restores_below_floor_and_cpfp_set() {
+        let value = 50_000_000u64;
+        let dir = tmp_dir();
+        let utxos = coins(&[(0x11, value), (0x22, value)]);
+        let anchor_op = OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let low_op = OutPoint {
+            txid: Txid::from_byte_array([0x22; 32]),
+            vout: 0,
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let anchor_wu = fat_spend(anchor_op, value, 0).weight().to_wu();
+        let victim_wu = spend_tx_fee(low_op, value, 0).weight().to_wu();
+        mp.max_weight = anchor_wu + victim_wu + 500;
+        let floor = mp.mempool_min_fee_sat_kvb();
+        let anchor = fat_spend(anchor_op, value, fee_at_least(anchor_wu, floor));
+        let victim_fee = fee_at_least(victim_wu, floor);
+        let victim = spend_tx_fee(low_op, value, victim_fee);
+        let victim_id = victim.compute_txid();
+        let victim_rate = policy::fee_rate_sat_per_kvb(victim_fee, victim_wu);
+        mp.accept_tx(&anchor, &utxos, TIP_OK).expect("anchor");
+        mp.accept_tx(&victim, &utxos, TIP_OK)
+            .expect("victim at the pre-eviction floor");
+        let replacement = heavy_conflict(
+            low_op,
+            OutPoint {
+                txid: anchor.compute_txid(),
+                vout: 0,
+            },
+            value + anchor.output[0].value.to_sat(),
+            30_000,
+            victim_wu + 500,
+        );
+        let err = mp
+            .accept_tx(&replacement, &utxos, TIP_OK)
+            .expect_err("replacement over budget");
+        assert!(matches!(err, AcceptError::Policy("mempool full")), "{err}");
+        let enforced = mp.mempool_min_fee_sat_kvb();
+        assert!(
+            enforced > victim_rate,
+            "eviction must price out the victim ({victim_rate} vs {enforced})"
+        );
+        assert!(!mp.graph.contains(&replacement.compute_txid()));
+        assert!(
+            mp.graph.contains(&victim_id),
+            "below-floor conflict must stay"
+        );
+        assert_eq!(mp.orphan_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = tmp_dir();
+        let utxos = coins(&[(0x41, value), (0x42, value)]);
+        let anchor_op = OutPoint {
+            txid: Txid::from_byte_array([0x41; 32]),
+            vout: 0,
+        };
+        let parent_op = OutPoint {
+            txid: Txid::from_byte_array([0x42; 32]),
+            vout: 0,
+        };
+        let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+        let (parent, child) = cpfp_child_sorts_first(parent_op, value);
+        assert!(child.compute_txid() < parent.compute_txid());
+        let anchor_wu = fat_spend(anchor_op, value, 0).weight().to_wu();
+        mp.max_weight = anchor_wu + parent.weight().to_wu() + child.weight().to_wu() + 500;
+        let floor = mp.mempool_min_fee_sat_kvb();
+        let anchor = fat_spend(anchor_op, value, fee_at_least(anchor_wu, floor));
+        mp.accept_tx(&anchor, &utxos, TIP_OK).expect("anchor");
+        mp.accept_package(&[parent.clone(), child.clone()], &utxos, TIP_OK)
+            .expect("CPFP package");
+        let replacement = heavy_conflict(
+            parent_op,
+            OutPoint {
+                txid: anchor.compute_txid(),
+                vout: 0,
+            },
+            value + anchor.output[0].value.to_sat(),
+            90_000,
+            parent.weight().to_wu() + child.weight().to_wu() + 500,
+        );
+        let err = mp
+            .accept_tx(&replacement, &utxos, TIP_OK)
+            .expect_err("replacement over budget");
+        assert!(matches!(err, AcceptError::Policy("mempool full")), "{err}");
+        assert!(
+            mp.graph.contains(&parent.compute_txid()),
+            "below-min-relay parent must stay"
+        );
+        assert!(
+            mp.graph.contains(&child.compute_txid()),
+            "paying child must stay"
+        );
+        assert_eq!(mp.orphan_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn coins(specs: &[(u8, u64)]) -> MapUtxoProvider {
+        let mut map = HashMap::new();
+        for &(tag, value) in specs {
+            let op = OutPoint {
+                txid: Txid::from_byte_array([tag; 32]),
+                vout: 0,
+            };
+            map.insert(
+                op,
+                coin(TxOut {
+                    value: Amount::from_sat(value),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }),
+            );
+        }
+        MapUtxoProvider { map }
+    }
+
+    fn spend_tx_fee(op: OutPoint, input_value: u64, fee: u64) -> Transaction {
+        spend_tx(op, input_value - fee)
+    }
+
+    fn fat_spend(op: OutPoint, input_value: u64, fee: u64) -> Transaction {
+        let mut fat = Vec::new();
+        for _ in 0..6 {
+            fat.push(0x4d);
+            fat.extend_from_slice(&520u16.to_le_bytes());
+            fat.extend(std::iter::repeat_n(0u8, 520));
+            fat.push(0x75);
+        }
+        fat.push(0x51);
+        let mut tx = spend_tx_fee(op, input_value, fee);
+        tx.output[0].script_pubkey = ScriptBuf::from_bytes(fat);
+        tx
+    }
+
+    fn fee_at_least(weight: u64, sat_kvb: u64) -> u64 {
+        let vsize = weight.div_ceil(4);
+        vsize.saturating_mul(sat_kvb).div_ceil(1000).max(1)
+    }
+
+    fn heavy_conflict(
+        conflict: OutPoint,
+        anchor: OutPoint,
+        input_value: u64,
+        fee: u64,
+        min_wu: u64,
+    ) -> Transaction {
+        let mut n = 64usize;
+        loop {
+            let tx = Transaction {
+                version: Version::TWO,
+                lock_time: LockTime::ZERO,
+                input: vec![
+                    TxIn {
+                        previous_output: conflict,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    },
+                    TxIn {
+                        previous_output: anchor,
+                        script_sig: ScriptBuf::new(),
+                        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                        witness: Witness::new(),
+                    },
+                ],
+                output: vec![TxOut {
+                    value: Amount::from_sat(input_value - fee),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51; n]),
+                }],
+            };
+            if tx.weight().to_wu() > min_wu {
+                return tx;
+            }
+            n += 32;
+            assert!(n < 20_000, "conflict replacement never got heavy enough");
+        }
+    }
+
+    fn cpfp_child_sorts_first(parent_op: OutPoint, input_value: u64) -> (Transaction, Transaction) {
+        for n in 0..10_000u32 {
+            let mut parent = spend_tx_fee(parent_op, input_value, 1);
+            parent.lock_time = LockTime::from_consensus(n);
+            let child = spend_tx(
+                OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                parent.output[0].value.to_sat() - 40_000,
+            );
+            if child.compute_txid() < parent.compute_txid() {
+                return (parent, child);
+            }
+        }
+        panic!("no locktime put the child txid first");
     }
 
     include!("accept_life_journey.rs");
