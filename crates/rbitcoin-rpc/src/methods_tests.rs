@@ -325,14 +325,6 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
-    let (hex, _spend) = spend_generated_coinbase(
-        &ctx,
-        1,
-        50_0000_0000 - 1_000,
-        ScriptBuf::from_bytes(vec![0x51]),
-    );
-    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
-    let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
     ctx.query.set_block_filter_index(true).unwrap();
     assert_eq!(ctx.query.filter_index_next(), Some(0));
 
@@ -340,54 +332,23 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     assert_eq!(missing["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(missing["message"], "Block not found");
 
+    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    let behind = dispatch(&ctx, "getblockfilter", vec![tip]).unwrap_err();
+    assert_eq!(behind["code"], ERR_MISC);
+    assert_eq!(behind["message"], "Index is not caught up");
+
     let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
     let height1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
     let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
     let g = dispatch(&ctx, "getblockfilter", vec![genesis.clone()]).unwrap();
-    let one_before = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap();
-    let two_before = dispatch(&ctx, "getblockfilter", vec![height2]).unwrap();
-    let tip_before = dispatch(&ctx, "getblockfilter", vec![tip.clone()]).unwrap();
-    assert!(
-        tip_before["filter"].as_str().unwrap().len() > 2,
-        "{tip_before}"
-    );
     let zero = "00".repeat(32);
     assert_eq!(
         g["header"],
         json!(filter_header_hex(g["filter"].as_str().unwrap(), &zero)),
         "genesis filter header chains from the zero prev-header"
     );
-    assert_eq!(
-        one_before["header"],
-        json!(filter_header_hex(
-            one_before["filter"].as_str().unwrap(),
-            g["header"].as_str().unwrap(),
-        )),
-        "height 1 chains from the genesis filter header before anything is sealed, got {one_before}"
-    );
-    assert_eq!(
-        two_before["header"],
-        json!(filter_header_hex(
-            two_before["filter"].as_str().unwrap(),
-            one_before["header"].as_str().unwrap(),
-        )),
-        "height 2 chains through an unsealed parent, got {two_before}"
-    );
-    let tip_block = dispatch(&ctx, "getblock", vec![tip.clone()]).unwrap();
-    let parent_before = dispatch(
-        &ctx,
-        "getblockfilter",
-        vec![tip_block["previousblockhash"].clone()],
-    )
-    .unwrap();
-    assert_eq!(
-        tip_before["header"],
-        json!(filter_header_hex(
-            tip_before["filter"].as_str().unwrap(),
-            parent_before["header"].as_str().unwrap(),
-        )),
-        "tip chains from its unsealed parent, got {tip_before}"
-    );
+    let gap = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap_err();
+    assert_eq!(gap["message"], "Index is not caught up", "{gap}");
 
     let body = rbitcoin_primitives::hex_decode(g["filter"].as_str().unwrap()).unwrap();
     let fk = ctx
@@ -403,26 +364,17 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
             .unwrap(),
         1
     );
-    let g_sealed = dispatch(&ctx, "getblockfilter", vec![genesis]).unwrap();
-    assert_eq!(g_sealed, g, "sealed genesis filter must match the rebuild");
-
     let one = dispatch(&ctx, "getblockfilter", vec![height1]).unwrap();
-    assert_eq!(one["filter"], one_before["filter"]);
     assert_eq!(
-        one["header"], one_before["header"],
-        "sealing the parent must not change the child filter header"
+        one["header"],
+        json!(filter_header_hex(
+            one["filter"].as_str().unwrap(),
+            g["header"].as_str().unwrap(),
+        )),
+        "height 1 is built once its parent filter header is sealed, got {one}"
     );
-
-    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
-    let stale = dispatch(&ctx, "getblockfilter", vec![tip]).unwrap();
-    assert_eq!(
-        stale["filter"], tip_before["filter"],
-        "a stored block off the best chain still has a basic filter"
-    );
-    assert_eq!(
-        stale["header"], tip_before["header"],
-        "a stale block keeps the same BIP157 header, got {stale}"
-    );
+    let still = dispatch(&ctx, "getblockfilter", vec![height2]).unwrap_err();
+    assert_eq!(still["message"], "Index is not caught up", "{still}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5441,14 +5393,9 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         "getblockfilter",
         vec![json!(hub.tip_hash().unwrap().to_string())],
     )
-    .unwrap();
+    .unwrap_err();
     assert!(
-        tip_filter["filter"].as_str().unwrap_or("").len() > 2,
-        "an unsealed tip is built on demand: {tip_filter}"
-    );
-    assert_eq!(
-        tip_filter["header"].as_str().unwrap_or("").len(),
-        64,
+        rpc_message(&tip_filter).contains("Index is not caught up"),
         "{tip_filter}"
     );
     let unknown_filter = dispatch(

@@ -224,10 +224,10 @@ impl Query {
 
     /// Filter bytes and header for `hash`.
     ///
-    /// Best-chain heights use the sealed index when the watermark has caught
-    /// up. A hash that is stored but not on the best chain (or not sealed
-    /// yet) is built from the Class A body: non-`OP_RETURN` output scripts,
-    /// then each spent prevout script.
+    /// A sealed best-chain row is that row. One unsealed block is built from
+    /// its Class A body only when the previous filter header is already
+    /// sealed (the zero header, for genesis). An unsealed best-chain gap is
+    /// refused instead of rebuilt back to genesis.
     pub fn basic_filter_for_hash(
         &self,
         hash: &[u8; 32],
@@ -271,61 +271,18 @@ impl Query {
         basic_filter_from_scripts(&hash, outputs, spent_refs)
     }
 
-    /// Header of `prev_hash`. Zeros are only the genesis prev-header. A sealed
-    /// best-chain row is that row; every other stored block is rebuilt back
-    /// to the last sealed header, or to genesis, and linked in chain order.
+    /// Header of `prev_hash`. Zeros are the genesis prev-header. A sealed
+    /// best-chain parent is that row. Anything else is an unsealed gap.
     fn parent_basic_filter_header(&self, prev_hash: &[u8; 32]) -> Result<FilterHeader, QueryError> {
         if *prev_hash == [0u8; 32] {
             return Ok(FilterHeader::from_byte_array([0u8; 32]));
         }
-        let mut pending = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        let mut cursor = *prev_hash;
-        let anchor = loop {
-            if cursor == [0u8; 32] {
-                break FilterHeader::from_byte_array([0u8; 32]);
+        if let Some(h) = self.height_of_hash(prev_hash)? {
+            if let Some((_, header)) = self.basic_filter_at(h.0)? {
+                return Ok(header);
             }
-            if let Some(h) = self.height_of_hash(&cursor)? {
-                if let Some((_, header)) = self.basic_filter_at(h.0)? {
-                    break header;
-                }
-            }
-            if !seen.insert(cursor) {
-                return Err(StoreError::Corrupt("invariant: blockfilter header cycle"));
-            }
-            pending.push(cursor);
-            cursor = self.prev_header_hash(&cursor)?;
-        };
-        let mut header = anchor;
-        for hash in pending.iter().rev() {
-            let block = self.block_for_basic_filter(hash)?;
-            let spent = self.spent_scripts(&block)?;
-            let filter = self.basic_filter_content(&block, &spent)?;
-            header = filter.filter_header(&header);
         }
-        Ok(header)
-    }
-
-    fn prev_header_hash(&self, hash: &[u8; 32]) -> Result<[u8; 32], QueryError> {
-        let Some((_, rec)) = self.get_header_by_hash(hash)? else {
-            return Err(StoreError::Corrupt(
-                "invariant: blockfilter parent header missing",
-            ));
-        };
-        if rec.prev_fk.is_null() {
-            return Ok([0u8; 32]);
-        }
-        Ok(self.get_header(rec.prev_fk)?.hash)
-    }
-
-    fn block_for_basic_filter(&self, hash: &[u8; 32]) -> Result<Block, QueryError> {
-        if let Some(h) = self.height_of_hash(hash)? {
-            return self.reconstruct_block_at_height(h);
-        }
-        self.reconstruct_archived_block(hash)?
-            .ok_or(StoreError::Corrupt(
-                "invariant: blockfilter parent body missing",
-            ))
+        Err(StoreError::Rejected("Index is not caught up"))
     }
 
     fn spent_scripts(&self, block: &Block) -> Result<Vec<Vec<u8>>, QueryError> {
