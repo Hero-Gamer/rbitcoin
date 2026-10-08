@@ -3179,7 +3179,7 @@ fn proposal_connect(
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
     // RAM: decoded outputs of this block's distinct confirmed parents.
-    // Dropped when the check returns.
+    // Dropped when the check returns. The fk resolve does not decode the body.
     let mut parents: HashMap<Txid, (Fk, Vec<TxOut>)> = HashMap::new();
     let mut fees = 0u64;
     for (i, tx) in block.txdata.iter().enumerate() {
@@ -3259,7 +3259,7 @@ fn chain_txout(
     Some((slot.0, out))
 }
 
-/// Create fk and every output of a confirmed tx.
+/// Create fk, from an identity resolve, and every output of a confirmed tx.
 fn chain_tx_outputs(query: &Query, txid: &[u8; 32]) -> Option<(Fk, Vec<TxOut>)> {
     let fk = query.tx_fk_by_txid(txid).ok().flatten()?;
     let (_, outs) = query.store().get_tx_meta_and_outputs(fk).ok()?;

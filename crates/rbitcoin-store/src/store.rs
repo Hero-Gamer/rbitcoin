@@ -294,7 +294,8 @@ pub struct Store {
     utxo_view: std::sync::atomic::AtomicU64,
     /// Packed `txout` decodes through [`Self::get_tx_meta_and_outputs`].
     tx_outs_decodes: std::sync::atomic::AtomicU64,
-    /// Whole-body decodes through [`Self::get_tx`] that keep only the meta.
+    /// Whole-body decodes that keep only the meta: [`Self::get_tx`], and
+    /// each matching row in [`Self::resolve_txid`].
     tx_gets: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
@@ -1094,6 +1095,8 @@ impl Store {
         mode: TxidResolveMode,
     ) -> Result<Option<Fk>, StoreError> {
         let all = self.txs.get_all_by_txid(txid)?;
+        self.tx_gets
+            .fetch_add(all.len() as u64, std::sync::atomic::Ordering::Relaxed);
         if all.is_empty() {
             return Ok(None);
         }
@@ -1155,7 +1158,11 @@ impl Store {
     ///
     /// **`TipThenAny`:** RPC / reconstruct (connected if present, else newest).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        self.resolve_txid(txid, TxidResolveMode::TipThenAny)
+        Ok(self
+            .get_fk_by_txid_batch_mode(std::slice::from_ref(txid), TxidResolveMode::TipThenAny)?
+            .into_iter()
+            .next()
+            .and_then(|(_, hit)| hit.map(|(fk, _)| fk)))
     }
 
     /// Confirm / consensus: connected instance only.
@@ -2629,7 +2636,13 @@ mod tests {
             span_hashes, expect,
             "fk-span script hashes must match per-fk decode"
         );
+        let _ = s.sample_reset_tx_gets();
         assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
+        assert_eq!(
+            s.sample_reset_tx_gets(),
+            0,
+            "fk resolve does not decode the body"
+        );
         assert_eq!(s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0, create_fk);
 
         // Second tx spends create vout 0.
@@ -3822,6 +3835,7 @@ mod tests {
             s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
             Some(new)
         );
+        assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(new));
         assert_eq!(
             s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
             None
@@ -3838,6 +3852,7 @@ mod tests {
             s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
             Some(old)
         );
+        assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(old));
         let batch_tip = s
             .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
             .unwrap();
