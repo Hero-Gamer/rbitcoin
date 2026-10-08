@@ -487,12 +487,20 @@ pub struct ActiveMempool {
     /// Ids removed by the latest `finish_commit` when that commit returns
     /// `Err` (the success path carries them on [`AcceptResult::evicted`]).
     last_evicted: Vec<Txid>,
+    /// Bodies removed for replacement when `finish_commit` later returns
+    /// `Err`. Success moves them onto [`AcceptResult::replaced_txs`].
+    undone_replacements: Vec<Transaction>,
 }
 
 impl ActiveMempool {
     /// Evictions from a commit that returned `Err`. Empty after a success.
     pub fn take_failed_evictions(&mut self) -> Vec<Txid> {
         std::mem::take(&mut self.last_evicted)
+    }
+
+    /// Conflicts a failed `finish_commit` already removed. Empty after a success.
+    pub fn take_undone_replacements(&mut self) -> Vec<Transaction> {
+        std::mem::take(&mut self.undone_replacements)
     }
 }
 
@@ -603,6 +611,7 @@ impl ActiveMempool {
             recent_invalid: HashSet::new(),
             extra_compact: VecDeque::new(),
             last_evicted: Vec::new(),
+            undone_replacements: Vec::new(),
         })
     }
 
@@ -751,6 +760,7 @@ impl ActiveMempool {
             }
             Err(AcceptError::Orphaned { missing, .. }) => Err(self.park_orphan(tx, missing)),
             Err(e) => {
+                self.restore_undone(utxos, tip);
                 self.note_accept_failure(tx, &e);
                 Err(e)
             }
@@ -1068,6 +1078,7 @@ impl ActiveMempool {
         prep: PreparedAdmit,
         trim: bool,
     ) -> Result<AcceptResult, AcceptError> {
+        self.undone_replacements.clear();
         let (conflict_set, fee_sat, adj_weight) = self.plan_after_script(tx, &prep)?;
         let txid = prep.txid;
         let weight = prep.weight;
@@ -1088,6 +1099,8 @@ impl ActiveMempool {
         replaced_scripthashes.sort_unstable();
         replaced_scripthashes.dedup();
 
+        // Kept until success so a later error can put these bodies back.
+        self.undone_replacements = replaced_txs;
         for c in conflict_set.iter().rev() {
             let _ = self.remove_txid(c);
         }
@@ -1152,6 +1165,7 @@ impl ActiveMempool {
             !evicted.contains(&txid),
             "a successful admit is not in its own eviction set"
         );
+        let replaced_txs = std::mem::take(&mut self.undone_replacements);
 
         Ok(AcceptResult {
             txid,
@@ -1283,6 +1297,8 @@ impl ActiveMempool {
         for child in children {
             if let Ok(r) = self.accept_tx_with(&child, utxos, tip, 0, true, None) {
                 self.promote_orphans_of(r.txid, utxos, tip);
+            } else {
+                self.restore_undone(utxos, tip);
             }
         }
     }
@@ -1525,6 +1541,7 @@ impl ActiveMempool {
                     accepted.push(r);
                 }
                 Err(e) => {
+                    self.restore_undone(utxos, tip);
                     self.rollback_accepted_package(&accepted, utxos, tip);
                     return Err(e);
                 }
@@ -1546,6 +1563,14 @@ impl ActiveMempool {
         for r in accepted.iter().rev() {
             let _ = self.remove_txid_tree(&r.txid);
         }
+        for tx in victims {
+            let _ = self.accept_tx(&tx, utxos, tip);
+        }
+    }
+
+    /// Re-accept conflicts a failed commit already removed.
+    fn restore_undone(&mut self, utxos: &impl UtxoProvider, tip: ChainTipCtx) {
+        let victims = std::mem::take(&mut self.undone_replacements);
         for tx in victims {
             let _ = self.accept_tx(&tx, utxos, tip);
         }
