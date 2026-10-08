@@ -6599,8 +6599,8 @@ mod tests {
         assert_eq!(hub.check_block_proposal(&block), Ok(fees));
         assert_eq!(
             store.txs.sample_reset_body_decodes(),
-            51,
-            "one packed body decode per distinct parent, plus one per input from the spentness probe"
+            1,
+            "one packed body decode per distinct parent; the spentness probes and the fk resolve decode nothing"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -2640,20 +2640,18 @@ impl TxTable {
     /// All Class A fks whose body txid equals `txid` (BIP30: more than one).
     ///
     /// Order is **newest-first** (deepest probe match first), matching
-    /// [`Self::probe_body_match_fk`].
-    pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
-        let mut out: Vec<(Fk, TxRecord)> = Vec::new();
+    /// [`Self::probe_body_match_fk`]. Verifies `txid.body` only; no packed
+    /// decode.
+    pub(crate) fn fks_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let mut out: Vec<Fk> = Vec::new();
         let mixed = self.secret.mix_txid(txid);
         // probe_candidates already open-first then sealed newest→oldest, deep-first within.
         let cands = self.head.probe_candidates(&mixed)?;
         for fk in cands {
-            if out.iter().any(|(have, _)| have.0 == fk.0) {
+            if out.contains(&fk) || self.body_txid(fk)? != *txid {
                 continue;
             }
-            if self.body_txid(fk)? != *txid {
-                continue;
-            }
-            out.push((fk, self.get(fk)?));
+            out.push(fk);
         }
         Ok(out)
     }

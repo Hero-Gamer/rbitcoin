@@ -1038,8 +1038,7 @@ impl Store {
             fk
         } else {
             self.txs
-                .get_by_txid(out_txid)?
-                .map(|(fk, _)| fk)
+                .probe_body_match_fk(out_txid)?
                 .ok_or(StoreError::NotFound)?
         };
         self.put_spend_create(create_fk, out_index, spending_tx_fk, spending_vin)?;
@@ -1070,11 +1069,10 @@ impl Store {
         txid: &[u8; 32],
         mode: TxidResolveMode,
     ) -> Result<Option<Fk>, StoreError> {
-        let all = self.txs.get_all_by_txid(txid)?;
-        if all.is_empty() {
+        let fks = self.txs.fks_by_txid(txid)?;
+        if fks.is_empty() {
             return Ok(None);
         }
-        let fks: Vec<Fk> = all.iter().map(|(fk, _)| *fk).collect();
         let heights = self.tx_height_get_batch(&fks)?;
         for (fk, h) in fks.iter().zip(heights.iter()) {
             if h.is_some() {
@@ -1083,7 +1081,7 @@ impl Store {
         }
         match mode {
             TxidResolveMode::TipOnly => Ok(None),
-            TxidResolveMode::TipThenAny => Ok(Some(all[0].0)),
+            TxidResolveMode::TipThenAny => Ok(Some(fks[0])),
         }
     }
 
@@ -1536,7 +1534,7 @@ impl Store {
         out_index: u32,
         tip: Option<u32>,
     ) -> Result<bool, StoreError> {
-        let Some((create_fk, _)) = self.txs.get_by_txid(out_txid)? else {
+        let Some(create_fk) = self.txs.probe_body_match_fk(out_txid)? else {
             return Ok(false);
         };
         let mut found = false;
@@ -1588,7 +1586,7 @@ impl Store {
         out_txid: &[u8; 32],
         out_index: u32,
     ) -> Result<Vec<PointRecord>, StoreError> {
-        let Some((create_fk, _)) = self.txs.get_by_txid(out_txid)? else {
+        let Some(create_fk) = self.txs.probe_body_match_fk(out_txid)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -2687,8 +2685,8 @@ mod tests {
         s.put_spend(&[10u8; 32], 0, spend3_fk, 0).unwrap();
         assert_eq!(
             s.txs.sample_reset_body_decodes(),
-            1,
-            "put_spend decodes the create body to find its fk"
+            0,
+            "put_spend resolves the create by head probe only"
         );
         s.put_spend_batch(&[([10u8; 32], 1, spend_fk, 0)]).unwrap();
         s.put_spend_create(create_fk, 1, spend2_fk, 0).unwrap();
@@ -2735,8 +2733,8 @@ mod tests {
         assert!(s.has_confirmed_strong_spender(&[10u8; 32], 0).unwrap());
         assert_eq!(
             s.txs.sample_reset_body_decodes(),
-            1,
-            "the spentness probe decodes the create body to find its fk"
+            0,
+            "the spentness probe resolves the create by head probe only"
         );
         let unspent = s
             .unspent_create_vouts(create_fk, &[0, 1], Some((soff, slen)))
@@ -2750,8 +2748,8 @@ mod tests {
         assert_eq!(strong_sp[0].spending_tx_fk, spend_fk);
         assert_eq!(
             s.txs.sample_reset_body_decodes(),
-            2,
-            "each spender walk decodes the create body to find its fk"
+            0,
+            "spender walks resolve the create by head probe only"
         );
 
         // Batch helpers
