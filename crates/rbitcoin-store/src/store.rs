@@ -292,6 +292,11 @@ pub struct Store {
     /// Even while confirmed spentness is stable. Odd while a confirm annotate
     /// or a disconnect is publishing a change.
     utxo_view: std::sync::atomic::AtomicU64,
+    /// Packed `txout` decodes through [`Self::get_tx_meta_and_outputs`].
+    tx_outs_decodes: std::sync::atomic::AtomicU64,
+    /// Whole-body decodes that keep only the meta: [`Self::get_tx`], and
+    /// each matching row in [`Self::resolve_txid`].
+    tx_gets: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
@@ -395,6 +400,8 @@ impl Store {
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: std::sync::atomic::AtomicU64::new(0),
+            tx_outs_decodes: std::sync::atomic::AtomicU64::new(0),
+            tx_gets: std::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
@@ -460,6 +467,8 @@ impl Store {
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: std::sync::atomic::AtomicU64::new(0),
+            tx_outs_decodes: std::sync::atomic::AtomicU64::new(0),
+            tx_gets: std::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
@@ -729,8 +738,17 @@ impl Store {
         Ok(())
     }
 
+    /// Meta by fk. Decodes the whole packed body and drops the ins and outs.
+    /// A parent-prevout reader wants [`Self::get_tx_meta_and_outputs`].
     pub fn get_tx(&self, fk: Fk) -> Result<TxRecord, StoreError> {
+        self.tx_gets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.txs.get(fk)
+    }
+
+    /// Sample-and-reset meta-only whole-body decodes (instance stats).
+    pub fn sample_reset_tx_gets(&self) -> u64 {
+        self.tx_gets.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn reset_tx_full_gets(&self) {
@@ -801,7 +819,15 @@ impl Store {
         &self,
         fk: Fk,
     ) -> Result<(TxRecord, Vec<OutputRecord>), StoreError> {
+        self.tx_outs_decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.txs.get_meta_and_outputs(fk)
+    }
+
+    /// Sample-and-reset packed outs decodes (instance stats).
+    pub fn sample_reset_tx_outs_decodes(&self) -> u64 {
+        self.tx_outs_decodes
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Page-grouped `txid.body` identity for scattered create fks.
@@ -1069,6 +1095,8 @@ impl Store {
         mode: TxidResolveMode,
     ) -> Result<Option<Fk>, StoreError> {
         let all = self.txs.get_all_by_txid(txid)?;
+        self.tx_gets
+            .fetch_add(all.len() as u64, std::sync::atomic::Ordering::Relaxed);
         if all.is_empty() {
             return Ok(None);
         }
@@ -1130,7 +1158,11 @@ impl Store {
     ///
     /// **`TipThenAny`:** RPC / reconstruct (connected if present, else newest).
     pub fn get_fk_by_txid(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        self.resolve_txid(txid, TxidResolveMode::TipThenAny)
+        Ok(self
+            .get_fk_by_txid_batch_mode(std::slice::from_ref(txid), TxidResolveMode::TipThenAny)?
+            .into_iter()
+            .next()
+            .and_then(|(_, hit)| hit.map(|(fk, _)| fk)))
     }
 
     /// Confirm / consensus: connected instance only.
@@ -2550,9 +2582,28 @@ mod tests {
         );
         let fks = s.put_tx_full_batch_indexed(&[create], true).unwrap();
         let create_fk = fks[0];
+        let _ = s.sample_reset_tx_outs_decodes();
+        let _ = s.sample_reset_tx_gets();
         let (meta, outs) = s.get_tx_meta_and_outputs(create_fk).unwrap();
         assert_eq!(meta.txid, [10u8; 32]);
         assert_eq!(outs.len(), 2);
+        assert_eq!(
+            s.sample_reset_tx_outs_decodes(),
+            1,
+            "one packed outs decode"
+        );
+        assert_eq!(
+            s.sample_reset_tx_gets(),
+            0,
+            "an outs decode is not a get_tx"
+        );
+        assert_eq!(s.get_tx(create_fk).unwrap().txid, [10u8; 32]);
+        assert_eq!(s.sample_reset_tx_gets(), 1, "one meta-only body decode");
+        assert_eq!(
+            s.sample_reset_tx_outs_decodes(),
+            0,
+            "a get_tx is not an outs decode"
+        );
         let full = s.get_tx_full(create_fk).unwrap();
         assert_eq!(full.2.len(), 2);
         let (m2, prevs) = s.get_tx_meta_and_prevouts(create_fk).unwrap();
@@ -2561,6 +2612,16 @@ mod tests {
         assert_eq!(s.get_tx_full(create_fk).unwrap().0.txid, [10u8; 32]);
         assert_eq!(s.get_tx_meta_and_prevouts(create_fk).unwrap().1.len(), 1);
         assert_eq!(s.get_tx_meta_and_outputs(create_fk).unwrap().1.len(), 2);
+        assert_eq!(
+            s.sample_reset_tx_outs_decodes(),
+            1,
+            "full and prevout reads are not outs decodes; the sample resets"
+        );
+        assert_eq!(
+            s.sample_reset_tx_gets(),
+            0,
+            "full and prevout reads are not get_tx"
+        );
         let mut span_hashes = Vec::new();
         s.for_each_create_script_hashes_in_fk_span(create_fk.0, create_fk.0, |_fk, sh| {
             span_hashes.push(sh);
@@ -2575,7 +2636,13 @@ mod tests {
             span_hashes, expect,
             "fk-span script hashes must match per-fk decode"
         );
+        let _ = s.sample_reset_tx_gets();
         assert_eq!(s.get_fk_by_txid(&[10u8; 32]).unwrap(), Some(create_fk));
+        assert_eq!(
+            s.sample_reset_tx_gets(),
+            0,
+            "fk resolve does not decode the body"
+        );
         assert_eq!(s.get_tx_by_txid(&[10u8; 32]).unwrap().unwrap().0, create_fk);
 
         // Second tx spends create vout 0.
@@ -3768,6 +3835,7 @@ mod tests {
             s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
             Some(new)
         );
+        assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(new));
         assert_eq!(
             s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
             None
@@ -3784,6 +3852,7 @@ mod tests {
             s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
             Some(old)
         );
+        assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(old));
         let batch_tip = s
             .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
             .unwrap();
