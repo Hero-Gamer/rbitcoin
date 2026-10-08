@@ -1516,6 +1516,14 @@ fn chain_ops_proposal_spends(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     let cb_f = generated_coinbase_value(ctx, f);
     let (hex, spend) = spend_generated_coinbase(ctx, f, cb_f - 1_000, true_spk());
     assert!(propose(ctx, &proposal_on_tip(ctx, vec![spend.clone()])).is_null());
+    let mut bad_script = spend.clone();
+    bad_script.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x69]);
+    let got = propose(ctx, &proposal_on_tip(ctx, vec![bad_script]));
+    let reason = got.as_str().unwrap_or("");
+    assert!(
+        reason.starts_with("block-script-verify-flag-failed"),
+        "a failing script must not validate: {got}"
+    );
     assert_eq!(
         propose(ctx, &proposal_on_tip(ctx, vec![spend.clone(), spend.clone()])),
         "bad-txns-inputs-missingorspent",

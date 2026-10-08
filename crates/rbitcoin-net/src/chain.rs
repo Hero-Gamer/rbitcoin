@@ -3208,7 +3208,7 @@ pub fn check_block_proposal_with(
     if let Err(e) = rbitcoin_consensus::validate_block_structure(block, &vctx) {
         return Err(rbitcoin_consensus::block_reject_reason(&e));
     }
-    let fees = proposal_connect(query, block, height, mtp, params.coinbase_maturity())?;
+    let (fees, prevouts) = proposal_connect(query, block, height, mtp, params.coinbase_maturity())?;
     let subsidy = rbitcoin_consensus::block_subsidy(height, params) as u64;
     let mut coinbase_out = 0u64;
     for o in &block.txdata[0].output {
@@ -3220,19 +3220,29 @@ pub fn check_block_proposal_with(
     if coinbase_out > allowed {
         return Err("bad-cb-amount".into());
     }
+    let flags = rbitcoin_consensus::ScriptVerifyFlags::for_block(
+        params,
+        height,
+        &block.block_hash().to_byte_array(),
+        mtp,
+    );
+    for (tx, ins) in block.txdata.iter().skip(1).zip(prevouts) {
+        rbitcoin_consensus::verify_tx_scripts_with_flags(ins, tx.clone(), flags)
+            .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
+    }
     Ok(fees)
 }
 
 /// Resolves every spend against the block and the confirmed chain. `Ok` is
-/// the fee total over the non-coinbase txs. Caller has already passed
-/// [`rbitcoin_consensus::validate_block_structure`].
+/// the fee total and the prevouts already resolved for each non-coinbase tx.
+/// Caller has already passed [`rbitcoin_consensus::validate_block_structure`].
 fn proposal_connect(
     query: &Query,
     block: &Block,
     height: u32,
     mtp: u32,
     maturity: u32,
-) -> Result<u64, String> {
+) -> Result<(u64, Vec<Vec<TxOut>>), String> {
     if block.txdata.is_empty() {
         return Err("bad-blk-length".into());
     }
@@ -3246,6 +3256,7 @@ fn proposal_connect(
     // Dropped when the check returns. The fk resolve does not decode the body.
     let mut parents: HashMap<Txid, (Fk, Vec<TxOut>)> = HashMap::new();
     let mut fees = 0u64;
+    let mut prevouts = Vec::with_capacity(block.txdata.len().saturating_sub(1));
     for (i, tx) in block.txdata.iter().enumerate() {
         if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
             return Err("bad-txns-nonfinal".into());
@@ -3263,6 +3274,7 @@ fn proposal_connect(
             continue;
         }
         let mut in_val = 0u64;
+        let mut tx_prevouts = Vec::with_capacity(tx.input.len());
         for inp in &tx.input {
             let op = inp.previous_output;
             if !spent.insert(op) {
@@ -3286,6 +3298,7 @@ fn proposal_connect(
             in_val = in_val
                 .checked_add(txout.value.to_sat())
                 .ok_or("bad-txns-inputvalues-outofrange")?;
+            tx_prevouts.push(txout);
         }
         let mut out_val = 0u64;
         for o in &tx.output {
@@ -3299,6 +3312,7 @@ fn proposal_connect(
         fees = fees
             .checked_add(in_val - out_val)
             .ok_or("bad-txns-fee-outofrange")?;
+        prevouts.push(tx_prevouts);
         let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
             created.insert(
@@ -3310,7 +3324,7 @@ fn proposal_connect(
             );
         }
     }
-    Ok(fees)
+    Ok((fees, prevouts))
 }
 
 /// `op`'s unspent confirmed output. `parents` holds each parent's create fk
