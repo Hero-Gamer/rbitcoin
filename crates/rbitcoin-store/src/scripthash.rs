@@ -32,7 +32,6 @@ use crate::scripthash_slabs::{
     slab_class_for_packed_len, SH_MEGAKEY_MIN_FKS,
 };
 use crate::scripthash_sorted_head::SortedHead;
-use crate::sorted_run::{list_materialize_claims, list_runs};
 use bitcoin_hashes::{sha256, Hash};
 use rbitcoin_primitives::{uleb128_len, Fk, TableKind};
 use std::collections::HashMap;
@@ -1074,25 +1073,29 @@ impl ScriptHashTable {
     }
 }
 
-/// Schema 17 SH run compare key is the full 40-byte `{scripthash\|create_fk}` record.
-pub const SH_RUN_SORT_KEY_LEN: u32 = 40;
-
-/// Refuse leftover schema-16 SH run catalogs (`key_len != 40`).
+/// Drop leftover `scripthash.runs` names except `SEAL` / `SEAL.tmp`.
 ///
-/// Empty / missing `scripthash.runs` is ok. A sealed SH head is not inspected.
-pub fn sh_run_catalog_key_len_ok(store_dir: &Path) -> Result<(), StoreError> {
+/// Production no longer writes runs. A missing directory is fine. A sealed
+/// SH head is not inspected.
+pub fn unlink_scripthash_run_leftovers(store_dir: &Path) -> Result<(), StoreError> {
     let runs = store_dir.join("scripthash.runs");
     if !runs.exists() {
         return Ok(());
     }
-    let mut found = Vec::new();
-    found.extend(list_runs(&runs)?);
-    found.extend(list_materialize_claims(&runs)?);
-    for r in found {
-        if r.key_len != SH_RUN_SORT_KEY_LEN {
-            return Err(StoreError::Corrupt(
-                "schema 17 refuses key_len=32 scripthash.runs; wipe store/scripthash.runs and rematerialize",
-            ));
+    let Ok(rd) = std::fs::read_dir(&runs) else {
+        return Ok(());
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name == "SEAL" || name == "SEAL.tmp" {
+            continue;
+        }
+        let p = e.path();
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
         }
     }
     Ok(())

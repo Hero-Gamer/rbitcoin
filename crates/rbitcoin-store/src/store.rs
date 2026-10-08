@@ -418,7 +418,7 @@ impl Store {
         let confirmed = ConfirmedTable::open(&path)?;
         let height_fence = HeightFence::from_confirmed(&confirmed, &header_txs)?;
         drop_leftover_tx_height(&path);
-        crate::scripthash::sh_run_catalog_key_len_ok(&path)?;
+        crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
         open_layout_rewrite_current(&path, meta_ver)?;
         let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
         let txs = TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts())?;
@@ -2848,7 +2848,7 @@ mod tests {
     }
 
     #[test]
-    fn open_does_not_gc_uncataloged_sh_run() {
+    fn open_unlinks_scripthash_run_leftovers_and_keeps_seal() {
         let dir = tmp();
         {
             let s = Store::create_tiny(&dir).unwrap();
@@ -2856,23 +2856,23 @@ mod tests {
         }
         let runs = dir.join("scripthash.runs");
         std::fs::create_dir_all(&runs).unwrap();
-        let mut rec = [0u8; 40];
-        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
-        crate::sorted_run::write_sorted_run(&runs.join("000001.run"), 40, 40, &rec).unwrap();
-        let orphan = runs.join("000099.run");
-        crate::sorted_run::write_sorted_run_file_with_policy(
-            &orphan,
-            40,
-            40,
-            &rec,
-            crate::sorted_run::RunWritePolicy::CATALOG,
-        )
-        .unwrap();
-        assert!(orphan.exists());
-        crate::scripthash::sh_run_catalog_key_len_ok(&dir).unwrap();
+        std::fs::write(runs.join("000001.run"), b"not a catalog").unwrap();
+        std::fs::write(runs.join("SEAL"), b"seal").unwrap();
         Store::open_tiny(&dir).unwrap();
-        assert!(orphan.exists(), "open-time catalog check must not GC");
+        assert!(
+            !runs.join("000001.run").exists(),
+            "leftover run must be unlinked"
+        );
+        assert_eq!(std::fs::read(runs.join("SEAL")).unwrap(), b"seal");
+        let dir2 = tmp();
+        {
+            let s = Store::create_tiny(&dir2).unwrap();
+            s.flush().unwrap();
+        }
+        assert!(!dir2.join("scripthash.runs").exists());
+        Store::open_tiny(&dir2).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

@@ -2926,20 +2926,14 @@ async fn enter_tip_mode_indexes() {
     // run is discarded, Electrum opens, and the next block lands in history.
     let runs = store.join("scripthash.runs");
     std::fs::create_dir_all(&runs).unwrap();
-    let stale_sh = [0xee; 32];
-    let mut rec = [0u8; 40];
-    rec[..32].copy_from_slice(&stale_sh);
-    rec[32..].copy_from_slice(&99u64.to_le_bytes());
-    rbitcoin_store::write_sorted_run(&rbitcoin_store::next_run_path(&runs, 50), 40, 40, &rec)
-        .unwrap();
+    std::fs::write(runs.join("000050.run"), b"leftover").unwrap();
     let hwm_path = store.join(rbitcoin_store::INCLUDE_HWM_NAME);
     let hwm = u64::from_le_bytes(std::fs::read(&hwm_path).unwrap().try_into().unwrap());
     std::fs::write(&hwm_path, (hwm - 2).to_le_bytes()).unwrap();
     let node = start(true);
     wait_listeners(&[electrum_addr, rpc_addr]).await;
-    assert_eq!(
-        rbitcoin_store::list_runs(&runs).unwrap().len(),
-        0,
+    assert!(
+        !runs.join("000050.run").exists(),
         "leftover run discarded"
     );
     assert_eq!(

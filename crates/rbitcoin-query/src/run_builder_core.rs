@@ -1,6 +1,5 @@
 //! Shared leftover-run dir helpers (SEAL + discard). Not a catalog spill path.
 
-use rbitcoin_store::{list_materialize_claims, list_runs};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -25,18 +24,21 @@ impl RunControl {
     }
 }
 
-/// On-disk leftover run count under `runs_io`.
+/// On-disk leftover count under `runs_io`.
 ///
-/// Catalog scan only (`list_runs`); does not unlink. Includes incomplete
-/// materialize claims (`*.run.mat`) so tip-entry leftover detection sees crash
-/// mid-old-k-way state.
+/// Every name except `SEAL` / `SEAL.tmp`. Does not unlink.
 pub fn on_disk_run_count(runs_dir: &Path, runs_io: &Mutex<()>) -> usize {
     let _held = runs_io.lock().unwrap();
-    let catalog = list_runs(runs_dir).map(|r| r.len()).unwrap_or(0);
-    let claims = list_materialize_claims(runs_dir)
-        .map(|r| r.len())
-        .unwrap_or(0);
-    catalog.saturating_add(claims)
+    let Ok(rd) = std::fs::read_dir(runs_dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name != "SEAL" && name != "SEAL.tmp"
+        })
+        .count()
 }
 
 /// Snapshot `(runs_dir, runs_io)` from a locked catalog control.
@@ -103,13 +105,12 @@ mod tests {
         let dir = rbitcoin_store::testutil::TempDir::labeled("runcount").unwrap();
         let ctrl = RunControl::open(&dir, "sh.runs");
         let runs = &ctrl.runs_dir;
-        let mut rec = [0u8; 40];
-        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
-        rbitcoin_store::write_sorted_run(&runs.join("000001.run"), 40, 40, &rec).unwrap();
-        let orphan = runs.join("000099.run");
-        std::fs::copy(runs.join("000001.run"), &orphan).unwrap();
+        std::fs::write(runs.join("000001.run"), b"leftover").unwrap();
         let (rd, io) = runs_dir_io(&ctrl);
         assert_eq!(on_disk_run_count(&rd, &io), 1);
-        assert!(orphan.exists(), "leftover count must not GC");
+        assert!(
+            runs.join("000001.run").exists(),
+            "leftover count must not GC"
+        );
     }
 }
