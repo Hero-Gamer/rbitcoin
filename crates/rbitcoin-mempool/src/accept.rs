@@ -1091,7 +1091,7 @@ impl ActiveMempool {
 
         let aux = Self::vin_aux_from_prep(tx, &prep);
         let t_dur = Instant::now();
-        let slot = self.store.append_live_tx(
+        let slot = match self.store.append_live_tx(
             tx,
             &txid,
             &prep.wtxid,
@@ -1099,7 +1099,13 @@ impl ActiveMempool {
             weight,
             prep.sigop_cost,
             &aux,
-        )?;
+        ) {
+            Ok(slot) => slot,
+            Err(e) => {
+                self.last_evicted = evicted;
+                return Err(e.into());
+            }
+        };
         self.last_accept_stages.durable_us = self
             .last_accept_stages
             .durable_us
@@ -1129,12 +1135,13 @@ impl ActiveMempool {
                 }
             }
         }
-        self.last_evicted = evicted.clone();
         // A descendant of an evicted parent leaves with that tree.
         // A lone protected tx stays.
         if trim && !self.graph.contains(&txid) {
+            self.last_evicted = evicted;
             return Err(AcceptError::Policy("mempool full"));
         }
+        self.last_evicted.clear();
         debug_assert!(
             !evicted.contains(&txid),
             "a successful admit is not in its own eviction set"

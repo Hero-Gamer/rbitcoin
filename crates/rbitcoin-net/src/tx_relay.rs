@@ -1992,7 +1992,7 @@ impl MempoolHub {
             Ok(p) => p,
             Err(_) => {
                 self.meter_accept_stages(lock_us, stages);
-                self.rollback_1p1c_parent(&parent_res.txid);
+                self.rollback_1p1c_parent(&parent_res.txid, &parent_res.evicted);
                 return None;
             }
         };
@@ -2011,18 +2011,19 @@ impl MempoolHub {
             }
             Err(_) => {
                 self.unindex_evicted(&child_failed);
-                self.rollback_1p1c_parent(&parent_res.txid);
+                self.rollback_1p1c_parent(&parent_res.txid, &parent_res.evicted);
                 self.publish_fee_floor();
                 None
             }
         }
     }
 
-    fn rollback_1p1c_parent(&self, txid: &Txid) {
-        let gone = {
+    fn rollback_1p1c_parent(&self, txid: &Txid, evicted: &[Txid]) {
+        let mut gone = evicted.to_vec();
+        {
             let mut g = self.lock_write();
-            g.remove_txid_tree(txid)
-        };
+            gone.extend(g.remove_txid_tree(txid));
+        }
         self.unindex_evicted(&gone);
     }
 
@@ -2031,7 +2032,10 @@ impl MempoolHub {
             .iter()
             .flat_map(|r| r.replaced_txs.iter().cloned())
             .collect();
-        let mut gone = Vec::new();
+        let mut gone: Vec<Txid> = accepted
+            .iter()
+            .flat_map(|r| r.evicted.iter().copied())
+            .collect();
         {
             let mut g = self.lock_write();
             for r in accepted.iter().rev() {
@@ -2044,20 +2048,25 @@ impl MempoolHub {
         }
     }
 
-    /// Drop hub relay / sh / fee-delta / template state for txs already
-    /// removed from the live graph (`remove_for_block_spent`, 1p1c rollback).
+    /// Drop relay maps for txs already removed from the live graph.
+    ///
+    /// A `prioritisetransaction` delta stays until the tx is mined.
     fn unindex_evicted(&self, gone: &[Txid]) {
         if gone.is_empty() {
             return;
         }
         self.note_template_update();
-        let mut deltas = self.fee_deltas.lock().unwrap();
         for tid in gone {
             self.unindex_txid(tid);
+        }
+        self.publish_fee_floor();
+    }
+
+    fn drop_mined_fee_deltas(&self, txids: &[Txid]) {
+        let mut deltas = self.fee_deltas.lock().unwrap();
+        for tid in txids {
             deltas.remove(tid);
         }
-        drop(deltas);
-        self.publish_fee_floor();
     }
 
     fn note_if_accept_failure(&self, tx: &Transaction, e: &AcceptError) {
@@ -2568,6 +2577,7 @@ impl MempoolHub {
         }
         if n > 0 {
             self.unindex_evicted(txids);
+            self.drop_mined_fee_deltas(txids);
         }
         n
     }
@@ -4608,7 +4618,7 @@ mod tests {
         assert!(hub.relay_seq_of(&sib_w).is_some());
         assert!(hub.accept_time_txid(&sib_id).is_some());
         let tmpl = hub.template_updates();
-        hub.rollback_1p1c_parent(&lpid);
+        hub.rollback_1p1c_parent(&lpid, &[]);
         assert!(!hub.contains(&lpid));
         assert!(!hub.contains(&sib_id));
         assert!(
@@ -5125,6 +5135,137 @@ mod tests {
         assert!(!hub.contains(&id));
         assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&id));
         let _ = std::fs::remove_dir_all(&mp);
+    }
+
+    /// Package member 0 can evict X and member 1 can then fail. X leaves the
+    /// relay maps with that rollback, and a prioritisation delta stays.
+    #[test]
+    fn package_rollback_unindexes_slot_eviction_and_keeps_delta() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let victim = spend_true(cbs[0], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        hub.prioritise_tx(victim_id, 11);
+        hub.accept_tx(&victim).expect("victim");
+        hub.lock_write().store.testing_pin_full_slot_table();
+        let parent = spend_true(cbs[1], 50_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        let mut bad_child = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk,
+            }],
+        };
+        bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let err = hub
+            .accept_package(&[parent, bad_child])
+            .expect_err("annex child rolls the package back");
+        assert!(matches!(err, AcceptError::Policy("libre annex")), "{err}");
+        assert!(!hub.contains(&parent_id));
+        assert!(!hub.contains(&victim_id));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&victim_id),
+            "rolled-back member's eviction must leave sh_index"
+        );
+        assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&victim_id));
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != victim_id));
+        assert_eq!(hub.fee_delta(&victim_id), 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 1-parent-1-child admit that commits the parent, evicts for a slot,
+    /// then fails the child, drops the evicted tx's relay maps.
+    #[test]
+    fn onep_rollback_unindexes_slot_eviction() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let victim = spend_true(cbs[0], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        hub.accept_tx(&victim).expect("victim");
+        hub.lock_write().store.testing_pin_full_slot_table();
+        let parent = spend_true(cbs[1], 50_000, ScriptBuf::from_bytes(vec![0x00]));
+        let parent_id = parent.compute_txid();
+        assert!(hub.try_note_extra_compact(&parent));
+        let child = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk,
+            }],
+        };
+        let _ = hub.accept_tx(&child);
+        assert!(!hub.contains(&parent_id));
+        assert!(!hub.contains(&victim_id));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&victim_id),
+            "1p1c rollback must unindex the parent's eviction"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Eviction keeps a prioritisation delta. A later duplicate of the
+    /// survivor does not apply that eviction again. Mining drops the delta.
+    #[test]
+    fn eviction_keeps_priority_and_duplicate_does_not_replay_it() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let low = spend_true(cbs[0], 1_000, spk.clone());
+        let high = spend_true(cbs[1], 50_000, spk);
+        let budget = low.weight().to_wu();
+        let hub = MempoolHub::open_with_weight(&dir, q, budget).unwrap();
+        hub.set_relay_enabled(true);
+        let low_id = low.compute_txid();
+        let high_id = high.compute_txid();
+        hub.prioritise_tx(low_id, 9);
+        hub.prioritise_tx(high_id, 4);
+        hub.accept_tx(&low).expect("low");
+        hub.accept_tx(&high).expect("high evicts low");
+        assert!(!hub.contains(&low_id));
+        assert_eq!(hub.fee_delta(&low_id), 9);
+        let updates = hub.template_updates();
+        let err = hub.accept_tx(&high).expect_err("already in the pool");
+        assert!(matches!(err, AcceptError::Duplicate(_)), "{err}");
+        assert_eq!(hub.template_updates(), updates);
+        assert_eq!(hub.fee_delta(&low_id), 9);
+        assert!(hub.remove_for_block(&[high_id]) >= 1);
+        assert_eq!(hub.fee_delta(&high_id), 0);
+        assert_eq!(hub.fee_delta(&low_id), 9);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A full slot table evicts a live tx to admit the next one, and that
