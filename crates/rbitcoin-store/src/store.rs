@@ -2876,6 +2876,26 @@ mod tests {
     }
 
     #[test]
+    fn open_fails_when_scripthash_runs_cannot_be_read() {
+        let dir = tmp();
+        {
+            let s = Store::create_tiny(&dir).unwrap();
+            s.flush().unwrap();
+        }
+        let runs = dir.join("scripthash.runs");
+        std::fs::write(&runs, b"not a directory").unwrap();
+        let msg = match Store::open_tiny(&dir) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("open must fail when leftovers cannot be read"),
+        };
+        assert!(
+            msg.contains("scripthash.runs"),
+            "open must fail when leftovers cannot be read: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn class_a_v17_roundtrip_templates() {
         let dir = tmp();
         let s = Store::create_tiny(&dir).unwrap();

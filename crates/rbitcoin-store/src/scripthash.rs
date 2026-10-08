@@ -1082,10 +1082,9 @@ pub fn unlink_scripthash_run_leftovers(store_dir: &Path) -> Result<(), StoreErro
     if !runs.exists() {
         return Ok(());
     }
-    let Ok(rd) = std::fs::read_dir(&runs) else {
-        return Ok(());
-    };
-    for e in rd.flatten() {
+    let rd = std::fs::read_dir(&runs).map_err(|e| StoreError::io(&runs, e))?;
+    for e in rd {
+        let e = e.map_err(|err| StoreError::io(&runs, err))?;
         let name = e.file_name();
         let name = name.to_string_lossy();
         if name == "SEAL" || name == "SEAL.tmp" {
@@ -1093,9 +1092,9 @@ pub fn unlink_scripthash_run_leftovers(store_dir: &Path) -> Result<(), StoreErro
         }
         let p = e.path();
         if p.is_dir() {
-            let _ = std::fs::remove_dir_all(&p);
+            std::fs::remove_dir_all(&p).map_err(|err| StoreError::io(&p, err))?;
         } else {
-            let _ = std::fs::remove_file(&p);
+            std::fs::remove_file(&p).map_err(|err| StoreError::io(&p, err))?;
         }
     }
     Ok(())

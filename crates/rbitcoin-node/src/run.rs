@@ -2088,7 +2088,7 @@ pub(crate) fn enter_tip_mode(
             warn!("node: index materialize failed: {e}");
             warn!(
                 "node: Electrum history incomplete until materialize succeeds — \
-                 keep store/scripthash.runs (incl. *.run.mat / merge/) and restart; \
+                 restart resumes from scripthash.unsorted or scripthash.cold_progress; \
                  stay Direct (no write-behind onto an incomplete head)"
             );
             false
