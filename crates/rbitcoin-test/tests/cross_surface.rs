@@ -3077,6 +3077,9 @@ async fn sv2_tp_bootstrap() {
     cfg.sv2_tp_listen = Some(sv2_addr);
     cfg.sv2_tp_authority_sec = Some(Sv2AuthoritySecret(SV2_AUTHORITY_SEC));
     cfg.sv2_tp_stale_grace_secs = 1;
+    // Over the bootstrap tx's 10_000 sat fee: only the fee-push story pushes.
+    cfg.sv2_tp_fee_delta = 10_001;
+    cfg.sv2_tp_template_interval_secs = 1;
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
     cfg.max_run_secs = Some(60);
     let node = tokio::spawn(run_p2p(cfg));
@@ -3154,17 +3157,14 @@ async fn sv2_tp_bootstrap() {
         sv2_tx_data_error(sv2_recv(&mut c).await),
         (t2.template_id + 100, "template-id-not-found".to_string())
     );
-    // Three templates retained per session: the oldest is now stale.
+    // Every template on the tip stays retained, the first included.
     let mut last = t2.template_id;
     for sigops in 2..4 {
         c.coinbase_output_constraints(0, sigops).await.unwrap();
         last = sv2_template(sv2_recv(&mut c).await).template_id;
     }
     c.request_transaction_data(t.template_id).await.unwrap();
-    assert_eq!(
-        sv2_tx_data_error(sv2_recv(&mut c).await),
-        (t.template_id, "stale-template-id".to_string())
-    );
+    assert_eq!(sv2_tx_data(sv2_recv(&mut c).await).0, t.template_id);
     c.request_transaction_data(t2.template_id).await.unwrap();
     assert_eq!(sv2_tx_data(sv2_recv(&mut c).await).2.len(), 1);
 
@@ -3236,6 +3236,8 @@ async fn sv2_tp_bootstrap() {
     while header.validate_pow(header.target()).is_err() {
         header.nonce += 1;
     }
+    // Before the solved tip's template is sent: a floor on its send time.
+    let solving = std::time::Instant::now();
     c.submit_solution(
         pushed.template_id,
         pushed.version,
@@ -3265,6 +3267,55 @@ async fn sv2_tp_bootstrap() {
             tx.compute_txid().to_string()
         ])
     );
+
+    // Fee gains on the unchanged tip: below the delta nothing past a check;
+    // crossing it pushes on the next check, without SetNewPrevHash.
+    let child = acs_spend(
+        tx.compute_txid(),
+        50_0000_0000 - fee,
+        2_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let grandchild = acs_spend(
+        child.compute_txid(),
+        50_0000_0000 - fee - 2_000,
+        9_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([encode_tx(&child)])).await;
+    assert_eq!(sent["result"], child.compute_txid().to_string(), "{sent}");
+    let fee_push = {
+        let recv = c.recv();
+        tokio::pin!(recv);
+        let below = tokio::time::timeout(Duration::from_millis(1500), &mut recv).await;
+        assert!(below.is_err(), "2_000 sat is below the 10_001 delta");
+        let sent = jsonrpc(
+            rpc_addr,
+            "sendrawtransaction",
+            json!([encode_tx(&grandchild)]),
+        )
+        .await;
+        assert_eq!(
+            sent["result"],
+            grandchild.compute_txid().to_string(),
+            "{sent}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), recv)
+            .await
+            .expect("fee push in time")
+            .expect("sv2 message")
+    };
+    // The 5 s default's first check is at least 5 s after `solving`; the 1 s
+    // interval's second is about 2 s after it.
+    let waited = solving.elapsed();
+    assert!(
+        waited < Duration::from_millis(4500),
+        "pushed on the 1 s interval, waited {waited:?}"
+    );
+    let fee_push = sv2_template(fee_push);
+    assert!(!fee_push.future_template, "fee push keeps the prev hash");
+    assert!(fee_push.template_id > next.template_id);
+    assert_eq!(fee_push.value_remaining, next.value_remaining + 11_000);
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;

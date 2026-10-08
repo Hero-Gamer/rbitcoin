@@ -1,6 +1,6 @@
 use crate::test_chain::{padded_chain_with, shared_regtest, TestChain};
 use crate::testutil::TpClient;
-use crate::{run_sv2_tp, Sv2TpConfig, SETUP_TIMEOUT, WRITE_TIMEOUT};
+use crate::{run_sv2_tp, Sv2TpConfig, FEE_DELTA, SETUP_TIMEOUT, TEMPLATE_INTERVAL, WRITE_TIMEOUT};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{
@@ -184,6 +184,8 @@ async fn template_budget_fees_coinbase_and_merkle_path() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -235,6 +237,8 @@ async fn template_resent_constraints_do_not_rebuild() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -275,6 +279,8 @@ async fn template_constraint_rebuilds_are_rate_limited() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -310,6 +316,8 @@ async fn sync_gate_holds_constraints_until_a_fresh_tip() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -362,6 +370,8 @@ async fn constraints_while_ibd_keep_the_last_budget() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -415,6 +425,11 @@ struct FirstTemplate {
 }
 
 async fn first_template(tc: &TestChain) -> FirstTemplate {
+    first_template_every(tc, TEMPLATE_INTERVAL).await
+}
+
+/// [`first_template`] on a session that checks fees every `template_interval`.
+async fn first_template_every(tc: &TestChain, template_interval: Duration) -> FirstTemplate {
     mock_live_tip(tc);
     let tp = run_sv2_tp(Sv2TpConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
@@ -424,6 +439,8 @@ async fn first_template(tc: &TestChain) -> FirstTemplate {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval,
     })
     .await
     .expect("listen");
@@ -658,6 +675,8 @@ async fn constraints_flood_closes_the_session() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -708,6 +727,8 @@ async fn tip_event_rebuilds_a_template_built_on_its_prev_hash() {
         stale_grace: Duration::from_secs(10),
         setup_timeout: SETUP_TIMEOUT,
         write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: TEMPLATE_INTERVAL,
     })
     .await
     .expect("listen");
@@ -782,6 +803,278 @@ async fn same_prev_hash_template_keeps_the_sent_bits() {
         tc.chain.tip_header().unwrap().block_hash(),
         header.block_hash()
     );
+
+    tp.shutdown().await;
+}
+
+/// With the tip unchanged, a rebuild whose fees reach the last sent
+/// template's plus the delta is pushed once the interval has passed, with no
+/// `SetNewPrevHash`. The delta is against the last sent template, so gains
+/// below it add up. A budget change queued by the constraints cooldown
+/// builds once: the fee check leaves it to the deferred rebuild. Wall is
+/// about 3 s, most of it the fixed 1 s cooldown and the silence after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn fee_push_after_the_interval_past_the_delta() {
+    let tc = shared_regtest(3);
+    mock_live_tip(&tc);
+    let interval = Duration::from_millis(250);
+    let tp = run_sv2_tp(Sv2TpConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        chain: Arc::clone(&tc.chain),
+        authority_secret: [7; 32],
+        cert_validity: Duration::from_secs(3600),
+        stale_grace: Duration::from_secs(10),
+        setup_timeout: SETUP_TIMEOUT,
+        write_timeout: WRITE_TIMEOUT,
+        fee_delta: 1_000,
+        template_interval: interval,
+    })
+    .await
+    .expect("listen");
+    let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
+        .await
+        .expect("handshake");
+    c.setup_connection(2, 2, 2, 0).await.unwrap();
+    c.recv().await.expect("setup reply");
+    // Before the first template is sent, so a lower bound on its send time.
+    let asked = tokio::time::Instant::now();
+    c.coinbase_output_constraints(0, 0).await.unwrap();
+    let first = expect_template(&mut c, &tc, &[], true).await;
+
+    let cheap = ScriptBuf::from_bytes(vec![OP_TRUE]);
+    let a = spend(tc.coinbases[0], 1_000, cheap.clone());
+    tc.mempool.accept_tx(&a).expect("mempool accept");
+    // `future: false` also asserts no SetNewPrevHash follows.
+    let id = expect_template(&mut c, &tc, &[&a], false).await;
+    assert!(
+        asked.elapsed() >= interval,
+        "no fee push inside the interval"
+    );
+    assert!(id > first, "template_id must increase");
+
+    let b = spend(tc.coinbases[1], 600, cheap.clone());
+    tc.mempool.accept_tx(&b).expect("mempool accept");
+    let d = spend(tc.coinbases[2], 400, cheap.clone());
+    // One recv future throughout: dropping it mid-frame breaks the Noise decoder.
+    let pushed = {
+        let recv = c.recv();
+        tokio::pin!(recv);
+        let below = tokio::time::timeout(3 * interval, &mut recv).await;
+        assert!(
+            below.is_err(),
+            "600 sat over the last sent is below the delta"
+        );
+        // 600 + 400 since the last sent template reaches the delta.
+        tc.mempool.accept_tx(&d).expect("mempool accept");
+        tokio::time::timeout(Duration::from_secs(10), recv)
+            .await
+            .expect("fee push at the delta")
+            .expect("message")
+    };
+    let next = check_template(&mut c, &tc, pushed, &[&a, &b, &d], false).await;
+    assert!(next > id, "template_id must increase");
+
+    // Inside the cooldown of that push: the new budget waits out the second.
+    // A fee check in between must not send it early and again at the end.
+    let e = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: a.compute_txid(),
+                vout: 0,
+            },
+            ..a.input[0].clone()
+        }],
+        output: vec![TxOut {
+            value: a.output[0].value - Amount::from_sat(1_000),
+            script_pubkey: cheap,
+        }],
+        ..a.clone()
+    };
+    // Budget first: it queues the rebuild before `e` moves the counter.
+    c.coinbase_output_constraints(0, 1).await.unwrap();
+    tc.mempool.accept_tx(&e).expect("mempool accept");
+    let mut f = recv_in_time(&mut c).await;
+    assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
+    let t: NewTemplate = binary_sv2::from_bytes(&mut f.payload).expect("decode");
+    let next_h = tc.chain.query.tip_height().expect("tip").0 + 1;
+    assert!(!t.future_template);
+    assert!(t.template_id > next, "template_id must increase");
+    assert_eq!(
+        t.coinbase_tx_value_remaining,
+        block_subsidy(next_h, &tc.chain.params) as u64 + 3_000
+    );
+    let extra = tokio::time::timeout(Duration::from_secs(1), c.recv()).await;
+    assert!(extra.is_err(), "one template for the deferred budget");
+
+    tp.shutdown().await;
+}
+
+/// Fee pushes add templates on the same tip, and a miner may still be on an
+/// older job: every template since `SetNewPrevHash` stays solvable until
+/// the tip moves (sv2-tp keeps the same set).
+#[tokio::test(flavor = "multi_thread")]
+async fn fee_pushes_keep_older_same_tip_templates_solvable() {
+    let tc = shared_regtest(3);
+    let interval = Duration::from_millis(250);
+    let FirstTemplate {
+        tp,
+        mut c,
+        template_id,
+        version,
+        mut header,
+        coinbase,
+    } = first_template_every(&tc, interval).await;
+
+    let cheap = ScriptBuf::from_bytes(vec![OP_TRUE]);
+    let mut txs = (0..3)
+        .map(|i| spend(tc.coinbases[i], FEE_DELTA, cheap.clone()))
+        .collect::<Vec<_>>();
+    let child = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: txs[0].compute_txid(),
+                vout: 0,
+            },
+            ..txs[0].input[0].clone()
+        }],
+        output: vec![TxOut {
+            value: txs[0].output[0].value - Amount::from_sat(FEE_DELTA),
+            script_pubkey: cheap,
+        }],
+        ..txs[0].clone()
+    };
+    txs.push(child);
+    // More fee pushes than a three-template ring would keep.
+    let mut last = template_id;
+    for tx in &txs {
+        tc.mempool.accept_tx(tx).expect("mempool accept");
+        let mut f = recv_in_time(&mut c).await;
+        assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
+        let t: NewTemplate = binary_sv2::from_bytes(&mut f.payload).expect("decode");
+        assert!(!t.future_template && t.template_id > last, "fee push");
+        last = t.template_id;
+    }
+
+    while header.validate_pow(header.target()).is_err() {
+        header.nonce += 1;
+    }
+    c.submit_solution(template_id, version, header.time, header.nonce, &coinbase)
+        .await
+        .unwrap();
+    let f = recv_in_time(&mut c).await;
+    assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
+    assert_eq!(
+        tc.chain.tip_header().unwrap().block_hash(),
+        header.block_hash(),
+        "the first template on the tip still solves"
+    );
+
+    tp.shutdown().await;
+}
+
+/// Fee pushes stay an interval apart while txs keep arriving: a tx admitted
+/// during a build or send waits for the next check, not the moment after
+/// the push. Steady admission makes that window likely on some push, not
+/// certain. Cost: about 0.8 s over the shared pad copy. A smaller fan-out
+/// runs out before four pushes, and a sparser stream rarely lands inside a
+/// build; with this one, arming the check at the send was caught on every
+/// run, with pushes 3-6 ms apart against the 125 ms floor.
+#[tokio::test(flavor = "multi_thread")]
+async fn fee_pushes_stay_an_interval_apart_under_steady_admission() {
+    let tc = shared_regtest(1);
+    let cheap = ScriptBuf::from_bytes(vec![OP_TRUE]);
+    // Confirmed fan-out: each streamed spend is its own cluster. Enough
+    // outputs to outlast four pushes on a loaded runner.
+    let outs = 1_000u64;
+    let each = (50_0000_0000 - 10_000) / outs;
+    let mut fanout = spend(tc.coinbases[0], 10_000, cheap.clone());
+    fanout.output = vec![
+        TxOut {
+            value: Amount::from_sat(each),
+            script_pubkey: cheap.clone(),
+        };
+        outs as usize
+    ];
+    let tip = tc.chain.tip_header().expect("tip");
+    let h = tc.chain.query.tip_height().expect("tip height").0;
+    let block = mine_regtest_paying(
+        tip.block_hash(),
+        tip.time + 1,
+        h + 1,
+        cheap.clone(),
+        vec![fanout.clone()],
+    );
+    tc.chain.accept_block(block).expect("accept fan-out");
+    mock_live_tip(&tc);
+
+    let interval = Duration::from_millis(250);
+    let tp = run_sv2_tp(Sv2TpConfig {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        chain: Arc::clone(&tc.chain),
+        authority_secret: [7; 32],
+        cert_validity: Duration::from_secs(3600),
+        stale_grace: Duration::from_secs(10),
+        setup_timeout: SETUP_TIMEOUT,
+        write_timeout: WRITE_TIMEOUT,
+        fee_delta: FEE_DELTA,
+        template_interval: interval,
+    })
+    .await
+    .expect("listen");
+    let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
+        .await
+        .expect("handshake");
+    c.setup_connection(2, 2, 2, 0).await.unwrap();
+    c.recv().await.expect("setup reply");
+    c.coinbase_output_constraints(0, 0).await.unwrap();
+    expect_template(&mut c, &tc, &[], true).await;
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let feeder = {
+        let (mempool, stop, fanout) = (Arc::clone(&tc.mempool), Arc::clone(&stop), fanout);
+        std::thread::spawn(move || {
+            for vout in 0..outs as u32 {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                let tx = Transaction {
+                    input: vec![TxIn {
+                        previous_output: OutPoint {
+                            txid: fanout.compute_txid(),
+                            vout,
+                        },
+                        ..fanout.input[0].clone()
+                    }],
+                    output: vec![TxOut {
+                        value: Amount::from_sat(each - FEE_DELTA),
+                        script_pubkey: cheap.clone(),
+                    }],
+                    ..fanout.clone()
+                };
+                mempool.accept_tx(&tx).expect("mempool accept");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let mut at = Vec::new();
+    for _ in 0..4 {
+        let mut f = recv_in_time(&mut c).await;
+        at.push(tokio::time::Instant::now());
+        assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
+        let t: NewTemplate = binary_sv2::from_bytes(&mut f.payload).expect("decode");
+        assert!(!t.future_template, "fee push");
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    feeder.join().expect("feeder");
+    // Receive times jitter around the server's sends; half an interval
+    // leaves room for that and still fails a push right after the last.
+    for w in at.windows(2) {
+        assert!(
+            w[1] - w[0] >= interval / 2,
+            "pushes {:?} apart, interval {interval:?}",
+            w[1] - w[0]
+        );
+    }
 
     tp.shutdown().await;
 }

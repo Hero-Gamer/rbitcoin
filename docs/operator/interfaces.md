@@ -262,9 +262,10 @@ sync + rust-gbt; they are empty until `/internal/mempool/txs` has filled.
 `--sv2-tp-listen ADDR` serves the SV2 Template Distribution Protocol (TDP v2)
 over Noise NX. A Job Declarator Client or pool connects, sends
 `CoinbaseOutputConstraints`, and gets `NewTemplate` / `SetNewPrevHash` on
-every tip. It can request a template's transactions and submit a solved
-block, which the node validates and connects like any other block. Default
-is **off**; there is no plaintext mode.
+every tip, plus a fresh `NewTemplate` when fees on the same tip rise. It
+can request a template's transactions and submit a solved block, which the
+node validates and connects like any other block. Default is **off**; there
+is no plaintext mode.
 
 | Flag (conf key) | Default | Meaning |
 |---|---|---|
@@ -273,6 +274,8 @@ is **off**; there is no plaintext mode.
 | `--sv2-tp-authority-sec KEY` (`sv2_tp_authority_sec`) | — | The same secret inline. Argv shows in `ps`; prefer the file or the conf file |
 | `--sv2-tp-cert-validity SECS` (`sv2_tp_cert_validity`) | 3600 | Lifetime of each per-connection Noise certificate; 1 to 4294967295 (`u32::MAX`, the Noise cert field) |
 | `--sv2-tp-stale-grace SECS` (`sv2_tp_stale_grace`) | 10 | How long templates on a replaced tip still answer; 0 to 86400 (one day), `0` retires them at once |
+| `--sv2-tp-fee-delta SATS` (`sv2_tp_fee_delta`) | 1000 | Fee gain over a client's last template that pushes a new one on the same tip; `0` pushes any rebuild after a mempool change that did not lower the fees |
+| `--sv2-tp-template-interval SECS` (`sv2_tp_template_interval`) | 5 | Check period: each session checks for that gain every SECS, and a fee push never comes sooner than this after the client's last template. A gain can wait up to one more period than on sv2-tp, which rechecks every second after its interval; `1` matches that. 1 to 86400 |
 
 `--sv2-tp-listen` needs one of the authority flags. At startup the node logs
 `sv2 TP on ADDR (authority pubkey KEY)`. KEY is in the SRI `key-utils`
@@ -286,8 +289,14 @@ once a write to it makes no progress for 30 s.
 A changed `CoinbaseOutputConstraints` within 1 s of the last template waits
 out the rest of that second; a client that keeps replacing a queued budget
 (more than 8 times before it is built) is closed.
-Each session keeps its last 3 templates. A request for an older template id
-answers `stale-template-id`, and an undecodable `SubmitSolution` or one
+Each session keeps every template on the current tip, up to 64, so a miner
+still on an older job after fee pushes can submit its solution; templates
+on a replaced tip retire after `--sv2-tp-stale-grace`. The templates share
+the mempool's transaction bodies, so each costs little until its
+transactions leave the mempool. A request for a template id no longer kept
+answers `stale-template-id`. Each check after a mempool change is one
+template build per session. An undecodable
+`SubmitSolution` or one
 that misses the template target is logged and dropped. A `header_timestamp`
 outside the sv2 rolling window (a miner clock running ahead) is logged and
 still submitted; block validation applies the consensus time rules.
@@ -313,6 +322,7 @@ services.rbitcoin.sv2.tp = {
   port = 8442;                         # default; address = "127.0.0.1"
   authoritySecretFile = "/run/keys/sv2-authority"; # readable by the service user
   # certValidity = 3600; staleGrace = 10; openFirewall = false;
+  # feeDelta = 1000; templateInterval = 5;
 };
 ```
 

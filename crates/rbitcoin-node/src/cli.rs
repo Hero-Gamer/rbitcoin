@@ -310,7 +310,7 @@ fn operator_usage() -> String {
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
-    [--sv2-tp-listen ADDR] [--sv2-tp-authority-sec KEY] [--sv2-tp-authority-sec-file PATH] [--sv2-tp-cert-validity SECS] [--sv2-tp-stale-grace SECS] \\\n\
+    [--sv2-tp-listen ADDR] [--sv2-tp-authority-sec KEY] [--sv2-tp-authority-sec-file PATH] [--sv2-tp-cert-validity SECS] [--sv2-tp-stale-grace SECS] [--sv2-tp-fee-delta SATS] [--sv2-tp-template-interval SECS] \\\n\
     [--sh-index] [--block-filter-index] [--prune-seqsigwit] [--prune-seqsigwit-ram-threshold-bytes N] [--sp-tweaks] [--sp-tweaks-dust SATS] [--max-sh-creates N] [--electrum-max-subs N] [--esplora-block-template] \\\n\
     [--rpc] [--rpc-listen [ADDR]] [--rest] [--rpc-socket PATH] [--rpc-token-file PATH] [--rpc-cookie-file PATH] [--rpc-work-queue N] \\\n\
     [--milestone HEIGHT] \\\n\
@@ -372,6 +372,8 @@ SV2: --sv2-tp-listen ADDR serves the Stratum v2 Template Distribution Protocol (
   (the same hex in a file). The x-only pubkey is logged.\n\
   --sv2-tp-cert-validity SECS per-connection certificate lifetime, at most 4294967295 (default 3600).\n\
   --sv2-tp-stale-grace SECS keeps a replaced tip's templates answering for SECS, at most 86400 (default 10).\n\
+  --sv2-tp-fee-delta SATS pushes a same-tip template once its fees gain SATS over the last one sent (default 1000).\n\
+  --sv2-tp-template-interval SECS checks for that gain every SECS, 1 to 86400 (default 5).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer); --rpc-cookie-file opts TCP into Core cookie HTTP Basic. No --rpcuser. --rest turns on unauthenticated /rest/ on those listeners (off unless set).\n\
 Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
   Default (flag omitted): hot and cold files both live under --datadir.\n\
@@ -644,6 +646,8 @@ mod tests {
             "--sv2-tp-authority-sec-file",
             "--sv2-tp-cert-validity",
             "--sv2-tp-stale-grace",
+            "--sv2-tp-fee-delta",
+            "--sv2-tp-template-interval",
             "--rpc",
             "--rpc-listen",
             "--rest",

@@ -83,9 +83,12 @@ Do not copy them here.
 - Reactor rule: template builds and solution assembly run in a blocking
   region, never on tokio workers. `MempoolHub` accessors assert
   not-reactor.
-- Named RAM trade (CONTRIBUTING 9): each session retains, per live
-  template, the full witness-serialized non-coinbase txs (≤ ~4 MB × ~3
-  templates × capped sessions; ≤ ~96 MB at the default cap of 8).
+- Named RAM trade (CONTRIBUTING 9): each session retains its templates
+  (up to 64) holding the mempool's own `Arc<Transaction>` bodies, about
+  24 KB of pointers per full template while the txs are still pooled.
+  A body that leaves the pool stays alive while a template holds it: at
+  most 64 × ~4 MB per session (~2 GB at the default cap of 8) if every
+  template's txs were replaced, which costs replacement fees each time.
   Retention is required: the mempool may evict a tx
   before `RequestTransactionData` or `SubmitSolution` arrives. Stale grace
   (default 10 s) after a tip change, then drop (mirrors sv2-tp).
@@ -326,7 +329,8 @@ Ships the listener, bootstrap, tip push, transaction data, and
 - **Contract:** a live `template_id` →
   `RequestTransactionData.Success{template_id, excess_data: "",
   transaction_list}` with the witness-serialized txs in template order.
-  A session retains its last 3 templates; an id it was sent but dropped →
+  A session retains its templates (count bound in Plan C C1); an id it was
+  sent but dropped →
   `RequestTransactionData.Error{error_code: "stale-template-id"}`, an id
   never sent → `"template-id-not-found"`.
 - **Red:** extend the B4b journey: request the served template's data,
@@ -476,27 +480,80 @@ when fees rise enough to matter, throttled. Requires Plan B.
 
 ### C1 — Fee-delta push
 
-- **Contract:** with the tip unchanged, when `MempoolHub::template_updates`
-  advances and a rebuilt template's total fees exceed the last sent by
-  `--sv2-tp-fee-delta` sats, and at least `--sv2-tp-template-interval`
-  seconds passed since the last push, the session sends
-  `NewTemplate{future_template: false}` with **no** `SetNewPrevHash`.
-  Below the delta or inside the interval: nothing.
-- **Red:** extend the B journey: submit higher-fee txs via the harness
-  RPC, assert the push; submit a fee-trivial tx, assert silence; assert
-  the interval throttle.
-- **Green:** watch task on the counter; per-session last-sent fee/instant;
-  feeds the B6 publish path.
-- **Refactor:** share the throttle predicate between the decision and its
-  unit.
-- **Verify:** journey filter.
+- **Contract:** with the tip unchanged, a session sends
+  `NewTemplate{future_template: false}` with **no** `SetNewPrevHash` when a
+  rebuild's total fees are at least `--sv2-tp-fee-delta` sats above the
+  last template it sent, and at least `--sv2-tp-template-interval` passed
+  since its last push. Below the delta, inside the interval, or with
+  `MempoolHub::template_updates` unchanged: nothing. Defaults follow
+  stratum-mining `sv2-tp` (`src/sv2/template_provider.h`: `fee_delta{1000}`
+  sat, `template_interval{5}` s; `-templateinterval` is at least 1 s), and
+  the comparison is Core's waitNext (`node/block_template_manager.cpp`:
+  `new_fees >= current_fees + fee_threshold`). Fees are base fees on both
+  sides: Core sums `vTxFees`, which `node/miner.cpp` fills with
+  `entry.GetFee()` (the modified fee only orders selection), and here
+  `value_remaining` is subsidy plus `Selected.fee_sat`. A
+  `prioritisetransaction` that reorders the selection without raising base
+  fees by the delta does not push, as on Core.
+- **Design:** `template_updates` is a plain counter, not a notifier (GBT
+  longpoll polls it every 50 ms). The session `select!` gains one
+  `sleep_until` arm beside `rebuild_at` / `retire_at`, armed one interval
+  after each push and re-armed one interval after each check. When it
+  fires the session rebuilds only if the counter moved since its last
+  build and no constraints rebuild is queued (that rebuild publishes the
+  latest mempool); a rebuild on a different prev hash is dropped (the tip
+  event follows and publishes). The library refuses an interval under
+  100 ms (`MIN_TEMPLATE_INTERVAL`) or over a day; the node flag takes whole
+  seconds. The fee push goes through the B6 publish path, so
+  it keeps the `SetNewPrevHash` nBits and target (`sent_bits`, B4a); bits
+  are not recomputed. CPU trade: at most `MAX_SESSIONS` builds per interval
+  under the mempool read lock. The interval is a check period: sv2-tp
+  suppresses fee updates for `-templateinterval` after a push and then
+  rechecks on Core's 1 s waitNext tick, so a gain can reach a client here
+  up to one interval later than there; `--sv2-tp-template-interval 1`
+  matches that latency at 1 build per second per session. A check whose
+  build fails (a reorg pops the tip block by block with no event until the
+  new branch connects) is skipped; the tip event publishes.
+- **Retention:** fee pushes add one same-tip template per interval while a
+  miner may still be on any job since `SetNewPrevHash` (SV1 translators
+  update with `clean_jobs=false`). So every template on the current tip
+  stays retained, as sv2-tp's `PruneBlockTemplateCache` keeps every
+  current-prev template, up to `MAX_RETAINED` = 64 per session, oldest
+  dropped first (replaced tips before the current one). Templates share the
+  mempool's bodies (the `Arc` selection in Plan A), so the count is cheap.
+  Templates on a replaced tip still retire after `--sv2-tp-stale-grace`.
+- **Red:** `cargo test -p rbitcoin-sv2 fee_push` — a padded regtest
+  session on a short interval: a tx above the delta is pushed after the
+  interval with no `SetNewPrevHash`; one below it is not; a push never
+  lands inside the interval; a budget queued by the constraints cooldown
+  builds once; the first template on the tip still solves after more fee
+  pushes than the old three-template ring; under steady admission
+  consecutive pushes stay at least half an interval apart. The
+  cross-surface `sv2_tp_bootstrap` journey gains one RPC-driven fee push.
+- **Known mutant survivors** (nightly cargo-mutants, not PR checks):
+  deleting the re-arm in `check_fees` (a session spins after a check that
+  does not push) and dropping the unchanged-counter skip (one idle build
+  per interval) change only CPU; the SV2 build metric follow-up makes them
+  observable. Dropping the same-prev-hash guard in `check_fees` would send
+  a fee rebuild from the store-publish-before-strip window as a new prev
+  hash; a fee check cannot be steered into that window deterministically,
+  so the guard is pinned by review, not a test.
+- **Green:** per-session check deadline and last-seen counter; publish
+  split into build and send.
+- **Refactor:** none expected.
+- **Verify:** `cargo test -p rbitcoin-sv2 --lib`,
+  `cargo test -p rbitcoin-test --test cross_surface sv2`
 
 ### C2 — Operator surface
 
-- **Contract:** OPERATOR documents `--sv2-tp-fee-delta` and
-  `--sv2-tp-template-interval`; `services.rbitcoin.sv2.tp.*` gains both
-  with argv asserts.
-- **Red / Green / Refactor / Verify:** as B8b.
+- **Contract:** `--sv2-tp-fee-delta SATS` (conf `sv2_tp_fee_delta`) and
+  `--sv2-tp-template-interval SECS` (conf `sv2_tp_template_interval`, at
+  least 1, at most 86400); `services.rbitcoin.sv2.tp.{feeDelta,
+  templateInterval}` with argv asserts in `nix/tests/nixos-module-eval.nix`;
+  `docs/operator/interfaces.md` documents both and the
+  `RequestTransactionData` window.
+- **Red / Green / Refactor / Verify:** as B8b, plus config parse units
+  under `sv2_tp_`.
 
 ---
 
