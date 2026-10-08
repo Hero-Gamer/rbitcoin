@@ -33,7 +33,7 @@ mod versionbits_warn;
 
 pub use asmap::{AsMap, TWO_PREFIX_ASMAP};
 pub use cache::BlockCache;
-pub use chain::{AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
+pub use chain::{check_block_proposal_with, AcceptOutcome, ChainHub, ChainTipInfo, TipEvent};
 pub use compact::{
     classify_v2_cmpct_peer, prefilled_indexes_ok, shortid_map_from_txs, try_reconstruct,
     v2_header_hashes, CmpctPeerFrame,

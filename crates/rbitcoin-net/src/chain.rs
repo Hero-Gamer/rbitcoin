@@ -7,7 +7,10 @@ use crate::cache::BlockCache;
 use crate::error::NetError;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash, CompactTarget, ScriptBuf, Target, Transaction, Txid, Work};
+use bitcoin::{
+    Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Target, Transaction, TxOut, Txid,
+    Work,
+};
 use rbitcoin_consensus::{
     accept_and_connect_block_preverified, confirm_wire_load_from_plan as consensus_load_from_plan,
     confirm_wire_load_phase_pipelined, confirm_write_phase, genesis_block, header_to_record,
@@ -1746,6 +1749,19 @@ impl ChainHub {
         )
     }
 
+    /// Core `TestBlockValidity` for a `getblocktemplate` proposal or an SV2
+    /// job: no PoW, no UTXO write. `Ok` is the block fees in sat; `Err` is
+    /// Core's reject string.
+    pub fn check_block_proposal(&self, block: &Block) -> Result<u64, String> {
+        check_block_proposal_with(
+            &self.query,
+            &self.params,
+            self.milestone,
+            self.clock.now_secs() as u32,
+            block,
+        )
+    }
+
     /// Regtest uses the trivial-bits miner. An `OP_TRUE` signet uses signet
     /// bits and an empty BIP325 solution so `generatetoaddress` can extend
     /// that challenge the way Bitcoin Core's miner does.
@@ -3089,6 +3105,149 @@ impl ChainHub {
         }
         Ok(())
     }
+}
+
+/// [`ChainHub::check_block_proposal`] on explicit inputs, for a caller that
+/// holds a [`Query`] but no live hub.
+pub fn check_block_proposal_with(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    now: u32,
+    block: &Block,
+) -> Result<u64, String> {
+    let tip_h = query.tip_height().ok_or("no tip")?;
+    let (_, tip_rec) = query
+        .header_at_height(tip_h)
+        .map_err(|e| e.to_string())?
+        .ok_or("tip header missing")?;
+    if block.header.prev_blockhash.to_byte_array() != tip_rec.hash {
+        return Err("inconclusive-not-best-prevblk".into());
+    }
+    let height = tip_h.0.saturating_add(1);
+    let expected =
+        rbitcoin_consensus::expected_next_bits(query, params, Height(height), block.header.time)
+            .map(|c| c.to_consensus())
+            .unwrap_or(tip_rec.bits);
+    if block.header.bits.to_consensus() != expected {
+        return Err("bad-diffbits".into());
+    }
+    let mtp = rbitcoin_consensus::median_time_past(query, tip_h).unwrap_or(tip_rec.timestamp);
+    // Core is `<=` MTP. Proposal uses `<` so a template stamped at the
+    // parent's mediantime+1 still validates after that parent is submitted
+    // (new MTP often equals that stamp on an incrementing cache).
+    if block.header.time < mtp {
+        return Err("time-too-old".into());
+    }
+    if u64::from(block.header.time) > u64::from(now).saturating_add(2 * 60 * 60) {
+        return Err("time-too-new".into());
+    }
+    // Spends before txid-uniqueness: two copies of the same non-coinbase
+    // tx are `bad-txns-inputs-missingorspent` (Core CheckBlock order).
+    let fees = proposal_connect(query, block, height, mtp)?;
+    let mut seen = HashSet::new();
+    for tx in &block.txdata {
+        if !seen.insert(tx.compute_txid()) {
+            return Err("bad-txns-duplicate".into());
+        }
+    }
+    let vctx = rbitcoin_consensus::ValidationContext::at(params, Height(height), milestone);
+    if let Err(e) = rbitcoin_consensus::validate_block_structure(block, &vctx) {
+        return Err(rbitcoin_consensus::block_reject_reason(&e));
+    }
+    let subsidy = rbitcoin_consensus::block_subsidy(height, params) as u64;
+    let coinbase_out = block.txdata[0]
+        .output
+        .iter()
+        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
+    if coinbase_out > subsidy.saturating_add(fees) {
+        return Err("bad-cb-amount".into());
+    }
+    Ok(fees)
+}
+
+/// Resolves every spend against the block and the confirmed chain. `Ok` is
+/// the fee total over the non-coinbase txs.
+fn proposal_connect(query: &Query, block: &Block, height: u32, mtp: u32) -> Result<u64, String> {
+    if block.txdata.is_empty() {
+        return Err("bad-blk-length".into());
+    }
+    if !block.txdata[0].is_coinbase() {
+        return Err("bad-cb-missing".into());
+    }
+    let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
+    let mut spent: HashSet<OutPoint> = HashSet::new();
+    let mut fees = 0u64;
+    for tx in block.txdata.iter() {
+        if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
+            return Err("bad-txns-nonfinal".into());
+        }
+        if tx.is_coinbase() {
+            let tid = tx.compute_txid();
+            for (vout, o) in tx.output.iter().enumerate() {
+                created.insert(
+                    OutPoint {
+                        txid: tid,
+                        vout: vout as u32,
+                    },
+                    o.clone(),
+                );
+            }
+            continue;
+        }
+        let mut in_val = 0u64;
+        for inp in &tx.input {
+            let op = inp.previous_output;
+            if !spent.insert(op) {
+                return Err("bad-txns-inputs-missingorspent".into());
+            }
+            let txout = if let Some(o) = created.get(&op) {
+                o.clone()
+            } else if let Some(o) = chain_txout(query, &op) {
+                o
+            } else {
+                return Err("bad-txns-inputs-missingorspent".into());
+            };
+            in_val = in_val.saturating_add(txout.value.to_sat());
+        }
+        let out_val: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        if out_val > in_val {
+            return Err("bad-txns-in-belowout".into());
+        }
+        fees = fees.saturating_add(in_val - out_val);
+        let tid = tx.compute_txid();
+        for (vout, o) in tx.output.iter().enumerate() {
+            created.insert(
+                OutPoint {
+                    txid: tid,
+                    vout: vout as u32,
+                },
+                o.clone(),
+            );
+        }
+    }
+    Ok(fees)
+}
+
+fn chain_txout(query: &Query, op: &OutPoint) -> Option<TxOut> {
+    let tid = op.txid.to_byte_array();
+    if query.is_outpoint_spent(&tid, op.vout).ok()? {
+        return None;
+    }
+    let (fk, rec) = query.get_tx_by_txid(&tid).ok().flatten()?;
+    let out = query
+        .tx_output_at_fk(fk, op.vout)
+        .ok()
+        .or_else(|| query.tx_output(&rec, op.vout).ok())?;
+    let value = if out.value < 0 {
+        Amount::ZERO
+    } else {
+        Amount::from_sat(out.value as u64)
+    };
+    Some(TxOut {
+        value,
+        script_pubkey: ScriptBuf::from_bytes(out.script),
+    })
 }
 
 pub fn accept_block_header_nodos_log(hash: impl std::fmt::Display) -> String {
@@ -6059,6 +6218,74 @@ mod tests {
         );
         assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The block proposal check shared by `getblocktemplate` proposal mode
+    /// and the SV2 template provider: a child of the tip passes, a block on
+    /// any other parent is `inconclusive-not-best-prevblk`.
+    #[test]
+    fn check_block_proposal_accepts_tip_child_and_rejects_other_parent() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let block = hub
+            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block),
+            Ok(0),
+            "no fees in a coinbase-only block"
+        );
+        let mut off_tip = block;
+        off_tip.header.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
+        assert_eq!(
+            hub.check_block_proposal(&off_tip).unwrap_err(),
+            "inconclusive-not-best-prevblk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Core prices the coinbase in ConnectBlock, after CheckBlock: a coinbase
+    /// over subsidy + fees is `bad-cb-amount` once the structure checks pass,
+    /// and a structure reject on the same block still wins.
+    #[test]
+    fn check_block_proposal_rejects_bad_cb_amount_after_structure() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let mut block = hub
+            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+            .unwrap();
+        let cb = &mut block.txdata[0].output[0].value;
+        *cb = Amount::from_sat(cb.to_sat() + 1);
+        let root_for_fat_cb = block.compute_merkle_root().unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txnmrklroot",
+            "structure checks run before the coinbase is priced"
+        );
+        block.header.merkle_root = root_for_fat_cb;
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-cb-amount"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `Ok` carries the block fees, so a template provider can price the
+    /// coinbase: a coinbase at exactly subsidy + fees passes.
+    #[test]
+    fn check_block_proposal_returns_the_block_fees() {
+        let (dir, hub) = tmp_hub();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(101, op_true.clone(), vec![])
+            .unwrap();
+        let spend = mature_spend_tx(&hub, 1);
+        let mut block = hub.assemble_block_to_script(op_true, vec![spend]).unwrap();
+        assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
+        let subsidy = rbitcoin_consensus::block_subsidy(102, &hub.params) as u64;
+        block.txdata[0].output[0].value = Amount::from_sat(subsidy + 10_000);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
         let _ = std::fs::remove_dir_all(dir);
     }
 }
