@@ -534,7 +534,7 @@ when fees rise enough to matter, throttled. Requires Plan B.
   deleting the re-arm in `check_fees` (a session spins after a check that
   does not push) and dropping the unchanged-counter skip (one idle build
   per interval) change only CPU. The listener's `Sv2TpStats` (also
-  `tip: perf sv2` and `/metrics`) count checks and builds, and
+  `tip: perf` JSON `sv2_checks` / `sv2_builds` and `/metrics`) count checks and builds, and
   `idle_session_checks_each_interval_and_does_not_rebuild` pins both.
   Dropping the same-prev-hash guard in `check_fees` would send
   a fee rebuild from the store-publish-before-strip window as a new prev

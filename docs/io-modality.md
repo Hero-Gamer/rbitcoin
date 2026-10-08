@@ -224,9 +224,7 @@ export RBITCOIN_IO=uring   # or pread for second arm
 ./target/release/rbitcoin-node --datadir /path/to/local/datadir …flags…
 
 # Capture steady-state minutes:
-grep 'ibd: perf' host.log
-grep 'ibd: perf_dbg' host.log    # head=, plan_batch, class_a head insert, pin
-grep 'ibd: sizes' host.log       # rss= anon= file=
+grep 'ibd: perf {' host.log | sed 's/.*ibd: perf //' | jq -c '{ts, load_ms, rss_kb, rss_file_kb}'
 ```
 
 **A/B:** same host, same network/milestone/height band when possible; baseline
@@ -235,7 +233,7 @@ SHA vs candidate SHA; compare tip rate, head ms/blk, RssFile. **Fail ship** on
 
 There is no separate store microbench binary (`rbitcoin-store-bench` was
 removed; default graph is product + suite). Head-insert A/B is the live
-`ibd: perf` / `ibd: perf_dbg` window above.
+`ibd: perf` JSON window above.
 
 `TableFile` has no maps (`memmap2` not in the workspace). There is no
 `RBITCOIN_TX_HEAD_ACCESS` hatch. Tables are fd pread/pwrite + fallocate.

@@ -7,9 +7,9 @@ use rbitcoin_electrum::{run_electrum, ElectrumConfig, ElectrumHandle, TipNotify}
 use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandle, EsploraListen};
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
-    default_port, format_serve_perf, format_tip_perf_sizes, netgroup, read_platform_rss,
-    sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap, BlockingRegion, ChainHub,
-    Dialer, IbdConfig, MempoolHub, P2PNode, PeerConnType, TipEvent, TipPerfSizes,
+    default_port, netgroup, read_platform_rss, sample_reset_serve_perf, socks_dns_seed_dests,
+    tip_perf_json, AddrMan, AsMap, BlockingRegion, ChainHub, Dialer, IbdConfig, MempoolHub,
+    P2PNode, PeerConnType, TipEvent, TipPerfLog,
 };
 use rbitcoin_primitives::Network;
 use rbitcoin_query::{spawn_sh_writebehind, Query, SpendSync};
@@ -1221,40 +1221,45 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         .unwrap_or(mp.accept_us);
                     let esp_avg = esp_us.checked_div(esp_n).unwrap_or(0);
                     let el_avg = el_us.checked_div(el_n).unwrap_or(0);
-                    let serve_s = format_serve_perf(&serve);
-                    let sv2_s = sv2.map_or_else(String::new, |(checks, (n, us, max))| {
-                        format!(
-                            " sv2 checks={checks} builds={n} build_avg_us={} build_max_us={max}",
-                            us.checked_div(n).unwrap_or(0)
-                        )
-                    });
-                    let sizes = format_tip_perf_sizes(&TipPerfSizes {
+                    let (sv2_checks, sv2_builds, sv2_build_us, sv2_build_max_us) =
+                        sv2.map(|(checks, (n, us, max))| (checks, n, us, max))
+                            .unwrap_or((0, 0, 0, 0));
+                    let line = tip_perf_json(&TipPerfLog {
                         rss: read_platform_rss(),
                         cache_bodies: node.hub.cache_body_count(),
                         held_bodies: node.hub.held_body_count(),
                         sh_heads: node.query.process_owned_size_snapshot().sh_heads,
                         mp_live: live,
+                        follow_live,
+                        blocks: blks,
+                        accepts: mp.accepts,
+                        rejects: mp.rejects,
+                        accept_avg_us: acc_avg,
+                        accept_max_us: mp.accept_max_us,
+                        accept_lock_us: mp.accept_lock_us,
+                        accept_utxo_us: mp.accept_utxo_us,
+                        accept_script_us: mp.accept_script_us,
+                        accept_durable_us: mp.accept_durable_us,
+                        inv_tx: mp.inv_tx,
+                        getdata_tx: mp.getdata_tx,
+                        announce: mp.announce,
+                        esplora_n: esp_n,
+                        esplora_avg_us: esp_avg,
+                        esplora_max_us: esp_max,
+                        electrum_n: el_n,
+                        electrum_avg_us: el_avg,
+                        electrum_max_us: el_max,
+                        serve_n: serve.n,
+                        serve_bytes: serve.bytes,
+                        serve_tx: serve.tx_count,
+                        serve_avg_us: serve.wall_ns.checked_div(serve.n).unwrap_or(0) / 1_000,
+                        serve_max_us: serve.max_ns / 1_000,
+                        sv2_checks,
+                        sv2_builds,
+                        sv2_build_avg_us: sv2_build_us.checked_div(sv2_builds).unwrap_or(0),
+                        sv2_build_max_us,
                     });
-                    debug!(
-                        "tip: perf {sizes} follow_live={follow_live} blocks={blks} \
-                         mempool live={live} accepts={} rejects={} accept_avg_us={acc_avg} \
-                         accept_max_us={} accept_lock_us={} accept_utxo_us={} \
-                         accept_script_us={} accept_durable_us={} \
-                         inv_tx={} getdata_tx={} announce={} \
-                         esplora req={esp_n} avg_us={esp_avg} max_us={esp_max} \
-                         electrum req={el_n} avg_us={el_avg} max_us={el_max} \
-                         {serve_s}{sv2_s}",
-                        mp.accepts,
-                        mp.rejects,
-                        mp.accept_max_us,
-                        mp.accept_lock_us,
-                        mp.accept_utxo_us,
-                        mp.accept_script_us,
-                        mp.accept_durable_us,
-                        mp.inv_tx,
-                        mp.getdata_tx,
-                        mp.announce
-                    );
+                    debug!("tip: perf {line}");
                 }
             }
 

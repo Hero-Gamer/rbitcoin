@@ -131,16 +131,16 @@ ContigPark charge/release is **retired**.
 
 Host check / in-process:
 
-Every ~5s IBD emits **`ibd: sizes`** (INFO) with process RSS and occupancy of
-known retain structures. Tip-follow emits **`tip: perf`** (DEBUG) with the same
-`rss=` `anon=` `file=` `hwm=` split plus `cache=` `held=` `sh_heads=` `mp_live=`.
-`anon=` growth is process heap; `file=` growth is mmap page cache.
-
-Grep:
+Every ~5s IBD emits one DEBUG **`ibd: perf`** JSON object. RSS and retain
+occupancy are fields on that object (`rss_kb`, `rss_anon_kb`, `rss_file_kb`,
+`vm_hwm_kb`, `work`, `owned`, `conf_pipe`). Tip-follow emits **`tip: perf`**
+(DEBUG) as JSON with `rss.rss_kb` / `rss.anon_kb` / `rss.file_kb` / `rss.hwm_kb`
+plus `cache_bodies`, `held_bodies`, `sh_heads`, `mp_live`. `rss_anon_kb` growth
+is process heap; `rss_file_kb` growth is mmap page cache.
 
 ```bash
-grep 'ibd: sizes' mainnet.log
-grep 'tip: perf' mainnet.log
+grep 'ibd: perf {' mainnet.log | sed 's/.*ibd: perf //' | jq -c '{ts, rss_kb, rss_anon_kb, rss_file_kb, vm_hwm_kb}'
+grep 'tip: perf {' mainnet.log | sed 's/.*tip: perf //' | jq -c '{ts, rss, cache_bodies, held_bodies, sh_heads, mp_live}'
 ```
 
 | Token group | What it meters |
@@ -177,12 +177,7 @@ Meters `fuse8=` / `mphf_g=` / `mphf_occ=` / `class_c_l2=` enter `accounted`.
 supers only (mapped occ is `file=`).
 Mapped fuse / occ RSS is `file=`, not a fake leak.
 
-Grep:
-
-```bash
-grep 'ibd: sizes' mainnet.log
-grep 'tip: perf' mainnet.log
-```
+The same JSON fields (`owned.head.class_a_n`, `rss_anon_kb`, `owned.head.fuse8_bytes`) are on each `ibd: perf` line. The jq above selects them.
 
 ## Hard RAM (page-cache working set)
 
