@@ -2932,10 +2932,7 @@ async fn enter_tip_mode_indexes() {
     std::fs::write(&hwm_path, (hwm - 2).to_le_bytes()).unwrap();
     let node = start(true);
     wait_listeners(&[electrum_addr, rpc_addr]).await;
-    assert!(
-        !runs.join("000050.run").exists(),
-        "leftover run discarded"
-    );
+    assert!(!runs.join("000050.run").exists(), "leftover run discarded");
     assert_eq!(
         history_len(
             electrum_addr,

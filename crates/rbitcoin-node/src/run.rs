@@ -1221,9 +1221,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         .unwrap_or(mp.accept_us);
                     let esp_avg = esp_us.checked_div(esp_n).unwrap_or(0);
                     let el_avg = el_us.checked_div(el_n).unwrap_or(0);
-                    let (sv2_checks, sv2_builds, sv2_build_us, sv2_build_max_us) =
-                        sv2.map(|(checks, (n, us, max))| (checks, n, us, max))
-                            .unwrap_or((0, 0, 0, 0));
+                    let (sv2_checks, sv2_builds, sv2_build_us, sv2_build_max_us) = sv2
+                        .map(|(checks, (n, us, max))| (checks, n, us, max))
+                        .unwrap_or((0, 0, 0, 0));
                     let line = tip_perf_json(&TipPerfLog {
                         rss: read_platform_rss(),
                         cache_bodies: node.hub.cache_body_count(),
