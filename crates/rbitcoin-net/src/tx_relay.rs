@@ -2088,7 +2088,7 @@ impl MempoolHub {
         let sample_p = self.sample_chain_coins(&parent, utxo);
         let parent_commit = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, false, &sample_p)
+            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, true, &sample_p)
         };
         let (parent_res, prevouts_p) = match parent_commit.result {
             Ok(r) => (r, parent_commit.prevouts),
@@ -2116,11 +2116,16 @@ impl MempoolHub {
         let sample_c = self.sample_chain_coins(child, utxo);
         let child_commit = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, child, prep_c, utxo, false, &sample_c)
+            Self::commit_rechecked(&mut g, child, prep_c, utxo, true, &sample_c)
         };
         self.meter_accept_stages(lock_us, stages);
         match child_commit.result {
             Ok(r) => {
+                self.trim_over_budget();
+                if !self.try_contains(&parent_res.txid) || !self.try_contains(&r.txid) {
+                    self.publish_fee_floor();
+                    return None;
+                }
                 self.publish_admitted(&parent, &parent_res, &prevouts_p, utxo);
                 self.publish_admitted(child, &r, &child_commit.prevouts, utxo);
                 let _ = self.expire_stale();
@@ -2669,7 +2674,7 @@ impl MempoolHub {
             let committed = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
-                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, false, &sample);
+                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, true, &sample);
                 stages = g.last_accept_stages;
                 committed
             };
@@ -2691,6 +2696,15 @@ impl MempoolHub {
                     return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             }
+        }
+        self.trim_over_budget();
+        if accepted.iter().any(|r| !self.try_contains(&r.txid)) {
+            self.publish_fee_floor();
+            let us = t0.elapsed().as_micros() as u64;
+            self.meter_accept_stages(lock_us, stages);
+            return Err(self
+                .finish_accept_err(us, AcceptError::Policy("mempool full"))
+                .unwrap_err());
         }
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
@@ -3463,6 +3477,11 @@ impl MempoolHub {
     /// Core `-bytespersigop` overlay: `0` disables sigop-adjusted sizing.
     pub fn set_bytes_per_sigop(&self, bytes_per_sigop: u64) {
         self.lock_write().set_bytes_per_sigop(bytes_per_sigop);
+    }
+
+    /// Weight budget in WU.
+    pub fn set_max_weight(&self, wu: u64) {
+        self.lock_write().max_weight = wu;
     }
 
     /// Min-relay overlay (sat/kvB). `0` admits any non-negative fee.

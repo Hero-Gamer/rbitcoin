@@ -2635,7 +2635,22 @@ fn mempool_under_pressure() {
         assert_eq!(v["error"], json!("package-not-validated"), "{sub}");
     }
 
+    // Height 3's coinbase is one block short of maturity on the 101-block pad.
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     pressure_admit_then_cluster(&ctx, &spk);
+
+    // Parent is under the relay floor alone. The pool is already heavier than
+    // the package, and the cap fits the package only. Trimming between the
+    // two members used to evict the parent and answer `mempool full`.
+    let (low_hex, low_parent) = spend_generated_coinbase(&ctx, 3, 50_0000_0000 - 1, spk.clone());
+    let low_child = child_of(&low_parent, 80_000);
+    let low_child_hex = hex_encode(serialize(&low_child));
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_max_weight(low_parent.weight().to_wu() + low_child.weight().to_wu());
+    let kept = dispatch(&ctx, "submitpackage", vec![json!([low_hex, low_child_hex])]).unwrap();
+    assert_eq!(kept["package_msg"], "success", "{kept}");
+    assert!(mp.contains(&low_parent.compute_txid()));
+    assert!(mp.contains(&low_child.compute_txid()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
