@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Contract: the runner gives the child a private TMPDIR under the base,
 # passes the exit code through, removes the dir, and falls back to the
-# caller's TMPDIR when the base is missing or short on space.
+# caller's TMPDIR when the base is missing or short on space. The child
+# also inherits an address-space cap so one allocation cannot exhaust the
+# hosted runner.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,6 +52,25 @@ rc=0
 RBTC_TEST_TMPFS="$BASE" RBTC_TEST_TMPFS_MIN_MB=999999999 TMPDIR="$CALLER" \
   "$RUN" bash -c "$child" _ "$WORK/seen" || rc=$?
 assert_ok "short base keeps the caller TMPDIR" test "$(cat "$WORK/seen")" = "$CALLER"
+
+# A small heap fits. A heap past the cap must fail inside the child.
+rc=0
+RBTC_TEST_AS_MB=512 RBTC_TEST_TMPFS="$BASE" RBTC_TEST_TMPFS_MIN_MB=0 \
+  "$RUN" python3 -c 'b = bytearray(32 * 1024 * 1024); b[-1] = 1' || rc=$?
+assert_ok "allocation under the address-space cap succeeds" test "$rc" -eq 0
+
+rc=0
+RBTC_TEST_AS_MB=128 RBTC_TEST_TMPFS="$BASE" RBTC_TEST_TMPFS_MIN_MB=0 \
+  "$RUN" python3 -c 'b = bytearray(400 * 1024 * 1024); b[-1] = 1' >/dev/null 2>&1 || rc=$?
+assert_ok "allocation past the address-space cap fails" test "$rc" -ne 0
+
+rc=0
+RBTC_TEST_AS_MB=0 RBTC_TEST_TMPFS="$BASE" RBTC_TEST_TMPFS_MIN_MB=0 \
+  "$RUN" python3 -c 'b = bytearray(200 * 1024 * 1024); b[-1] = 1' || rc=$?
+assert_ok "address-space cap of 0 is unlimited" test "$rc" -eq 0
+
+assert_ok "default address-space cap is 6 GiB" \
+  grep -q 'RBTC_TEST_AS_MB:-6144' "$RUN"
 
 echo "tmpfs-test-runner: $PASS passed, $FAIL failed"
 ((FAIL == 0))

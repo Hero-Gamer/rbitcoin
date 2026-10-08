@@ -107,9 +107,9 @@ EOF
 prog="$(python3 "$PY" progress --log "$tmp/killed.log" --slice "$tmp/slice.txt")"
 assert_ok "progress ignores unfiltered deletes and stops at a hole" test "$prog" = 1
 
-# A quarter of the job budget is the new-mutant window. A batch already
-# started may finish after that mark; the next batch is backlog. Names
-# below are one file each so a cap of 1 is one cargo invocation.
+# Half the job budget is the new-mutant window. A batch already started
+# may finish after that mark; the next batch is backlog. Names below are
+# one file each so a cap of 1 is one cargo invocation.
 cat >"$tmp/new-q.txt" <<'EOF'
 crates/new/a.rs:1:1: replace a with b in n1
 crates/new/b.rs:2:1: replace a with b in n2
@@ -127,26 +127,26 @@ EOF
 
 sched="$(python3 "$PY" schedule --new "$tmp/new-q.txt" --old "$tmp/old-q.txt" \
   --budget 1000 --batch-sec 200 --cap 1)"
-assert_ok "both sides: after a quarter of the budget the names are backlog" \
+assert_ok "both sides: after half the budget the names are backlog" \
   python3 -c '
 import sys
 rows = [line.split("\t", 2) for line in sys.argv[1].splitlines()]
-quarter = 250
-after = [r for r in rows if int(r[1]) >= quarter]
-before = [r for r in rows if int(r[1]) < quarter]
+half = 500
+after = [r for r in rows if int(r[1]) >= half]
+before = [r for r in rows if int(r[1]) < half]
 assert after and all(r[0] == "old" for r in after), after
 assert before and all(r[0] == "new" for r in before), before
-assert any(r[0] == "new" and int(r[1]) + 200 > quarter for r in before), before
+assert any(r[0] == "new" and int(r[1]) + 200 > half for r in before), before
 ' "$sched"
 
 cross="$(python3 "$PY" schedule --new "$tmp/new-q.txt" --old "$tmp/old-q.txt" \
-  --budget 1000 --batch-sec 200 --cap 1)"
-assert_ok "a batch that started before the quarter stays new" \
+  --budget 1000 --batch-sec 400 --cap 1)"
+assert_ok "a batch that started before half stays new" \
   python3 -c '
 import sys
 rows = [line.split("\t", 2) for line in sys.argv[1].splitlines()]
 by = {int(r[1]): r[0] for r in rows}
-assert by[0] == "new" and by[200] == "new" and by[400] == "old", rows
+assert by[0] == "new" and by[400] == "new" and by[800] == "old", rows
 ' "$cross"
 
 cat >"$tmp/one-new.txt" <<'EOF'
@@ -175,12 +175,12 @@ assert all(r[0] == "old" for r in rows), rows
 
 empty_old="$(python3 "$PY" schedule --new "$tmp/new-q.txt" --old "$tmp/empty-q.txt" \
   --budget 1000 --batch-sec 200 --cap 1)"
-assert_ok "empty backlog keeps scheduling new past a quarter" \
+assert_ok "empty backlog keeps scheduling new past half" \
   python3 -c '
 import sys
 rows = [line.split("\t", 2) for line in sys.argv[1].splitlines()]
 assert rows and all(r[0] == "new" for r in rows), rows
-assert any(int(r[1]) >= 250 for r in rows), rows
+assert any(int(r[1]) >= 500 for r in rows), rows
 ' "$empty_old"
 
 capped="$(python3 "$PY" schedule --new "$tmp/new-q.txt" --old "$tmp/old-q.txt" \
@@ -262,11 +262,8 @@ assert_ok "a covered new_skip clears the skip" \
   grep -q '"new_skip": 0' "$tmp/stuck.json"
 
 printf '%s\n' '{"new_base":"abc","new_skip":0,"old_index":0,"old_name":"","new_cap_used":false,"run_id":"7"}' >"$tmp/cap.json"
-python3 "$PY" mark-cap --cursor "$tmp/cap.json" --elapsed 249 --budget 1000 --new-left 2 --old-left 2
-assert_ok "just before a quarter the new cap is still open" \
-  grep -q '"new_cap_used": false' "$tmp/cap.json"
-python3 "$PY" mark-cap --cursor "$tmp/cap.json" --elapsed 250 --budget 1000 --new-left 2 --old-left 2
-assert_ok "a quarter of the budget with both sides left consumes the new cap" \
+python3 "$PY" mark-cap --cursor "$tmp/cap.json" --elapsed 500 --budget 1000 --new-left 2 --old-left 2
+assert_ok "half the budget with both sides left consumes the new cap" \
   grep -q '"new_cap_used": true' "$tmp/cap.json"
 python3 "$PY" mark-cap --cursor "$tmp/cap.json" --elapsed 0 --budget 1000 --new-left 2 --old-left 2
 assert_ok "a consumed new cap stays consumed for the rest of the night" \
@@ -282,8 +279,8 @@ assert_ok "mutants.toml excludes rbitcoin-bench" \
   grep -q 'crates/rbitcoin-bench/\*\*/\*.rs' "$TOML"
 WF="$ROOT/.github/workflows/mutants.yml"
 CI="$ROOT/.github/workflows/ci.yml"
-assert_ok "nightly cron is 02:47 UTC" \
-  grep -q 'cron: "47 2 \* \* \*"' "$WF"
+assert_ok "nightly cron is 00:47 UTC" \
+  grep -q 'cron: "47 0 \* \* \*"' "$WF"
 assert_ok "workflow_dispatch remains" \
   grep -q 'workflow_dispatch:' "$WF"
 assert_ok "ci does not run the nightly mutants script" \
@@ -306,26 +303,24 @@ assert_ok "same-file cursor copy is skipped" \
   grep -q -- '-ef' "$NIGHTLY"
 assert_ok "per-mutant timeout stays 20 minutes" \
   grep -q 'MUTANTS_TIMEOUT:-1200' "$NIGHTLY"
-assert_ok "one job budget is 5 hours" \
-  grep -q 'MUTANTS_BUDGET_SEC:-18000' "$NIGHTLY"
+assert_ok "one job budget is 4 hours" \
+  grep -q 'MUTANTS_BUDGET_SEC:-14400' "$NIGHTLY"
 assert_ok "missed mutants do not fail the nightly script" \
   grep -q 'MISSED (not a failure' "$NIGHTLY"
 assert_ok "queued nights are not cancelled" \
   grep -q 'cancel-in-progress: false' "$WF"
 
-assert_ok "one job is 5 hours and the timeout has 30 minutes of slack under 6 hours" \
+assert_ok "two jobs sum to 8 hours and each timeout has 30 minutes of slack under 6 hours" \
   python3 -c '
 import pathlib, sys
 text = pathlib.Path(sys.argv[1]).read_text()
-budgets = text.count("MUTANTS_BUDGET_SEC: \"18000\"")
-timeouts = text.count("timeout-minutes: 330")
-assert budgets == 1, budgets
-assert timeouts == 1, timeouts
-assert 18000 == 5 * 3600
-assert 330 <= 360
-assert 330 >= 18000 // 60 + 30
-assert "timeout-minutes: 270" not in text
-assert "MUTANTS_BUDGET_SEC: \"14400\"" not in text
+budgets = text.count("MUTANTS_BUDGET_SEC: \"14400\"")
+timeouts = text.count("timeout-minutes: 270")
+assert budgets == 2, budgets
+assert timeouts == 2, timeouts
+assert 14400 * 2 == 8 * 3600
+assert 270 <= 360
+assert 270 >= 14400 // 60 + 30
 ' "$WF"
 
 assert_ok "each mutant job restores the state branch before the queue and publishes it after" \
@@ -333,7 +328,7 @@ assert_ok "each mutant job restores the state branch before the queue and publis
 import pathlib, sys
 lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
 starts = [i for i, line in enumerate(lines) if line.startswith("  mutants-")]
-assert len(starts) == 1, starts
+assert len(starts) == 2, starts
 starts.append(len(lines))
 for a, b in zip(starts, starts[1:]):
     block = lines[a:b]
@@ -356,8 +351,8 @@ assert_ok "publisher pushes only the state branch ref" \
   grep -q 'HEAD:${BRANCH}' "$ROOT/scripts/publish-mutants-state.sh"
 assert_ok "workflow names the state branch" \
   grep -q 'MUTANTS_STATE_BRANCH: mutants-state' "$WF"
-assert_ok "the job records the run id" \
-  bash -c 'test "$(grep -c "github.run_id" "$1")" -eq 1' _ "$WF"
+assert_ok "both jobs share one run id" \
+  bash -c 'test "$(grep -c "github.run_id" "$1")" -ge 2' _ "$WF"
 assert_ok "state publish has contents write" \
   grep -q 'contents: write' "$WF"
 

@@ -105,13 +105,6 @@ def order(mutants: list[str], changed: set[tuple[str, int]], old_index: int) -> 
     return new, rotated
 
 
-def new_window(budget: int) -> int:
-    """Seconds of new mutants before the backlog, about a quarter of the job."""
-    if budget < 1:
-        raise ValueError("budget")
-    return budget // 4
-
-
 def next_side(
     elapsed: int,
     budget: int,
@@ -121,11 +114,10 @@ def next_side(
 ) -> str:
     """Which queue the next file-batch comes from.
 
-    New work goes first until a quarter of this job's budget has elapsed,
-    or until this night already used that window. An empty side does not
-    block the other. A batch already started is not cancelled here; the
-    caller asks again after it finishes, and that next batch is the other
-    side.
+    New work goes first until half of this job's budget has elapsed, or
+    until this night already used that half. An empty side does not block
+    the other. A batch already started is not cancelled here; the caller
+    asks again after it finishes, and that next batch is the other side.
     """
     if budget < 1 or elapsed < 0:
         raise ValueError("budget")
@@ -135,7 +127,7 @@ def next_side(
         return "new"
     if old_remaining and not new_remaining:
         return "old"
-    if new_cap_used or elapsed >= new_window(budget):
+    if new_cap_used or elapsed >= budget // 2:
         return "old"
     return "new"
 
@@ -144,8 +136,8 @@ def cap_consumed(elapsed: int, budget: int, new_left: int, old_left: int, alread
     """True once this night's new window is spent and backlog work remains.
 
     An empty side does not burn the window: the other side may use the
-    whole job. ``already`` stays set for a later invocation in the same
-    night so that invocation does not open another new window.
+    whole job. ``already`` stays set for a later job in the same night so
+    that job does not open a second new window.
     """
     if already:
         return True
@@ -153,7 +145,7 @@ def cap_consumed(elapsed: int, budget: int, new_left: int, old_left: int, alread
         return False
     if budget < 1 or elapsed < 0:
         raise ValueError("budget")
-    return elapsed >= new_window(budget)
+    return elapsed >= budget // 2
 
 
 def schedule(
@@ -167,8 +159,8 @@ def schedule(
     """Fake-clock walk used by the queue self-test and the same side rule as the job.
 
     Each file-batch starts at the current elapsed second and then advances
-    the clock by ``batch_sec``. Names in a batch that started before a
-    quarter of the budget stay on that side.
+    the clock by ``batch_sec``. Names in a batch that started before half
+    the budget stay on that side.
     """
     if batch_sec < 1:
         raise ValueError("batch-sec")
@@ -197,7 +189,7 @@ def begin_night(cursor: dict, run_id: str) -> None:
     """Clear the new-mutant cap when ``run_id`` is a different night.
 
     An empty ``run_id`` is a local run: the cap starts unused. The same
-    id keeps a cap an earlier invocation in this night already consumed.
+    id across two jobs keeps a cap the earlier job already consumed.
     """
     if run_id:
         if str(cursor.get("run_id", "")) != run_id:
