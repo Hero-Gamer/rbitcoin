@@ -2921,34 +2921,21 @@ async fn enter_tip_mode_indexes() {
     stop_run_p2p(rpc_addr, node).await;
 
     // A crash left a collect run behind and the write-behind mark short of
-    // the tip. Turning the index off kept it, so it resumes under
-    // write-behind: a recollect would merge the stale run, and instead the
-    // run is discarded, Electrum opens, and the next block lands in history.
+    // the tip. Open unlinks the leftover. The history already indexed stays,
+    // and the next block lands in it.
     let runs = store.join("scripthash.runs");
     std::fs::create_dir_all(&runs).unwrap();
-    let stale_sh = [0xee; 32];
-    let mut rec = [0u8; 40];
-    rec[..32].copy_from_slice(&stale_sh);
-    rec[32..].copy_from_slice(&99u64.to_le_bytes());
-    rbitcoin_store::write_sorted_run(&rbitcoin_store::next_run_path(&runs, 50), 40, 40, &rec)
-        .unwrap();
+    std::fs::write(runs.join("000050.run"), b"leftover").unwrap();
     let hwm_path = store.join(rbitcoin_store::INCLUDE_HWM_NAME);
     let hwm = u64::from_le_bytes(std::fs::read(&hwm_path).unwrap().try_into().unwrap());
     std::fs::write(&hwm_path, (hwm - 2).to_le_bytes()).unwrap();
     let node = start(true);
     wait_listeners(&[electrum_addr, rpc_addr]).await;
+    assert!(!runs.join("000050.run").exists(), "leftover run discarded");
     assert_eq!(
-        rbitcoin_store::list_runs(&runs).unwrap().len(),
-        0,
-        "leftover run discarded"
-    );
-    assert_eq!(
-        history_len(
-            electrum_addr,
-            &bitcoin::hex::DisplayHex::to_lower_hex_string(&stale_sh[..])
-        )
-        .await,
-        0
+        history_len(electrum_addr, &op_true).await,
+        3,
+        "discard left the indexed history"
     );
     let mined = jsonrpc(rpc_addr, "generateblock", json!(["raw(51)", []])).await;
     assert!(mined["result"]["hash"].is_string(), "{mined}");

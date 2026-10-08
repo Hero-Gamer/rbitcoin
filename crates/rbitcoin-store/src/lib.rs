@@ -97,10 +97,8 @@ pub use scripthash_materialize::{
     clear_unsorted_shard_dir, collect_unsorted_shard_files, materialize_sh_unsorted_from_class_a,
     unsorted_collect_workers, unsorted_done_last_fk, unsorted_pack_workers, unsorted_shard_dir,
 };
+pub use sorted_run::free_gib_label;
 pub(crate) use sorted_run::host_mem_available_bytes;
-pub use sorted_run::{
-    free_gib_label, list_materialize_claims, list_runs, next_run_path, write_sorted_run,
-};
 pub use sp_tweaks::{SpTweaksTable, TrimLast};
 pub use sp_tweaks_uring::{load_tweak_wave, LoadedTweakTx};
 pub use spend_annotate_uring::spend_ann_backend;

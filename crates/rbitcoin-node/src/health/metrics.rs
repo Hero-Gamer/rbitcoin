@@ -61,7 +61,7 @@ pub(super) fn render(status: &NodeStatus) -> String {
     if rss_kb > 0 {
         out.gauge(
             "process_resident_memory_bytes",
-            "Resident memory size in bytes. ibd: sizes rss= is the same reading in MiB.",
+            "Resident memory size in bytes. ibd: perf JSON rss_kb is the same reading in KiB.",
             rss_kb * 1024,
         );
     }

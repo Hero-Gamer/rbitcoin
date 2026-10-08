@@ -233,7 +233,7 @@ impl ShRunBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbitcoin_store::{next_run_path, write_sorted_run, Store};
+    use rbitcoin_store::Store;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -258,12 +258,7 @@ mod tests {
         store_seal(&runs_dir, 1_400_000_000).unwrap();
         b.refresh_seal();
         assert_eq!(b.sealed_max_create_fk(), 1_400_000_000);
-        let mut body = Vec::new();
-        let mut rec = [0u8; 40];
-        rec[..32].fill(0xab);
-        rec[32..].copy_from_slice(&99u64.to_le_bytes());
-        body.extend_from_slice(&rec);
-        write_sorted_run(&next_run_path(&runs_dir, 1), 40, 40, &body).unwrap();
+        std::fs::write(runs_dir.join("000001.run"), b"leftover").unwrap();
         assert!(b.on_disk_run_count() > 0);
 
         b.prepare_force_full_rebuild(&store).unwrap();

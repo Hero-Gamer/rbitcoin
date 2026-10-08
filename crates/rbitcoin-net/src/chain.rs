@@ -17,7 +17,7 @@ use rbitcoin_consensus::{
     mine_op_true_signet_paying, mine_regtest_paying, validate_header, validate_header_on_parent,
     ChainParams, Milestone, PlanStampOutcome, ScriptOkBatch, ScriptPreverified, WireLoadPipeline,
 };
-use rbitcoin_log::info;
+use rbitcoin_log::{debug, info};
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
 use std::collections::{HashMap, HashSet};
@@ -3344,71 +3344,52 @@ pub struct TipAcceptShInput {
     pub sh: rbitcoin_query::TipShSnap,
 }
 
-/// Format `tip: accept …` body (no log level). Pure for tests.
+/// JSON body for DEBUG `tip: accept` (no log prefix). `ts` is unix milliseconds.
+/// Fields are the raw counters; a reader derives milliseconds.
 pub fn format_tip_accept_sh_line(i: &TipAcceptShInput) -> String {
-    let wall_ms = i.wall_ns / 1_000_000;
-    let load_ms = i.load_ns / 1_000_000;
-    let script_ms = i.script_ns / 1_000_000;
-    let class_a_ms = i.class_a_ns / 1_000_000;
-    let class_c_ms = i.class_c_ns / 1_000_000;
-    let spend_ms = i.spend_ns / 1_000_000;
-    let strong_ms = i.strong_ns / 1_000_000;
-    let tip_ms = i.tip_ns / 1_000_000;
-    let lookup_ms = i.lookup_ns / 1_000_000;
-    let structural_ms = i.structural_ns / 1_000_000;
-    let drain_ms = i.drain_ns / 1_000_000;
-    let mp_strip_ms = i.mp_strip_ns / 1_000_000;
-    let pres_ms = i.pres_ns / 1_000_000;
-    let bf_ms = i.bf_ns / 1_000_000;
-    let named = i
-        .load_ns
-        .saturating_add(i.script_ns)
-        .saturating_add(i.class_a_ns)
-        .saturating_add(i.class_c_ns)
-        .saturating_add(i.sh.total_sh_ns())
-        .saturating_add(i.spend_ns)
-        .saturating_add(i.lookup_ns)
-        .saturating_add(i.structural_ns)
-        .saturating_add(i.drain_ns)
-        .saturating_add(i.mp_strip_ns)
-        .saturating_add(i.pres_ns);
-    let other_ms = i.wall_ns.saturating_sub(named) / 1_000_000;
     let sh = &i.sh;
-    let sh_ms = sh.total_sh_ns() / 1_000_000;
-    let coll_ms = sh.collect_ns / 1_000_000;
-    let sort_ms = sh.sort_ns / 1_000_000;
-    let seed_ms = sh.seed_ns / 1_000_000;
-    let body_ms = sh.body_ns / 1_000_000;
-    let head_ms = sh.head_ns / 1_000_000;
-    let sync_ms = sh.sync_ns / 1_000_000;
-    let sh_ratio = if i.wall_ns == 0 {
-        0u64
-    } else {
-        (sh.total_sh_ns().saturating_mul(100)) / i.wall_ns.max(1)
-    };
-    // class_c = strong + tip only (table work). SH is parallel and listed separately.
-    format!(
-        "tip: accept h={h} tx={tx_count} wall={wall_ms}ms load={load_ms}ms script={script_ms}ms \
-         class_a={class_a_ms}ms class_c={class_c_ms}ms (strong={strong_ms} tip_set={tip_ms}) \
-         sh={sh_ms}ms sh_lag={sh_lag} \
-         (collect={coll_ms} sort={sort_ms} seed={seed_ms} body={body_ms} head={head_ms} sync={sync_ms} \
-         pin={pin} cold={cold} creates={creates} unique={unique} written={written}) \
-         spend={spend_ms}ms bf={bf_ms}ms bf_lag={bf_lag} \
-         lookup={lookup_ms}ms struct={structural_ms}ms \
-         drain={drain_ms}ms mp_strip={mp_strip_ms}ms pres={pres_ms}ms other={other_ms}ms sh/wall={sh_ratio}%",
-        h = i.height,
-        tx_count = i.tx_count,
-        sh_lag = i.sh_lag,
-        bf_lag = i.bf_lag,
-        pin = sh.pin,
-        cold = sh.cold,
-        creates = sh.creates,
-        unique = sh.unique,
-        written = sh.written,
-    )
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "ts": ts,
+        "height": i.height,
+        "tx_count": i.tx_count,
+        "wall_ns": i.wall_ns,
+        "load_ns": i.load_ns,
+        "script_ns": i.script_ns,
+        "class_a_ns": i.class_a_ns,
+        "class_c_ns": i.class_c_ns,
+        "spend_ns": i.spend_ns,
+        "strong_ns": i.strong_ns,
+        "tip_ns": i.tip_ns,
+        "lookup_ns": i.lookup_ns,
+        "structural_ns": i.structural_ns,
+        "drain_ns": i.drain_ns,
+        "mp_strip_ns": i.mp_strip_ns,
+        "pres_ns": i.pres_ns,
+        "bf_ns": i.bf_ns,
+        "bf_lag": i.bf_lag,
+        "sh_lag": i.sh_lag,
+        "sh": {
+            "collect_ns": sh.collect_ns,
+            "sort_ns": sh.sort_ns,
+            "seed_ns": sh.seed_ns,
+            "body_ns": sh.body_ns,
+            "head_ns": sh.head_ns,
+            "sync_ns": sh.sync_ns,
+            "pin": sh.pin,
+            "cold": sh.cold,
+            "creates": sh.creates,
+            "unique": sh.unique,
+            "written": sh.written
+        }
+    })
+    .to_string()
 }
 
-/// Sample meters after tip accept and emit INFO `tip: accept …` (SH breakdown).
+/// Sample meters after tip accept and emit DEBUG `tip: accept {json}`.
 fn log_tip_accept_sh(
     query: &Query,
     height: u32,
@@ -3463,7 +3444,7 @@ fn log_tip_accept_sh(
         sh_lag: query.sh_lag_heights(),
         sh,
     });
-    info!("{line}");
+    debug!("tip: accept {line}");
 }
 
 /// Immediate seed: genesis + tip (and tip-1) so open is O(1) at mainnet scale.
@@ -4568,72 +4549,32 @@ mod tests {
     }
 
     #[test]
-    fn format_tip_accept_sh_line_has_sh_breakdown_tokens() {
+    fn tip_accept_line_is_timestamped_json() {
         let line = format_tip_accept_sh_line(&TipAcceptShInput {
             height: 961_445,
-            tx_count: 4_959,
+            tx_count: 4,
             wall_ns: 2_500_000_000,
             load_ns: 100_000_000,
-            script_ns: 200_000_000,
-            class_a_ns: 50_000_000,
-            // Tables only (strong+tip) — not SH join wall.
-            class_c_ns: 7_000_000,
-            spend_ns: 80_000_000,
-            strong_ns: 5_000_000,
-            tip_ns: 2_000_000,
-            lookup_ns: 300_000_000,
-            structural_ns: 40_000_000,
-            drain_ns: 10_000_000,
-            mp_strip_ns: 20_000_000,
-            pres_ns: 3_000_000,
-            bf_ns: 90_000_000,
-            bf_lag: 3,
-            sh_lag: 2,
-            sh: rbitcoin_query::TipShSnap {
-                collect_ns: 20_000_000,
-                sort_ns: 5_000_000,
-                seed_ns: 800_000_000,
-                body_ns: 600_000_000,
-                head_ns: 300_000_000,
-                sync_ns: 50_000_000,
-                pin: 4_000,
-                cold: 12,
-                creates: 12_000,
-                unique: 9_500,
-                written: 9_400,
-            },
+            script_ns: 0,
+            class_a_ns: 0,
+            class_c_ns: 0,
+            spend_ns: 0,
+            strong_ns: 0,
+            tip_ns: 0,
+            lookup_ns: 0,
+            structural_ns: 0,
+            drain_ns: 0,
+            mp_strip_ns: 0,
+            pres_ns: 0,
+            bf_ns: 0,
+            bf_lag: 0,
+            sh_lag: 0,
+            sh: rbitcoin_query::TipShSnap::default(),
         });
-        assert!(line.starts_with("tip: accept h=961445"), "{line}");
-        assert!(!line.contains("nTx"), "{line}");
-        for tok in [
-            "tx=4959",
-            "wall=2500ms",
-            "class_c=7ms",
-            "(strong=5 tip_set=2)",
-            "sh=1775ms", // 20+5+800+600+300+50
-            "sh_lag=2",
-            // Substep ms are unitless inside the paren (outer fields carry `ms`).
-            "seed=800",
-            "body=600",
-            "head=300 sync=50 ",
-            "creates=12000",
-            "unique=9500",
-            "written=9400",
-            "pin=4000",
-            "cold=12",
-            // Filter appender time is off the accept wall: listed, not in `other`.
-            "bf=90ms bf_lag=3",
-            "lookup=300ms",
-            "struct=40ms",
-            "drain=10ms",
-            "mp_strip=20ms",
-            "pres=3ms",
-            // 2500 - (100+200+50+7+1775+80+300+40+10+20+3) = -85 → 0
-            "other=0ms",
-            "sh/wall=71%",
-        ] {
-            assert!(line.contains(tok), "{tok}: {line}");
-        }
+        assert!(line.starts_with('{') && line.ends_with('}'), "{line}");
+        assert!(line.contains("\"height\":961445"), "{line}");
+        assert!(line.contains("\"ts\":"), "{line}");
+        assert!(line.contains("\"wall_ns\":2500000000"), "{line}");
     }
 
     #[test]

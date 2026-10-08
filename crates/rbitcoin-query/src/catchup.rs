@@ -383,9 +383,7 @@ mod tests {
     use crate::sh_builder::{load_seal, sh_force_rebuild, store_seal};
     use crate::testutil::FixtureChain;
     use rbitcoin_primitives::{Fk, Height};
-    use rbitcoin_store::{
-        next_run_path, write_sorted_run, HeaderRecord, InputRecord, OutputRecord, TxRecord,
-    };
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
     use std::sync::Mutex;
 
     /// Serialize FORCE_REBUILD env mutations (parallel tests share process env).
@@ -393,13 +391,6 @@ mod tests {
 
     fn lock_force_env() -> std::sync::MutexGuard<'static, ()> {
         FORCE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn leftover_run_rec(sh0: u8, fk: u64) -> Vec<u8> {
-        let mut rec = [0u8; 40];
-        rec[..32].fill(sh0);
-        rec[32..40].copy_from_slice(&fk.to_le_bytes());
-        rec.to_vec()
     }
 
     fn coinbase_block(
@@ -535,13 +526,7 @@ mod tests {
         let high_seal = 1_400_000_000u64;
         store_seal(&runs_dir, high_seal).unwrap();
         q.sh_run.refresh_seal();
-        write_sorted_run(
-            &next_run_path(&runs_dir, 1),
-            40,
-            40,
-            &leftover_run_rec(0xab, 99),
-        )
-        .unwrap();
+        std::fs::write(runs_dir.join("000001.run"), b"leftover").unwrap();
 
         let _ = q.finalize_sh_runs().unwrap();
         assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
@@ -633,13 +618,7 @@ mod tests {
 
         let runs_dir = dir.join("scripthash.runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
-        write_sorted_run(
-            &next_run_path(&runs_dir, 50),
-            40,
-            40,
-            &leftover_run_rec(0xee, 99),
-        )
-        .unwrap();
+        std::fs::write(runs_dir.join("000050.run"), b"leftover").unwrap();
         assert!(q.sh_run.on_disk_run_count() > 0);
         assert!(!q.sh_is_tip_ready(), "strict HWM/run check is still false");
         assert!(

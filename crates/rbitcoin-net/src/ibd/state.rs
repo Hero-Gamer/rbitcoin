@@ -20,7 +20,7 @@ use std::time::Instant;
 use super::peer_io::PeerSlot;
 
 /// O(1) occupancy of [`IbdWorkState`] retain structures (for `ibd: sizes`).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct WorkStructureSizes {
     pub ordered: usize,
     pub ordered_set: usize,

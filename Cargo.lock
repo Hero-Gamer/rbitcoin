@@ -994,6 +994,8 @@ dependencies = [
  "rbitcoin-primitives",
  "rbitcoin-query",
  "rbitcoin-store",
+ "serde",
+ "serde_json",
  "sha3",
  "tokio",
 ]

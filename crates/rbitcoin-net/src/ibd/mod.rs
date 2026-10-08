@@ -33,7 +33,7 @@ mod state;
 mod status;
 
 pub use dial::connect_timeout_for;
-pub use perf_log::{format_tip_perf_sizes, read_platform_rss, ProcessRss, TipPerfSizes};
+pub use perf_log::{read_platform_rss, tip_perf_json, ProcessRss, TipPerfLog};
 
 use archive::{rehydrate_block_queue_into_confirm, rehydrate_class_a_into_body_queue};
 use assign_plan::{need_ready_headroom, want_headers_beyond_soft_cap};

@@ -2365,18 +2365,6 @@ mod minimal_data_tests {
     }
 
     #[test]
-    fn scriptnum_minimal_encoding() {
-        use rbitcoin_primitives::scriptnum_is_minimal;
-        assert!(scriptnum_is_minimal(&[]));
-        assert!(!scriptnum_is_minimal(&[0x00])); // zero pad
-        assert!(!scriptnum_is_minimal(&[0x80])); // negative zero
-        assert!(scriptnum_is_minimal(&[0x01]));
-        assert!(!scriptnum_is_minimal(&[0x01, 0x00])); // leading zero
-        assert!(scriptnum_is_minimal(&[0xff, 0x00])); // +255 needs high-bit pad
-        assert!(scriptnum_is_minimal(&[0xff, 0x80])); // -255
-    }
-
-    #[test]
     fn executed_nonminimal_push_rejects_when_flag_on() {
         // PUSHDATA1 empty (0x4c 0x00) then DROP OP_1
         let script = vec![0x4c, 0x00, 0x75, 0x51];

@@ -278,7 +278,7 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 
 | Line | Level | Use |
 |------|-------|-----|
-| `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= tx= avg_us= max_us=`, with `--sv2-tp-listen` `sv2 checks= builds= build_avg_us= build_max_us=` |
+| `tip: perf` | DEBUG | One JSON object every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block serve (`serve_n`, `serve_bytes`, `serve_tx`, `serve_avg_us`, `serve_max_us`), and SV2 (`sv2_checks`, `sv2_builds`, `sv2_build_avg_us`, `sv2_build_max_us`; zeros without `--sv2-tp-listen`) |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
 | `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
@@ -293,18 +293,16 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 | `p2p: headers sync timeout` | INFO | Headers-sync peer stalled (`disconnect` or `keep`) |
 | `p2p: session … closed` | DEBUG | Clean session end. Unexpected end stays **WARN** `p2p: session … ended` |
 
-Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` / `ibd: sizes` / `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`).
+Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD use `ibd: progress` at INFO; enable `ibd: perf` and `tip: perf` with `--log-level debug` (or conf / `RBITCOIN_LOG=debug`). Each of those is one JSON object with `ts` (unix milliseconds). A full IBD is every `ibd: perf` line in the log.
 
 ### IBD status lines (every ~5s)
 
 | Line | Level | Use |
 |------|-------|-----|
 | `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window, at/over 1 GiB assign-stop holes within that window and not past fetched_hi) |
-| `ibd: perf` | DEBUG | Inflight + **`bq soft= RAM=`**; **`load=`** is pin+assemble only. **`load_thr pack/stamp/pin/asm/prune`** is the load OS thread. **`stamp=`** nests **`pack=`** (plan HashMap) vs **`head=`** (leftover TipOnly; IBD skeleton keeps this ~0). **`script=`** is verify ns (`jobs=` / `skip=`); recv/send are wait. **`pin_txid=`** is skeleton hits vs leftover `tx.head` |
-| `ibd: sizes` | DEBUG | RSS + work path + **`bq soft=` / `RAM=`** + **conf_plans** + confirm pipe |
-| `ibd: perf_dbg` | DEBUG | µs/blk load/write, pin detail, **plan_batch** (`us/pin_txid` vs `probe/idx/body us/key`) + **class_a commit** |
+| `ibd: perf` | DEBUG | One JSON object of the 5s sample (inflight, queues, stage times, RSS, work path, confirm pipe). Zeros are included. `load_ms` is pin+assemble only |
 
-Default INFO is `ibd: progress` only. `--log-level debug` adds perf / sizes / perf_dbg from the same sample. Ghost columns from deleted paths (wave-fill stubs, Direct SH head RMW) are omitted from both formatters. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
+Default INFO is `ibd: progress` only. `--log-level debug` adds the JSON sample. `tip: accept` is the same kind of JSON line at DEBUG; `tip: best` stays INFO. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
 
 `pin_txid%` is stamp `txid→create_fk` from the load-batch skeleton vs leftover `tx.head` (IBD skeleton path should stay at 100%). `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
@@ -499,14 +497,14 @@ lock on the progress registry. NixOS:
 | `rbitcoin_mempool_max_weight` | gauge | Mempool weight cap. `getmempoolinfo.maxmempool` is that cap in virtual-size bytes (weight/4) |
 | `rbitcoin_mempool_orphan_transactions` | gauge | `getmempoolinfo.orphanage.size` |
 | `rbitcoin_mempool_unbroadcast_transactions` | gauge | `getmempoolinfo.unbroadcastcount` |
-| `rbitcoin_scripthash_lag_blocks` | gauge | `tip: accept sh_lag=` (with `--sh-index`) |
-| `rbitcoin_esplora_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf esplora req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
-| `rbitcoin_electrum_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf electrum req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
-| `rbitcoin_block_serve_total` / `_bytes_total` | counter | Lifetime sum of `tip: perf serve n=` / `bytes=`. That line is the last ~5s window |
-| `rbitcoin_sv2_fee_checks_total` | counter | Lifetime sum of `tip: perf sv2 checks=` (with `--sv2-tp-listen`): about one per SV2 session per `--sv2-tp-template-interval` |
-| `rbitcoin_sv2_template_builds_total` / `_template_build_seconds_total` | counter | Lifetime sum of `tip: perf sv2 builds=`, and of the build wall time in seconds. Every template sent is a build; a fee check whose gain is under the delta builds one it does not send |
-| `rbitcoin_mempool_accepts_total` / `_rejects_total` | counter | Lifetime sum of `tip: perf accepts=` / `rejects=`. That line is the last ~5s window |
-| `process_resident_memory_bytes` | gauge | Same RSS reading as `ibd: sizes rss=` and `tip: perf rss=`, in bytes (`rss_kb * 1024`). Those lines print integer MiB (`rss_kb / 1024`). Linux and macOS |
+| `rbitcoin_scripthash_lag_blocks` | gauge | `tip: accept` JSON `sh_lag` (with `--sh-index`) |
+| `rbitcoin_esplora_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf` JSON `esplora_n`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`esplora_avg_us` in microseconds) |
+| `rbitcoin_electrum_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf` JSON `electrum_n`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`electrum_avg_us` in microseconds) |
+| `rbitcoin_block_serve_total` / `_bytes_total` | counter | Lifetime sum of `tip: perf` JSON `serve_n` / `serve_bytes`. That line is the last ~5s window |
+| `rbitcoin_sv2_fee_checks_total` | counter | Lifetime sum of `tip: perf` JSON `sv2_checks` (with `--sv2-tp-listen`): about one per SV2 session per `--sv2-tp-template-interval` |
+| `rbitcoin_sv2_template_builds_total` / `_template_build_seconds_total` | counter | Lifetime sum of `tip: perf` JSON `sv2_builds`, and of the build wall time in seconds. Every template sent is a build; a fee check whose gain is under the delta builds one it does not send |
+| `rbitcoin_mempool_accepts_total` / `_rejects_total` | counter | Lifetime sum of `tip: perf` JSON `accepts` / `rejects`. That line is the last ~5s window |
+| `process_resident_memory_bytes` | gauge | Same RSS reading as `ibd: perf` JSON `rss_kb` and `tip: perf` JSON `rss.rss_kb`, in bytes (`rss_kb * 1024`). Linux and macOS |
 | `process_start_time_seconds` | gauge | Unix time `rbitcoin-node` started |
 | `rbitcoin_progress_done{stage}` / `_target{stage}` / `_start_time_seconds{stage}` | gauge | `GET /progress` `done` and `total`, and Unix time the stage began; one series per running stage name (the newest if two overlap). Absent while none runs |
 
@@ -568,7 +566,7 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
 - **BIP324 v2 only** — plaintext v1 peers disconnect (`peer does not speak BIP324 v2`).
 - **IBD `getdata` serve** reconstructs witness blocks from contiguous Class A
   spans (`txout.body` + `seqsigwit.body`), off the session reactor. Serve volume
-  is on DEBUG `tip: perf` (`serve n= bytes= tx= avg_us= max_us=`), not a
+  is on DEBUG `tip: perf` (`serve_n`, `serve_bytes`, `serve_tx`, `serve_avg_us`, `serve_max_us`), not a
   per-block line. Host throughput probe:
   `python3 scripts/ibd-serve-bench.py 127.0.0.1:8333` (needs `cryptography`
   and a BIP324 client; see [`TESTING.md`](TESTING.md) § P2P serve bench).

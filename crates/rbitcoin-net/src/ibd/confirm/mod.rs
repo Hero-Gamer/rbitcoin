@@ -1055,7 +1055,7 @@ pub(crate) struct ConfirmQueueDepths {
 }
 
 /// Snapshot of confirm pipeline retain (queue depths + batch contents + feed).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct ConfirmPipelineSizes {
     /// lookup→load batches (`loadq`).
     pub load_batches: usize,
@@ -1077,6 +1077,7 @@ pub(crate) struct ConfirmPipelineSizes {
 
 impl ConfirmPipelineSizes {
     /// Parent entries sitting in scriptq + writeq (pipeline-wide, no budget).
+    #[cfg(test)]
     #[inline]
     pub fn parents_total(&self) -> usize {
         self.script_parents.saturating_add(self.write_parents)

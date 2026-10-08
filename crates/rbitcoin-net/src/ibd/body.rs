@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// O(1) occupancy of each [`BodyPresence`] set (for `ibd: sizes` logs).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub(crate) struct BodyPresenceSizes {
     pub known: usize,
     pub pending: usize,

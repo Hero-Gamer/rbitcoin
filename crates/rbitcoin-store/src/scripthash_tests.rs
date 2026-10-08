@@ -2101,11 +2101,7 @@ fn open_migrates_legacy_head_when_runs_present() {
 
         let runs_dir = dir.join("scripthash.runs");
         std::fs::create_dir_all(&runs_dir).unwrap();
-        let mut rec = [0u8; 40];
-        rec[0] = 0xab;
-        rec[32..40].copy_from_slice(&1u64.to_le_bytes());
-        let path = crate::sorted_run::next_run_path(&runs_dir, 1);
-        crate::sorted_run::write_sorted_run(&path, 32, 40, &rec).unwrap();
+        std::fs::write(runs_dir.join("000001.run"), b"leftover").unwrap();
 
         match ScriptHashTable::open_tiny(&dir) {
             Ok(_) => panic!("leftover OA must refuse"),

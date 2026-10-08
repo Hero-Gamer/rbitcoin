@@ -1,4 +1,4 @@
-//! Instance-owned confirm window meters (IBD `ibd: perf` / `ibd: sizes` / `ibd: perf_dbg`).
+//! Instance-owned confirm window meters (IBD `ibd: perf` JSON).
 //!
 //! [`Query`](crate::Query) owns one [`ConfirmStats`]. Hot path notes through `&self`.
 //! Window sample is field-wise take (swap to 0) — not a process-global last-writer.

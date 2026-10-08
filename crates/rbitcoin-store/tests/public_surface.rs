@@ -10,16 +10,15 @@ use rbitcoin_store::{
     decode_seqsigwit_secret, encode_packed_tx, encode_packed_tx_with_secret,
     encode_txout_meta_and_outs, encode_unspent_output_into_secret, ensure_nofile_budget,
     free_gib_label, is_probe_exhausted_error, is_store_corrupt_display, leftover_probe_diag_ready,
-    leftover_probe_diag_recorded, list_materialize_claims, list_runs, load_tweak_wave,
-    materialize_sh_unsorted_from_class_a, merkle_branch, merkle_root_from_txids,
-    merkle_root_mutated, next_run_path, output_flags, script_hash, sh_heads_insert_capped,
-    spend_ann_backend, spend_meta_backend, spent_abs, unsorted_collect_workers,
-    unsorted_done_last_fk, unsorted_pack_workers, unsorted_shard_dir, write_sorted_run, BlockQueue,
-    ColdProgress, FkMap, FkSet, HeadOpenOpts, HeadResizeSizeSnapshot, HeadScale, HeaderRecord,
-    HeightFence, IdxBodyJob, IdxBodyMode, InputRecord, OutputRecord, PackedCreate, PointRecord,
-    QueuedBlockMeta, ReadIoBackend, ScriptHashRecord, ShHeadValue, SpTweaksTable, Store,
-    StoreError, StoreLayout, StoreSecret, TakenRaw, TxRecord, U32Map, U64IdentityHasher, U64Map,
-    U64Set, WriteIoBackend, INCLUDE_HWM_NAME, SH_HEADS_CAP,
+    leftover_probe_diag_recorded, load_tweak_wave, materialize_sh_unsorted_from_class_a,
+    merkle_branch, merkle_root_from_txids, merkle_root_mutated, output_flags, script_hash,
+    sh_heads_insert_capped, spend_ann_backend, spend_meta_backend, spent_abs,
+    unsorted_collect_workers, unsorted_done_last_fk, unsorted_pack_workers, unsorted_shard_dir,
+    BlockQueue, ColdProgress, FkMap, FkSet, HeadOpenOpts, HeadResizeSizeSnapshot, HeadScale,
+    HeaderRecord, HeightFence, IdxBodyJob, IdxBodyMode, InputRecord, OutputRecord, PackedCreate,
+    PointRecord, QueuedBlockMeta, ReadIoBackend, ScriptHashRecord, ShHeadValue, SpTweaksTable,
+    Store, StoreError, StoreLayout, StoreSecret, TakenRaw, TxRecord, U32Map, U64IdentityHasher,
+    U64Map, U64Set, WriteIoBackend, INCLUDE_HWM_NAME, SH_HEADS_CAP,
 };
 
 #[test]
@@ -66,13 +65,11 @@ fn crate_root_exports_cross_crate_names() {
     let _ = merkle_branch;
     let _ = merkle_root_from_txids;
     let _ = merkle_root_mutated;
-    let _ = next_run_path;
     let _ = script_hash;
     let _ = sh_heads_insert_capped;
     let _ = spend_ann_backend;
     let _ = spend_meta_backend;
     let _ = spent_abs;
-    let _ = write_sorted_run;
     let _ = clear_unsorted_shard_dir;
     let _ = collect_unsorted_shard_files;
     let _ = decode_seqsigwit_secret;
@@ -86,8 +83,6 @@ fn crate_root_exports_cross_crate_names() {
     let _ = free_gib_label;
     let _ = is_probe_exhausted_error;
     let _ = is_store_corrupt_display;
-    let _ = list_materialize_claims;
-    let _ = list_runs;
     let _ = materialize_sh_unsorted_from_class_a;
     let _ = output_flags::MULTI_SPENDER;
     let _ = unsorted_collect_workers;
