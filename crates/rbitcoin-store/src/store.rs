@@ -1063,28 +1063,6 @@ impl Store {
         Ok(self.fence().get_batch(fks))
     }
 
-    /// Among Class A rows for `txid`, prefer a connected fk (fence height Some).
-    pub fn resolve_txid(
-        &self,
-        txid: &[u8; 32],
-        mode: TxidResolveMode,
-    ) -> Result<Option<Fk>, StoreError> {
-        let fks = self.txs.fks_by_txid(txid)?;
-        if fks.is_empty() {
-            return Ok(None);
-        }
-        let heights = self.tx_height_get_batch(&fks)?;
-        for (fk, h) in fks.iter().zip(heights.iter()) {
-            if h.is_some() {
-                return Ok(Some(*fk));
-            }
-        }
-        match mode {
-            TxidResolveMode::TipOnly => Ok(None),
-            TxidResolveMode::TipThenAny => Ok(Some(fks[0])),
-        }
-    }
-
     /// Coinbase Class A fk for each confirmed height (or `None` if tip/header missing).
     ///
     /// Uses only Class C dense tables (`confirmed` + `header_txs_first`) — **no**
@@ -1139,7 +1117,22 @@ impl Store {
 
     /// Confirm / consensus: connected instance only.
     pub fn get_fk_by_txid_tip(&self, txid: &[u8; 32]) -> Result<Option<Fk>, StoreError> {
-        self.resolve_txid(txid, TxidResolveMode::TipOnly)
+        Ok(self.get_fk_by_txid_tip_height(txid)?.map(|(fk, _)| fk))
+    }
+
+    /// The connected instance and its fence height: verifies each head
+    /// candidate's body txid and does one batched fence read, no body decode.
+    /// A prevout reader that needs the create height takes this once.
+    pub fn get_fk_by_txid_tip_height(
+        &self,
+        txid: &[u8; 32],
+    ) -> Result<Option<(Fk, u32)>, StoreError> {
+        let fks = self.txs.fks_by_txid(txid)?;
+        let heights = self.tx_height_get_batch(&fks)?;
+        Ok(fks
+            .into_iter()
+            .zip(heights)
+            .find_map(|(fk, h)| Some((fk, h?))))
     }
 
     /// Batch head resolve for plan stamp: txid → (fk, body_range).
@@ -3825,26 +3818,15 @@ mod tests {
             .put_tx_full_batch_indexed(&[(rec(2), vec![], out)], true)
             .unwrap()[0];
         assert_ne!(old, new);
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(new)
-        );
         assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(new));
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
-            None
-        );
+        assert_eq!(s.get_fk_by_txid_tip(&txid).unwrap(), None);
         s.header_txs.put_range(Fk(1), old, 1).unwrap();
         s.confirmed.set(Height(0), Fk(1)).unwrap();
         s.rebuild_height_fence().unwrap();
         assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
+            s.get_fk_by_txid_tip(&txid).unwrap(),
             Some(old),
             "connected older row must win"
-        );
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(old)
         );
         assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(old));
         let batch_tip = s
@@ -4002,10 +3984,7 @@ mod tests {
         );
 
         // Neither connected yet: newest unconnected (hot) for TipThenAny.
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(new)
-        );
+        assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(new));
         assert_eq!(
             s.get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
                 .unwrap()[0]
@@ -4025,14 +4004,8 @@ mod tests {
         s.confirmed.set(Height(0), Fk(1)).unwrap();
         s.rebuild_height_fence().unwrap();
 
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipOnly).unwrap(),
-            Some(old)
-        );
-        assert_eq!(
-            s.resolve_txid(&txid, TxidResolveMode::TipThenAny).unwrap(),
-            Some(old)
-        );
+        assert_eq!(s.get_fk_by_txid_tip(&txid).unwrap(), Some(old));
+        assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(old));
         let batch_tip = s
             .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipOnly)
             .unwrap();

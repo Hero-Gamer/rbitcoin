@@ -3262,9 +3262,10 @@ pub fn check_block_proposal_with(
 /// Caller has already passed [`rbitcoin_consensus::validate_block_structure`].
 ///
 /// RAM: `created` holds this block's outputs and [`confirmed_parent_outputs`]
-/// only the parent outputs this block spends, O(block outputs + block
-/// inputs), dropped at return; the returned prevouts are those spent outputs
-/// in block order. CPU: each distinct parent's packed body is decoded once;
+/// only the parent outputs this block spends with their parent's fk and
+/// height, O(block outputs + block inputs), dropped at return; the returned
+/// prevouts are those spent outputs in block order. CPU: each distinct
+/// parent's packed body is decoded once and its fence height read once;
 /// spentness is still probed per input, never served from that map.
 fn proposal_connect(
     query: &Query,
@@ -3316,8 +3317,8 @@ fn proposal_connect(
             }
             let txout = if let Some(o) = created.get(&op) {
                 o.clone()
-            } else if let Some((fk, o)) = chain_txout(query, &parents, &op) {
-                if coinbase_spend_is_immature(query, *fk, height, maturity)? {
+            } else if let Some((fk, created_h, o)) = chain_txout(query, &parents, &op) {
+                if coinbase_spend_is_immature(query, *fk, *created_h, height, maturity)? {
                     return Err("bad-txns-premature-spend-of-coinbase".into());
                 }
                 o.clone()
@@ -3359,9 +3360,9 @@ fn proposal_connect(
 /// pre-decoded entry in `parents`.
 fn chain_txout<'a>(
     query: &Query,
-    parents: &'a HashMap<OutPoint, (Fk, TxOut)>,
+    parents: &'a HashMap<OutPoint, (Fk, u32, TxOut)>,
     op: &OutPoint,
-) -> Option<&'a (Fk, TxOut)> {
+) -> Option<&'a (Fk, u32, TxOut)> {
     if query
         .is_outpoint_spent(&op.txid.to_byte_array(), op.vout)
         .ok()?
@@ -3372,15 +3373,17 @@ fn chain_txout<'a>(
 }
 
 /// The confirmed-parent outputs `block` spends: one tip-only fk resolve and
-/// one packed body decode per distinct parent, keeping only the spent vouts.
-/// Spends of `txids` (created in the block) are left to the connect loop; a
-/// parent that does not resolve contributes nothing, so its spends reject in
-/// block order.
+/// one packed body decode per distinct parent
+/// ([`Query::connected_tx_outputs`]), keeping only the spent vouts with the
+/// parent's fk and create height. A row that exists only in a reorged-out
+/// block resolves to nothing, as in Core. Spends of `txids` (created in the
+/// block) are left to the connect loop; a parent that does not resolve
+/// contributes nothing, so its spends reject in block order.
 fn confirmed_parent_outputs(
     query: &Query,
     block: &Block,
     txids: &[Txid],
-) -> HashMap<OutPoint, (Fk, TxOut)> {
+) -> HashMap<OutPoint, (Fk, u32, TxOut)> {
     let in_block: HashSet<&Txid> = txids.iter().collect();
     let mut vouts_by_parent: HashMap<Txid, Vec<u32>> = HashMap::new();
     for inp in block.txdata.iter().skip(1).flat_map(|tx| &tx.input) {
@@ -3391,7 +3394,11 @@ fn confirmed_parent_outputs(
     }
     let mut outs = HashMap::new();
     for (txid, vouts) in vouts_by_parent {
-        let Some((fk, all)) = chain_tx_outputs(query, &txid.to_byte_array()) else {
+        let Some((fk, created_h, all)) = query
+            .connected_tx_outputs(&txid.to_byte_array())
+            .ok()
+            .flatten()
+        else {
             continue;
         };
         for vout in vouts {
@@ -3400,23 +3407,11 @@ fn confirmed_parent_outputs(
                     value: Amount::from_sat(u64::try_from(out.value).unwrap_or(0)),
                     script_pubkey: ScriptBuf::from_bytes(out.script.clone()),
                 };
-                outs.insert(OutPoint { txid, vout }, (fk, txout));
+                outs.insert(OutPoint { txid, vout }, (fk, created_h, txout));
             }
         }
     }
     outs
-}
-
-/// Every output of a tx on the connected chain: one head resolve, one packed
-/// outs decode. A row that exists only in a reorged-out block is `None`, as
-/// in Core.
-fn chain_tx_outputs(
-    query: &Query,
-    txid: &[u8; 32],
-) -> Option<(Fk, Vec<rbitcoin_store::OutputRecord>)> {
-    let fk = query.tx_fk_by_txid_tip(txid).ok().flatten()?;
-    let (_, outs) = query.store().get_tx_meta_and_outputs(fk).ok()?;
-    Some((fk, outs))
 }
 
 /// Core `CheckTxInputs`: the creating tx is the coinbase at its height and
@@ -3424,24 +3419,16 @@ fn chain_tx_outputs(
 fn coinbase_spend_is_immature(
     query: &Query,
     create_fk: Fk,
+    created_h: u32,
     spend_height: u32,
     maturity: u32,
 ) -> Result<bool, String> {
-    let created_h = match query.store().tx_height_get(create_fk) {
-        Ok(Some(h)) => h,
-        // Not on the best-chain fence (reorged-out or never connected).
-        // `tx_height_get` does not return `NotFound`.
-        Ok(None) => return Err("bad-txns-inputs-missingorspent".into()),
-        Err(e) => return Err(e.to_string()),
-    };
     if spend_height >= created_h.saturating_add(maturity) {
         return Ok(false);
     }
-    let coinbases = query
-        .store()
-        .coinbase_fk_at_heights(&[created_h])
-        .map_err(|e| e.to_string())?;
-    Ok(coinbases.get(&created_h).copied() == Some(create_fk))
+    query
+        .is_coinbase_create(create_fk, created_h)
+        .map_err(|e| e.to_string())
 }
 
 pub fn accept_block_header_nodos_log(hash: impl std::fmt::Display) -> String {
