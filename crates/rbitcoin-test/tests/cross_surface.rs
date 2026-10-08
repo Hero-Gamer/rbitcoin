@@ -3080,10 +3080,13 @@ async fn sv2_tp_bootstrap() {
     // Over the bootstrap tx's 10_000 sat fee: only the fee-push story pushes.
     cfg.sv2_tp_fee_delta = 10_001;
     cfg.sv2_tp_template_interval_secs = 1;
+    let health_addr = ephemeral_addr();
+    cfg.listen.health = Some(health_addr);
+    cfg.metrics = true;
     std::fs::write(td.path().join("rpc.token"), "pass").unwrap();
     cfg.max_run_secs = Some(60);
     let node = tokio::spawn(run_p2p(cfg));
-    wait_listeners(&[rpc_addr, sv2_addr]).await;
+    wait_listeners(&[rpc_addr, sv2_addr, health_addr]).await;
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let authority = bitcoin::secp256k1::Keypair::from_seckey_slice(&secp, &SV2_AUTHORITY_SEC)
@@ -3316,6 +3319,17 @@ async fn sv2_tp_bootstrap() {
     assert!(!fee_push.future_template, "fee push keeps the prev hash");
     assert!(fee_push.template_id > next.template_id);
     assert_eq!(fee_push.value_remaining, next.value_remaining + 11_000);
+
+    // Seven templates reached this client, and the below-delta check built
+    // one it did not send; the 1 s interval ran a check per second since.
+    let m = scrape_metrics(health_addr).await;
+    let builds = m["rbitcoin_sv2_template_builds_total"];
+    assert!(builds >= 8.0, "{m:?}");
+    assert!(m["rbitcoin_sv2_fee_checks_total"] >= 2.0, "{m:?}");
+    assert!(
+        m["rbitcoin_sv2_template_build_seconds_total"] > 0.0,
+        "{m:?}"
+    );
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;

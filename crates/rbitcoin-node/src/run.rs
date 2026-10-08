@@ -856,6 +856,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
     }
     let sv2_tp = start_sv2_tp(&config, &node.hub).await;
+    let sv2_stats = sv2_tp.as_ref().map(Sv2TpHandle::stats);
+    if let Some(s) = &sv2_stats {
+        status.attach_sv2(Arc::clone(s));
+    }
     let mut i2p_wallet = Vec::new();
     if config.listen.i2p_accept_incoming {
         if let Some(addr) = config.listen.i2p_sam {
@@ -1204,6 +1208,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 let (esp_n, esp_us, esp_max) = rbitcoin_esplora::sample_reset_perf();
                 let (el_n, el_us, el_max) = rbitcoin_electrum::sample_reset_perf();
                 let serve = sample_reset_serve_perf();
+                let sv2 = sv2_stats
+                    .as_ref()
+                    .map(|s| (s.fee_checks.take_window().0, s.builds.take_window()));
                 let blks = std::mem::take(&mut window_blocks);
                 if enabled(Level::Debug) {
                     let live = mempool_blocking(&mempool, MempoolHub::live_count).await?;
@@ -1215,6 +1222,12 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     let esp_avg = esp_us.checked_div(esp_n).unwrap_or(0);
                     let el_avg = el_us.checked_div(el_n).unwrap_or(0);
                     let serve_s = format_serve_perf(&serve);
+                    let sv2_s = sv2.map_or_else(String::new, |(checks, (n, us, max))| {
+                        format!(
+                            " sv2 checks={checks} builds={n} build_avg_us={} build_max_us={max}",
+                            us.checked_div(n).unwrap_or(0)
+                        )
+                    });
                     let sizes = format_tip_perf_sizes(&TipPerfSizes {
                         rss: read_platform_rss(),
                         cache_bodies: node.hub.cache_body_count(),
@@ -1230,7 +1243,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                          inv_tx={} getdata_tx={} announce={} \
                          esplora req={esp_n} avg_us={esp_avg} max_us={esp_max} \
                          electrum req={el_n} avg_us={el_avg} max_us={el_max} \
-                         {serve_s}",
+                         {serve_s}{sv2_s}",
                         mp.accepts,
                         mp.rejects,
                         mp.accept_max_us,

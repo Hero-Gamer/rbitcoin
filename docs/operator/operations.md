@@ -278,7 +278,7 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 
 | Line | Level | Use |
 |------|-------|-----|
-| `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= tx= avg_us= max_us=` |
+| `tip: perf` | DEBUG | Every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block `serve n= bytes= tx= avg_us= max_us=`, with `--sv2-tp-listen` `sv2 checks= builds= build_avg_us= build_max_us=` |
 | `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
 | `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
@@ -503,6 +503,8 @@ lock on the progress registry. NixOS:
 | `rbitcoin_esplora_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf esplora req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
 | `rbitcoin_electrum_requests_total` / `_request_seconds_total` | counter | Lifetime sum of `tip: perf electrum req=`, and of that handler's wall time in seconds. The DEBUG line is the last ~5s window (`req=`, `avg_us` in microseconds) |
 | `rbitcoin_block_serve_total` / `_bytes_total` | counter | Lifetime sum of `tip: perf serve n=` / `bytes=`. That line is the last ~5s window |
+| `rbitcoin_sv2_fee_checks_total` | counter | Lifetime sum of `tip: perf sv2 checks=` (with `--sv2-tp-listen`): about one per SV2 session per `--sv2-tp-template-interval` |
+| `rbitcoin_sv2_template_builds_total` / `_template_build_seconds_total` | counter | Lifetime sum of `tip: perf sv2 builds=`, and of the build wall time in seconds. Every template sent is a build; a fee check whose gain is under the delta builds one it does not send |
 | `rbitcoin_mempool_accepts_total` / `_rejects_total` | counter | Lifetime sum of `tip: perf accepts=` / `rejects=`. That line is the last ~5s window |
 | `process_resident_memory_bytes` | gauge | Same RSS reading as `ibd: sizes rss=` and `tip: perf rss=`, in bytes (`rss_kb * 1024`). Those lines print integer MiB (`rss_kb / 1024`). Linux and macOS |
 | `process_start_time_seconds` | gauge | Unix time `rbitcoin-node` started |

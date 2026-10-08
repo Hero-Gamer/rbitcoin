@@ -94,6 +94,7 @@ pub(crate) struct NodeStatus {
     chain: OnceLock<Arc<ChainHub>>,
     peers: OnceLock<Arc<PeerHub>>,
     mempool: OnceLock<Arc<MempoolHub>>,
+    sv2: OnceLock<Arc<rbitcoin_sv2::Sv2TpStats>>,
     /// Configured listeners that failed to bind (RPC, Electrum, Esplora only warn).
     unbound: OnceLock<Vec<&'static str>>,
 }
@@ -108,6 +109,7 @@ impl NodeStatus {
             chain: OnceLock::new(),
             peers: OnceLock::new(),
             mempool: OnceLock::new(),
+            sv2: OnceLock::new(),
             unbound: OnceLock::new(),
         })
     }
@@ -123,6 +125,10 @@ impl NodeStatus {
 
     pub(crate) fn attach_mempool(&self, mempool: &Arc<MempoolHub>) {
         let _ = self.mempool.set(Arc::clone(mempool));
+    }
+
+    pub(crate) fn attach_sv2(&self, stats: Arc<rbitcoin_sv2::Sv2TpStats>) {
+        let _ = self.sv2.set(stats);
     }
 
     /// Enter [`Phase::Following`] with the configured listeners that did not bind.

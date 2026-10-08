@@ -174,6 +174,25 @@ pub(super) fn render(status: &NodeStatus) -> String {
         "Electrum dispatch wall time in seconds.",
         seconds(us),
     );
+    if let Some(sv2) = status.sv2.get() {
+        let (checks, _) = sv2.fee_checks.totals();
+        out.counter(
+            "rbitcoin_sv2_fee_checks_total",
+            "SV2 TP fee checks across sessions (tip: perf sv2 checks=).",
+            checks,
+        );
+        let (builds, us) = sv2.builds.totals();
+        out.counter(
+            "rbitcoin_sv2_template_builds_total",
+            "SV2 TP template builds across sessions (tip: perf sv2 builds=).",
+            builds,
+        );
+        out.counter(
+            "rbitcoin_sv2_template_build_seconds_total",
+            "SV2 TP template build wall time in seconds.",
+            seconds(us),
+        );
+    }
     let (blocks, bytes) = rbitcoin_net::serve_perf_totals();
     out.counter(
         "rbitcoin_block_serve_total",

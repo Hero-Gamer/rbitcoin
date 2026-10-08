@@ -533,8 +533,10 @@ when fees rise enough to matter, throttled. Requires Plan B.
 - **Known mutant survivors** (nightly cargo-mutants, not PR checks):
   deleting the re-arm in `check_fees` (a session spins after a check that
   does not push) and dropping the unchanged-counter skip (one idle build
-  per interval) change only CPU; the SV2 build metric follow-up makes them
-  observable. Dropping the same-prev-hash guard in `check_fees` would send
+  per interval) change only CPU. The listener's `Sv2TpStats` (also
+  `tip: perf sv2` and `/metrics`) count checks and builds, and
+  `idle_session_checks_each_interval_and_does_not_rebuild` pins both.
+  Dropping the same-prev-hash guard in `check_fees` would send
   a fee rebuild from the store-publish-before-strip window as a new prev
   hash; a fee check cannot be steered into that window deterministically,
   so the guard is pinned by review, not a test.
