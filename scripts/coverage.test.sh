@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Contract: LCOV gate ignores test files (not substring "test"), runs default
-# workspace tests (Tier A IBD included), 92% floor (no never-falls ratchet),
+# workspace tests (Tier A IBD included), 93% floor (no never-falls ratchet),
 # writes Shields JSON. Does not run llvm-cov.
 set -euo pipefail
 
@@ -142,7 +142,7 @@ LF:4
 end_of_record
 EOF
 python3 "$ROOT/scripts/coverage-badge.py" \
-  --lh 51 --lf 64 --gate 92 --sha abcdef1234567890 --date 2026-10-05 \
+  --lh 51 --lf 64 --gate 93 --sha abcdef1234567890 --date 2026-10-05 \
   --lcov "$lcov" --out "$tmp"
 python3 - "$tmp" <<'PY'
 import json, sys
@@ -173,7 +173,7 @@ LF:1
 end_of_record
 EOF
 if python3 "$ROOT/scripts/coverage-badge.py" \
-  --lh 2 --lf 3 --gate 92 --lcov "$lcov" --out "$tmp" >/dev/null 2>"$tmp.err"; then
+  --lh 2 --lf 3 --gate 93 --lcov "$lcov" --out "$tmp" >/dev/null 2>"$tmp.err"; then
   echo "not ok - badge accepts lines outside crates/"
   FAIL=$((FAIL + 1))
 else
@@ -216,23 +216,23 @@ assert_gate_fail() {
   fi
 }
 
-assert_gate_pass "92.00% floor passes" --lh 92 --lf 100
-assert_gate_fail "91.99% floor fails" --lh 9199 --lf 10000
-assert_gate_pass "production-scale 92.18% passes the 92% floor" \
-  --lh 110725 --lf 120122
-assert_gate_fail "91.00% fails the 92% floor" --lh 91 --lf 100
+assert_gate_pass "93.00% floor passes" --lh 93 --lf 100
+assert_gate_fail "92.99% floor fails" --lh 9299 --lf 10000
+assert_gate_pass "production-scale 93.32% passes the 93% floor" \
+  --lh 150469 --lf 161235
+assert_gate_fail "92.00% fails the 93% floor" --lh 92 --lf 100
 
 st="$(mktemp)"
-python3 "$GATE" --lh 110725 --lf 120122 --status-out "$st" >/dev/null
+python3 "$GATE" --lh 150469 --lf 161235 --status-out "$st" >/dev/null
 python3 - "$st" <<'PY'
 import json, sys
 from pathlib import Path
 d = json.loads(Path(sys.argv[1]).read_text())
 assert d["ok"] is True, d
 assert d["mode"] == "floor", d
-assert d["floor"] == 92, d
+assert d["floor"] == 93, d
 PY
-assert_ok "status-out JSON names 92% floor" true
+assert_ok "status-out JSON names 93% floor" true
 rm -f "$st"
 
 assert_ok "coverage.sh calls coverage-gate.py" \

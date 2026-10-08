@@ -164,7 +164,7 @@ engineering.
 2. Prefer **high-level functional/integration tests** over unit tests
    ([`TESTING.md`](./TESTING.md)). A branch no peer, client, or operator can
    trigger is removed rather than covered by a unit.
-3. Every PR must keep production line coverage **≥ 92%** (`LH*100 >= LF*92`).
+3. Every PR must keep production line coverage **≥ 93%** (`LH*100 >= LF*93`).
    Nightly branch coverage stays ≥90% when measured. Same bar as CI via
    `./scripts/coverage.sh`. CRAP `--fail-above 30` with the allowlist in
    `.cargo-crap.toml`. Hold the floor by covering from the surface journey

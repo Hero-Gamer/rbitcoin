@@ -70,7 +70,7 @@ at an explicit rank with **Q-63+**.
 | **—** | Large process-resident body, pin, or archive caches (FIFO, LRU, or sticky residency). Examples: process pin FIFO, CreateResidency, ContigPark, archive sticky | Pins are plan/batch only. IBD is body-queue → lookup → load |
 | **—** | `rbitcoin-bench` in default-members / musl / required CI | Optional host A/B. Not a packaging or coverage gate |
 | **—** | `cargo miri test --workspace` | io_uring, tokio, secp256k1-sys. Primitives only |
-| **—** | LCOV never-falls vs master | llvm-cov LH jitters tens of hits. Floor is 92% |
+| **—** | LCOV never-falls vs master | llvm-cov LH jitters tens of hits. Floor is 93% |
 | **—** | ast-grep as a second clippy | Structural RSS/task-leak *shapes* only |
 | **Q-54** | ast-grep named-cap rules | Caps live in [`ibd-memory.md`](./ibd-memory.md) and production evict. Pinning `const = 128` is a second clippy. **Q-51** already owns shapes. |
 
