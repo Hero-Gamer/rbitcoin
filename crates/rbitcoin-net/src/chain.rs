@@ -3142,19 +3142,11 @@ pub fn check_block_proposal_with(
     if u64::from(block.header.time) > u64::from(now).saturating_add(2 * 60 * 60) {
         return Err("time-too-new".into());
     }
-    // Spends before txid-uniqueness: two copies of the same non-coinbase
-    // tx are `bad-txns-inputs-missingorspent` (Core CheckBlock order).
-    let fees = proposal_connect(query, block, height, mtp)?;
-    let mut seen = HashSet::new();
-    for tx in &block.txdata {
-        if !seen.insert(tx.compute_txid()) {
-            return Err("bad-txns-duplicate".into());
-        }
-    }
     let vctx = rbitcoin_consensus::ValidationContext::at(params, Height(height), milestone);
     if let Err(e) = rbitcoin_consensus::validate_block_structure(block, &vctx) {
         return Err(rbitcoin_consensus::block_reject_reason(&e));
     }
+    let fees = proposal_connect(query, block, height, mtp, params.coinbase_maturity())?;
     let subsidy = rbitcoin_consensus::block_subsidy(height, params) as u64;
     let coinbase_out = block.txdata[0]
         .output
@@ -3167,27 +3159,34 @@ pub fn check_block_proposal_with(
 }
 
 /// Resolves every spend against the block and the confirmed chain. `Ok` is
-/// the fee total over the non-coinbase txs.
-fn proposal_connect(query: &Query, block: &Block, height: u32, mtp: u32) -> Result<u64, String> {
+/// the fee total over the non-coinbase txs. Caller has already passed
+/// [`rbitcoin_consensus::validate_block_structure`].
+fn proposal_connect(
+    query: &Query,
+    block: &Block,
+    height: u32,
+    mtp: u32,
+    maturity: u32,
+) -> Result<u64, String> {
     if block.txdata.is_empty() {
         return Err("bad-blk-length".into());
     }
     if !block.txdata[0].is_coinbase() {
         return Err("bad-cb-missing".into());
     }
+    let cb_txid = block.txdata[0].compute_txid();
     let mut created: HashMap<OutPoint, TxOut> = HashMap::new();
     let mut spent: HashSet<OutPoint> = HashSet::new();
     let mut fees = 0u64;
-    for tx in block.txdata.iter() {
+    for (i, tx) in block.txdata.iter().enumerate() {
         if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
             return Err("bad-txns-nonfinal".into());
         }
-        if tx.is_coinbase() {
-            let tid = tx.compute_txid();
+        if i == 0 {
             for (vout, o) in tx.output.iter().enumerate() {
                 created.insert(
                     OutPoint {
-                        txid: tid,
+                        txid: cb_txid,
                         vout: vout as u32,
                     },
                     o.clone(),
@@ -3201,9 +3200,17 @@ fn proposal_connect(query: &Query, block: &Block, height: u32, mtp: u32) -> Resu
             if !spent.insert(op) {
                 return Err("bad-txns-inputs-missingorspent".into());
             }
+            // Same-block coinbase outputs are not spendable yet. Counting
+            // them would inflate `fees` and hide `bad-cb-amount`.
+            if op.txid == cb_txid && created.contains_key(&op) {
+                return Err("bad-txns-premature-spend-of-coinbase".into());
+            }
             let txout = if let Some(o) = created.get(&op) {
                 o.clone()
-            } else if let Some(o) = chain_txout(query, &op) {
+            } else if let Some((fk, o)) = chain_txout(query, &op) {
+                if coinbase_spend_is_immature(query, fk, height, maturity)? {
+                    return Err("bad-txns-premature-spend-of-coinbase".into());
+                }
                 o
             } else {
                 return Err("bad-txns-inputs-missingorspent".into());
@@ -3229,7 +3236,7 @@ fn proposal_connect(query: &Query, block: &Block, height: u32, mtp: u32) -> Resu
     Ok(fees)
 }
 
-fn chain_txout(query: &Query, op: &OutPoint) -> Option<TxOut> {
+fn chain_txout(query: &Query, op: &OutPoint) -> Option<(Fk, TxOut)> {
     let tid = op.txid.to_byte_array();
     if query.is_outpoint_spent(&tid, op.vout).ok()? {
         return None;
@@ -3244,10 +3251,37 @@ fn chain_txout(query: &Query, op: &OutPoint) -> Option<TxOut> {
     } else {
         Amount::from_sat(out.value as u64)
     };
-    Some(TxOut {
-        value,
-        script_pubkey: ScriptBuf::from_bytes(out.script),
-    })
+    Some((
+        fk,
+        TxOut {
+            value,
+            script_pubkey: ScriptBuf::from_bytes(out.script),
+        },
+    ))
+}
+
+/// Core `CheckTxInputs`: the creating tx is the coinbase at its height and
+/// `spend_height` is still inside the maturity window.
+fn coinbase_spend_is_immature(
+    query: &Query,
+    create_fk: Fk,
+    spend_height: u32,
+    maturity: u32,
+) -> Result<bool, String> {
+    use rbitcoin_store::StoreError;
+    let created_h = match query.store().tx_height_get(create_fk) {
+        Ok(Some(h)) => h,
+        Ok(None) | Err(StoreError::NotFound) => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    };
+    if spend_height >= created_h.saturating_add(maturity) {
+        return Ok(false);
+    }
+    let coinbases = query
+        .store()
+        .coinbase_fk_at_heights(&[created_h])
+        .map_err(|e| e.to_string())?;
+    Ok(coinbases.get(&created_h).copied() == Some(create_fk))
 }
 
 pub fn accept_block_header_nodos_log(hash: impl std::fmt::Display) -> String {
@@ -6287,5 +6321,76 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         assert_eq!(hub.check_block_proposal(&block), Ok(10_000));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An immature coinbase is not a fee source. Spending this block's
+    /// coinbase, or one still inside the maturity window, is Core's
+    /// `bad-txns-premature-spend-of-coinbase` even when that spend would
+    /// otherwise cover an overpaying coinbase. A bad merkle root still wins.
+    #[test]
+    fn check_block_proposal_rejects_immature_coinbase_before_fees() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        let mut block = hub
+            .assemble_block_to_script(op_true.clone(), vec![])
+            .unwrap();
+        let subsidy = block.txdata[0].output[0].value.to_sat();
+        block.txdata[0].output[0].value = Amount::from_sat(subsidy + 1);
+        let cb_txid = block.txdata[0].compute_txid();
+        block.txdata.push(spend_out(cb_txid, 0));
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txnmrklroot",
+            "structure checks run before the immature spend"
+        );
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-premature-spend-of-coinbase",
+            "a same-block coinbase spend must not inflate fees"
+        );
+
+        hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+        let prev = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .clone();
+        let prev_value = prev.output[0].value.to_sat();
+        let immature = spend_out(prev.compute_txid(), prev_value - 1_000);
+        let block = hub
+            .assemble_block_to_script(op_true.clone(), vec![immature])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-premature-spend-of-coinbase"
+        );
+        let over = spend_out(prev.compute_txid(), prev_value + 1);
+        let block = hub.assemble_block_to_script(op_true, vec![over]).unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-premature-spend-of-coinbase",
+            "maturity is reported before bad-txns-in-belowout"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn spend_out(txid: bitcoin::Txid, value: u64) -> Transaction {
+        Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
     }
 }
