@@ -585,6 +585,13 @@ pub struct TxTable {
     rebuild_seal_bits: u32,
     rebuild_workers: usize,
     prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
+    /// Per-fk packed `txout` decodes for an outs reader
+    /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
+    /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
+    /// the confirm write stage's decoder and is not counted; span and pin
+    /// machines decode raw spans and are not counted. One Relaxed add per
+    /// decode.
+    body_decodes: std::sync::atomic::AtomicU64,
 }
 
 /// Structural-meta backend from env hierarchy.
@@ -901,6 +908,7 @@ impl TxTable {
             input: crate::input::Input::create(seqsigwit_dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
+            body_decodes: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
@@ -1132,6 +1140,7 @@ impl TxTable {
             input,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
+            body_decodes: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
@@ -1518,21 +1527,10 @@ impl TxTable {
         self.body.reserve_append(body_bytes, n_records)
     }
 
+    /// Meta by fk: the same packed decode as [`Self::get_meta_and_outputs`]
+    /// with the outs dropped (`txout` never carries ins).
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
-        let pair = self
-            .create_loc_range_batch(&[fk])?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or(StoreError::NotFound)?;
-        let raw = self
-            .body
-            .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
-        let (mut tx, _, _, _) =
-            decode_packed_tx_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
-        tx.txid = self.txids.get(fk)?;
-        self.overlay_stamped_n_in(fk, &mut tx)?;
-        Ok(tx)
+        self.get_meta_and_outputs(fk).map(|(tx, _)| tx)
     }
 
     /// Read create identity from **`txid.body`** (schema 13+).
@@ -2219,11 +2217,19 @@ impl TxTable {
         let raw = self
             .body
             .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
+        self.body_decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (mut tx, outs, _) =
             decode_packed_tx_outs_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
         self.overlay_stamped_n_in(fk, &mut tx)?;
         Ok((tx, outs))
+    }
+
+    /// Sample-and-reset per-fk packed body decodes (instance stats).
+    pub fn sample_reset_body_decodes(&self) -> u64 {
+        self.body_decodes
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Walk create_fks `first..=last` from a coalesced `txout.body` span (one idx

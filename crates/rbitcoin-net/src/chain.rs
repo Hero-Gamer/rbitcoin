@@ -6595,18 +6595,12 @@ mod tests {
         let block = hub.assemble_block_to_script(op_true, children).unwrap();
         let fees: u64 = (0..50).map(|vout| parent_value(vout) - payout).sum();
         let store = hub.query.store();
-        let _ = store.sample_reset_tx_outs_decodes();
-        let _ = store.sample_reset_tx_gets();
+        let _ = store.txs.sample_reset_body_decodes();
         assert_eq!(hub.check_block_proposal(&block), Ok(fees));
         assert_eq!(
-            store.sample_reset_tx_outs_decodes(),
-            1,
-            "one packed outs decode per distinct parent"
-        );
-        assert_eq!(
-            store.sample_reset_tx_gets(),
-            0,
-            "the parent fk resolve does not decode the body"
+            store.txs.sample_reset_body_decodes(),
+            51,
+            "one packed body decode per distinct parent, plus one per input from the spentness probe"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
