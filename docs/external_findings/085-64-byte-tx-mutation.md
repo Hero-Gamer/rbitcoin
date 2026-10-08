@@ -1,9 +1,7 @@
 # 085 — A coinbase-less 64-byte body is mutated
 
 **Severity:** high
-**Status:** partial — tip, P2P `block`, compact block, and `submitblock`
-paths fixed; the IBD confirm path needs the companion change on branch
-`consensus/ibd-mutated-body-reject`
+**Status:** fixed
 **Found by:** consensus audit, 2026-10-02
 
 A merkle root also matches a body made of its inner nodes read as
@@ -26,16 +24,15 @@ tip hub returns `NetError::Mutated` for any other caller.
 accept, without a cache. It did cache other mutated bodies (padded
 witness bytes); it now skips the cache for every `NetError::is_mutated`.
 
-**Scope:** this change covers the tip hub, the P2P `block` handler,
-compact reconstruct, and `submitblock`. The IBD body path
-(`PeerEvent::BlockFramed` → confirm → `reject_bad_block_tx_layout` →
-`ConfirmRejectClass::from_consensus` → `apply_consensus_invalid_reject`)
-still marks the hash invalid for this body. The companion change on
-branch `consensus/ibd-mutated-body-reject` fixes that path; until it
-lands, this finding is not fully fixed.
+Block checks compare the merkle root before the other body rules. A first
+transaction that is not a coinbase, plus any 64-byte transaction, is
+`merkle mutated by a 64-byte tx`. IBD classifies that as a bad copy
+(`SoftWire`): the body is dropped, the hash is not cached invalid, and
+the block is requested again.
 
 **Regression:** `rbitcoin-net`
 `chain::tests::hostile_peer_session`,
 `peer::tests::peer_header_dos_and_self_announce`,
-`compact::tests::prefilled_64_byte_body_without_coinbase_is_not_a_block`;
+`compact::tests::prefilled_64_byte_body_without_coinbase_is_not_a_block`,
+`ibd::events::confirm_reject_tests::ibd_mutated_body_is_refetched_not_blacklisted`;
 `rbitcoin-rpc` `methods::tests::rpc_regtest_from_genesis`.

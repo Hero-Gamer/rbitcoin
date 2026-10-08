@@ -105,8 +105,9 @@ pub const SCHEMA_VERSION: u16 = 26;
 ///
 /// Schema **26** is current. Meta **22** through **26** opens. Occupied **22**
 /// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
-/// trailing size/weight from 96 B `header.body` rows. Occupied **25** rewrites
-/// `meta` and zero-extends `txstat.body`. Meta older than **22** is not
+/// trailing size/weight from 96 B `header.body` rows. Any meta below **26**
+/// is rewritten to 26; a short `txstat.body` is aligned to the loc count.
+/// Meta older than **22** is not
 /// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /
 /// `seqsigwit.body`) were wiped, not rewritten.
 #[inline]
