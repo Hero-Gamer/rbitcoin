@@ -3268,10 +3268,11 @@ fn coinbase_spend_is_immature(
     spend_height: u32,
     maturity: u32,
 ) -> Result<bool, String> {
-    use rbitcoin_store::StoreError;
     let created_h = match query.store().tx_height_get(create_fk) {
         Ok(Some(h)) => h,
-        Ok(None) | Err(StoreError::NotFound) => return Ok(false),
+        // Not on the best-chain fence (reorged-out or never connected).
+        // `tx_height_get` does not return `NotFound`.
+        Ok(None) => return Err("bad-txns-inputs-missingorspent".into()),
         Err(e) => return Err(e.to_string()),
     };
     if spend_height >= created_h.saturating_add(maturity) {
@@ -6373,6 +6374,32 @@ mod tests {
             hub.check_block_proposal(&block).unwrap_err(),
             "bad-txns-premature-spend-of-coinbase",
             "maturity is reported before bad-txns-in-belowout"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A body that is still in the tx index after its block leaves the best
+    /// chain has no fence height. That is not a mature input.
+    #[test]
+    fn check_block_proposal_rejects_unconnected_prevout() {
+        let (dir, hub) = tmp_hub();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(1, op_true, vec![]).unwrap();
+        let prev = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .clone();
+        let value = prev.output[0].value.to_sat();
+        hub.rewind_to_height(0).unwrap();
+        let spend = spend_out(prev.compute_txid(), value - 1_000);
+        let block = hub
+            .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x52]), vec![spend])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-txns-inputs-missingorspent"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
