@@ -296,47 +296,6 @@ impl Input {
         Ok(())
     }
 
-    /// Catch an existing store up with unstamped `n_in == 0` rows. No body bytes.
-    pub fn append_unstamped(&self, n: u64) -> Result<(), StoreError> {
-        if n == 0 {
-            return Ok(());
-        }
-        let base = self.count.load(Ordering::Acquire);
-        let body_at = self.body_end.load(Ordering::Acquire);
-        let mut written = 0u64;
-        while written < n {
-            let chunk = (n - written).min(1 << 20);
-            let loc_bytes = vec![0u8; chunk as usize * LOC_SLOT as usize];
-            let at = FILE_HEADER_LEN as u64 + (base + written) * LOC_SLOT;
-            self.loc.write_at(at, &loc_bytes)?;
-            written += chunk;
-        }
-        let mut new_offs: Vec<(u64, u64)> = Vec::new();
-        for i in 0..n {
-            let fk = base + 1 + i;
-            if fk.is_multiple_of(LOC_WINDOW) {
-                new_offs.push((fk / LOC_WINDOW - 1, body_at));
-            }
-        }
-        if !new_offs.is_empty() {
-            let mut blob = Vec::with_capacity(new_offs.len() * OFF_SLOT as usize);
-            for &(_, abs) in &new_offs {
-                blob.extend_from_slice(&abs.to_le_bytes());
-            }
-            let off_at = FILE_HEADER_LEN as u64 + new_offs[0].0 * OFF_SLOT;
-            self.off.write_at(off_at, &blob)?;
-            let mut cps = self.checkpoints.write().unwrap_or_else(|e| e.into_inner());
-            for &(w, abs) in &new_offs {
-                if w as usize != cps.len() {
-                    return Err(StoreError::Corrupt("invariant: input.off index"));
-                }
-                cps.push(abs);
-            }
-        }
-        self.count.store(base + n, Ordering::Release);
-        Ok(())
-    }
-
     pub fn truncate_to_count(&self, new_count: u64) -> Result<(), StoreError> {
         let cur = self.count.load(Ordering::Acquire);
         if new_count > cur {
@@ -540,31 +499,6 @@ mod tests {
         let t = Input::open(dir.path()).unwrap();
         assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(7, 1)]);
         assert_eq!(t.n_in(Fk(1025)).unwrap(), Some(1));
-    }
-
-    #[test]
-    fn append_unstamped_is_zero_n_in_until_a_later_edge() {
-        let dir = TempDir::labeled("input-unstamped").unwrap();
-        let t = Input::create(dir.path()).unwrap();
-        t.append_unstamped(0).unwrap();
-        assert_eq!(t.count(), 0);
-        t.append_unstamped(3).unwrap();
-        assert_eq!(t.count(), 3);
-        assert_eq!(t.n_in(Fk(1)).unwrap(), None);
-        assert!(t.edges(Fk(3)).unwrap().is_none());
-        t.append_unstamped(1021).unwrap();
-        assert_eq!(t.count(), 1024);
-        assert_eq!(t.n_in(Fk(1024)).unwrap(), None);
-        t.append(&[vec![edge(4, 2)]]).unwrap();
-        assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
-        t.append_unstamped(1024).unwrap();
-        assert_eq!(t.count(), 2049);
-        assert_eq!(t.n_in(Fk(2049)).unwrap(), None);
-        drop(t);
-        let t = Input::open(dir.path()).unwrap();
-        assert_eq!(t.count(), 2049);
-        assert_eq!(t.edges(Fk(1025)).unwrap().unwrap(), vec![edge(4, 2)]);
-        assert_eq!(t.n_in(Fk(1)).unwrap(), None);
     }
 
     #[test]

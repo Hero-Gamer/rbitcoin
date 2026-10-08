@@ -525,27 +525,27 @@ fn annotate_slots_from_connected_hash(
     else {
         return Ok(());
     };
-    for &spend_fk in &tx_fks {
+    for (tx_i, &spend_fk) in tx_fks.iter().enumerate() {
         let (_meta, ins, _outs) = query
             .store()
             .get_tx_full(spend_fk)
             .map_err(ConsensusError::from)?;
+        if tx_i == 0 {
+            let coinbase = ins.len() == 1 && ins[0].is_coinbase();
+            if !coinbase {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "coinbase input edge",
+                )));
+            }
+            continue;
+        }
         for (inp_i, inp) in ins.into_iter().enumerate() {
-            if inp.is_coinbase() {
-                continue;
+            if inp.is_coinbase() || inp.create_fk.is_null() {
+                return Err(ConsensusError::Store(StoreError::Corrupt(
+                    "non-coinbase input edge",
+                )));
             }
-            let create_fk = if inp.create_fk.is_null() {
-                query
-                    .store()
-                    .get_fk_by_txid_tip(&inp.prev_txid)
-                    .map_err(ConsensusError::from)?
-                    .unwrap_or(rbitcoin_primitives::Fk::NULL)
-            } else {
-                inp.create_fk
-            };
-            if create_fk.is_null() {
-                continue;
-            }
+            let create_fk = inp.create_fk;
             let (off, len) = query
                 .store()
                 .tx_spent_range(create_fk)

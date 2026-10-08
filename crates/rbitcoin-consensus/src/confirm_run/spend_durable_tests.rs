@@ -586,3 +586,290 @@ fn checkpoint_after_reorg_does_not_skip_the_reconnected_spends() {
     assert!(matches!(err, ConsensusError::PrevoutSpent), "{err}");
     let _ = dir;
 }
+
+fn marker_heights(store: &std::path::Path) -> Option<(u32, u32)> {
+    let path = store.join(rbitcoin_store::SPEND_DURABLE_NAME);
+    let buf = std::fs::read(&path).ok()?;
+    if buf.len() != 16 {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+    ))
+}
+
+fn connect_until(
+    q: &rbitcoin_query::Query,
+    params: &ChainParams,
+    ms: Milestone,
+    tip: &mut bitcoin::BlockHash,
+    tip_time: &mut u32,
+    end_height: u32,
+) {
+    let start = q.tip_height().map(|h| h.0).unwrap_or(0);
+    for h in (start + 1)..=end_height {
+        let b = mine(*tip, *tip_time + 600, h, Vec::new());
+        accept_and_connect_block(q, params, Height(h), &b, ms).unwrap();
+        *tip = b.block_hash();
+        *tip_time = b.header.time;
+    }
+}
+
+/// Shrink `input.loc` so `keep` creates remain. Simulates a power loss that
+/// published the Class A tail without the input high-water mark.
+fn shrink_input_loc_hwm(store: &std::path::Path, keep: u64) {
+    let logical = 16u64 + keep * 2;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(store.join("input.loc"))
+        .unwrap();
+    f.seek(SeekFrom::Start(8)).unwrap();
+    f.write_all(&logical.to_le_bytes()).unwrap();
+}
+
+fn input_body_off(q: &rbitcoin_query::Query, spend_fk: rbitcoin_primitives::Fk) -> u64 {
+    let mut before = 0u64;
+    for id in 1..spend_fk.0 {
+        let (_, ins, _) = q.store().get_tx_full(rbitcoin_primitives::Fk(id)).unwrap();
+        before += ins.len() as u64;
+    }
+    16 + before * 8
+}
+
+fn sealed_spend_chain() -> (
+    rbitcoin_query::testutil::TempDir,
+    rbitcoin_query::Query,
+    ChainParams,
+    Milestone,
+    u32,
+    Txid,
+    Block,
+    u32,
+) {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-edge-loss");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+    let h_spend = maturity + 3;
+    let tx = spend_one(c1, Amount::from_sat(49_0000_0000));
+    let block = mine(tip, tip_time + 600, h_spend, vec![tx]);
+    accept_and_connect_block(&q, &params, Height(h_spend), &block, ms).unwrap();
+    (dir, q, params, ms, h_spend, c1, block, tip_time)
+}
+
+#[test]
+fn short_input_hwm_shrinks_below_the_edgeless_create() {
+    let (dir, q, params, ms, h_spend, c1, block, tip_time) = sealed_spend_chain();
+    assert_eq!(q.tip_height(), Some(Height(h_spend)));
+    let keep = u64::from(h_spend);
+    let store = q.store().path().to_path_buf();
+    drop(q);
+    shrink_input_loc_hwm(&store, keep);
+
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    q.set_spend_index(true);
+    let tip_h = q.tip_height().expect("a prefix of the chain stays");
+    assert!(
+        tip_h.0 < h_spend,
+        "open must drop the block whose creates lost their edges, tip {}",
+        tip_h.0
+    );
+    crate::replay_spend_annotations(&q).unwrap();
+    let marked = q.store().spend_annotated_through().unwrap();
+    assert_ne!(
+        marked,
+        Some(h_spend),
+        "the spend marker must not name the pre-loss tip"
+    );
+    if let Some((ann, durable)) = marker_heights(&store) {
+        assert_ne!(ann, h_spend);
+        assert_ne!(durable, h_spend);
+    }
+    let spend_txid = block.txdata[1].compute_txid();
+    assert!(
+        q.tx_fk_by_txid(spend_txid.as_byte_array())
+            .unwrap()
+            .is_none(),
+        "the edgeless spend create is not left in the archive"
+    );
+
+    accept_and_connect_block(&q, &params, Height(tip_h.0 + 1), &block, ms).unwrap();
+    let respend = mine(
+        block.block_hash(),
+        tip_time + 1_200,
+        tip_h.0 + 2,
+        vec![spend_one(c1, Amount::from_sat(48_0000_0000))],
+    );
+    let err = accept_and_connect_block(&q, &params, Height(tip_h.0 + 2), &respend, ms)
+        .expect_err("reconnecting the spend keeps the output spent");
+    assert!(
+        matches!(err, ConsensusError::PrevoutSpent),
+        "respend after reconnect: {err}"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn zeroed_input_body_shrinks_and_is_not_a_coinbase() {
+    let (dir, q, _params, _ms, h_spend, c1, block, _tip_time) = sealed_spend_chain();
+    let spend_txid = block.txdata[1].compute_txid();
+    let spend_fk = q
+        .tx_fk_by_txid(spend_txid.as_byte_array())
+        .unwrap()
+        .unwrap();
+    let off = input_body_off(&q, spend_fk);
+    let store = q.store().path().to_path_buf();
+    drop(q);
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.join("input.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&[0u8; 8]).unwrap();
+    }
+
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    q.set_spend_index(true);
+    let tip_h = q.tip_height().unwrap();
+    assert!(
+        tip_h.0 < h_spend,
+        "a coinbase-shaped edge on a non-coinbase shrinks the tip, got {}",
+        tip_h.0
+    );
+    crate::replay_spend_annotations(&q).unwrap();
+    assert_ne!(q.store().spend_annotated_through().unwrap(), Some(h_spend));
+    assert!(
+        !q.is_outpoint_spent(c1.as_byte_array(), 0).unwrap(),
+        "the rolled-back spend must not leave the parent spent"
+    );
+    let _ = dir;
+}
+
+#[test]
+fn replay_rejects_coinbase_edge_on_a_non_coinbase() {
+    let (dir, q, _params, _ms, h_spend, _c1, block, _tip_time) = sealed_spend_chain();
+    q.store().checkpoint_spend_through(h_spend - 1).unwrap();
+    assert_eq!(
+        q.store().spend_annotated_through().unwrap(),
+        Some(h_spend - 1)
+    );
+    let spend_fk = q
+        .tx_fk_by_txid(block.txdata[1].compute_txid().as_byte_array())
+        .unwrap()
+        .unwrap();
+    let off = input_body_off(&q, spend_fk);
+    let store = q.store().path().to_path_buf();
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.join("input.body"))
+            .unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(&[0u8; 8]).unwrap();
+    }
+    let err = crate::replay_spend_annotations(&q).expect_err("replay must fail closed");
+    assert!(
+        matches!(
+            err,
+            ConsensusError::Store(rbitcoin_store::StoreError::Corrupt(_))
+        ),
+        "{err}"
+    );
+    let (ann, durable) = marker_heights(&store).unwrap();
+    assert_eq!(ann, h_spend - 1);
+    assert_eq!(durable, h_spend - 1);
+    let _ = dir;
+}
+
+fn chain_at_height(
+    label: &str,
+    height: u32,
+) -> (rbitcoin_query::testutil::TempDir, rbitcoin_query::Query) {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, height);
+    (dir, q)
+}
+
+#[test]
+fn checkpoint_disconnect_inside_sync_does_not_publish() {
+    let (dir, q) = chain_at_height("spend-gen-reorg", 2);
+    q.store().checkpoint_spend_through(1).unwrap();
+    let parent = q.header_at_height(Height(1)).unwrap().unwrap().1;
+    let replacement = mine(
+        bitcoin::BlockHash::from_byte_array(parent.hash),
+        parent.timestamp + 600,
+        2,
+        Vec::new(),
+    );
+    let q = std::sync::Arc::new(q);
+    let during = std::sync::Arc::clone(&q);
+    q.store()
+        .checkpoint_spend_through_between(2, move |_store| {
+            during.disconnect_tip().unwrap();
+            accept_and_connect_block(
+                &during,
+                &ChainParams::regtest(),
+                Height(2),
+                &replacement,
+                Milestone::NONE,
+            )
+            .unwrap();
+        })
+        .unwrap();
+    let (ann, durable) = marker_heights(q.store().path()).unwrap();
+    assert_eq!(ann, 1, "a reorg inside the sync window must not publish 2");
+    assert_eq!(durable, 1);
+    assert_eq!(q.tip_height(), Some(Height(2)));
+    let _ = dir;
+}
+
+#[test]
+fn checkpoint_append_above_snapshot_still_publishes() {
+    let (dir, q) = chain_at_height("spend-gen-append", 2);
+    let tip = q.header_at_height(Height(2)).unwrap().unwrap().1.hash;
+    let tip_time = q.header_at_height(Height(2)).unwrap().unwrap().1.timestamp;
+    let next = mine(
+        bitcoin::BlockHash::from_byte_array(tip),
+        tip_time + 600,
+        3,
+        Vec::new(),
+    );
+    let q = std::sync::Arc::new(q);
+    let during = std::sync::Arc::clone(&q);
+    q.store()
+        .checkpoint_spend_through_between(2, move |_store| {
+            accept_and_connect_block(
+                &during,
+                &ChainParams::regtest(),
+                Height(3),
+                &next,
+                Milestone::NONE,
+            )
+            .unwrap();
+        })
+        .unwrap();
+    let (ann, durable) = marker_heights(q.store().path()).unwrap();
+    assert_eq!(ann, 2);
+    assert_eq!(durable, 2);
+    assert_eq!(q.tip_height(), Some(Height(3)));
+    let _ = dir;
+}

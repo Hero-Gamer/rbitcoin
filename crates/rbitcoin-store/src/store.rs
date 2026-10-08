@@ -286,6 +286,9 @@ pub struct Store {
     /// First height of a confirm write whose spend annotate has not finished,
     /// plus one. Zero means none.
     spend_annotate_from: std::sync::atomic::AtomicU64,
+    /// Disconnects since process start. A checkpoint publishes only when this
+    /// word is unchanged across its `sync_data` window.
+    spend_reorg_gen: std::sync::atomic::AtomicU64,
     #[cfg(debug_assertions)]
     tx_full_log: std::sync::Mutex<Vec<u64>>,
     #[cfg(debug_assertions)]
@@ -375,6 +378,7 @@ impl Store {
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
+            spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
@@ -438,6 +442,7 @@ impl Store {
             mtp_ring: std::sync::RwLock::new(MtpRing::empty()),
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
+            spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             path,
             cold_path,
@@ -1725,15 +1730,25 @@ impl Store {
             Some(h) => tip.min(h.0),
             None => 0,
         };
+        let gen = self
+            .spend_reorg_gen
+            .load(std::sync::atomic::Ordering::Acquire);
         self.txs.sync_replay_bodies()?;
         self.spenders.flush()?;
-        self.store_spend_marker(tip, tip)?;
+        self.store_spend_marker(tip, tip, gen)?;
         Ok(t.elapsed().as_nanos() as u64)
     }
 
     /// Publish the marker at `min(requested, confirmed tip)` under [`Self::spend_marker`].
-    fn store_spend_marker(&self, annotated: u32, durable: u32) -> Result<(), StoreError> {
+    ///
+    /// A disconnect bumps [`Self::spend_reorg_gen`] before it takes the same
+    /// lock. A publish sampled at `gen` writes nothing when that word moved.
+    fn store_spend_marker(&self, annotated: u32, durable: u32, gen: u64) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
         let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
+        if self.spend_reorg_gen.load(Ordering::Acquire) != gen {
+            return Ok(());
+        }
         let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
         crate::spend_durable::SpendDurable::new(annotated.min(tip), durable.min(tip))
             .store(self.path())
@@ -1848,14 +1863,35 @@ impl Store {
     }
 
     /// `sync_data` the replay stems, then publish `A = D = height` when the
-    /// confirmed tip is still at least `height`. A lower tip leaves the marker.
+    /// confirmed tip is still at least `height` and no disconnect ran during
+    /// the sync. A lower tip, or a disconnect, leaves the marker.
     ///
     /// A pending spend annotate caps the published height below its first
     /// height, so open still replays it. With pending from genesis, nothing is
     /// published.
     pub fn checkpoint_spend_through(&self, height: u32) -> Result<(), StoreError> {
+        self.checkpoint_spend_through_between(height, |_| {})
+    }
+
+    /// [`Self::checkpoint_spend_through`] with `between` invoked after
+    /// `sync_data` and before the marker publish.
+    ///
+    /// Appends above `height` do not bump the disconnect generation, so a
+    /// block connected in `between` still allows the snapshot to publish.
+    /// A disconnect in `between` does not.
+    pub fn checkpoint_spend_through_between(
+        &self,
+        height: u32,
+        between: impl FnOnce(&Self),
+    ) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        let gen = self.spend_reorg_gen.load(Ordering::Acquire);
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
+        between(self);
+        if self.spend_reorg_gen.load(Ordering::Acquire) != gen {
+            return Ok(());
+        }
         let Some(tip) = self.confirmed.tip_height().map(|h| h.0) else {
             return Ok(());
         };
@@ -1869,16 +1905,18 @@ impl Store {
             },
             _ => height,
         };
-        self.store_spend_marker(height, height)
+        self.store_spend_marker(height, height, gen)
     }
 
     /// A disconnect below the marker lowers both heights to the new tip.
     ///
     /// The spend snapshot drops to the new tip too. A reconnect above it is not
     /// annotated until its write finishes, so the checkpoint must not publish
-    /// the old snapshot over it.
+    /// the old snapshot over it. The generation bump is what the in-flight
+    /// checkpoint observes, including when this datadir has no marker file yet.
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
+        self.spend_reorg_gen.fetch_add(1, Ordering::AcqRel);
         let _ = self
             .spend_snapshot
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {

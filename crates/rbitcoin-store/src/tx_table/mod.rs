@@ -655,7 +655,11 @@ fn class_a_skew_target_count(
     n_txids: u64,
     n_seqsigwit_loc: u64,
     prune_seqsigwit_mode: bool,
+    short_new_layout_input: Option<u64>,
 ) -> Option<u64> {
+    if let Some(n) = short_new_layout_input {
+        return Some(n);
+    }
     if n_txids == n_loc && (prune_seqsigwit_mode || n_seqsigwit_loc == n_loc) {
         return None;
     }
@@ -664,6 +668,54 @@ fn class_a_skew_target_count(
     } else {
         n_loc.min(n_txids).min(n_seqsigwit_loc)
     })
+}
+
+fn stem_min(n_loc: u64, n_txids: u64, n_seqsigwit_loc: u64, prune_seqsigwit_mode: bool) -> u64 {
+    if prune_seqsigwit_mode {
+        n_loc.min(n_txids)
+    } else {
+        n_loc.min(n_txids).min(n_seqsigwit_loc)
+    }
+}
+
+/// `true` when create `fk` stores its parent edge on `input.body`.
+fn create_prevout_on_inputs(stems: &ClassASkewStems<'_>, fk: Fk) -> Result<bool, StoreError> {
+    let Some(Some((off, len))) = stems.seqsigwit_loc.range_batch(&[fk])?.into_iter().next() else {
+        return Ok(false);
+    };
+    if len == 0 {
+        return Ok(false);
+    }
+    let flags = stems.seqsigwit.with_bytes_at(off, 1, |b| Ok(b[0]))?;
+    Ok(flags & input_flags::PREV_ON_INPUTS != 0)
+}
+
+/// A short `input` that already existed, whose next create is new-layout.
+///
+/// Legacy inline prevouts stay out of this floor so open can still backfill
+/// them. A fresh `Input::create` this open is not a power-loss tail.
+fn short_new_layout_input(
+    stems: &ClassASkewStems<'_>,
+    n_loc: u64,
+    n_txids: u64,
+    n_seqsigwit_loc: u64,
+    prune_seqsigwit_mode: bool,
+    input_existed: bool,
+) -> Result<Option<u64>, StoreError> {
+    if !input_existed {
+        return Ok(None);
+    }
+    let n_in = stems.input.count();
+    let stem = stem_min(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode);
+    if n_in >= stem || stem == 0 {
+        return Ok(None);
+    }
+    let next = Fk(n_in.saturating_add(1));
+    if create_prevout_on_inputs(stems, next)? {
+        Ok(Some(n_in))
+    } else {
+        Ok(None)
+    }
 }
 
 fn class_a_skew_stem_ends(
@@ -754,17 +806,32 @@ fn class_a_skew_assert_aligned(
 fn repair_class_a_count_skew(
     stems: ClassASkewStems<'_>,
     prune_seqsigwit_mode: bool,
+    input_existed: bool,
 ) -> Result<(), StoreError> {
     let n_loc = stems.create_loc.count();
     let n_txids = stems.txids.count();
     let n_seqsigwit_loc = stems.seqsigwit_loc.count();
-    let Some(n) = class_a_skew_target_count(n_loc, n_txids, n_seqsigwit_loc, prune_seqsigwit_mode)
-    else {
+    let short_input = short_new_layout_input(
+        &stems,
+        n_loc,
+        n_txids,
+        n_seqsigwit_loc,
+        prune_seqsigwit_mode,
+        input_existed,
+    )?;
+    let Some(n) = class_a_skew_target_count(
+        n_loc,
+        n_txids,
+        n_seqsigwit_loc,
+        prune_seqsigwit_mode,
+        short_input,
+    ) else {
         return Ok(());
     };
+    let n_input = stems.input.count();
     rbitcoin_log::warn!(
         "store: Class A count skew loc={n_loc} seqsigwit.loc={n_seqsigwit_loc} \
-         txid.body={n_txids} — truncating to {n}"
+         txid.body={n_txids} input={n_input} — truncating to {n}"
     );
     let (tx_end, sp_end, in_end) = class_a_skew_stem_ends(&stems, n, prune_seqsigwit_mode)?;
     class_a_skew_apply_truncate(
@@ -959,7 +1026,8 @@ impl TxTable {
             }
         }
         let txstat = crate::txstat::TxStat::open(seqsigwit_dir)?;
-        let input = if seqsigwit_dir.join("input.loc").exists() {
+        let input_existed = seqsigwit_dir.join("input.loc").exists();
+        let input = if input_existed {
             crate::input::Input::open(seqsigwit_dir)?
         } else if seqsigwit_dir.join("input.body").exists()
             || seqsigwit_dir.join("input.off").exists()
@@ -980,6 +1048,7 @@ impl TxTable {
                 input: &input,
             },
             prune_seqsigwit_mode,
+            input_existed,
         )?;
         let n_bodies = create_loc.count();
         if txstat.count() != n_bodies {
@@ -1069,18 +1138,19 @@ impl TxTable {
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
-                // A missing tail on the new layout has no inline prevout. Stamp
-                // those rows empty. A legacy tail (or a fresh backfill) still
-                // walks seqsigwit.
+                // Legacy inline prevouts (and a missing file, which starts at
+                // fk 1) rebuild edges from seqsigwit. A new-layout tail has no
+                // inline prevout: stamping n_in = 0 would seal those creates
+                // as having no parents.
                 let legacy = from == 1 || t.seqsigwit_has_inline_prevout(Fk(from))?;
-                if legacy {
-                    t.backfill_inputs_from_seqsigwit(from)?;
-                } else {
-                    t.input
-                        .append_unstamped(unstamped_tail(n_bodies, t.input.count()))?;
+                if !legacy {
+                    return Err(StoreError::Corrupt("input tail missing"));
                 }
+                t.backfill_inputs_from_seqsigwit(from)?;
             }
-            InputOpenTail::Unstamped { n } => t.input.append_unstamped(n)?,
+            InputOpenTail::Unstamped { .. } => {
+                return Err(StoreError::Corrupt("input tail missing"));
+            }
             InputOpenTail::Ahead => {
                 return Err(StoreError::Corrupt(
                     "invariant: input.loc ahead of create.loc",

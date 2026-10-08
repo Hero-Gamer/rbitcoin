@@ -37,7 +37,9 @@ fn flush_clears_pending_sync_on_replay_stems() {
     let dir = tempfile_dir("flush-pending");
     let t = create_tiny(&dir);
     t.txids.append_batch(0, &[[9u8; 32]]).unwrap();
-    t.input.append_unstamped(1).unwrap();
+    t.input
+        .append(&[vec![crate::input::InputEdge::coinbase()]])
+        .unwrap();
     assert!(t.txids.pending_sync());
     assert!(t.txstat.pending_sync());
     assert!(t.input.pending_sync());
@@ -335,8 +337,8 @@ fn reopen_without_inputs_refuses_new_seqsigwit() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 
-    // New-layout tail: one stamped create, one missing. The gap is exactly
-    // one unstamped row, not a seqsigwit walk.
+    // New-layout tail: one stamped create, one missing. That create is not
+    // stamped n_in = 0. Class A truncates to the stamped input count.
     let dir = tempfile_dir("input-unstamped-tail");
     let t = create_tiny(&dir);
     t.put_full_batch_indexed(&[two_input_item(), two_input_item()], true)
@@ -357,10 +359,15 @@ fn reopen_without_inputs_refuses_new_seqsigwit() {
         .unwrap();
     drop(partial);
     let t2 = TxTable::open_tiny(&dir).unwrap();
-    assert_eq!(t2.input.count(), 2);
+    assert_eq!(t2.count(), 1, "short new-layout input truncates Class A");
+    assert_eq!(t2.input.count(), 1);
     assert!(
-        t2.input.edges(Fk(2)).unwrap().is_none(),
-        "new seqsigwit has no inline prevout to backfill"
+        t2.input.edges(Fk(1)).unwrap().is_some(),
+        "the stamped create keeps its edges"
+    );
+    assert!(
+        t2.input.edges(Fk(2)).is_err(),
+        "the edgeless create is not left unstamped"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

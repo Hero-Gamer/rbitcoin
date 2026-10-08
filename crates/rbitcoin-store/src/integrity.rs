@@ -441,10 +441,112 @@ impl Store {
             return Err("merkle root mismatch");
         }
         match self.strong_tx.all_strong_range(first, count) {
-            Ok(true) => Ok(()),
+            Ok(true) => self.check_block_input_edges(fk, first.0, count, report),
             Ok(false) => Err("strong bits missing in tip window"),
             Err(_) => Err("strong_tx read"),
         }
+    }
+
+    /// Parent edges for one confirmed block. The first tx is the coinbase.
+    ///
+    /// A missing edge, a coinbase-shaped edge on a later tx, or a parent that
+    /// is not an in-range output drops the block association and fails the
+    /// window so the tip shrinks below that block. Seqsigwit count is skipped
+    /// while that stem is pruned.
+    fn check_block_input_edges(
+        &self,
+        header_fk: Fk,
+        first: u64,
+        count: u32,
+        report: &mut TipRevalidateReport,
+    ) -> Result<(), &'static str> {
+        let reason = self.block_input_edge_reason(first, count);
+        if let Err(reason) = reason {
+            let _ = self.header_txs.clear_body(header_fk);
+            report.bodies_cleared = report.bodies_cleared.saturating_add(1);
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    fn block_input_edge_reason(&self, first: u64, count: u32) -> Result<(), &'static str> {
+        if count == 0 {
+            return Err("input edges short");
+        }
+        let last = first.saturating_add(u64::from(count)).saturating_sub(1);
+        let spans = self
+            .txs
+            .input
+            .edges_span(first, last)
+            .map_err(|_| "input edges read")?;
+        if spans.len() != count as usize {
+            return Err("input edges short");
+        }
+        let prune = self.txs.prune_seqsigwit_mode();
+        let mut parents: Vec<(Fk, u32)> = Vec::new();
+        for (i, slot) in spans.iter().enumerate() {
+            let Some(edges) = slot else {
+                return Err("input unstamped");
+            };
+            if !prune {
+                let n = self.seqsigwit_input_count(Fk(first + i as u64))?;
+                if n != edges.len() {
+                    return Err("input edge count");
+                }
+            }
+            if i == 0 {
+                let coinbase = edges.len() == 1 && edges[0].parent.is_null() && edges[0].vout == 0;
+                if !coinbase {
+                    return Err("coinbase input edge");
+                }
+                continue;
+            }
+            for edge in edges {
+                if edge.parent.is_null() {
+                    return Err("non-coinbase input edge");
+                }
+                parents.push((edge.parent, edge.vout));
+            }
+        }
+        if parents.is_empty() {
+            return Ok(());
+        }
+        let fks: Vec<Fk> = parents.iter().map(|(fk, _)| *fk).collect();
+        let locs = self
+            .txs
+            .create_loc
+            .range_batch(&fks)
+            .map_err(|_| "input parent read")?;
+        if locs.len() != parents.len() {
+            return Err("input parent missing");
+        }
+        for ((_, vout), loc) in parents.iter().zip(locs.iter()) {
+            let Some(pair) = loc else {
+                return Err("input parent missing");
+            };
+            if *vout >= pair.n_out {
+                return Err("input vout OOB");
+            }
+        }
+        Ok(())
+    }
+
+    fn seqsigwit_input_count(&self, fk: Fk) -> Result<usize, &'static str> {
+        let (off, len) = self
+            .txs
+            .seqsigwit_range(fk)
+            .map_err(|_| "seqsigwit range")?;
+        if len == 0 {
+            return Ok(0);
+        }
+        let raw = self
+            .txs
+            .seqsigwit
+            .with_bytes_at(off, len, |b| Ok(b.to_vec()))
+            .map_err(|_| "seqsigwit read")?;
+        crate::tx_table::decode_seqsigwit_secret_to_end(&raw, None)
+            .map(|ins| ins.len())
+            .map_err(|_| "seqsigwit decode")
     }
 
     /// Truncate confirmed tip to `last_good` (inclusive), or empty if `None`.
