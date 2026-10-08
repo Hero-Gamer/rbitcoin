@@ -2165,14 +2165,73 @@ impl MempoolHub {
         self.restore_replaced(&victims);
     }
 
-    /// Put conflicts removed by a failed replacement back, the same way a
-    /// package rollback re-accepts them. A victim that cannot re-enter is
-    /// dropped from the relay maps.
+    /// Put conflicts removed by a failed replacement back. They were already
+    /// admitted, so the fee floor is not applied again and a descendant is
+    /// not parked ahead of its parent. A victim that still cannot re-enter
+    /// leaves the relay maps.
     fn restore_replaced(&self, victims: &[Transaction]) {
-        for tx in victims {
-            if self.accept_tx(tx).is_err() {
-                self.unindex_txid(&tx.compute_txid());
+        if victims.is_empty() {
+            return;
+        }
+        let utxo = self.utxo_provider();
+        for i in rbitcoin_mempool::ActiveMempool::ancestor_first_order(victims) {
+            let tx = &victims[i];
+            match self.reaccept_waived(tx, &utxo) {
+                Ok((result, prevouts)) => {
+                    if self.relay_indexed(&result.txid) {
+                        self.unindex_evicted(&result.evicted);
+                        for old in &result.replaced {
+                            self.unindex_txid(old);
+                        }
+                    } else {
+                        self.publish_admitted(tx, &result, &prevouts, &utxo);
+                    }
+                }
+                Err(_) => self.unindex_if_absent(tx),
             }
+        }
+    }
+
+    /// Re-insert one already-admitted conflict without recording a reject.
+    fn reaccept_waived(
+        &self,
+        tx: &Transaction,
+        utxo: &impl rbitcoin_mempool::UtxoProvider,
+    ) -> Result<(AcceptResult, Vec<TxOut>), AcceptError> {
+        let mut stages = rbitcoin_mempool::AcceptStageUs::default();
+        let mut lock_us = 0u64;
+        let spec = AdmitSpec {
+            report_orphans: false,
+            fee_delta: self.fee_delta(&tx.compute_txid()),
+            time_prepare_lock: false,
+            min_relay: Some(0),
+        };
+        let prep = self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us)?;
+        let sample = self.sample_chain_coins(tx, utxo);
+        let committed = {
+            let mut g = self.lock_write();
+            Self::commit_rechecked(&mut g, tx, prep, utxo, false, &sample)
+        };
+        match committed.result {
+            Ok(r) => Ok((r, committed.prevouts)),
+            Err(e) => {
+                self.unindex_evicted(&committed.failed_evict);
+                self.restore_replaced(&committed.undone);
+                self.publish_fee_floor();
+                Err(e)
+            }
+        }
+    }
+
+    fn relay_indexed(&self, txid: &Txid) -> bool {
+        self.wtxid_by_txid.lock().unwrap().contains_key(txid)
+    }
+
+    fn unindex_if_absent(&self, tx: &Transaction) {
+        let txid = tx.compute_txid();
+        let parked = self.lock_read().orphanage.contains(&txid);
+        if !self.contains(&txid) && !parked {
+            self.unindex_txid(&txid);
         }
     }
 
@@ -6551,6 +6610,238 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// A conflict cheaper than the chunk the failed attempt evicted must stay,
+    /// and must not be recent-rejected.
+    #[test]
+    fn failed_replacement_keeps_below_floor_victim() {
+        let (_store, owned_q, owned_cbs) = pad_cbs(3);
+        let q = &owned_q;
+        let cbs = owned_cbs.as_slice();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        for package in [false, true] {
+            // Cheap ancestor so the replacement is not its own protected chunk.
+            let anchor_spk = cheap_anchor_script();
+            let anchor_wu = spend_true(cbs[0], 0, anchor_spk.clone()).weight().to_wu();
+            let victim_wu = spend_true(cbs[1], 0, spk.clone()).weight().to_wu();
+            let budget = anchor_wu + victim_wu + 500;
+            let dir = tmp();
+            let hub = MempoolHub::open_with_weight(&dir, Arc::clone(q), budget).unwrap();
+            hub.set_relay_enabled(true);
+            let floor = hub.lock_read().mempool_min_fee_sat_kvb();
+            let anchor = spend_true(cbs[0], fee_at_least(anchor_wu, floor), anchor_spk);
+            let anchor_id = anchor.compute_txid();
+            let anchor_out = anchor.output[0].value.to_sat();
+            let repl_fee = 80_000u64;
+            let replacement = heavier_than(
+                OutPoint {
+                    txid: cbs[1],
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: anchor_id,
+                    vout: 0,
+                },
+                50_0000_0000 + anchor_out - repl_fee,
+                victim_wu + 500,
+            );
+            let victim_fee = fee_at_least(victim_wu, floor);
+            let victim = spend_true(cbs[1], victim_fee, spk.clone());
+            let victim_id = victim.compute_txid();
+            let victim_rate =
+                rbitcoin_consensus::policy::fee_rate_sat_per_kvb(victim_fee, victim_wu);
+            assert!(
+                hub.accept_tx(&anchor).is_ok(),
+                "package={package}: anchor fits"
+            );
+            assert!(
+                hub.accept_tx(&victim).is_ok(),
+                "package={package}: victim at the pre-eviction floor fits, fee {victim_fee} floor {floor}"
+            );
+            let err = submit_one(&hub, &replacement, package);
+            assert!(
+                matches!(err, Err(AcceptError::Policy("mempool full"))),
+                "package={package}: replacement must not stay, got {err:?}"
+            );
+            let enforced = hub.lock_read().mempool_min_fee_sat_kvb();
+            assert!(
+                enforced > victim_rate,
+                "package={package}: eviction must price out the victim ({victim_rate} vs {enforced})"
+            );
+            assert!(!hub.contains(&replacement.compute_txid()));
+            assert!(
+                hub.contains(&victim_id),
+                "package={package}: below-floor conflict must stay"
+            );
+            assert!(
+                !hub.try_recent_reject(&victim.compute_wtxid()),
+                "package={package}: restored conflict must not be recent-rejected"
+            );
+            assert_eq!(hub.orphan_count(), 0);
+            assert!(
+                hub.wtxid_by_txid.lock().unwrap().contains_key(&victim_id),
+                "package={package}: relay map must still name the conflict"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A conflict set that was only valid as CPFP (parent under min relay,
+    /// child paying) must come back ancestor-first, not as an orphan.
+    #[test]
+    fn failed_replacement_keeps_cpfp_conflict_set() {
+        let (_store, owned_q, owned_cbs) = pad_cbs(3);
+        let q = &owned_q;
+        let cbs = owned_cbs.as_slice();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        for package in [false, true] {
+            let anchor_spk = cheap_anchor_script();
+            let anchor_wu = spend_true(cbs[0], 0, anchor_spk.clone()).weight().to_wu();
+            let (parent, child) = cpfp_child_sorts_first(cbs[1], &spk);
+            assert!(
+                child.compute_txid() < parent.compute_txid(),
+                "child txid must sort first so txid order is not ancestor order"
+            );
+            let parent_id = parent.compute_txid();
+            let child_id = child.compute_txid();
+            let budget = anchor_wu + parent.weight().to_wu() + child.weight().to_wu() + 500;
+            let dir = tmp();
+            let hub = MempoolHub::open_with_weight(&dir, Arc::clone(q), budget).unwrap();
+            hub.set_relay_enabled(true);
+            let floor = hub.lock_read().mempool_min_fee_sat_kvb();
+            let anchor = spend_true(cbs[0], fee_at_least(anchor_wu, floor), anchor_spk);
+            let anchor_id = anchor.compute_txid();
+            let anchor_out = anchor.output[0].value.to_sat();
+            let repl_fee = 80_000u64;
+            let replacement = heavier_than(
+                OutPoint {
+                    txid: cbs[1],
+                    vout: 0,
+                },
+                OutPoint {
+                    txid: anchor_id,
+                    vout: 0,
+                },
+                50_0000_0000 + anchor_out - repl_fee,
+                parent.weight().to_wu() + child.weight().to_wu() + 500,
+            );
+            assert!(
+                hub.accept_tx(&anchor).is_ok(),
+                "package={package}: anchor fits"
+            );
+            hub.accept_package(&[parent.clone(), child.clone()])
+                .expect("CPFP package admits a below-min-relay parent");
+            assert!(hub.contains(&parent_id));
+            assert!(hub.contains(&child_id));
+            let err = submit_one(&hub, &replacement, package);
+            assert!(
+                matches!(err, Err(AcceptError::Policy("mempool full"))),
+                "package={package}: replacement must not stay, got {err:?}"
+            );
+            assert!(!hub.contains(&replacement.compute_txid()));
+            assert!(
+                hub.contains(&parent_id),
+                "package={package}: below-min-relay parent must stay"
+            );
+            assert!(
+                hub.contains(&child_id),
+                "package={package}: paying child must stay"
+            );
+            assert_eq!(
+                hub.orphan_count(),
+                0,
+                "package={package}: child must not be parked waiting on its parent"
+            );
+            assert!(!hub.try_recent_reject(&parent.compute_wtxid()));
+            assert!(!hub.try_recent_reject(&child.compute_wtxid()));
+            let maps = hub.wtxid_by_txid.lock().unwrap();
+            assert!(maps.contains_key(&parent_id));
+            assert!(maps.contains_key(&child_id));
+            drop(maps);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    fn cheap_anchor_script() -> ScriptBuf {
+        let mut fat = Vec::new();
+        for _ in 0..6 {
+            fat.push(0x4d);
+            fat.extend_from_slice(&520u16.to_le_bytes());
+            fat.extend(std::iter::repeat_n(0u8, 520));
+            fat.push(0x75);
+        }
+        fat.push(0x51);
+        ScriptBuf::from_bytes(fat)
+    }
+
+    fn fee_at_least(weight: u64, sat_kvb: u64) -> u64 {
+        let vsize = weight.div_ceil(4);
+        vsize.saturating_mul(sat_kvb).div_ceil(1000).max(1)
+    }
+
+    fn submit_one(hub: &MempoolHub, tx: &Transaction, package: bool) -> Result<(), AcceptError> {
+        if package {
+            hub.accept_package(std::slice::from_ref(tx)).map(|_| ())
+        } else {
+            hub.accept_tx(tx).map(|_| ())
+        }
+    }
+
+    fn heavier_than(a: OutPoint, b: OutPoint, value: u64, min_wu: u64) -> Transaction {
+        let mut n = 64usize;
+        loop {
+            let tx = two_in_one_out(a, b, value, ScriptBuf::from_bytes(vec![0x51; n]));
+            if tx.weight().to_wu() > min_wu {
+                return tx;
+            }
+            n += 32;
+            assert!(n < 20_000, "replacement never exceeded the slack");
+        }
+    }
+
+    fn two_in_one_out(a: OutPoint, b: OutPoint, value: u64, spk: ScriptBuf) -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: a,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+                TxIn {
+                    previous_output: b,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: spk,
+            }],
+        }
+    }
+
+    /// Parent fee is 1 sat. Child txid sorts before the parent.
+    fn cpfp_child_sorts_first(coin: Txid, spk: &ScriptBuf) -> (Transaction, Transaction) {
+        for n in 0..10_000u32 {
+            let mut parent = spend_true(coin, 1, spk.clone());
+            parent.lock_time = LockTime::from_consensus(n);
+            let child = spend_vout(
+                OutPoint {
+                    txid: parent.compute_txid(),
+                    vout: 0,
+                },
+                parent.output[0].value.to_sat() - 40_000,
+            );
+            if child.compute_txid() < parent.compute_txid() {
+                return (parent, child);
+            }
+        }
+        panic!("no locktime put the child txid first");
     }
 
     #[test]
