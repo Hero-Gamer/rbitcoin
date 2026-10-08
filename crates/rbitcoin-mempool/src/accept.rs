@@ -2111,10 +2111,8 @@ pub fn pure_rbfr_pays(new_fee: u64, new_weight: u64, direct_fee: u64, direct_wei
     if new_v == 0 || old_v == 0 {
         return false;
     }
-    new_fee.saturating_mul(RBFR_RATIO_DEN).saturating_mul(old_v)
-        >= direct_fee
-            .saturating_mul(RBFR_RATIO_NUM)
-            .saturating_mul(new_v)
+    u128::from(new_fee) * u128::from(RBFR_RATIO_DEN) * u128::from(old_v)
+        >= u128::from(direct_fee) * u128::from(RBFR_RATIO_NUM) * u128::from(new_v)
 }
 
 /// Admit replacement if BIP125-style rules **or** pure RBFR (Libre).
@@ -3036,6 +3034,11 @@ mod tests {
         assert!(rbf_allows_replacement(
             2_000, 4000, 50_000, 40_000, 1_000, 4000
         ));
+        // TESTING.md True journeys: pure arithmetic. A session cannot reach
+        // this product without a near-supply fee. Equal fees are not 1.25×.
+        // Saturating `u64` products both become `u64::MAX` and would pass.
+        let near = u64::MAX / 4 + 1;
+        assert!(!pure_rbfr_pays(near, 4000, near, 4000));
     }
 
     #[test]
