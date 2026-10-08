@@ -2831,6 +2831,12 @@ impl MempoolHub {
     /// Drop live txs that are non-final / immature at the new tip (invalidate
     /// of empty blocks still has to evict mempool coinbase spends).
     pub fn evict_after_reorg(&self) {
+        self.evict_after_reorg_between(|_| {});
+    }
+
+    /// Same as [`Self::evict_after_reorg`]. `between` runs after each removal
+    /// and before the next coin check, while no mempool write lock is held.
+    fn evict_after_reorg_between(&self, mut between: impl FnMut(&Self)) {
         let utxo = self.utxo_provider();
         let tip = self.chain_tip_ctx();
         loop {
@@ -2873,16 +2879,22 @@ impl MempoolHub {
             if to_drop.is_empty() {
                 break;
             }
-            let mut g = self.lock_write();
-            let mut removed = false;
-            for id in &to_drop {
-                if g.remove_txid(id).is_ok() {
-                    removed = true;
+            // Parent and in-mempool descendants leave under one write lock.
+            // A template read cannot observe the child after the parent is gone.
+            let mut gone = Vec::new();
+            {
+                let mut g = self.lock_write();
+                for id in &to_drop {
+                    if g.graph.contains(id) {
+                        gone.extend(g.remove_txid_tree(id));
+                    }
                 }
             }
-            if !removed {
+            if gone.is_empty() {
                 break;
             }
+            self.unindex_evicted(&gone);
+            between(self);
         }
         self.publish_fee_floor();
     }
@@ -4958,6 +4970,63 @@ mod tests {
             hub.get_live_meta(&timed.compute_txid()).is_some(),
             "evict_after_reorg must not drop a still-valid BIP68 time lock"
         );
+        let _ = std::fs::remove_dir_all(&mp);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// Disconnecting the parent's coin must not leave the child selectable.
+    /// The check runs after the parent is gone and before the function returns.
+    #[test]
+    fn reorg_evict_does_not_template_a_parentless_child() {
+        let (store, q, cbs) = copy_maturity_pad(3);
+        let mp = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = spend_true(cbs[0], 1_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        hub.accept_tx(&parent).expect("parent");
+        let child = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9998_0000),
+                script_pubkey: spk,
+            }],
+        };
+        let child_id = child.compute_txid();
+        hub.accept_tx(&child).expect("child");
+        while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
+            q.disconnect_tip().unwrap();
+        }
+        let mut saw_parentless = false;
+        hub.evict_after_reorg_between(|hub| {
+            let picked: Vec<_> = hub
+                .select_block_template(hub.template_budget(0))
+                .into_iter()
+                .map(|(_, s)| s.txid)
+                .collect();
+            if !hub.contains(&parent_id) && picked.contains(&child_id) {
+                saw_parentless = true;
+            }
+        });
+        assert!(
+            !saw_parentless,
+            "template selected the child after its in-mempool parent was removed"
+        );
+        assert!(!hub.contains(&parent_id));
+        assert!(!hub.contains(&child_id));
+        assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&parent_id));
+        assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&child_id));
         let _ = std::fs::remove_dir_all(&mp);
         let _ = std::fs::remove_dir_all(&store);
     }
