@@ -156,9 +156,11 @@ binary gets a private `TMPDIR` under `/dev/shm`, removed when it exits.
 Store fsyncs dominate suite wall on disk; tmpfs runs the same syscalls for
 free (local workspace suite 141–299 s on disk, 79 s on tmpfs). With less than
 `RBTC_TEST_TMPFS_MIN_MB` (2048) free, it keeps the caller's `TMPDIR`.
-`windows` and `macos` stay on real disk. Local opt-in: export the same
-variable with an absolute path. Keep default-tier fixtures small: on tmpfs,
-test bytes are RAM.
+The same wrapper sets the child's address space to `RBTC_TEST_AS_MB`
+(6144, 6 GiB) so a mutant that allocates without bound dies in the test
+process. `RBTC_TEST_AS_MB=0` leaves the caller's limit. `windows` and
+`macos` stay on real disk. Local opt-in: export the same variable with an
+absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 
 ### Suite speed budgets (default tier)
 
