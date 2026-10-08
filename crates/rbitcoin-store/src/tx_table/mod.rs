@@ -1144,12 +1144,12 @@ impl TxTable {
                 // as having no parents.
                 let legacy = from == 1 || t.seqsigwit_has_inline_prevout(Fk(from))?;
                 if !legacy {
-                    return Err(StoreError::Corrupt("input tail missing"));
+                    return Err(StoreError::Corrupt("invariant: input tail missing"));
                 }
                 t.backfill_inputs_from_seqsigwit(from)?;
             }
             InputOpenTail::Unstamped { .. } => {
-                return Err(StoreError::Corrupt("input tail missing"));
+                return Err(StoreError::Corrupt("invariant: input tail missing"));
             }
             InputOpenTail::Ahead => {
                 return Err(StoreError::Corrupt(

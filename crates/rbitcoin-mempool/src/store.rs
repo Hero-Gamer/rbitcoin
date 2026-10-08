@@ -650,14 +650,14 @@ impl Mempool {
         self.find_free_slot().ok_or(MempoolError::Full)
     }
 
-    /// Double slot capacity (up to [`MAX_SLOT_CAP`]) and extend the slots image with FREE records.
     /// Pretend the slot table is at its cap and already full of LIVE rows.
     /// The next admit takes the slot-eviction path instead of growing.
-    pub fn testing_pin_full_slot_table(&mut self) {
+    pub(crate) fn testing_pin_full_slot_table(&mut self) {
         self.slot_cap = self.live_count.max(1);
         self.grow_pinned = true;
     }
 
+    /// Double slot capacity (up to [`MAX_SLOT_CAP`]) and extend the slots image with FREE records.
     pub fn grow_slots(&mut self) -> Result<(), MempoolError> {
         if self.grow_pinned || self.slot_cap >= MAX_SLOT_CAP {
             return Err(MempoolError::Full);

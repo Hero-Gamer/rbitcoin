@@ -5252,7 +5252,7 @@ mod tests {
         let victim_id = victim.compute_txid();
         hub.prioritise_tx(victim_id, 11);
         hub.accept_tx(&victim).expect("victim");
-        hub.lock_write().store.testing_pin_full_slot_table();
+        rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
         let parent = spend_true(cbs[1], 50_000, spk.clone());
         let parent_id = parent.compute_txid();
         let mut bad_child = Transaction {
@@ -5307,7 +5307,7 @@ mod tests {
         let victim = spend_true(cbs[0], 1_000, spk.clone());
         let victim_id = victim.compute_txid();
         hub.accept_tx(&victim).expect("victim");
-        hub.lock_write().store.testing_pin_full_slot_table();
+        rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
         let parent = spend_true(cbs[1], 50_000, ScriptBuf::from_bytes(vec![0x00]));
         let parent_id = parent.compute_txid();
         assert!(hub.try_note_extra_compact(&parent));
@@ -5383,7 +5383,7 @@ mod tests {
         let second = spend_true(cbs[1], 2_000, spk);
         let first_id = first.compute_txid();
         hub.accept_tx(&first).expect("first admit");
-        hub.lock_write().store.testing_pin_full_slot_table();
+        rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
         hub.accept_tx(&second)
             .expect("second admit evicts for a slot");
         assert!(!hub.contains(&first_id));

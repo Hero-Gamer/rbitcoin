@@ -41,6 +41,7 @@ mod graph;
 mod orphanage;
 mod packed;
 mod store;
+pub mod testutil;
 
 pub use accept::{
     check_mempool_structural, AcceptError, AcceptFailureRecord, AcceptResult, AcceptStageUs,

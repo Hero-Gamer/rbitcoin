@@ -534,7 +534,7 @@ fn annotate_slots_from_connected_hash(
             let coinbase = ins.len() == 1 && ins[0].is_coinbase();
             if !coinbase {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "coinbase input edge",
+                    "invariant: coinbase input edge",
                 )));
             }
             continue;
@@ -542,7 +542,7 @@ fn annotate_slots_from_connected_hash(
         for (inp_i, inp) in ins.into_iter().enumerate() {
             if inp.is_coinbase() || inp.create_fk.is_null() {
                 return Err(ConsensusError::Store(StoreError::Corrupt(
-                    "non-coinbase input edge",
+                    "invariant: non-coinbase input edge",
                 )));
             }
             let create_fk = inp.create_fk;
