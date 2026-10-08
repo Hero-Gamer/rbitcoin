@@ -2926,6 +2926,7 @@ async fn enter_tip_mode_indexes() {
     // run is discarded, Electrum opens, and the next block lands in history.
     let runs = store.join("scripthash.runs");
     std::fs::create_dir_all(&runs).unwrap();
+    let stale_sh = [0xee; 32];
     std::fs::write(runs.join("000050.run"), b"leftover").unwrap();
     let hwm_path = store.join(rbitcoin_store::INCLUDE_HWM_NAME);
     let hwm = u64::from_le_bytes(std::fs::read(&hwm_path).unwrap().try_into().unwrap());
