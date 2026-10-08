@@ -2687,6 +2687,85 @@ fn reorg_same_height_then_multi_block_branch() {
     }
     pin_precious_held_chaintips(&hub, ext, ext_h);
     pin_side_weaker_and_unknown_parent(&hub);
+    pin_fake_work_side_does_not_rewind(&hub);
+}
+
+/// A held branch whose parent is an ancestor of the tip, with enormous claimed
+/// work and no valid proof of work on a later header, must not disconnect.
+/// A later held branch that really has more work still becomes the tip.
+fn pin_fake_work_side_does_not_rewind(hub: &rbitcoin_net::ChainHub) {
+    use rbitcoin_net::AcceptOutcome;
+
+    let tip_h = hub.tip_height().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let ancestor = hub
+        .query
+        .header_at_height(Height(tip_h - 3))
+        .unwrap()
+        .unwrap()
+        .1;
+    let side = mine_regtest_block(
+        BlockHash::from_byte_array(ancestor.hash),
+        ancestor.timestamp.saturating_add(1_100),
+        tip_h - 2,
+        vec![],
+    );
+    assert!(
+        matches!(
+            hub.accept_received_block(side.clone()).unwrap(),
+            AcceptOutcome::IgnoredWeaker
+        ),
+        "one honest side block is weaker than the tip"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), tip);
+
+    let mut fake = mine_regtest_block(
+        side.block_hash(),
+        side.header.time.saturating_add(600),
+        tip_h - 1,
+        vec![],
+    );
+    // Claimed work is ~2^256/target. This target is far below regtest, and
+    // the header was mined for the easy regtest target, so proof of work fails.
+    // The parent is not on the best chain, so the sibling header check does not run.
+    fake.header.bits = bitcoin::CompactTarget::from_consensus(0x1d00ffff);
+    let fake_hash = fake.block_hash();
+    let mut seen = 0u64;
+    let _ = hub.query.take_disconnect(&mut seen);
+    let submitted = hub.accept_received_block(fake);
+    assert_eq!(
+        hub.tip_height(),
+        Some(tip_h),
+        "fake work must not move the tip: {submitted:?}"
+    );
+    assert_eq!(hub.tip_hash().unwrap(), tip);
+    assert!(
+        hub.is_block_invalid(&fake_hash),
+        "fake work must be remembered invalid: {submitted:?}"
+    );
+    assert!(
+        hub.query.take_disconnect(&mut seen).is_none(),
+        "header failure must not disconnect: {submitted:?}"
+    );
+
+    let mut p = side.block_hash();
+    let mut t = side.header.time;
+    let mut heavier = Vec::new();
+    for h in (tip_h - 1)..=(tip_h + 1) {
+        let b = mine_regtest_block(p, t.saturating_add(700 + h), h, vec![]);
+        p = b.block_hash();
+        t = b.header.time;
+        heavier.push(b);
+    }
+    for b in &heavier {
+        hub.accept_received_block(b.clone())
+            .unwrap_or_else(|e| panic!("heavier {}: {e}", b.block_hash()));
+    }
+    assert_eq!(hub.tip_height(), Some(tip_h + 1));
+    assert_eq!(
+        hub.tip_hash().unwrap(),
+        heavier.last().unwrap().block_hash()
+    );
 }
 
 /// After catch-up (`initialblockdownload` false; `-maxtipage` so the 2011

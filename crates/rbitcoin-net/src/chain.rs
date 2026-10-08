@@ -2263,6 +2263,7 @@ impl ChainHub {
         if self.accept_branch_weaker(blocks, old_work)? {
             return Ok((AcceptOutcome::IgnoredWeaker, None));
         }
+        self.accept_branch_check_headers(blocks, fork_height)?;
         let old_path = self.accept_branch_collect_old(fork_height)?;
         self.accept_branch_disconnect(fork_height)?;
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
@@ -2403,6 +2404,52 @@ impl ChainHub {
             old_path.push(b);
         }
         Ok(old_path)
+    }
+
+    /// Hash and bits for every header before any `disconnect_to`. The first
+    /// block's parent is on the best chain. Later parents are this branch.
+    fn accept_branch_check_headers(
+        &self,
+        blocks: &[Block],
+        fork_height: Option<u32>,
+    ) -> Result<(), NetError> {
+        let Some(fork_h) = fork_height else {
+            return Ok(());
+        };
+        let mut batch = HashMap::with_capacity(blocks.len());
+        for (i, b) in blocks.iter().enumerate() {
+            let height = fork_h.saturating_add(1).saturating_add(i as u32);
+            let checked = if i == 0 {
+                validate_header(self.query.as_ref(), &self.params, Height(height), &b.header)
+                    .map_err(|e| header_reject(&b.header, &e))
+            } else {
+                let parent = &blocks[i - 1].header;
+                let mtp = self.mtp_off_tip(parent, &batch);
+                let expected = self.expected_bits_off_tip(
+                    &b.header,
+                    parent,
+                    height.saturating_sub(1),
+                    &batch,
+                )?;
+                validate_header_on_parent(&self.params, Height(height), &b.header, mtp, expected)
+                    .map_err(|e| header_reject(&b.header, &e))
+            };
+            if let Err(e) = checked {
+                return Err(NetError::ConnectFailed {
+                    hash: b.block_hash().to_byte_array(),
+                    msg: e.to_string(),
+                });
+            }
+            batch.insert(
+                b.block_hash().to_byte_array(),
+                HeaderSyncNode {
+                    fk: Fk(0),
+                    header: b.header,
+                    height: Some(height),
+                },
+            );
+        }
+        Ok(())
     }
 
     fn accept_branch_disconnect(&self, fork_height: Option<u32>) -> Result<(), NetError> {
