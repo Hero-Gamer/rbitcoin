@@ -189,10 +189,12 @@ still wait for durable SH when shindex is on.
 |-----|-----------------|
 | `{datadir}/rpc.sock` (filesystem) | TLS in-process / mTLS |
 | `{datadir}/rpc.token` Bearer on TCP | multi-user tokens |
-| Harness `.cookie` + Basic on the test proxy only | `rpcallowip` |
+| TCP HTTP Basic from `--rpc-cookie-file` (operator-written; the node never creates it). The functional harness still uses its own cookie on the test proxy | `rpcallowip` |
 
 ## Related
 
 - [`COMPAT.md`](../COMPAT.md) — product surface
 - [`OPERATOR.md`](../OPERATOR.md) — flags and shindex tradeoffs
 - [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) — fee product
+- [`wallets.md`](./wallets.md) — which wallets use Electrum, Esplora, or this RPC
+- [`lightning.md`](./lightning.md) — CLN, LDK, LND chain sources
