@@ -267,7 +267,8 @@ async fn unknown_parent_bodies(
     let mut follow = PeerFollowState::new();
     follow.send_cmpct = true;
     follow.cmpct_version = 2;
-    let block = orphan_body(BlockHash::from_byte_array([0xcd; 32]), 0);
+    let mut block = orphan_body(BlockHash::from_byte_array([0xcd; 32]), 0);
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
     push(
         hub,
@@ -300,8 +301,8 @@ async fn unknown_parent_bodies(
     peer.note_awaiting_headers();
     let mut child = block.clone();
     child.header.prev_blockhash = block.block_hash();
-    child.header.nonce = 1;
     child.header.merkle_root = child.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut child.header);
     let child_hsi = HeaderAndShortIds::from_block(&child, 1, 2, &[0]).unwrap();
     push(
         hub,
@@ -1315,4 +1316,206 @@ async fn peer_header_dos_and_self_announce() {
 
     let _ = std::fs::remove_dir_all(src_dir);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Tip work meets the floor. A bad-proof-of-work compact whose parent is the
+/// tip must not walk the mempool, and it scores like a bad `block`. A valid
+/// compact of the next block still fills from the mempool.
+#[tokio::test]
+async fn bad_pow_cmpct_does_not_scan_mempool() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let (dir, hub) = crate::chain::tiny_regtest_hub_labeled("cmpct-pow");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    let floor = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(floor));
+    assert!(hub.meets_minimum_chain_work());
+    let mp = crate::tx_relay::MempoolHub::open(dir.join("mp"), std::sync::Arc::clone(&hub.query))
+        .unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(std::sync::Arc::clone(&mp)).is_ok());
+    let peers = crate::peers::PeerHub::new();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+
+    let bad = bad_pow_cmpct_on_tip(&hub);
+    assert_eq!(bad.short_ids.len(), 1);
+    assert!(!hub.header_claimed_pow_ok(&bad.header));
+    let scans = mp.cmpct_avail_scans();
+    let plain = live_peer(&peers, 18510, 30, true);
+    let mut follow = PeerFollowState::new();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(plain.as_ref()),
+        NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: bad.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        mp.cmpct_avail_scans(),
+        scans,
+        "bad proof of work must not walk the mempool"
+    );
+    assert!(
+        follow.ban_score >= BAN_SCORE_THRESHOLD,
+        "bad compact proof of work scores like a bad block"
+    );
+    assert!(
+        plain.stop.load(Ordering::SeqCst),
+        "a plain peer is disconnected"
+    );
+    assert!(
+        follow.pending_headers.is_empty(),
+        "bad proof of work must not enter pending headers"
+    );
+    assert!(
+        plain.best_known().is_none(),
+        "bad proof of work must not update best known"
+    );
+    let rejected = take_msgs(&mut out_rx);
+    assert!(
+        !rejected
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetBlockTxn(_))),
+        "a rejected compact must not ask for blocktxn"
+    );
+    assert!(
+        !rejected
+            .iter()
+            .any(|m| matches!(m, NetworkMessage::GetHeaders(_))),
+        "a rejected compact must not ask for headers"
+    );
+
+    peers.set_noban(true);
+    let noban = live_peer(&peers, 18511, 31, true);
+    let mut follow = PeerFollowState::new();
+    let scans = mp.cmpct_avail_scans();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(noban.as_ref()),
+        NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: bad.clone(),
+        }),
+    )
+    .await;
+    assert_eq!(mp.cmpct_avail_scans(), scans);
+    assert_eq!(follow.ban_score, 0, "a noban peer gathers no score");
+    assert!(!noban.stop.load(Ordering::SeqCst));
+    peers.set_noban(false);
+
+    let manual = live_peer_as(&peers, 18512, 32, crate::peers::PeerConnType::Manual);
+    let mut follow = PeerFollowState::new();
+    let scans = mp.cmpct_avail_scans();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(manual.as_ref()),
+        NetworkMessage::CmpctBlock(CmpctBlock { compact_block: bad }),
+    )
+    .await;
+    assert_eq!(mp.cmpct_avail_scans(), scans);
+    assert_eq!(follow.ban_score, 0, "a manual peer gathers no score");
+    assert!(!manual.stop.load(Ordering::SeqCst));
+
+    hub.generate_to_script(100, op_true(), vec![]).unwrap();
+    assert_eq!(hub.tip_height(), Some(101));
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(rbitcoin_primitives::Height(1))
+        .unwrap()
+        .txdata
+        .into_iter()
+        .next()
+        .unwrap();
+    let spend = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: cb.compute_txid(),
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(49_9999_9000),
+            script_pubkey: op_true(),
+        }],
+    };
+    let spend_id = spend.compute_txid();
+    mp.accept_tx(&spend).expect("mature coinbase spend");
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(1);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    let block =
+        rbitcoin_consensus::mine_regtest_paying(prev, time, height, op_true(), vec![spend]);
+    let hsi = HeaderAndShortIds::from_block(&block, 7, 2, &[0]).unwrap();
+    assert_eq!(hsi.short_ids.len(), 1);
+    assert!(hub.header_claimed_pow_ok(&hsi.header));
+    let scans = mp.cmpct_avail_scans();
+    let peer = live_peer(&peers, 18513, 33, true);
+    let mut follow = PeerFollowState::new();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi }),
+    )
+    .await;
+    assert_eq!(
+        mp.cmpct_avail_scans(),
+        scans + 1,
+        "a valid compact of the next tip still reads the mempool"
+    );
+    assert_eq!(hub.tip_height(), Some(102));
+    assert!(!mp.contains(&spend_id));
+    assert_eq!(follow.ban_score, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Next-tip compact with one short id and a nonce that fails proof of work.
+fn bad_pow_cmpct_on_tip(hub: &crate::chain::ChainHub) -> bitcoin::bip152::HeaderAndShortIds {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    let prev = hub.tip_hash().unwrap();
+    let time = hub.tip_header().unwrap().time.saturating_add(1);
+    let height = hub.tip_height().unwrap().saturating_add(1);
+    let extra = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([0x44; 32]),
+                vout: 0,
+            },
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: op_true(),
+        }],
+    };
+    let block = rbitcoin_consensus::mine_regtest_paying(prev, time, height, op_true(), vec![extra]);
+    let mut hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+    let target = bitcoin::Target::from_compact(hsi.header.bits);
+    loop {
+        hsi.header.nonce = hsi.header.nonce.wrapping_add(1);
+        if hsi.header.validate_pow(target).is_err() {
+            break;
+        }
+    }
+    hsi
 }

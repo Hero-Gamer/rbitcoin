@@ -1739,6 +1739,19 @@ fn ibd_confirm_pin_fault() {
     };
     let mut spend_txid = [0u8; 32];
     spend_txid[0] = 0x11;
+    let coinbase = TxApply {
+        tx: TxRecord {
+            txid: [0x22; 32],
+            version: 1,
+            locktime: 0,
+            input_start_fk: Fk::NULL,
+            input_count: 1,
+            output_start_fk: Fk::NULL,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
+        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+    };
     let ta1 = TxApply {
         tx: TxRecord {
             txid: spend_txid,
@@ -1760,8 +1773,10 @@ fn ibd_confirm_pin_fault() {
         outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
     };
     hub.query.set_spend_index(false);
-    hub.query.connect_block(Height(t + 1), &h1, &[ta1]).unwrap();
-    let spend_fk = hub.query.block_tx_fks(Height(t + 1)).unwrap()[0];
+    hub.query
+        .connect_block(Height(t + 1), &h1, &[coinbase, ta1])
+        .unwrap();
+    let spend_fk = hub.query.block_tx_fks(Height(t + 1)).unwrap()[1];
     let (multi, field, _) = hub
         .query
         .store()

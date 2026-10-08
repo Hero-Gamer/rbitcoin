@@ -108,6 +108,8 @@ pub struct Mempool {
     last_body_write_off: u64,
     /// Bytes written to `slots` on the last persist (tests: incremental pwrite).
     last_slot_write_bytes: u64,
+    /// Tests pin the table at the live count so the next admit evicts.
+    grow_pinned: bool,
 }
 
 impl Mempool {
@@ -144,6 +146,7 @@ impl Mempool {
             last_persist_ms: 0,
             last_body_write_off: 0,
             last_slot_write_bytes: 0,
+            grow_pinned: false,
         };
         let body_schema = u16::from_le_bytes(mp.body[4..6].try_into().unwrap());
         if body_schema != MEM_SCHEMA {
@@ -647,9 +650,16 @@ impl Mempool {
         self.find_free_slot().ok_or(MempoolError::Full)
     }
 
+    /// Pretend the slot table is at its cap and already full of LIVE rows.
+    /// The next admit takes the slot-eviction path instead of growing.
+    pub(crate) fn testing_pin_full_slot_table(&mut self) {
+        self.slot_cap = self.live_count.max(1);
+        self.grow_pinned = true;
+    }
+
     /// Double slot capacity (up to [`MAX_SLOT_CAP`]) and extend the slots image with FREE records.
     pub fn grow_slots(&mut self) -> Result<(), MempoolError> {
-        if self.slot_cap >= MAX_SLOT_CAP {
+        if self.grow_pinned || self.slot_cap >= MAX_SLOT_CAP {
             return Err(MempoolError::Full);
         }
         let new_cap = self

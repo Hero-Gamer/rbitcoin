@@ -542,6 +542,7 @@ async fn peer_catchup_compact_reorg() {
         txdata: vec![coinbase(161, 0x03), spend],
     };
     pending_block.header.merkle_root = pending_block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut pending_block.header);
     let pending_hash = pending_block.block_hash();
     let pending_hsi = HeaderAndShortIds::from_block(&pending_block, 0xbeef, 2, &[]).unwrap();
     handle_peer_frame(

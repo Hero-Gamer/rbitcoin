@@ -378,6 +378,7 @@ pub(super) fn post_commit(
 ) -> Result<u64, ConsensusError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
+        let _utxo_view = query.store().hold_utxo_view();
         let backend = spend_ann_backend_next();
         let t_ann = Instant::now();
         let cold = query

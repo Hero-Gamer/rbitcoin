@@ -77,6 +77,12 @@ pub trait UtxoProvider {
 
     /// Spender about to resolve coins (BIP68 time-lock MTP only when needed).
     fn note_spender(&self, _tx: &Transaction) {}
+
+    /// Even stamp of the confirmed UTXO view. `None` while a confirm or
+    /// disconnect is publishing spentness. Map and test providers stay at 0.
+    fn utxo_view_stamp(&self) -> Option<u64> {
+        Some(0)
+    }
 }
 
 /// Confirmed-chain lookup for one prevout.
@@ -171,6 +177,10 @@ pub struct AcceptResult {
     pub replaced_scripthashes: Vec<[u8; 32]>,
     /// Replaced bodies, for package rollback to restore victims.
     pub replaced_txs: Vec<Transaction>,
+    /// Txids dropped to free a slot or the weight budget while admitting this tx.
+    /// Distinct from [`Self::replaced`]. The admitted tx is not in this list
+    /// when the commit succeeds.
+    pub evicted: Vec<Txid>,
 }
 
 /// Why accept failed (policy / graph / durable / consensus script).
@@ -474,6 +484,16 @@ pub struct ActiveMempool {
     recent_invalid: HashSet<Txid>,
     /// Recent rejects / RBF replacements for compact fill and 1p1c.
     extra_compact: VecDeque<(Txid, Transaction)>,
+    /// Ids removed by the latest `finish_commit` when that commit returns
+    /// `Err` (the success path carries them on [`AcceptResult::evicted`]).
+    last_evicted: Vec<Txid>,
+}
+
+impl ActiveMempool {
+    /// Evictions from a commit that returned `Err`. Empty after a success.
+    pub fn take_failed_evictions(&mut self) -> Vec<Txid> {
+        std::mem::take(&mut self.last_evicted)
+    }
 }
 
 impl ActiveMempool {
@@ -582,6 +602,7 @@ impl ActiveMempool {
             rolling_updated_ms: unix_ms(),
             recent_invalid: HashSet::new(),
             extra_compact: VecDeque::new(),
+            last_evicted: Vec::new(),
         })
     }
 
@@ -1071,11 +1092,12 @@ impl ActiveMempool {
             let _ = self.remove_txid(c);
         }
 
-        self.ensure_free_slot(Some(txid))?;
+        self.last_evicted.clear();
+        let mut evicted = self.ensure_free_slot(Some(txid))?;
 
         let aux = Self::vin_aux_from_prep(tx, &prep);
         let t_dur = Instant::now();
-        let slot = self.store.append_live_tx(
+        let slot = match self.store.append_live_tx(
             tx,
             &txid,
             &prep.wtxid,
@@ -1083,7 +1105,13 @@ impl ActiveMempool {
             weight,
             prep.sigop_cost,
             &aux,
-        )?;
+        ) {
+            Ok(slot) => slot,
+            Err(e) => {
+                self.last_evicted = evicted;
+                return Err(e.into());
+            }
+        };
         self.last_accept_stages.durable_us = self
             .last_accept_stages
             .durable_us
@@ -1105,13 +1133,25 @@ impl ActiveMempool {
         self.vin_aux.insert(txid, aux);
 
         if trim {
-            let _ = self.evict_to_budget(Some(txid))?;
-            // A descendant of an evicted parent leaves with that tree.
-            // A lone protected tx stays.
-            if !self.graph.contains(&txid) {
-                return Err(AcceptError::Policy("mempool full"));
+            match self.evict_to_budget(Some(txid)) {
+                Ok(more) => evicted.extend(more),
+                Err(e) => {
+                    self.last_evicted = evicted;
+                    return Err(e);
+                }
             }
         }
+        // A descendant of an evicted parent leaves with that tree.
+        // A lone protected tx stays.
+        if trim && !self.graph.contains(&txid) {
+            self.last_evicted = evicted;
+            return Err(AcceptError::Policy("mempool full"));
+        }
+        self.last_evicted.clear();
+        debug_assert!(
+            !evicted.contains(&txid),
+            "a successful admit is not in its own eviction set"
+        );
 
         Ok(AcceptResult {
             txid,
@@ -1121,6 +1161,7 @@ impl ActiveMempool {
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes,
             replaced_txs,
+            evicted,
         })
     }
 
@@ -1140,6 +1181,7 @@ impl ActiveMempool {
             replaced: conflict_set.into_iter().collect(),
             replaced_scripthashes: Vec::new(),
             replaced_txs: Vec::new(),
+            evicted: Vec::new(),
         })
     }
 
@@ -1250,23 +1292,24 @@ impl ActiveMempool {
     /// Order: if full of LIVE, **grow** the slot table first (weight may still have
     /// headroom — mainnet 4k-slot stall); if at max cap, **evict** worst chunks.
     /// Never surface as store corruption.
-    fn ensure_free_slot(&mut self, protect: Option<Txid>) -> Result<(), AcceptError> {
+    fn ensure_free_slot(&mut self, protect: Option<Txid>) -> Result<Vec<Txid>, AcceptError> {
         if self.store.has_free_slot() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         match self.store.grow_slots() {
             Ok(()) => {
                 if self.store.has_free_slot() {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
             }
             Err(MempoolError::Full) => {}
             Err(e) => return Err(e.into()),
         }
-        self.evict_worst_chunks(protect, EvictUntil::FreeSlot)?;
+        let gone = self.evict_worst_chunks(protect, EvictUntil::FreeSlot)?;
         if self.store.has_free_slot() {
-            return Ok(());
+            return Ok(gone);
         }
+        self.last_evicted = gone;
         Err(AcceptError::Policy("mempool full"))
     }
 

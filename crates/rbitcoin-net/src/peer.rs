@@ -1659,10 +1659,12 @@ pub async fn peer_session_with(
                 return Ok(());
             }
             // Core `fPauseSend`: no inbound message is read while the writer
-            // is past the send budget or a getdata tail waits for serve room.
-            // Heartbeat (ping timeout, block-request expiry) still runs.
+            // is past the send budget or a getdata / getblocktxn tail waits
+            // for serve room. Heartbeat (ping timeout, block-request expiry)
+            // still runs.
             let over_budget = session.as_ref().is_some_and(|s| s.send_over_budget());
-            let tail_pending = !follow.getdata_tail.is_empty();
+            let tail_pending =
+                !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty();
             let reading = !over_budget && !tail_pending;
             let hb_wait = SESSION_HEARTBEAT.saturating_sub(last_hb.elapsed());
             decoy_score.store(follow.ban_score, Ordering::Relaxed);
@@ -1881,8 +1883,19 @@ pub async fn peer_session_with(
                     if !room {
                         return Ok(());
                     }
-                    serve_getdata_tail(hub.as_ref(), &out_tx, &mut follow, session.as_deref())
+                    if !follow.getdata_tail.is_empty() {
+                        serve_getdata_tail(hub.as_ref(), &out_tx, &mut follow, session.as_deref())
+                            .await?;
+                    }
+                    if !follow.getblocktxn_tail.is_empty() {
+                        serve_getblocktxn_tail(
+                            hub.as_ref(),
+                            &out_tx,
+                            &mut follow,
+                            session.as_deref(),
+                        )
                         .await?;
+                    }
                 }
             }
         }
@@ -2501,6 +2514,9 @@ struct PeerFollowState {
     /// about 2 MB per session. That RAM keeps every hash served in order
     /// instead of dropping the rest or holding the reader across items.
     getdata_tail: VecDeque<Inventory>,
+    /// One parked `getblocktxn`. The session reads no frame while this is
+    /// non-empty, so a peer that never reads cannot stack reconstructs.
+    getblocktxn_tail: VecDeque<BlockTransactionsRequest>,
 }
 
 impl PeerFollowState {
@@ -2517,6 +2533,7 @@ impl PeerFollowState {
             requested_blocks: HashSet::new(),
             ban_score: 0,
             getdata_tail: VecDeque::new(),
+            getblocktxn_tail: VecDeque::new(),
         }
     }
 }
@@ -2577,6 +2594,9 @@ async fn handle_decoded_peer_msg(
             on_blocktxn(hub, out_tx, follow, session, &bt).await?
         }
         NetworkMessage::Tx(tx) => on_tx(hub, out_tx, follow, session, &tx).await?,
+        NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
+            serve_getblocktxn(hub, out_tx, follow, session, txs_request).await?
+        }
         other => handle_peer_sync_msg(&other, hub, out_tx, follow, session)?,
     }
     Ok(())
@@ -2793,9 +2813,6 @@ fn handle_peer_inventory_msg(
         NetworkMessage::AddrV2(list) => on_addrv2(follow, session, list)?,
         NetworkMessage::GetHeaders(gh) => on_getheaders(hub, out_tx, follow, session, gh)?,
         NetworkMessage::GetBlocks(gb) => on_getblocks(hub, out_tx, follow, session, gb)?,
-        NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request }) => {
-            on_getblocktxn(hub, out_tx, follow, session, txs_request)?
-        }
         NetworkMessage::Inv(items) => on_inv(hub, out_tx, follow, session, items)?,
         NetworkMessage::NotFound(items) => on_notfound(hub, session, items),
         NetworkMessage::Headers(headers) => on_headers(hub, out_tx, follow, session, headers)?,
@@ -2809,6 +2826,7 @@ fn handle_peer_inventory_msg(
         | NetworkMessage::GetCFCheckpt(_) => on_compact_filters(payload, hub, out_tx, session)?,
         NetworkMessage::Unknown { .. }
         | NetworkMessage::GetData(_)
+        | NetworkMessage::GetBlockTxn(_)
         | NetworkMessage::Block(_)
         | NetworkMessage::CmpctBlock(_)
         | NetworkMessage::BlockTxn(_)
@@ -3212,66 +3230,124 @@ fn serve_getdata_wtx(
     Ok(())
 }
 
-fn on_getblocktxn(
+/// Core: past this depth a `getblocktxn` is answered with the full block.
+const MAX_GETBLOCKTXN_DEPTH: u32 = 10;
+
+enum GetBlockTxnServe {
+    BadIndex,
+    Block(Block),
+    Txns(BlockTransactions),
+}
+
+/// Park one `getblocktxn` and serve it while the writer has room. A full
+/// queue keeps the request on [`PeerFollowState::getblocktxn_tail`].
+async fn serve_getblocktxn(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
-    txs_request: &BlockTransactionsRequest,
+    txs_request: BlockTransactionsRequest,
 ) -> Result<(), NetError> {
-    // Serve missing txs for a compact block we hold (BIP152).
-    let hash = txs_request.block_hash;
-    let block = match block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &hash) {
-        Ok(b) => b,
-        Err(e) => {
-            rbitcoin_log::warn!("p2p: getblocktxn reconstruct {hash}: {e}");
-            None
-        }
-    };
-    if let Some(block) = block {
-        let mut transactions = Vec::with_capacity(txs_request.indexes.len());
-        let mut bad = false;
-        for idx in &txs_request.indexes {
-            let i = *idx as usize;
-            match block.txdata.get(i) {
-                Some(tx) => transactions.push(tx.clone()),
-                None => {
-                    bad = true;
-                    break;
-                }
-            }
-        }
-        if bad {
+    follow.getblocktxn_tail.push_back(txs_request);
+    serve_getblocktxn_tail(hub, out_tx, follow, session).await
+}
+
+async fn serve_getblocktxn_tail(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    while session.is_none_or(|s| s.has_serve_room()) {
+        let Some(req) = follow.getblocktxn_tail.pop_front() else {
+            break;
+        };
+        serve_one_getblocktxn(hub, out_tx, follow, session, req).await?;
+    }
+    Ok(())
+}
+
+async fn serve_one_getblocktxn(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    txs_request: BlockTransactionsRequest,
+) -> Result<(), NetError> {
+    let query = Arc::clone(&hub.query);
+    let cache = Arc::clone(&hub.cache);
+    let reply = tokio::task::spawn_blocking(move || {
+        let _g = crate::reactor::BlockingRegion::enter();
+        let tip_h = query
+            .tip_height()
+            .map(|h| h.0)
+            .or_else(|| cache.tip_height())
+            .unwrap_or(0);
+        getblocktxn_reply(cache.as_ref(), query.as_ref(), txs_request, tip_h)
+    })
+    .await
+    .map_err(|_| NetError::Protocol("getblocktxn reconstruct join failed"))??;
+    match reply {
+        None => Ok(()),
+        Some(GetBlockTxnServe::BadIndex) => {
             rbitcoin_log::info!("p2p: getblocktxn with out-of-bounds tx indices");
             // Core `Misbehaving`: noban and manual peers stay connected.
             misbehaving(&mut follow.ban_score, session);
-        } else {
-            // Core: past `MAX_GETBLOCKTXN_DEPTH` (10) send the full block.
-            const MAX_GETBLOCKTXN_DEPTH: u32 = 10;
-            let tip_h = hub.tip_height().unwrap_or(0);
-            let block_h = hub
-                .query
-                .height_of_hash(&hash.to_byte_array())
-                .ok()
-                .flatten()
-                .map(|h| h.0)
-                .unwrap_or(0);
-            if tip_h.saturating_sub(block_h) > MAX_GETBLOCKTXN_DEPTH {
-                queue_out(out_tx, NetworkMessage::Block(block))?;
-            } else {
-                queue_out(
-                    out_tx,
-                    NetworkMessage::BlockTxn(BlockTxn {
-                        transactions: BlockTransactions {
-                            block_hash: hash,
-                            transactions,
-                        },
-                    }),
-                )?;
-            }
+            Ok(())
+        }
+        Some(GetBlockTxnServe::Block(block)) => queue_served(
+            session,
+            out_tx,
+            PeerOut::Served(NetworkMessage::Block(block)),
+        ),
+        Some(GetBlockTxnServe::Txns(transactions)) => queue_served(
+            session,
+            out_tx,
+            PeerOut::Served(NetworkMessage::BlockTxn(BlockTxn { transactions })),
+        ),
+    }
+}
+
+/// Serve missing txs for a compact block we hold (BIP152). Archive
+/// reconstruct stays off the connection task.
+fn getblocktxn_reply(
+    cache: &BlockCache,
+    query: &Query,
+    txs_request: BlockTransactionsRequest,
+    tip_h: u32,
+) -> Result<Option<GetBlockTxnServe>, NetError> {
+    crate::reactor::assert_not_reactor("getblocktxn reconstruct");
+    let hash = txs_request.block_hash;
+    let block = match block_for_peer(cache, query, &hash) {
+        Ok(b) => b,
+        Err(e) => {
+            rbitcoin_log::warn!("p2p: getblocktxn reconstruct {hash}: {e}");
+            return Ok(None);
+        }
+    };
+    let Some(block) = block else {
+        return Ok(None);
+    };
+    let mut transactions = Vec::with_capacity(txs_request.indexes.len());
+    for idx in &txs_request.indexes {
+        match block.txdata.get(*idx as usize) {
+            Some(tx) => transactions.push(tx.clone()),
+            None => return Ok(Some(GetBlockTxnServe::BadIndex)),
         }
     }
-    Ok(())
+    let block_h = query
+        .height_of_hash(&hash.to_byte_array())
+        .ok()
+        .flatten()
+        .map(|h| h.0)
+        .unwrap_or(0);
+    if tip_h.saturating_sub(block_h) > MAX_GETBLOCKTXN_DEPTH {
+        return Ok(Some(GetBlockTxnServe::Block(block)));
+    }
+    Ok(Some(GetBlockTxnServe::Txns(BlockTransactions {
+        block_hash: hash,
+        transactions,
+    })))
 }
 
 fn on_inv(
@@ -3811,11 +3887,6 @@ fn on_cmpctblock_reject_early(
         misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
-    if let Some(s) = session {
-        s.note_block_from_peer(hash);
-        s.note_best_known(hash);
-        s.note_last_block();
-    }
     if !crate::compact::prefilled_indexes_ok(hsi) {
         rbitcoin_log::info!("p2p: invalid index in cmpctblock message");
         misbehaving(&mut follow.ban_score, session);
@@ -3829,6 +3900,19 @@ fn on_cmpctblock_reject_early(
     }
     if hub.is_block_invalid(&hash) {
         return Ok(true);
+    }
+    // Claimed proof of work before any peer or header-sync state. Once the
+    // tip meets minimum chain work the work-path walk does not check this header.
+    if !hub.header_claimed_pow_ok(&hsi.header) {
+        rbitcoin_log::info!("{}", crate::chain::accept_block_header_nodos_log(hash));
+        misbehaving(&mut follow.ban_score, session);
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        return Ok(true);
+    }
+    if let Some(s) = session {
+        s.note_block_from_peer(hash);
+        s.note_best_known(hash);
+        s.note_last_block();
     }
     Ok(false)
 }
@@ -4507,10 +4591,10 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
     if block.header.prev_blockhash != tip {
         return;
     }
-    hub.remember_cmpct_prefill_from_block(block);
     if hub.ensure_header(&block.header).is_err() {
         return;
     }
+    hub.remember_cmpct_prefill_from_block(block);
     let Some(ph) = from.and_then(|s| s.peer_hub()) else {
         return;
     };

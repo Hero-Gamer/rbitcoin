@@ -118,7 +118,10 @@ impl FramedMessage {
     }
 
     /// Extra bytes / unknown command → [`NetworkMessage::Unknown`].
-    /// Oversize `headers` (`n > MAX_HEADERS_RESULTS`) is [`NetError::MessageTooLarge`].
+    /// Oversize `headers` (`n > MAX_HEADERS_RESULTS`), oversize inv-like
+    /// messages, and a `tx` / `block` / `cmpctblock` / `blocktxn` whose
+    /// compact-size count cannot fit in the remaining bytes are
+    /// [`NetError::MessageTooLarge`] before `consensus_decode` allocates.
     pub fn try_decode(self) -> Result<RawNetworkMessage, crate::error::NetError> {
         if self.is_headers() {
             let mut sl = self.payload.as_slice();
@@ -137,6 +140,9 @@ impl FramedMessage {
                     return Err(crate::error::NetError::MessageTooLarge(n));
                 }
             }
+        }
+        if let Some(n) = tx_family_too_large(&self.command, &self.payload) {
+            return Err(crate::error::NetError::MessageTooLarge(n));
         }
         Ok(self.decode())
     }
@@ -193,6 +199,263 @@ pub(crate) fn command_bytes_ok(cmd12: &[u8]) -> bool {
     any
 }
 
+/// Outpoint, empty script compact-size, and sequence.
+const MIN_INPUT_BYTES: u64 = 41;
+/// Value plus an empty script compact-size.
+const MIN_OUTPUT_BYTES: u64 = 9;
+/// Marker, flag, empty input list, empty output list, and locktime.
+const MIN_TX_BYTES: u64 = 12;
+
+enum Bound {
+    Fits,
+    /// Compact-size count cannot fit in the bytes still unread.
+    TooLarge(usize),
+    /// Truncated or non-minimal. `consensus_decode` decides.
+    Undecided,
+}
+
+fn too_large_n(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
+
+fn exceeds(count: u64, min_each: u64, remaining: usize) -> bool {
+    count.saturating_mul(min_each) > u64::try_from(remaining).unwrap_or(u64::MAX)
+}
+
+fn skip(data: &mut &[u8], n: usize) -> bool {
+    if data.len() < n {
+        return false;
+    }
+    *data = &data[n..];
+    true
+}
+
+fn read_compact_size(data: &mut &[u8]) -> Option<u64> {
+    let mut cur = *data;
+    match bitcoin::consensus::encode::VarInt::consensus_decode(&mut cur) {
+        Ok(n) => {
+            *data = cur;
+            Some(n.0)
+        }
+        Err(_) => None,
+    }
+}
+
+fn take_len_bytes(data: &mut &[u8]) -> Bound {
+    let Some(n) = read_compact_size(data) else {
+        return Bound::Undecided;
+    };
+    if n > u64::try_from(data.len()).unwrap_or(u64::MAX) {
+        return Bound::TooLarge(too_large_n(n));
+    }
+    let Some(n) = usize::try_from(n).ok() else {
+        return Bound::TooLarge(usize::MAX);
+    };
+    if skip(data, n) {
+        Bound::Fits
+    } else {
+        Bound::Undecided
+    }
+}
+
+fn walk_input(data: &mut &[u8]) -> Bound {
+    if !skip(data, 36) {
+        return Bound::Undecided;
+    }
+    match take_len_bytes(data) {
+        Bound::Fits => {}
+        other => return other,
+    }
+    if skip(data, 4) {
+        Bound::Fits
+    } else {
+        Bound::Undecided
+    }
+}
+
+fn walk_output(data: &mut &[u8]) -> Bound {
+    if !skip(data, 8) {
+        return Bound::Undecided;
+    }
+    take_len_bytes(data)
+}
+
+fn walk_counted(
+    data: &mut &[u8],
+    count: u64,
+    min_each: u64,
+    one: fn(&mut &[u8]) -> Bound,
+) -> Bound {
+    if exceeds(count, min_each, data.len()) {
+        return Bound::TooLarge(too_large_n(count));
+    }
+    let Some(n) = usize::try_from(count).ok() else {
+        return Bound::TooLarge(usize::MAX);
+    };
+    for _ in 0..n {
+        match one(data) {
+            Bound::Fits => {}
+            other => return other,
+        }
+    }
+    Bound::Fits
+}
+
+/// Witness stack. Each element is at least one byte, so a count past the
+/// remaining bytes is rejected before `Witness::consensus_decode` allocates
+/// `count * 4 + 128`.
+fn walk_witness(data: &mut &[u8]) -> Bound {
+    let Some(count) = read_compact_size(data) else {
+        return Bound::Undecided;
+    };
+    if count > u64::try_from(data.len()).unwrap_or(u64::MAX) {
+        return Bound::TooLarge(too_large_n(count));
+    }
+    let Some(n) = usize::try_from(count).ok() else {
+        return Bound::TooLarge(usize::MAX);
+    };
+    for _ in 0..n {
+        match take_len_bytes(data) {
+            Bound::Fits => {}
+            other => return other,
+        }
+    }
+    Bound::Fits
+}
+
+fn walk_tx(data: &mut &[u8]) -> Bound {
+    if !skip(data, 4) {
+        return Bound::Undecided;
+    }
+    let Some(marker_or_vin) = read_compact_size(data) else {
+        return Bound::Undecided;
+    };
+    let (vin, segwit) = if marker_or_vin == 0 {
+        let Some((flag, rest)) = data.split_first() else {
+            return Bound::Undecided;
+        };
+        *data = rest;
+        if *flag != 1 {
+            return Bound::Undecided;
+        }
+        let Some(vin) = read_compact_size(data) else {
+            return Bound::Undecided;
+        };
+        (vin, true)
+    } else {
+        (marker_or_vin, false)
+    };
+    match walk_counted(data, vin, MIN_INPUT_BYTES, walk_input) {
+        Bound::Fits => {}
+        other => return other,
+    }
+    let Some(vout) = read_compact_size(data) else {
+        return Bound::Undecided;
+    };
+    match walk_counted(data, vout, MIN_OUTPUT_BYTES, walk_output) {
+        Bound::Fits => {}
+        other => return other,
+    }
+    if segwit {
+        let Some(n) = usize::try_from(vin).ok() else {
+            return Bound::TooLarge(usize::MAX);
+        };
+        for _ in 0..n {
+            match walk_witness(data) {
+                Bound::Fits => {}
+                other => return other,
+            }
+        }
+    }
+    if skip(data, 4) {
+        Bound::Fits
+    } else {
+        Bound::Undecided
+    }
+}
+
+fn walk_tx_list(data: &mut &[u8], count: u64) -> Bound {
+    if exceeds(count, MIN_TX_BYTES, data.len()) {
+        return Bound::TooLarge(too_large_n(count));
+    }
+    let Some(n) = usize::try_from(count).ok() else {
+        return Bound::TooLarge(usize::MAX);
+    };
+    for _ in 0..n {
+        match walk_tx(data) {
+            Bound::Fits => {}
+            other => return other,
+        }
+    }
+    Bound::Fits
+}
+
+fn walk_cmpctblock(data: &mut &[u8]) -> Bound {
+    if !skip(data, 88) {
+        return Bound::Undecided;
+    }
+    let Some(shorts) = read_compact_size(data) else {
+        return Bound::Undecided;
+    };
+    if exceeds(shorts, 6, data.len()) {
+        return Bound::TooLarge(too_large_n(shorts));
+    }
+    let Some(nbytes) = usize::try_from(shorts).ok().and_then(|n| n.checked_mul(6)) else {
+        return Bound::TooLarge(usize::MAX);
+    };
+    if !skip(data, nbytes) {
+        return Bound::Undecided;
+    }
+    let Some(prefills) = read_compact_size(data) else {
+        return Bound::Undecided;
+    };
+    if exceeds(prefills, 1 + MIN_TX_BYTES, data.len()) {
+        return Bound::TooLarge(too_large_n(prefills));
+    }
+    let Some(n) = usize::try_from(prefills).ok() else {
+        return Bound::TooLarge(usize::MAX);
+    };
+    for _ in 0..n {
+        if read_compact_size(data).is_none() {
+            return Bound::Undecided;
+        }
+        match walk_tx(data) {
+            Bound::Fits => {}
+            other => return other,
+        }
+    }
+    Bound::Fits
+}
+
+/// `Some(count)` when a transaction-carrying payload declares a compact-size
+/// count the remaining bytes cannot hold. `None` lets `decode` run.
+fn tx_family_too_large(command: &[u8; 12], payload: &[u8]) -> Option<usize> {
+    let mut data = payload;
+    let bound = if command == b"tx\0\0\0\0\0\0\0\0\0\0" {
+        walk_tx(&mut data)
+    } else if command == b"blocktxn\0\0\0\0" {
+        if !skip(&mut data, 32) {
+            return None;
+        }
+        let n = read_compact_size(&mut data)?;
+        walk_tx_list(&mut data, n)
+    } else if command == b"block\0\0\0\0\0\0\0" {
+        if !skip(&mut data, 80) {
+            return None;
+        }
+        let n = read_compact_size(&mut data)?;
+        walk_tx_list(&mut data, n)
+    } else if command == b"cmpctblock\0\0" {
+        walk_cmpctblock(&mut data)
+    } else {
+        return None;
+    };
+    match bound {
+        Bound::TooLarge(n) => Some(n),
+        Bound::Fits | Bound::Undecided => None,
+    }
+}
+
 fn decode_cmd_payload(
     cmd: &str,
     d: &mut &[u8],
@@ -222,7 +485,9 @@ fn decode_cmd_payload(
         "tx" => one(d, NetworkMessage::Tx)?,
         "ping" => one(d, NetworkMessage::Ping)?,
         "pong" => one(d, NetworkMessage::Pong)?,
-        "merkleblock" => one(d, NetworkMessage::MerkleBlock)?,
+        // Bloom is off. `PartialMerkleTree` allocates `n * 8` bools from the
+        // flags compact-size before a short payload can fail the read.
+        "merkleblock" => return Ok(None),
         "filterload" => one(d, NetworkMessage::FilterLoad)?,
         "filteradd" => one(d, NetworkMessage::FilterAdd)?,
         "getcfilters" => one(d, NetworkMessage::GetCFilters)?,
@@ -493,5 +758,208 @@ mod tests {
             65
         ]);
         assert!(encode_is_cpu_heavy(&large));
+    }
+
+    fn frame(command: [u8; 12], payload: Vec<u8>) -> FramedMessage {
+        FramedMessage {
+            magic: signet_magic(),
+            command,
+            payload,
+        }
+    }
+
+    /// version, marker, flag, one empty input, one empty output, then a witness
+    /// stack count of 4_000_000 and no element bytes.
+    fn short_huge_witness_tx() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1i32.to_le_bytes());
+        p.push(0x00);
+        p.push(0x01);
+        p.push(1);
+        p.extend_from_slice(&[0u8; 36]);
+        p.push(0);
+        p.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        p.push(1);
+        p.extend_from_slice(&0u64.to_le_bytes());
+        p.push(0);
+        p.push(0xfe);
+        p.extend_from_slice(&4_000_000u32.to_le_bytes());
+        p
+    }
+
+    fn assert_witness_count_too_large(command: [u8; 12], payload: Vec<u8>) {
+        assert!(
+            payload.len() < 512,
+            "the frame must stay short so the failure is the count, not the byte cap"
+        );
+        match frame(command, payload).try_decode() {
+            Err(crate::error::NetError::MessageTooLarge(n)) => assert_eq!(n, 4_000_000),
+            other => panic!("huge witness count must be misbehavior, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn short_merkleblock_is_unknown_without_decoding() {
+        use bitcoin::consensus::serialize;
+        use bitcoin::MerkleBlock;
+
+        let genesis = genesis_block(Network::Regtest);
+        let mb = MerkleBlock::from_block_with_predicate(&genesis, |_| true);
+        let payload = serialize(&mb);
+        match frame(*b"merkleblock\0", payload).try_decode() {
+            Ok(msg) => match msg.payload() {
+                NetworkMessage::Unknown { command, .. } => {
+                    assert_eq!(command.to_string(), "merkleblock");
+                }
+                other => panic!("a merkleblock must be ignored, got {other:?}"),
+            },
+            Err(e) => panic!("merkleblock must be Unknown, not {e}"),
+        }
+
+        let mut huge = vec![0u8; 80];
+        huge.extend_from_slice(&1u32.to_le_bytes());
+        huge.push(1);
+        huge.extend_from_slice(&[0x11; 32]);
+        huge.push(0xfe);
+        huge.extend_from_slice(&4_000_000u32.to_le_bytes());
+        assert!(huge.len() < 200);
+        match frame(*b"merkleblock\0", huge).try_decode() {
+            Ok(msg) => match msg.payload() {
+                NetworkMessage::Unknown { command, .. } => {
+                    assert_eq!(command.to_string(), "merkleblock");
+                }
+                other => panic!("huge bit-count must not decode, got {other:?}"),
+            },
+            Err(e) => panic!("huge merkleblock must be Unknown, not {e}"),
+        }
+
+        match frame(*b"zzzzzzzzzzzz", Vec::new()).try_decode() {
+            Ok(msg) => assert!(matches!(msg.payload(), NetworkMessage::Unknown { .. })),
+            Err(e) => panic!("unrecognized command stays Unknown, got {e}"),
+        }
+
+        match frame(*b"tx\0\0\0\0\0\0\0\0\0\0", vec![1, 0, 0, 0]).try_decode() {
+            Ok(msg) => assert!(
+                matches!(msg.payload(), NetworkMessage::Unknown { .. }),
+                "a truncated tx is not the witness-count reject"
+            ),
+            Err(e) => panic!("truncated tx must stay Unknown, got {e}"),
+        }
+    }
+
+    #[test]
+    fn short_tx_witness_count_is_message_too_large() {
+        assert_witness_count_too_large(*b"tx\0\0\0\0\0\0\0\0\0\0", short_huge_witness_tx());
+    }
+
+    #[test]
+    fn short_cmpctblock_witness_count_is_message_too_large() {
+        let mut payload = vec![0u8; 88];
+        payload.push(0);
+        payload.push(1);
+        payload.push(0);
+        payload.extend(short_huge_witness_tx());
+        assert_witness_count_too_large(*b"cmpctblock\0\0", payload);
+    }
+
+    #[test]
+    fn short_blocktxn_witness_count_is_message_too_large() {
+        let mut payload = vec![0u8; 32];
+        payload.push(1);
+        payload.extend(short_huge_witness_tx());
+        assert_witness_count_too_large(*b"blocktxn\0\0\0\0", payload);
+    }
+
+    #[test]
+    fn short_block_witness_count_is_message_too_large() {
+        let mut payload = vec![0u8; 80];
+        payload.push(1);
+        payload.extend(short_huge_witness_tx());
+        assert_witness_count_too_large(*b"block\0\0\0\0\0\0\0", payload);
+    }
+
+    #[test]
+    fn witness_tx_cmpctblock_and_blocktxn_still_decode() {
+        use bitcoin::bip152::{
+            BlockTransactions, HeaderAndShortIds, PrefilledTransaction, ShortId,
+        };
+        use bitcoin::consensus::serialize;
+        use bitcoin::hashes::Hash as _;
+        use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
+
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::from_slice(&[b"abcd"]),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        match frame(*b"tx\0\0\0\0\0\0\0\0\0\0", serialize(&tx))
+            .try_decode()
+            .expect("witness tx")
+            .payload()
+        {
+            NetworkMessage::Tx(got) => assert_eq!(got, &tx),
+            other => panic!("expected tx, got {other:?}"),
+        }
+
+        let genesis = genesis_block(Network::Regtest);
+        let compact = CmpctBlock {
+            compact_block: HeaderAndShortIds {
+                header: genesis.header,
+                nonce: 1,
+                short_ids: vec![ShortId::with_siphash_keys(
+                    &tx.compute_txid().to_byte_array(),
+                    (1, 2),
+                )],
+                prefilled_txs: vec![PrefilledTransaction {
+                    idx: 0,
+                    tx: tx.clone(),
+                }],
+            },
+        };
+        match frame(*b"cmpctblock\0\0", serialize(&compact))
+            .try_decode()
+            .expect("cmpctblock")
+            .payload()
+        {
+            NetworkMessage::CmpctBlock(got) => {
+                assert_eq!(got.compact_block.prefilled_txs.len(), 1);
+                assert_eq!(got.compact_block.prefilled_txs[0].tx, tx);
+            }
+            other => panic!("expected cmpctblock, got {other:?}"),
+        }
+
+        let blocktxn = BlockTxn {
+            transactions: BlockTransactions {
+                block_hash: bitcoin::BlockHash::from_byte_array([7; 32]),
+                transactions: vec![tx.clone()],
+            },
+        };
+        match frame(*b"blocktxn\0\0\0\0", serialize(&blocktxn))
+            .try_decode()
+            .expect("blocktxn")
+            .payload()
+        {
+            NetworkMessage::BlockTxn(got) => assert_eq!(got.transactions.transactions, vec![tx]),
+            other => panic!("expected blocktxn, got {other:?}"),
+        }
+
+        let block_payload = serialize(&genesis);
+        match frame(*b"block\0\0\0\0\0\0\0", block_payload)
+            .try_decode()
+            .expect("genesis block")
+            .payload()
+        {
+            NetworkMessage::Block(got) => assert_eq!(got.block_hash(), genesis.block_hash()),
+            other => panic!("expected block, got {other:?}"),
+        }
     }
 }

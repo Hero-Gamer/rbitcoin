@@ -38,9 +38,14 @@ the writer frees room, and that wait ends when the session is told to
 disconnect or its writer is gone. The writer frees the served-body slot
 before it wakes the session.
 
-Only a getdata body takes a slot, and only it frees one. A compact tip
-announce or a deep `getblocktxn` block used to free a slot it never
-took, which let more than 16 small bodies queue behind a paused getdata.
+A getdata body and a `getblocktxn` reply (`blocktxn`, or the full block
+past depth 10) each take a slot, and each frees one when written. A
+`blocktxn` is charged its serialized payload, not a fixed 64 bytes.
+Further `getblocktxn` reconstructs wait on the same room, and the one
+parked request is served once the writer drains. A compact tip announce
+takes no slot. A deep `getblocktxn` block used to take none and then
+free one, which let more than 16 small bodies queue behind a paused
+getdata.
 
 The RAM bound: one session queues at most 16 reconstructed bodies, and
 holds one paused inventory of at most 50,000 items (about 2 MB).
@@ -51,4 +56,7 @@ holds one paused inventory of at most 50,000 items (about 2 MB).
 `peer::tests::paused_getdata_ends_on_disconnect_or_dead_writer`,
 `peer::tests::paused_session_still_times_out_a_silent_peer`,
 `peer::tests::paused_getdata_tail_is_served_before_the_next_getdata`,
-`peer::tests::uncounted_bodies_do_not_open_serve_slots`
+`peer::tests::uncounted_bodies_do_not_open_serve_slots`,
+`peer::tests::getblocktxn_over_send_budget_waits_for_writer`,
+`peer::tests::getblocktxn_reconstruct_is_off_the_connection_task`,
+`peer::tests::blocktxn_outbound_bytes_are_the_payload`

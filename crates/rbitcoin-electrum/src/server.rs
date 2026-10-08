@@ -513,23 +513,46 @@ where
                             .collect();
                         touched.sort_unstable();
                         touched.dedup();
-                        for sh in &touched {
-                            if let Ok(status) = scripthash_status_full(&query, mp, sh) {
-                                let Some(status) = take_new_status(
-                                    &mut last_sent_status,
-                                    &conn.sh_subs,
-                                    *sh,
-                                    status,
-                                ) else {
-                                    continue;
-                                };
-                                let msg = json!({
-                                    "jsonrpc": "2.0",
-                                    "method": "blockchain.scripthash.subscribe",
-                                    "params": [hash_hex_rev(sh), status_json(status)]
-                                });
-                                let _ = write_line(&mut writer, &msg).await;
+                        if touched.is_empty() {
+                            continue;
+                        }
+                        // History and the mempool read take std locks. The
+                        // blocking pool is named tokio-rt-worker too, so the
+                        // region has to be entered there.
+                        let q = Arc::clone(&query);
+                        let hub = Arc::clone(mp);
+                        let statuses = tokio::task::spawn_blocking(move || {
+                            let _g = BlockingRegion::enter();
+                            let mut out = Vec::with_capacity(touched.len());
+                            for sh in touched {
+                                if let Ok(status) = scripthash_status_full(&q, &hub, &sh) {
+                                    out.push((sh, status));
+                                }
                             }
+                            out
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            rbitcoin_log::warn!(
+                                "electrum: mempool scripthash status join failed: {e}"
+                            );
+                            Vec::new()
+                        });
+                        for (sh, status) in statuses {
+                            let Some(status) = take_new_status(
+                                &mut last_sent_status,
+                                &conn.sh_subs,
+                                sh,
+                                status,
+                            ) else {
+                                continue;
+                            };
+                            let msg = json!({
+                                "jsonrpc": "2.0",
+                                "method": "blockchain.scripthash.subscribe",
+                                "params": [hash_hex_rev(&sh), status_json(status)]
+                            });
+                            let _ = write_line(&mut writer, &msg).await;
                         }
                     }
                 }

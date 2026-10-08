@@ -100,10 +100,7 @@ fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
 }
 
 fn checkpoint(query: &Query) -> Result<(), rbitcoin_store::StoreError> {
-    let Some(h) = query.store().spend_snapshot_height() else {
-        return Ok(());
-    };
-    query.store().checkpoint_spend_through(h)
+    query.store().checkpoint_observed_spend()
 }
 
 #[cfg(test)]

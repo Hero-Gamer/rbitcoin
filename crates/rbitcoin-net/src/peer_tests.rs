@@ -589,6 +589,7 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
             txdata: vec![coinbase, spend],
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
+        rbitcoin_consensus::grind_regtest_pow(&mut block.header);
         let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
         let hash = block.block_hash();
         let peers = crate::peers::PeerHub::new();
@@ -676,6 +677,7 @@ fn handle_peer_frame_control_and_inv_paths() {
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
             getdata_tail: VecDeque::new(),
+            getblocktxn_tail: VecDeque::new(),
         };
 
         // SendHeaders / SendCmpct / WtxidRelay / Pong / GetAddr / Ping
@@ -1174,6 +1176,7 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
             getdata_tail: VecDeque::new(),
+            getblocktxn_tail: VecDeque::new(),
         };
 
         let unknown_txid = bitcoin::Txid::from_byte_array([0x42; 32]);
@@ -1459,6 +1462,7 @@ fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
             getdata_tail: VecDeque::new(),
+            getblocktxn_tail: VecDeque::new(),
         };
 
         rbitcoin_log::capture_logs(true);
@@ -1574,6 +1578,7 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
         ],
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
 
     let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
     // Mempool present but empty live → Some(missing) not None.
@@ -1874,6 +1879,7 @@ fn inv_of_already_asked_block_does_not_getdata() {
             requested_blocks: HashSet::new(),
             ban_score: 0u32,
             getdata_tail: VecDeque::new(),
+            getblocktxn_tail: VecDeque::new(),
         };
 
         handle_peer_frame(
@@ -1947,6 +1953,7 @@ fn bloom_disabled_messages_request_disconnect() {
         requested_blocks: HashSet::new(),
         ban_score: 0,
         getdata_tail: VecDeque::new(),
+        getblocktxn_tail: VecDeque::new(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2008,6 +2015,7 @@ fn oversize_locator_request_disconnect() {
         requested_blocks: HashSet::new(),
         ban_score: 0,
         getdata_tail: VecDeque::new(),
+        getblocktxn_tail: VecDeque::new(),
     };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2411,6 +2419,205 @@ fn getdata_past_serve_cap_waits_for_writer() {
     });
 }
 
+fn getblocktxn_frame(hash: BlockHash, indexes: Vec<u64>) -> FramedMessage {
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message::RawNetworkMessage;
+    let msg = NetworkMessage::GetBlockTxn(GetBlockTxn {
+        txs_request: BlockTransactionsRequest {
+            block_hash: hash,
+            indexes,
+        },
+    });
+    let magic = Magic::from(bitcoin::Network::Regtest);
+    let full = serialize(&RawNetworkMessage::new(magic, msg));
+    FramedMessage {
+        magic,
+        command: full[4..16].try_into().unwrap(),
+        payload: full[24..].to_vec(),
+    }
+}
+
+/// A `getblocktxn` for a block we hold, while the writer is already past
+/// the send budget, queues nothing and keeps the request. After the writer
+/// drains, that request is served as a `blocktxn` or a full block, charged
+/// at its real size, and it holds a serve slot.
+#[test]
+fn getblocktxn_over_send_budget_waits_for_writer() {
+    use std::time::Duration;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let s = serve_session("gbtxn-budget-waits", 12);
+        let tip = *s.hashes.last().unwrap();
+        let deep = s.hashes[0];
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        let earlier = crate::peers::PEER_SEND_BUDGET + 1;
+        s.sess.note_send_queued(earlier);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            handle_peer_frame(
+                getblocktxn_frame(tip, vec![0]),
+                &s.hub,
+                &out_tx,
+                &mut follow,
+                Some(s.sess.as_ref()),
+            ),
+        )
+        .await
+        .expect("a getblocktxn past the send budget returns to the session loop")
+        .unwrap();
+        assert!(
+            out_rx.try_recv().is_err(),
+            "getblocktxn past the send budget is not queued"
+        );
+        assert_eq!(
+            s.sess.send_queued(),
+            earlier,
+            "a paused getblocktxn reconstructs nothing"
+        );
+        assert!(
+            !follow.getblocktxn_tail.is_empty(),
+            "the request stays until the writer drains"
+        );
+
+        s.sess.note_send_written(earlier);
+        serve_getblocktxn_tail(&s.hub, &out_tx, &mut follow, Some(s.sess.as_ref()))
+            .await
+            .unwrap();
+        let served = out_rx
+            .try_recv()
+            .expect("drain serves the parked getblocktxn");
+        assert!(
+            served.holds_serve_slot(),
+            "a getblocktxn reply holds a serve slot"
+        );
+        let charged = crate::peers::outbound_queued_bytes(&served);
+        let msg = match &served {
+            PeerOut::Msg(m) | PeerOut::Served(m) => m,
+            PeerOut::Encoded(_) => panic!("getblocktxn reply is not a pre-encoded getdata body"),
+        };
+        match msg {
+            NetworkMessage::BlockTxn(bt) => {
+                let n = bitcoin::consensus::encode::serialize(&bt.transactions).len();
+                assert!(n > 64, "blocktxn is not the 64-byte fallback");
+                assert_eq!(charged, n);
+            }
+            NetworkMessage::Block(b) => {
+                assert!(b.total_size() > 64);
+                assert_eq!(charged, b.total_size());
+            }
+            other => panic!("expected blocktxn or block, got {other:?}"),
+        }
+        assert_eq!(s.sess.send_queued(), charged);
+        assert_eq!(s.sess.serve_inflight.load(Ordering::SeqCst), 1);
+        assert!(follow.getblocktxn_tail.is_empty());
+        wrote(&s.sess, &served);
+
+        // Depth > 10 is the full block, on the same slot and byte charge.
+        handle_peer_frame(
+            getblocktxn_frame(deep, vec![0]),
+            &s.hub,
+            &out_tx,
+            &mut follow,
+            Some(s.sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        let deep_out = out_rx.try_recv().expect("deep getblocktxn");
+        assert!(deep_out.holds_serve_slot());
+        match deep_out.expect_msg() {
+            NetworkMessage::Block(b) => assert_eq!(b.block_hash(), deep),
+            other => panic!("depth past 10 is a full block, got {other:?}"),
+        }
+
+        // The peer never reads. Further requests stop at the serve cap
+        // instead of reconstructing without bound.
+        let queued_before = s.sess.send_queued();
+        let mut extra = 0usize;
+        for _ in 0..MAX_SERVE_BLOCKS + 4 {
+            handle_peer_frame(
+                getblocktxn_frame(tip, vec![0]),
+                &s.hub,
+                &out_tx,
+                &mut follow,
+                Some(s.sess.as_ref()),
+            )
+            .await
+            .unwrap();
+            if out_rx.try_recv().is_err() {
+                break;
+            }
+            extra += 1;
+        }
+        assert_eq!(extra, MAX_SERVE_BLOCKS - 1, "the 17th getblocktxn waits");
+        assert_eq!(
+            s.sess.serve_inflight.load(Ordering::SeqCst),
+            MAX_SERVE_BLOCKS
+        );
+        assert_eq!(follow.getblocktxn_tail.len(), 1);
+        assert!(s.sess.send_queued() > queued_before);
+        assert!(
+            s.sess.send_queued() <= crate::peers::PEER_SEND_BUDGET,
+            "small blocktxn replies stay inside the byte budget at the slot cap"
+        );
+    });
+}
+
+/// Archive reconstruct for `getblocktxn` runs on the blocking pool. A
+/// connection task named `tokio-rt-worker` still receives the reply.
+#[test]
+fn getblocktxn_reconstruct_is_off_the_connection_task() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let s = serve_session("gbtxn-reactor", 1);
+        let tip = *s.hashes.last().unwrap();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        handle_peer_frame(
+            getblocktxn_frame(tip, vec![0]),
+            &s.hub,
+            &out_tx,
+            &mut follow,
+            Some(s.sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            out_rx.try_recv().unwrap().expect_msg(),
+            NetworkMessage::BlockTxn(_)
+        ));
+    });
+}
+
+/// `blocktxn` shares the send budget at its real payload size. The 64-byte
+/// fallback let a peer that never reads queue far more than 4 MiB.
+#[test]
+fn blocktxn_outbound_bytes_are_the_payload() {
+    use bitcoin::bip152::BlockTransactions;
+    use bitcoin::consensus::encode::serialize;
+    let block = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let txns = BlockTransactions {
+        block_hash: block.block_hash(),
+        transactions: vec![block.txdata[0].clone()],
+    };
+    let payload = serialize(&txns).len();
+    assert!(payload > 64, "a coinbase blocktxn is not the fallback size");
+    assert_eq!(
+        crate::peers::outbound_msg_bytes(&NetworkMessage::BlockTxn(BlockTxn {
+            transactions: txns
+        })),
+        payload
+    );
+}
+
 /// A reply already past the send budget pauses the whole getdata. It does
 /// not drop it.
 #[test]
@@ -2450,13 +2657,12 @@ fn getdata_over_send_budget_waits_for_writer() {
     });
 }
 
-/// Only a getdata body holds a serve slot. A compact tip announce queued
-/// by another session and a deep `getblocktxn` full block share the writer
-/// queue but free no slot when written, so a paused getdata never has more
-/// than `MAX_SERVE_BLOCKS` bodies queued.
+/// A compact tip announce holds no serve slot. A deep `getblocktxn` full
+/// block does, and shares the cap with getdata bodies. Writing the
+/// announces does not open a slot, so a paused getdata never queues more
+/// than `MAX_SERVE_BLOCKS` bodies.
 #[test]
 fn uncounted_bodies_do_not_open_serve_slots() {
-    use bitcoin::bip152::BlockTransactionsRequest;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2470,17 +2676,14 @@ fn uncounted_bodies_do_not_open_serve_slots() {
             let announce = cmpct_announce_msg(&s.hub, &tip, 2).expect("cmpct announce");
             queue_cmpct_tip_announce(&out_tx, announce).unwrap();
         }
-        let deep = BlockTransactionsRequest {
-            block_hash: s.hashes[0],
-            indexes: vec![0],
-        };
-        handle_peer_inventory_msg(
-            &NetworkMessage::GetBlockTxn(GetBlockTxn { txs_request: deep }),
+        handle_peer_frame(
+            getblocktxn_frame(s.hashes[0], vec![0]),
             &s.hub,
             &out_tx,
             &mut follow,
             Some(s.sess.as_ref()),
         )
+        .await
         .unwrap();
         handle_peer_frame(
             getdata_frame(&s.hashes),
@@ -2493,13 +2696,20 @@ fn uncounted_bodies_do_not_open_serve_slots() {
         .unwrap();
 
         let (queued, _) = take_queued(&mut out_rx);
-        let (bodies, uncounted): (Vec<_>, Vec<_>) = queued
-            .into_iter()
-            .partition(|out| matches!(out, PeerOut::Encoded(_)));
+        let (slots, uncounted): (Vec<_>, Vec<_>) =
+            queued.into_iter().partition(|out| out.holds_serve_slot());
+        assert_eq!(uncounted.len(), 3, "three announces hold no serve slot");
         assert_eq!(
-            uncounted.len(),
-            4,
-            "three announces and one getblocktxn block"
+            slots.len(),
+            MAX_SERVE_BLOCKS,
+            "the getblocktxn block shares the serve cap with getdata"
+        );
+        assert!(
+            matches!(
+                slots.first(),
+                Some(PeerOut::Served(NetworkMessage::Block(_)))
+            ),
+            "the deep getblocktxn block is the first served body"
         );
         for out in &uncounted {
             wrote(&s.sess, out);
@@ -2508,10 +2718,9 @@ fn uncounted_bodies_do_not_open_serve_slots() {
             .await
             .unwrap();
         let (more, _) = take_queued(&mut out_rx);
-        assert_eq!(
-            bodies.len() + more.len(),
-            MAX_SERVE_BLOCKS,
-            "an uncounted write let a getdata body past the serve cap"
+        assert!(
+            more.is_empty(),
+            "writing an announce must not let a getdata body past the serve cap"
         );
     });
 }

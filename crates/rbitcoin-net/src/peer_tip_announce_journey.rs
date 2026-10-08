@@ -810,6 +810,7 @@ async fn tip_announce_blocktxn_feeds_extra() {
         txdata: vec![coinbase.clone(), spend.clone()],
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[0, 1]).unwrap();
     let (out_tx, _out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();

@@ -61,6 +61,8 @@ Core, **fix the engine** before commit.
 | RB-017 | BIP68 sequence locks | `relative::LockTime::is_satisfied_by` is one input, `<=`, with no disable bit and no median-time past | `sequence_locks_satisfied` (Core `EvaluateSequenceLocks`) plus the unsigned version gate from RB-001 | `block/mod.rs` | mitigated | |
 | RB-018 | Difficulty scheduler | `from_next_work_required` is the 2016-block multiply-and-clamp only. It does not apply "retarget only on the boundary" or the testnet walk back across min-difficulty blocks | `next_work_bits` / `min_diff_bits` call the crate formula on a boundary and walk `bits_at` otherwise | `header.rs` | mitigated | Test `testnet_min_difficulty_after_20_minute_gap` |
 | RB-019 | Taproot key-spend helper | `taproot_key_spend_signature_hash` hardcodes `annex = None`. A key-path spend with an annex is consensus-valid; that helper hashes the wrong message. `taproot_script_spend_signature_hash` also drops the annex and pins the codeseparator at `0xFFFFFFFF`. `TapSighashType::from_consensus_u8(0x00)` is `Default`, so a 65-byte signature ending in `0x00` must be rejected before the parser | Key path and script path call in-tree `tap_signature_hash` (annex included; `leaf` absent on key path). They do not call the two wrappers. An explicit `0x00` type byte is rejected. The `0x00 → Default` mapping itself is correct | `script/p2tr.rs` `verify_key_path`, `verify_script_path`; tapscript `checksig_schnorr` | mitigated | Finding [008](./external_findings/008-p2tr-keypath-sighash-zero.md). Mainnet annex key-path example: block 896078 |
+| RB-020 | Witness decode allocation | `Witness::consensus_decode` allows a stack count up to `MAX_VEC_SIZE` (4_000_000), then allocates `count * 4 + 128` bytes before reading any element length. A short `tx`, `block`, `cmpctblock`, or `blocktxn` whose count is 4_000_000 zeros about 16 MB and then fails | Allocation-free pre-walk in `try_decode`. A count that cannot fit in the remaining bytes (an element is at least one byte) is `MessageTooLarge`, which the peer loop scores. Relay `tx`, `block`, `cmpctblock`, and `blocktxn` then walk inputs, outputs, and witnesses a second time inside `consensus_decode`. IBD block frames skip the pre-walk | `net/src/codec.rs` `walk_witness` | mitigated | `short_tx_witness_count_is_message_too_large` and the `block`, `cmpctblock`, and `blocktxn` siblings. A real witness payload still decodes |
+| RB-021 | `merkleblock` bit vector | `PartialMerkleTree::consensus_decode` reads a flag-byte compact-size capped at 4_000_000, then allocates `vec![false; n * 8]` before reading those bytes. At the cap that is 32 MB of bools. This node never asks for or handles a merkle block | The command is `Unknown` before `consensus_decode`. An unrecognized command stays `Unknown` | `net/src/codec.rs` `decode_cmd_payload` | mitigated | `short_merkleblock_is_unknown_without_decoding`. Esplora still builds a `MerkleBlock` itself for `/tx/:txid/merkleblock-proof` |
 
 ## Upstream queue
 
@@ -137,6 +139,29 @@ regtest harnesses included.
   `Option<Annex>`. Same for the script-spend wrapper (annex and
   codeseparator). Do not change `from_consensus_u8(0)`. **Title:**
   "`taproot_key_spend_signature_hash` ignores the annex."
+
+- **RB-020. Witness decode allocates from the element count.**
+  `Witness::consensus_decode` accepts a stack count up to `MAX_VEC_SIZE`
+  (4_000_000), then allocates `count * 4 + 128` bytes before reading one
+  element length. A transaction of a few dozen bytes whose count is
+  4_000_000 zeros about 16 MB and then hits end of file. The same decoder
+  runs for a prefilled compact-block transaction and for `blocktxn`.
+  Relay `tx`, `block`, `cmpctblock`, and `blocktxn` pay that walk twice:
+  once to reject a count that cannot fit, then again inside
+  `consensus_decode` over inputs, outputs, and witnesses. IBD block
+  frames skip the pre-walk.
+  **Ask:** if `count` is greater than the bytes still available, return
+  before allocating. Each element is at least one byte. **Title:**
+  "`Witness::consensus_decode` allocates before checking the payload."
+
+- **RB-021. Partial merkle tree allocates eight bools per flag byte.**
+  `PartialMerkleTree::consensus_decode` reads a compact-size byte count
+  capped at 4_000_000, then builds `vec![false; n * 8]` before reading
+  the flag bytes. At the cap that is 32 MB. Callers who do not need
+  BIP37 still pay it if they decode a `merkleblock`.
+  **Ask:** size the bit vector from bytes actually read, or cap `n` by
+  the remaining length. **Title:** "`PartialMerkleTree` allocates a bit
+  per flag before reading it."
 
 ### Consensus gaps that hit a full node and not a wallet
 

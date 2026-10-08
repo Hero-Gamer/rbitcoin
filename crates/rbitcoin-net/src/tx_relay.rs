@@ -238,6 +238,10 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             .store(tx_has_bip68_time_lock(tx), Ordering::Relaxed);
     }
 
+    fn utxo_view_stamp(&self) -> Option<u64> {
+        self.query.store().utxo_view_stamp()
+    }
+
     fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
         match self.chain_prevout(op) {
             ChainPrevout::Unspent(c) => Some(c),
@@ -592,6 +596,8 @@ pub struct MempoolHub {
     meter_spent_body_loads: AtomicU64,
     /// Full live-set clones ([`Self::list_live`]).
     meter_list_live: AtomicU64,
+    /// Compact short-id walks that take the mempool read lock.
+    meter_cmpct_avail: AtomicU64,
     /// Full live-set meta scans ([`Self::list_live_meta`]).
     meter_list_live_meta: AtomicU64,
     meter_list_live_wtxids: AtomicU64,
@@ -682,7 +688,20 @@ pub struct SubmitPackageRow {
     pub fee_with: Option<Vec<Txid>>,
 }
 
+/// Confirmed coins sampled before the write lock. `stamp` is `None` when a
+/// confirm or disconnect is already changing spentness.
+struct SampledCoins {
+    stamp: Option<u64>,
+    creators: Vec<bool>,
+    coins: Vec<Option<rbitcoin_mempool::Coin>>,
+}
+
 impl MempoolHub {
+    /// Short-id walks that entered the mempool, including a `try_read` miss.
+    pub fn cmpct_avail_scans(&self) -> u64 {
+        self.meter_cmpct_avail.load(Ordering::Relaxed)
+    }
+
     fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, ActiveMempool> {
         crate::reactor::assert_not_reactor("mempool inner read");
         self.inner.read().unwrap()
@@ -779,6 +798,7 @@ impl MempoolHub {
             meter_delta_prevouts: AtomicU64::new(0),
             meter_spent_body_loads: AtomicU64::new(0),
             meter_list_live: AtomicU64::new(0),
+            meter_cmpct_avail: AtomicU64::new(0),
             meter_list_live_meta: AtomicU64::new(0),
             meter_list_live_wtxids: AtomicU64::new(0),
             meter_age_scan: AtomicU64::new(0),
@@ -1249,7 +1269,15 @@ impl MempoolHub {
             let mut n = 0usize;
             let mut g = self.lock_write();
             for t in kill.iter().rev() {
-                if g.graph.get(t).is_some() && g.remove_txid(t).is_ok() {
+                if g.graph.get(t).is_some() {
+                    if g.remove_txid(t).is_ok() {
+                        self.unindex_txid(t);
+                        n += 1;
+                    }
+                } else {
+                    // Already gone from the graph (fee or slot eviction that
+                    // did not unindex). Drop the relay maps so the scan can
+                    // move past it.
                     self.unindex_txid(t);
                     n += 1;
                 }
@@ -1771,6 +1799,146 @@ impl MempoolHub {
         Ok(prep)
     }
 
+    /// Confirmed coins are read again before commit. A spend that lands while
+    /// scripts run must not commit from the prepare snapshot. An input whose
+    /// creator is still in the graph keeps its mempool parent (`chain_coins`
+    /// stays `None`). The read stays off the write lock when the UTXO view
+    /// stamp and the creator set are unchanged.
+    fn sample_chain_coins(&self, tx: &Transaction, utxo: &impl UtxoProvider) -> SampledCoins {
+        let Some(stamp) = utxo.utxo_view_stamp() else {
+            return SampledCoins {
+                stamp: None,
+                creators: Vec::new(),
+                coins: Vec::new(),
+            };
+        };
+        let creators: Vec<bool> = {
+            let g = self.lock_read();
+            tx.input
+                .iter()
+                .map(|inp| g.graph.creator(&inp.previous_output).is_some())
+                .collect()
+        };
+        let coins = tx
+            .input
+            .iter()
+            .zip(&creators)
+            .map(|(inp, had_creator)| {
+                if *had_creator {
+                    None
+                } else {
+                    utxo.get_coin(&inp.previous_output)
+                }
+            })
+            .collect();
+        SampledCoins {
+            stamp: Some(stamp),
+            creators,
+            coins,
+        }
+    }
+
+    fn sampled_coins_fresh(
+        g: &ActiveMempool,
+        tx: &Transaction,
+        utxo: &impl UtxoProvider,
+        sample: &SampledCoins,
+    ) -> bool {
+        let Some(stamp) = sample.stamp else {
+            return false;
+        };
+        if utxo.utxo_view_stamp() != Some(stamp) {
+            return false;
+        }
+        tx.input
+            .iter()
+            .zip(&sample.creators)
+            .all(|(inp, had)| g.graph.creator(&inp.previous_output).is_some() == *had)
+    }
+
+    fn apply_sampled_coins(
+        tx: &Transaction,
+        prep: &mut rbitcoin_mempool::PreparedAdmit,
+        sample: &SampledCoins,
+    ) -> Result<(), AcceptError> {
+        for (i, inp) in tx.input.iter().enumerate() {
+            if sample.creators.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let op = inp.previous_output;
+            let Some(coin) = sample.coins.get(i).and_then(|c| c.clone()) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(prev) = prep.prevouts.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(slot) = prep.chain_coins.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            *prev = coin.txout.clone();
+            *slot = Some(coin);
+        }
+        Ok(())
+    }
+
+    fn recheck_chain_coins(
+        g: &ActiveMempool,
+        tx: &Transaction,
+        prep: &mut rbitcoin_mempool::PreparedAdmit,
+        utxo: &impl UtxoProvider,
+    ) -> Result<(), AcceptError> {
+        for (i, inp) in tx.input.iter().enumerate() {
+            let op = inp.previous_output;
+            if g.graph.creator(&op).is_some() {
+                continue;
+            }
+            let Some(coin) = utxo.get_coin(&op) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(prev) = prep.prevouts.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            let Some(slot) = prep.chain_coins.get_mut(i) else {
+                return Err(AcceptError::MissingPrevout(op));
+            };
+            *prev = coin.txout.clone();
+            *slot = Some(coin);
+        }
+        Ok(())
+    }
+
+    /// Recheck, then commit. A miss does not take the previous admit's
+    /// eviction list: that admit already published it.
+    fn commit_rechecked(
+        g: &mut ActiveMempool,
+        tx: &Transaction,
+        mut prep: rbitcoin_mempool::PreparedAdmit,
+        utxo: &impl UtxoProvider,
+        defer_trim: bool,
+        sample: &SampledCoins,
+    ) -> (Result<AcceptResult, AcceptError>, Vec<Txid>, Vec<TxOut>) {
+        let rechecked = if Self::sampled_coins_fresh(g, tx, utxo, sample) {
+            Self::apply_sampled_coins(tx, &mut prep, sample)
+        } else {
+            Self::recheck_chain_coins(g, tx, &mut prep, utxo)
+        };
+        if let Err(e) = rechecked {
+            return (Err(e), Vec::new(), Vec::new());
+        }
+        let prevouts = prep.prevouts.clone();
+        let result = if defer_trim {
+            g.commit_after_script_defer_trim(tx, prep)
+        } else {
+            g.commit_after_script(tx, prep)
+        };
+        let failed = if result.is_err() {
+            g.take_failed_evictions()
+        } else {
+            Vec::new()
+        };
+        (result, failed, prevouts)
+    }
+
     fn accept_with_utxo(
         &self,
         tx: &Transaction,
@@ -1840,19 +2008,16 @@ impl MempoolHub {
             }
         };
 
-        let prevouts = prep.prevouts.clone();
-        let result = {
+        let sample = self.sample_chain_coins(tx, utxo);
+        let (result, failed_evict, prevouts) = {
             let t_lock = Instant::now();
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
-            let r = if defer_trim {
-                g.commit_after_script_defer_trim(tx, prep)
-            } else {
-                g.commit_after_script(tx, prep)
-            };
+            let (r, failed_evict, prevouts) =
+                Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim, &sample);
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
-            r
+            (r, failed_evict, prevouts)
         };
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
@@ -1867,6 +2032,7 @@ impl MempoolHub {
             Err(e) => {
                 // Eviction inside the commit may have raised the rolling floor
                 // before the error returned. The write guard is already gone.
+                self.unindex_evicted(&failed_evict);
                 self.publish_fee_floor();
                 self.finish_accept_err(us, e)
             }
@@ -1898,17 +2064,18 @@ impl MempoolHub {
                 return None;
             }
         };
-        let prevouts_p = prep_p.prevouts.clone();
         // Parent is live until the child commits (or we roll it back). A
         // concurrent spender of the parent that lands in this window survives
         // `remove_txid(parent)` if the child then fails.
-        let parent_commit = {
+        let sample_p = self.sample_chain_coins(&parent, utxo);
+        let (parent_commit, parent_failed, prevouts_p) = {
             let mut g = self.lock_write();
-            g.commit_after_script(&parent, prep_p)
+            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, false, &sample_p)
         };
         let parent_res = match parent_commit {
             Ok(r) => r,
             Err(_) => {
+                self.unindex_evicted(&parent_failed);
                 self.publish_fee_floor();
                 return None;
             }
@@ -1923,14 +2090,14 @@ impl MempoolHub {
             Ok(p) => p,
             Err(_) => {
                 self.meter_accept_stages(lock_us, stages);
-                self.rollback_1p1c_parent(&parent_res.txid);
+                self.rollback_1p1c_parent(&parent_res.txid, &parent_res.evicted);
                 return None;
             }
         };
-        let prevouts_c = prep_c.prevouts.clone();
-        let child_res = {
+        let sample_c = self.sample_chain_coins(child, utxo);
+        let (child_res, child_failed, prevouts_c) = {
             let mut g = self.lock_write();
-            g.commit_after_script(child, prep_c)
+            Self::commit_rechecked(&mut g, child, prep_c, utxo, false, &sample_c)
         };
         self.meter_accept_stages(lock_us, stages);
         match child_res {
@@ -1942,18 +2109,20 @@ impl MempoolHub {
                 Some(r)
             }
             Err(_) => {
-                self.rollback_1p1c_parent(&parent_res.txid);
+                self.unindex_evicted(&child_failed);
+                self.rollback_1p1c_parent(&parent_res.txid, &parent_res.evicted);
                 self.publish_fee_floor();
                 None
             }
         }
     }
 
-    fn rollback_1p1c_parent(&self, txid: &Txid) {
-        let gone = {
+    fn rollback_1p1c_parent(&self, txid: &Txid, evicted: &[Txid]) {
+        let mut gone = evicted.to_vec();
+        {
             let mut g = self.lock_write();
-            g.remove_txid_tree(txid)
-        };
+            gone.extend(g.remove_txid_tree(txid));
+        }
         self.unindex_evicted(&gone);
     }
 
@@ -1962,7 +2131,10 @@ impl MempoolHub {
             .iter()
             .flat_map(|r| r.replaced_txs.iter().cloned())
             .collect();
-        let mut gone = Vec::new();
+        let mut gone: Vec<Txid> = accepted
+            .iter()
+            .flat_map(|r| r.evicted.iter().copied())
+            .collect();
         {
             let mut g = self.lock_write();
             for r in accepted.iter().rev() {
@@ -1975,20 +2147,25 @@ impl MempoolHub {
         }
     }
 
-    /// Drop hub relay / sh / fee-delta / template state for txs already
-    /// removed from the live graph (`remove_for_block_spent`, 1p1c rollback).
+    /// Drop relay maps for txs already removed from the live graph.
+    ///
+    /// A `prioritisetransaction` delta stays until the tx is mined.
     fn unindex_evicted(&self, gone: &[Txid]) {
         if gone.is_empty() {
             return;
         }
         self.note_template_update();
-        let mut deltas = self.fee_deltas.lock().unwrap();
         for tid in gone {
             self.unindex_txid(tid);
+        }
+        self.publish_fee_floor();
+    }
+
+    fn drop_mined_fee_deltas(&self, txids: &[Txid]) {
+        let mut deltas = self.fee_deltas.lock().unwrap();
+        for tid in txids {
             deltas.remove(tid);
         }
-        drop(deltas);
-        self.publish_fee_floor();
     }
 
     fn note_if_accept_failure(&self, tx: &Transaction, e: &AcceptError) {
@@ -2011,6 +2188,11 @@ impl MempoolHub {
         for old in &r.replaced {
             self.unindex_txid(old);
         }
+        debug_assert!(
+            !r.evicted.contains(&r.txid),
+            "a successful admit is not in its own eviction set"
+        );
+        self.unindex_evicted(&r.evicted);
         let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
         let w = tx.compute_wtxid();
         self.insert_relay_maps(r.txid, w, seq);
@@ -2394,14 +2576,14 @@ impl MempoolHub {
                     return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             };
-            let prev = prep.prevouts.clone();
+            let sample = self.sample_chain_coins(tx, &utxo);
             let t_lock = Instant::now();
-            let commit = {
+            let (commit, failed_evict, prev) = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
-                let r = g.commit_after_script(tx, prep);
+                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, false, &sample);
                 stages = g.last_accept_stages;
-                r
+                committed
             };
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             match commit {
@@ -2410,6 +2592,7 @@ impl MempoolHub {
                     accepted.push(r);
                 }
                 Err(e) => {
+                    self.unindex_evicted(&failed_evict);
                     self.rollback_package_accepted(&accepted);
                     // The first member can evict and fail with nothing to roll
                     // back, so the rollback publish does not run.
@@ -2430,6 +2613,7 @@ impl MempoolHub {
             for old in &r.replaced {
                 self.unindex_txid(old);
             }
+            self.unindex_evicted(&r.evicted);
             // Same relay-age clock as an individual admit (`mempool_limit.py` INV).
             let seq = self.next_relay_seq.fetch_add(1, Ordering::Relaxed);
             self.insert_relay_maps(r.txid, tx.compute_wtxid(), seq);
@@ -2460,11 +2644,14 @@ impl MempoolHub {
     /// Samples removed entries' feerates into confirm-memory for the standard
     /// 10-minute fee estimate floor.
     ///
-    /// **No-op while relay is disabled** (IBD catch-up). Callers must not rely
-    /// on per-block strip until [`Self::set_relay_enabled`]`(true)` has run the
-    /// deferred [`Self::purge_confirmed_on_chain`].
+    /// **Strip is a no-op while relay is disabled** (IBD catch-up). Callers
+    /// must not rely on per-block strip until [`Self::set_relay_enabled`]`(true)`
+    /// has run the deferred [`Self::purge_confirmed_on_chain`]. Mined
+    /// prioritisation deltas still drop, including a tx that already left
+    /// the mempool and a block that removes nothing live.
     pub fn remove_for_block(&self, txids: &[Txid]) -> usize {
         if !self.relay_enabled() {
+            self.drop_mined_fee_deltas(txids);
             return 0;
         }
         let utxo = self.utxo_provider();
@@ -2494,6 +2681,7 @@ impl MempoolHub {
         if n > 0 {
             self.unindex_evicted(txids);
         }
+        self.drop_mined_fee_deltas(txids);
         n
     }
 
@@ -2743,10 +2931,17 @@ impl MempoolHub {
             }
             Err(e) => return Err(e),
         };
-        let prevouts = prep.prevouts.clone();
-        {
+        let sample = self.sample_chain_coins(tx, utxo);
+        let (result, failed, prevouts) = {
             let mut g = self.lock_write();
-            g.commit_after_script(tx, prep)?;
+            Self::commit_rechecked(&mut g, tx, prep, utxo, false, &sample)
+        };
+        match result {
+            Ok(r) => self.unindex_evicted(&r.evicted),
+            Err(e) => {
+                self.unindex_evicted(&failed);
+                return Err(e);
+            }
         }
         self.promote_orphans_staged(tx.compute_txid(), utxo);
         Ok(prevouts)
@@ -2778,6 +2973,12 @@ impl MempoolHub {
     /// Drop live txs that are non-final / immature at the new tip (invalidate
     /// of empty blocks still has to evict mempool coinbase spends).
     pub fn evict_after_reorg(&self) {
+        self.evict_after_reorg_between(|_| {});
+    }
+
+    /// Same as [`Self::evict_after_reorg`]. `between` runs after each removal
+    /// and before the next coin check, while no mempool write lock is held.
+    fn evict_after_reorg_between(&self, mut between: impl FnMut(&Self)) {
         let utxo = self.utxo_provider();
         let tip = self.chain_tip_ctx();
         loop {
@@ -2820,16 +3021,22 @@ impl MempoolHub {
             if to_drop.is_empty() {
                 break;
             }
-            let mut g = self.lock_write();
-            let mut removed = false;
-            for id in &to_drop {
-                if g.remove_txid(id).is_ok() {
-                    removed = true;
+            // Parent and in-mempool descendants leave under one write lock.
+            // A template read cannot observe the child after the parent is gone.
+            let mut gone = Vec::new();
+            {
+                let mut g = self.lock_write();
+                for id in &to_drop {
+                    if g.graph.contains(id) {
+                        gone.extend(g.remove_txid_tree(id));
+                    }
                 }
             }
-            if !removed {
+            if gone.is_empty() {
                 break;
             }
+            self.unindex_evicted(&gone);
+            between(self);
         }
         self.publish_fee_floor();
     }
@@ -3017,6 +3224,7 @@ impl MempoolHub {
         if needed.is_empty() && prefill_wtxids.is_empty() {
             return Some((HashMap::new(), crate::compact::CmpctFillSets::default()));
         }
+        self.meter_cmpct_avail.fetch_add(1, Ordering::Relaxed);
         let g = self.inner.try_read().ok()?;
         let keys = ShortId::calculate_siphash_keys(header, nonce);
         let sid_of = |tx: &Transaction| -> ShortId {
@@ -3349,6 +3557,7 @@ impl MempoolHub {
             replaced: Vec::new(),
             replaced_scripthashes: Vec::new(),
             replaced_txs: Vec::new(),
+            evicted: Vec::new(),
         })
     }
 
@@ -4011,6 +4220,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// Ghosts left in accept-time order by an earlier eviction occupy the
+    /// 256-entry scan. Unindexing them lets the next scan expire a live tx
+    /// that is already past the horizon.
+    #[test]
+    fn expire_stale_reaches_a_live_tx_behind_evicted_ghosts() {
+        const GHOSTS: usize = 256;
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.set_expiry_hours(1);
+        hub.note_mock_now(10_000);
+        let live = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+        let live_id = live.compute_txid();
+        hub.accept_tx(&live).expect("admit live");
+        {
+            let mut by_tx = hub.wtxid_by_txid.lock().unwrap();
+            let mut ats = hub.accept_at.lock().unwrap();
+            let mut order = hub.expiry_order.lock().unwrap();
+            for i in 0..GHOSTS {
+                let mut raw = [0u8; 32];
+                raw[0..4].copy_from_slice(&(i as u32 + 1).to_le_bytes());
+                let txid = Txid::from_byte_array(raw);
+                raw[31] = 1;
+                let wtxid = Wtxid::from_byte_array(raw);
+                let at = (i as u64) + 1;
+                by_tx.insert(txid, wtxid);
+                ats.insert(wtxid, at);
+                order.insert((at, wtxid), txid);
+            }
+        }
+        hub.min_live_accept_at.store(1, Ordering::Relaxed);
+        hub.note_mock_now(10_000 + 3600 + 5);
+        assert!(
+            hub.expire_stale() >= GHOSTS,
+            "ghosts in front of the scan must leave the expiry index"
+        );
+        assert!(
+            hub.contains(&live_id),
+            "one scan still stops after 256 entries"
+        );
+        assert_eq!(hub.expire_stale(), 1);
+        assert!(!hub.contains(&live_id));
+        assert!(hub.wtxid_by_txid.lock().unwrap().get(&live_id).is_none());
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != live_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn try_expire_stale_skips_when_the_order_lock_is_held() {
         let (_store, owned_q, owned_cbs) = pad_cbs(3);
@@ -4460,7 +4722,7 @@ mod tests {
         assert!(hub.relay_seq_of(&sib_w).is_some());
         assert!(hub.accept_time_txid(&sib_id).is_some());
         let tmpl = hub.template_updates();
-        hub.rollback_1p1c_parent(&lpid);
+        hub.rollback_1p1c_parent(&lpid, &[]);
         assert!(!hub.contains(&lpid));
         assert!(!hub.contains(&sib_id));
         assert!(
@@ -4729,8 +4991,8 @@ mod tests {
         hub.accept_tx(&child).expect("non-coinbase chain spend");
         let s = hub.sample_reset_perf();
         assert_eq!(
-            s.get_coin, 1,
-            "chain-spend index_txid must not re-Query the same prevout (got {})",
+            s.get_coin, 2,
+            "prepare and the pre-lock recheck each resolve the coin once (got {})",
             s.get_coin
         );
         assert_eq!(
@@ -4855,6 +5117,338 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store);
     }
 
+    /// Disconnecting the parent's coin must not leave the child selectable.
+    /// The check runs after the parent is gone and before the function returns.
+    #[test]
+    fn reorg_evict_does_not_template_a_parentless_child() {
+        let (store, q, cbs) = copy_maturity_pad(3);
+        let mp = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = spend_true(cbs[0], 1_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        hub.accept_tx(&parent).expect("parent");
+        let child = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_9998_0000),
+                script_pubkey: spk,
+            }],
+        };
+        let child_id = child.compute_txid();
+        hub.accept_tx(&child).expect("child");
+        while q.tip_height().map(|h| h.0).unwrap_or(0) > 0 {
+            q.disconnect_tip().unwrap();
+        }
+        let mut saw_parentless = false;
+        hub.evict_after_reorg_between(|hub| {
+            let picked: Vec<_> = hub
+                .select_block_template(hub.template_budget(0))
+                .into_iter()
+                .map(|(_, s)| s.txid)
+                .collect();
+            if !hub.contains(&parent_id) && picked.contains(&child_id) {
+                saw_parentless = true;
+            }
+        });
+        assert!(
+            !saw_parentless,
+            "template selected the child after its in-mempool parent was removed"
+        );
+        assert!(!hub.contains(&parent_id));
+        assert!(!hub.contains(&child_id));
+        assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&parent_id));
+        assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&child_id));
+        let _ = std::fs::remove_dir_all(&mp);
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    /// A coin spent after prepare and before commit is not inserted.
+    #[test]
+    fn commit_refuses_a_coin_spent_during_script_check() {
+        use std::sync::atomic::AtomicUsize;
+        /// First `get_coin` returns the prepared coin. Later calls are spent.
+        struct Flip {
+            map: HashMap<OutPoint, Coin>,
+            hits: AtomicUsize,
+        }
+        impl UtxoProvider for Flip {
+            fn get_coin(&self, op: &OutPoint) -> Option<Coin> {
+                let n = self.hits.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    self.map.get(op).cloned()
+                } else {
+                    None
+                }
+            }
+        }
+        let (_store, q, _cbs) = pad_cbs(3);
+        let mp = tmp();
+        let hub = MempoolHub::open(&mp, q).unwrap();
+        hub.set_relay_enabled(true);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let op = OutPoint {
+            txid: Txid::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let coin = Coin {
+            txout: TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: spk.clone(),
+            },
+            create_height: 1,
+            create_mtp: 0,
+            is_coinbase: false,
+            create_fk: None,
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: op,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: spk,
+            }],
+        };
+        let utxo = Flip {
+            map: HashMap::from([(op, coin)]),
+            hits: AtomicUsize::new(0),
+        };
+        let err = hub.accept_with_utxo(&tx, &utxo, None, false).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::MissingPrevout(missing) if missing == op),
+            "coin spent during the script check must conflict, got {err}"
+        );
+        let id = tx.compute_txid();
+        assert!(!hub.contains(&id));
+        assert!(!hub.sh_index.lock().unwrap().by_tx.contains_key(&id));
+        let _ = std::fs::remove_dir_all(&mp);
+    }
+
+    /// Package member 0 can evict X and member 1 can then fail. X leaves the
+    /// relay maps with that rollback, and a prioritisation delta stays.
+    #[test]
+    fn package_rollback_unindexes_slot_eviction_and_keeps_delta() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let victim = spend_true(cbs[0], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        hub.prioritise_tx(victim_id, 11);
+        hub.accept_tx(&victim).expect("victim");
+        rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
+        let parent = spend_true(cbs[1], 50_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        let mut bad_child = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk,
+            }],
+        };
+        bad_child.input[0].witness = Witness::from_slice(&[vec![0x01], vec![0x50, 0x01]]);
+        let err = hub
+            .accept_package(&[parent, bad_child])
+            .expect_err("annex child rolls the package back");
+        assert!(matches!(err, AcceptError::Policy("libre annex")), "{err}");
+        assert!(!hub.contains(&parent_id));
+        assert!(!hub.contains(&victim_id));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&victim_id),
+            "rolled-back member's eviction must leave sh_index"
+        );
+        assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&victim_id));
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != victim_id));
+        assert_eq!(hub.fee_delta(&victim_id), 11);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 1-parent-1-child admit that commits the parent, evicts for a slot,
+    /// then fails the child, drops the evicted tx's relay maps.
+    #[test]
+    fn onep_rollback_unindexes_slot_eviction() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let victim = spend_true(cbs[0], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        hub.accept_tx(&victim).expect("victim");
+        rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
+        let parent = spend_true(cbs[1], 50_000, ScriptBuf::from_bytes(vec![0x00]));
+        let parent_id = parent.compute_txid();
+        assert!(hub.try_note_extra_compact(&parent));
+        let child = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_id,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: spk,
+            }],
+        };
+        let _ = hub.accept_tx(&child);
+        assert!(!hub.contains(&parent_id));
+        assert!(!hub.contains(&victim_id));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&victim_id),
+            "1p1c rollback must unindex the parent's eviction"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Eviction keeps a prioritisation delta. A later duplicate of the
+    /// survivor does not apply that eviction again. Mining drops the delta.
+    #[test]
+    fn eviction_keeps_priority_and_duplicate_does_not_replay_it() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let low = spend_true(cbs[0], 1_000, spk.clone());
+        let high = spend_true(cbs[1], 50_000, spk);
+        let budget = low.weight().to_wu();
+        let hub = MempoolHub::open_with_weight(&dir, q, budget).unwrap();
+        hub.set_relay_enabled(true);
+        let low_id = low.compute_txid();
+        let high_id = high.compute_txid();
+        hub.prioritise_tx(low_id, 9);
+        hub.prioritise_tx(high_id, 4);
+        hub.accept_tx(&low).expect("low");
+        hub.accept_tx(&high).expect("high evicts low");
+        assert!(!hub.contains(&low_id));
+        assert_eq!(hub.fee_delta(&low_id), 9);
+        let updates = hub.template_updates();
+        let err = hub.accept_tx(&high).expect_err("already in the pool");
+        assert!(matches!(err, AcceptError::Duplicate(_)), "{err}");
+        assert_eq!(hub.template_updates(), updates);
+        assert_eq!(hub.fee_delta(&low_id), 9);
+        assert!(hub.remove_for_block(&[high_id]) >= 1);
+        assert_eq!(hub.fee_delta(&high_id), 0);
+        assert_eq!(hub.fee_delta(&low_id), 9);
+        assert_eq!(hub.remove_for_block(&[low_id]), 0);
+        assert_eq!(
+            hub.fee_delta(&low_id),
+            0,
+            "mining an evicted tx drops its prioritisation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full slot table evicts a live tx to admit the next one, and that
+    /// tx leaves the relay maps with the graph.
+    #[test]
+    fn slot_evict_unindexes_evicted_relay_maps() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let hub = MempoolHub::open(&dir, q).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let first = spend_true(cbs[0], 2_000, spk.clone());
+        let second = spend_true(cbs[1], 2_000, spk);
+        let first_id = first.compute_txid();
+        hub.accept_tx(&first).expect("first admit");
+        rbitcoin_mempool::testutil::pin_full_slot_table(&mut hub.lock_write().store);
+        hub.accept_tx(&second)
+            .expect("second admit evicts for a slot");
+        assert!(!hub.contains(&first_id));
+        assert!(hub.contains(&second.compute_txid()));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&first_id),
+            "slot eviction must drop sh_index"
+        );
+        assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&first_id));
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != first_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A single-tx admit that trims for the weight budget must drop the
+    /// evicted tx from the relay maps, not only the graph.
+    #[test]
+    fn admission_trim_unindexes_evicted_relay_maps() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let dir = tmp();
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let low = spend_true(cbs[0], 1_000, spk.clone());
+        let high = spend_true(cbs[1], 50_000, spk);
+        let budget = low.weight().to_wu();
+        let hub = MempoolHub::open_with_weight(&dir, q, budget).unwrap();
+        hub.set_relay_enabled(true);
+        hub.note_mock_now(10);
+        let low_id = low.compute_txid();
+        let high_id = high.compute_txid();
+        hub.accept_tx(&low).expect("low feerate fits");
+        hub.accept_tx(&high)
+            .expect("higher feerate evicts the low one");
+        assert!(
+            !hub.contains(&low_id),
+            "the low feerate tx leaves the graph"
+        );
+        assert!(hub.contains(&high_id));
+        assert!(
+            !hub.sh_index.lock().unwrap().by_tx.contains_key(&low_id),
+            "fee eviction must leave sh_index"
+        );
+        assert!(!hub.wtxid_by_txid.lock().unwrap().contains_key(&low_id));
+        assert!(hub
+            .expiry_order
+            .lock()
+            .unwrap()
+            .values()
+            .all(|id| *id != low_id));
+        assert!(hub.sh_index.lock().unwrap().by_tx.contains_key(&high_id));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Confirm/RBF unindex must drop `relay_seq` / `accept_at` for the gone
     /// wtxid and leave a still-live sibling indexed.
     #[test]
@@ -4932,8 +5526,14 @@ mod tests {
         let mp = MempoolHub::open(&dir, Arc::new(q)).unwrap();
         assert!(!mp.relay_enabled());
         let dummy = Txid::from_byte_array([9u8; 32]);
-        // No-op while relay off (IBD catch-up must not strip per block).
+        mp.prioritise_tx(dummy, 3);
+        // Strip stays deferred while relay is off. The mined delta still drops.
         assert_eq!(mp.remove_for_block(&[dummy]), 0);
+        assert_eq!(
+            mp.fee_delta(&dummy),
+            0,
+            "a mined delta drops while relay is off"
+        );
         // Enabling relay runs purge (empty → 0) and arms per-block strip.
         mp.set_relay_enabled(true);
         assert!(mp.relay_enabled());
@@ -6703,8 +7303,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
+    /// Prepare resolves coins off the write lock. A stable confirmed view
+    /// re-reads those coins before the commit takes the lock.
     #[test]
-    fn accept_commit_does_not_query_under_write() {
+    fn accept_rechecks_confirmed_input_under_write() {
         let (_store, owned_q, owned_cbs) = pad_cbs(3);
         let q = &owned_q;
         let cbs = owned_cbs.as_slice();
@@ -6720,6 +7322,9 @@ mod tests {
         impl UtxoProvider for ProbeUtxo<'_> {
             fn note_spender(&self, tx: &Transaction) {
                 self.inner.note_spender(tx);
+            }
+            fn utxo_view_stamp(&self) -> Option<u64> {
+                self.inner.utxo_view_stamp()
             }
             fn get_coin(&self, op: &OutPoint) -> Option<rbitcoin_mempool::Coin> {
                 let h = Arc::clone(&self.hub);
@@ -6748,7 +7353,17 @@ mod tests {
         assert_eq!(
             hits.load(Ordering::Relaxed),
             0,
-            "QueryUtxoProvider must not run while inner write is held"
+            "a stable UTXO view re-reads the confirmed input off the write lock"
+        );
+        hits.store(0, Ordering::Relaxed);
+        let held = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x52]));
+        let _view = q.store().hold_utxo_view();
+        hub.accept_with_utxo(&held, &probe, None, false)
+            .expect("accept while the view is held");
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "a held UTXO view re-reads the confirmed input under the write lock"
         );
         let _ = std::fs::remove_dir_all(&mp_dir);
     }

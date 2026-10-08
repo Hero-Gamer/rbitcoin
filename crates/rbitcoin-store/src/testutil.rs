@@ -134,3 +134,22 @@ pub fn drop_unsynced_tx_head_pages(root: &Path) {
         std::io::Write::write_all(&mut f, &vec![0u8; slots as usize]).expect("zero slot pages");
     }
 }
+
+/// Checkpoint an explicit height, running `between` after `sync_data`.
+pub fn checkpoint_spend_through_between(
+    store: &Store,
+    height: u32,
+    between: impl FnOnce(&Store),
+) -> Result<(), crate::StoreError> {
+    store.checkpoint_spend_through_between(height, between)
+}
+
+/// Disconnect-generation sample, then snapshot height, with a hook between
+/// them and a hook during `sync_data`.
+pub fn checkpoint_observed_spend_gap(
+    store: &Store,
+    after_first_read: impl FnOnce(&Store),
+    during_sync: impl FnOnce(&Store),
+) -> Result<(), crate::StoreError> {
+    store.checkpoint_observed_spend_gap(after_first_read, during_sync)
+}
