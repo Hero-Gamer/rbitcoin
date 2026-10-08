@@ -589,6 +589,7 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
             txdata: vec![coinbase, spend],
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
+        rbitcoin_consensus::grind_regtest_pow(&mut block.header);
         let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
         let hash = block.block_hash();
         let peers = crate::peers::PeerHub::new();
@@ -1577,6 +1578,7 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
         ],
     };
     block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
 
     let hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[]).unwrap();
     // Mempool present but empty live → Some(missing) not None.

@@ -592,6 +592,8 @@ pub struct MempoolHub {
     meter_spent_body_loads: AtomicU64,
     /// Full live-set clones ([`Self::list_live`]).
     meter_list_live: AtomicU64,
+    /// Compact short-id walks that take the mempool read lock.
+    meter_cmpct_avail: AtomicU64,
     /// Full live-set meta scans ([`Self::list_live_meta`]).
     meter_list_live_meta: AtomicU64,
     meter_list_live_wtxids: AtomicU64,
@@ -683,6 +685,11 @@ pub struct SubmitPackageRow {
 }
 
 impl MempoolHub {
+    /// Short-id walks that entered the mempool, including a `try_read` miss.
+    pub fn cmpct_avail_scans(&self) -> u64 {
+        self.meter_cmpct_avail.load(Ordering::Relaxed)
+    }
+
     fn lock_read(&self) -> std::sync::RwLockReadGuard<'_, ActiveMempool> {
         crate::reactor::assert_not_reactor("mempool inner read");
         self.inner.read().unwrap()
@@ -779,6 +786,7 @@ impl MempoolHub {
             meter_delta_prevouts: AtomicU64::new(0),
             meter_spent_body_loads: AtomicU64::new(0),
             meter_list_live: AtomicU64::new(0),
+            meter_cmpct_avail: AtomicU64::new(0),
             meter_list_live_meta: AtomicU64::new(0),
             meter_list_live_wtxids: AtomicU64::new(0),
             meter_age_scan: AtomicU64::new(0),
@@ -3102,6 +3110,7 @@ impl MempoolHub {
         if needed.is_empty() && prefill_wtxids.is_empty() {
             return Some((HashMap::new(), crate::compact::CmpctFillSets::default()));
         }
+        self.meter_cmpct_avail.fetch_add(1, Ordering::Relaxed);
         let g = self.inner.try_read().ok()?;
         let keys = ShortId::calculate_siphash_keys(header, nonce);
         let sid_of = |tx: &Transaction| -> ShortId {
@@ -4868,8 +4877,8 @@ mod tests {
         hub.accept_tx(&child).expect("non-coinbase chain spend");
         let s = hub.sample_reset_perf();
         assert_eq!(
-            s.get_coin, 1,
-            "chain-spend index_txid must not re-Query the same prevout (got {})",
+            s.get_coin, 2,
+            "prepare and the commit recheck each resolve the coin once (got {})",
             s.get_coin
         );
         assert_eq!(

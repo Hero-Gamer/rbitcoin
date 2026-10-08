@@ -3872,6 +3872,14 @@ async fn on_cmpctblock(
         persist_pending_header_path(hub, &follow.pending_headers, hash);
         return Ok(());
     }
+    // Claimed proof of work before any short-id walk. Once the tip meets
+    // minimum chain work the work-path walk does not check this header.
+    if !hub.header_claimed_pow_ok(&hsi.header) {
+        rbitcoin_log::info!("{}", crate::chain::accept_block_header_nodos_log(hash));
+        misbehaving(&mut follow.ban_score, session);
+        take_requested_block(hub, &mut follow.requested_blocks, &hash);
+        return Ok(());
+    }
     on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash).await
 }
 
@@ -4583,10 +4591,10 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
     if block.header.prev_blockhash != tip {
         return;
     }
-    hub.remember_cmpct_prefill_from_block(block);
     if hub.ensure_header(&block.header).is_err() {
         return;
     }
+    hub.remember_cmpct_prefill_from_block(block);
     let Some(ph) = from.and_then(|s| s.peer_hub()) else {
         return;
     };
