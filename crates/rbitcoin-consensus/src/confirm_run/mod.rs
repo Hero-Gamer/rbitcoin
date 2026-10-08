@@ -8,8 +8,9 @@
 //!   structure + plan_batch (binds carried BQ keys) + pin denserels → assemble
 //!   (uses intake wire; **no Class-A wire rebuild**)
 //! SCRIPTS STAGE (`ibd-confirm` OS thread publishes waves; `rbtc-scripts-*` steal):
-//!   script verify and live filter/tweak jobs on one wave. No Query, no disk.
-//!   No coordinator threads. The next batch starts when the wave is fully claimed.
+//!   script verify on one wave, then live filter/tweak jobs on a second.
+//!   No Query, no disk. No coordinator threads. The next batch starts when
+//!   both waves are fully claimed.
 //! WRITE STAGE (ibd-confirm-write OS thread, FIFO):
 //!   Class A commit (if plan) + structural + class_c + spend annotate + tip GC.
 //!   `tx.head` write-behind drain runs on process-wide `ibd-confirm-head`
@@ -21,8 +22,8 @@
 //!
 //! **Scripts purity:** [`confirm_scripts_phase`] is pure
 //! [`LoadedBatch`] → [`ScriptOkBatch`]. IBD [`drive_script_waves_with`] publishes
-//! the next batch when the front wave has nothing left to claim, then writes
-//! in height order once that wave has finished. Steal workers unpark the
+//! the next batch when both waves have nothing left to claim, then writes
+//! in height order once both waves have finished. Steal workers unpark the
 //! publisher when a wave completes.
 
 use crate::block::{
@@ -205,9 +206,13 @@ pub struct ConfirmLoadOutcome {
 /// Outcome of the scripts stage: ready batch + pure script wall.
 pub struct ConfirmScriptOutcome {
     pub batch: ScriptOkBatch,
-    /// Script verify only (when produced by [`confirm_scripts_phase`]).
+    /// Script-wave completion offset from batch start.
     pub work_ns: u64,
-    /// Filter and tweak assemble on this stage. Not part of `work_ns`.
+    /// Index-wave completion offset from the same batch start. Zero when the
+    /// batch has no index jobs. Not [`Self::idx_asm_ns`].
+    pub index_done_ns: u64,
+    /// Filter and tweak execution only: first index job start through index-wave
+    /// completion. Not time spent queued behind the script wave.
     pub idx_asm_ns: u64,
 }
 
@@ -431,7 +436,5 @@ impl ScriptOkBatch {
 
 #[cfg(test)]
 mod spend_durable_tests;
-#[cfg(test)]
-mod tweak_overlap_tests;
 #[cfg(test)]
 mod write_idempotent_tests;

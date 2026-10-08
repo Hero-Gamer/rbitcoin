@@ -1,16 +1,14 @@
 //! Scripts stage (pure CPU verify, plus live filter and tweak jobs).
 
-use super::index::{self, FilterJob, KindClock, TweakJob};
+use super::index::{self, IndexJob};
 use super::*;
 use crate::block::{verify_one_script_job, ScriptCheckJob};
-#[cfg(not(test))]
-use crate::script_pool::help_steal;
 use crate::script_pool::{
-    fg_has_unclaimed, set_script_publisher, start_for_each_owned, start_for_each_pooled, OwnedWave,
-    STEAL_CHUNK,
+    fg_has_unclaimed, help_steal, set_script_publisher, start_for_each_owned,
+    start_for_each_pooled, OwnedWave,
 };
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -51,6 +49,7 @@ fn take_script_jobs(
 fn outcome_from(
     batch: LoadedBatch,
     work_ns: u64,
+    index_done_ns: u64,
     seal: super::index::IndexSeal,
     idx_asm_ns: u64,
 ) -> ConfirmScriptOutcome {
@@ -68,82 +67,26 @@ fn outcome_from(
             index_seal: seal,
         },
         work_ns,
+        index_done_ns,
         idx_asm_ns,
     }
 }
 
-struct ScriptStage {
-    job: ScriptCheckJob,
-    clock: Arc<KindClock>,
-}
-
-enum StageJob {
-    Script(ScriptStage),
-    Tweak(TweakJob),
-    Filter(FilterJob),
-}
-
-fn apply_stage_job(job: &StageJob) -> Result<(), ConsensusError> {
-    match job {
-        StageJob::Script(stage) => {
-            verify_one_script_job(&stage.job)?;
-            stage.clock.job_done();
-            Ok(())
-        }
-        StageJob::Tweak(job) => index::apply_tweak(job),
-        StageJob::Filter(job) => index::apply_filter(job),
-    }
-}
-
-/// 32 script jobs, then 32 tweak jobs, repeating. Filters sit at the end so
-/// claim order does not drain every script job before any tweak.
-fn stripe_jobs(
-    scripts: Vec<ScriptCheckJob>,
-    tweaks: Vec<TweakJob>,
-    filters: Vec<FilterJob>,
-    script_clock: Arc<KindClock>,
-) -> Vec<StageJob> {
-    let mut scripts = scripts.into_iter();
-    let mut tweaks = tweaks.into_iter();
-    let mut out = Vec::new();
-    loop {
-        let mut n = 0;
-        for job in scripts.by_ref().take(STEAL_CHUNK) {
-            out.push(StageJob::Script(ScriptStage {
-                job,
-                clock: Arc::clone(&script_clock),
-            }));
-            n += 1;
-        }
-        for job in tweaks.by_ref().take(STEAL_CHUNK) {
-            out.push(StageJob::Tweak(job));
-            n += 1;
-        }
-        if n == 0 {
-            break;
-        }
-    }
-    for job in filters {
-        out.push(StageJob::Filter(job));
-    }
-    out
-}
-
-fn publish_stage(jobs: Vec<StageJob>) -> Result<Option<OwnedWave<StageJob>>, ConsensusError> {
-    let single_script = matches!(jobs.as_slice(), [StageJob::Script(_)]);
-    if single_script {
-        start_for_each_owned(jobs, apply_stage_job)
-    } else {
-        start_for_each_pooled(jobs, apply_stage_job)
-    }
+fn apply_script(job: &ScriptCheckJob) -> Result<(), ConsensusError> {
+    verify_one_script_job(job)
 }
 
 struct Inflight {
     batch: LoadedBatch,
-    wave: Option<OwnedWave<StageJob>>,
+    t0: Instant,
+    /// Older wave. Workers claim it before the index wave.
+    script_wave: Option<OwnedWave<ScriptCheckJob>>,
+    index_wave: Option<OwnedWave<IndexJob>>,
     slots: Vec<index::HeightSlots>,
-    script_clock: Arc<KindClock>,
-    index_clock: Arc<KindClock>,
+    index_started: Arc<OnceLock<Instant>>,
+    script_done: OnceLock<u64>,
+    index_done: OnceLock<u64>,
+    idx_asm: OnceLock<u64>,
     meta: ScriptsBatchMeta,
 }
 
@@ -156,53 +99,91 @@ impl Inflight {
         let meta = ScriptsBatchMeta::from_batch(&batch, mat_ns);
         let scripts =
             take_script_jobs(&mut batch.prepared, &batch.script_preverified, &batch.stats);
-        let index_jobs = match index::prepare_index_jobs(&batch, t0) {
+        let index_jobs = match index::prepare_index_jobs(&batch) {
             Ok(jobs) => jobs,
             Err(e) => return Err((e, meta)),
         };
-        let script_clock = KindClock::new(t0, scripts.len(), t0.elapsed().as_nanos() as u64);
-        let staged = stripe_jobs(
-            scripts,
-            index_jobs.tweaks,
-            index_jobs.filters,
-            Arc::clone(&script_clock),
-        );
-        let wave = match publish_stage(staged) {
+        let index_started = index_jobs.started;
+        let script_wave = match start_for_each_owned(scripts, apply_script) {
+            Ok(w) => w,
+            Err(e) => return Err((e, meta)),
+        };
+        let index_wave = match start_for_each_pooled(index_jobs.jobs, index::apply_index_job, 1) {
             Ok(w) => w,
             Err(e) => return Err((e, meta)),
         };
         let inf = Self {
             batch,
-            wave,
+            t0,
+            script_wave,
+            index_wave,
             slots: index_jobs.slots,
-            script_clock,
-            index_clock: index_jobs.clock,
+            index_started,
+            script_done: OnceLock::new(),
+            index_done: OnceLock::new(),
+            idx_asm: OnceLock::new(),
             meta,
         };
-        let _ = inf.is_complete();
+        inf.note_clocks();
         Ok(inf)
     }
 
-    fn is_complete(&self) -> bool {
-        self.wave.as_ref().is_none_or(|w| w.is_complete())
+    fn note_clocks(&self) {
+        let scripts_done = self.script_wave.as_ref().is_none_or(|w| w.is_complete());
+        if scripts_done {
+            let _ = self.script_done.set(self.t0.elapsed().as_nanos() as u64);
+        }
+        if self.index_wave.as_ref().is_some_and(|w| w.is_complete()) {
+            self.stamp_index();
+        }
     }
 
-    fn finish(self) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConsensusError> {
-        if let Some(w) = self.wave {
-            w.finish()?;
+    fn stamp_index(&self) {
+        let now = Instant::now();
+        let _ = self
+            .index_done
+            .set(now.saturating_duration_since(self.t0).as_nanos() as u64);
+        let asm = self
+            .index_started
+            .get()
+            .map(|start| now.saturating_duration_since(*start).as_nanos() as u64)
+            .unwrap_or(0);
+        let _ = self.idx_asm.set(asm);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.note_clocks();
+        let scripts_done = self.script_wave.as_ref().is_none_or(|w| w.is_complete());
+        let index_done = self.index_wave.as_ref().is_none_or(|w| w.is_complete());
+        scripts_done && index_done
+    }
+
+    fn finish(mut self) -> Result<(ConfirmScriptOutcome, ScriptsBatchMeta), ConsensusError> {
+        let script_res = match self.script_wave.take() {
+            Some(w) => w.finish(),
+            None => Ok(()),
+        };
+        let _ = self.script_done.set(self.t0.elapsed().as_nanos() as u64);
+        let had_index = self.index_wave.is_some();
+        let index_res = match self.index_wave.take() {
+            Some(w) => w.finish(),
+            None => Ok(()),
+        };
+        if had_index {
+            self.stamp_index();
         }
+        script_res?;
+        index_res?;
         let seal = if self.slots.is_empty() {
             index::IndexSeal::default()
         } else {
             index::rows_from_heights(&self.slots)?
         };
+        let work_ns = self.script_done.get().copied().unwrap_or(0);
+        let index_done_ns = self.index_done.get().copied().unwrap_or(0);
+        let idx_asm_ns = self.idx_asm.get().copied().unwrap_or(0);
         Ok((
-            outcome_from(
-                self.batch,
-                self.script_clock.ns(),
-                seal,
-                self.index_clock.ns(),
-            ),
+            outcome_from(self.batch, work_ns, index_done_ns, seal, idx_asm_ns),
             self.meta,
         ))
     }
@@ -215,9 +196,9 @@ pub fn confirm_scripts_phase(batch: LoadedBatch) -> Result<ConfirmScriptOutcome,
     }
 }
 
-/// IBD scripts stage: one wave per batch (script, tweak, and filter jobs).
-/// The next batch is published when that wave has nothing left to claim.
-/// Write handoff stays in height order, after the front wave has finished.
+/// IBD scripts stage: a script wave, then an index wave, per batch.
+/// The next batch is published when both waves have nothing left to claim.
+/// Write handoff stays in height order, after both waves have finished.
 ///
 /// `on_take` receives the recv-wait before this batch was taken (zero when
 /// `try_recv` hit a ready item).
@@ -256,9 +237,6 @@ pub fn drive_script_waves_with(
                 DriveStart::Abort | DriveStart::Stop | DriveStart::Idle => break,
             }
         }
-        // Tests skip help-steal. A chunk of 32 can hold every job of a small
-        // batch, and the publisher would run that chunk itself.
-        #[cfg(not(test))]
         if help_steal() {
             continue;
         }

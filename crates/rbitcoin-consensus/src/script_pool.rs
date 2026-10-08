@@ -215,9 +215,7 @@ pub(crate) fn fg_has_unclaimed() -> bool {
 /// Run one steal chunk on the caller (not a steal worker). Used by the
 /// scripts stage thread to finish a wave tail instead of parking.
 ///
-/// Tests do not call this. A 32-job chunk can hold a whole small batch, and
-/// the publisher would run the blocking tweak job itself.
-#[cfg_attr(test, allow(dead_code))]
+/// A one-job index claim can run on `ibd-confirm` when the workers are busy.
 pub(crate) fn help_steal() -> bool {
     if on_steal_worker() {
         return false;
@@ -301,15 +299,17 @@ pub(crate) fn start_for_each_owned_chunk<T: Sync>(
     start_wave(items, f, chunk, true)
 }
 
-/// Like [`start_for_each_owned`], but one job is still published to the pool.
+/// Like [`start_for_each_owned`], but a single job is still published.
 ///
-/// [`start_for_each_owned`] runs a single item on the caller. A one-tx tweak
-/// batch must not do that: it would block `ibd-confirm` and the next batch.
+/// [`start_for_each_owned`] runs a single item on the caller. The index wave
+/// must not do that: one filter would block `ibd-confirm` inside `start`.
+/// `chunk` of 0 is treated as 1.
 pub(crate) fn start_for_each_pooled<T: Sync>(
     items: Vec<T>,
     f: fn(&T) -> Result<(), ConsensusError>,
+    chunk: usize,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
-    start_wave(items, f, STEAL_CHUNK, false)
+    start_wave(items, f, chunk, false)
 }
 
 fn start_wave<T: Sync>(
