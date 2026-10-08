@@ -139,7 +139,7 @@ show as `core-functional / core-functional` and so on.
 | Check | Who |
 |-------|-----|
 | `qc` `test` `windows` `macos` `coverage` | Every PR (`ci.yml`). `qc` runs fmt, ast-grep, deny, script self-tests, clippy, then nixos-module-eval. |
-| `mutants` | Nightly `47 2 * * *` (19:47 Pacific during PDT) and `workflow_dispatch` (`mutants.yml`). Workspace tests. New mutants until a quarter of the budget, then the backlog. 5 hour budget in one job. Not required. Cursor and `MISSED` lines are on the `mutants-state` branch. |
+| `mutants` | Nightly `47 0 * * *` (17:47 Pacific during PDT) and `workflow_dispatch` (`mutants.yml`). Workspace tests. New mutants until half of the first job's budget, then the backlog; the second job does not open another new window. 8 hour budget in two jobs. Not required. Cursor and `MISSED` lines are on the `mutants-state` branch. |
 | `core-functional` | Nightly, `workflow_dispatch`, label **`core-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `overlay-functional` | Nightly (`42 6`), `workflow_dispatch`, label **`overlay-functional`**; via `release-gate.yml` on label **`release`** **or** ship version |
 | `warnet-example` | Label **`warnet`**, `workflow_dispatch`; via `release-gate.yml` on label **`release`** **or** ship version. Two-tank Docker lab. |

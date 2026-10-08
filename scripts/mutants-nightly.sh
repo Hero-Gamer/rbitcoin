@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # Time-boxed workspace mutants. New lines since the cursor first, then a
-# rotating backlog. While both queues still have work, new batches run
-# until a quarter of this job's budget has elapsed, then the backlog.
-# A later invocation in the same night does not open another new window.
-# MISSED is written for humans; it does not fail the run.
+# rotating backlog. One job spends the first half of its budget on new
+# mutants when both queues still have work, then the backlog. A later job
+# in the same night does not open another new window. MISSED is written
+# for humans; it does not fail the run.
 # Owner: TESTING.md (Mutation testing).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-# 5 hours. One workspace suite is the unit of work, and two of them in
+# 4 hours for this job. The nightly workflow runs two of these, 8 hours
+# total. One workspace suite is the unit of work, and two of them in
 # parallel do not fit a hosted runner, so this is -j 1. The job timeout
 # is 30 minutes longer so the script can stop itself and the workflow can
 # publish the state branch. GitHub-hosted jobs cannot run longer than 6 hours.
-BUDGET_SEC="${MUTANTS_BUDGET_SEC:-18000}"
+BUDGET_SEC="${MUTANTS_BUDGET_SEC:-14400}"
 # One cargo-mutants process per source file. 27.1.0 emits `..` struct
 # field deletes without applying --re, so a workspace-wide --re batch
 # retests every such delete. --file keeps that repeat inside this file.
