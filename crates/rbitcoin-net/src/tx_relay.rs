@@ -5457,6 +5457,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The orphan 1p1c path commits both members before the trim. When the
+    /// trim drops them, the conflict the parent replaced comes back.
+    #[test]
+    fn failed_1p1c_trim_restores_the_conflict() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let victim = spend_true(cbs[0], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        let dir = tmp();
+        let hub = MempoolHub::open_with_weight(&dir, q, victim.weight().to_wu() + 400).unwrap();
+        hub.set_relay_enabled(true);
+        hub.accept_tx(&victim).expect("victim");
+        let parent = spend_true(cbs[0], 20_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        assert!(hub.try_note_extra_compact(&parent));
+        let mut child = spend_vout(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            parent.output[0].value.to_sat() - 5_000,
+        );
+        child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
+        let err = hub.accept_tx(&child);
+        assert!(
+            err.is_err(),
+            "an over-budget 1p1c must not stay, got {err:?}"
+        );
+        assert!(
+            !hub.contains(&parent_id),
+            "trimmed parent must be rolled back"
+        );
+        assert!(!hub.contains(&child.compute_txid()));
+        assert!(
+            hub.contains(&victim_id),
+            "the conflict the parent replaced must be restored"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Eviction keeps a prioritisation delta. A later duplicate of the
     /// survivor does not apply that eviction again. Mining drops the delta.
     #[test]

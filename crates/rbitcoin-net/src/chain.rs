@@ -249,6 +249,15 @@ pub(crate) fn reject_is_mutated(reason: &str) -> bool {
 
 /// Core logs a contextual header reject (`bad-version`, `time-too-new`) with
 /// its reason. The returned error keeps the store-facing Display string.
+/// A consensus header failure names the block so it can be marked invalid.
+/// A store fault stays a store fault: it must not be cached as `BLOCK_FAILED`.
+fn connect_failed_for_header(hash: [u8; 32], e: NetError) -> NetError {
+    match e {
+        NetError::Consensus(msg) => NetError::ConnectFailed { hash, msg },
+        other => other,
+    }
+}
+
 fn header_reject(header: &Header, e: &rbitcoin_consensus::ConsensusError) -> NetError {
     if let rbitcoin_consensus::ConsensusError::Store(se) = e {
         return NetError::store(se);
@@ -2452,10 +2461,7 @@ impl ChainHub {
                     .map_err(|e| header_reject(&b.header, &e))
             };
             if let Err(e) = checked {
-                return Err(NetError::ConnectFailed {
-                    hash: b.block_hash().to_byte_array(),
-                    msg: e.to_string(),
-                });
+                return Err(connect_failed_for_header(b.block_hash().to_byte_array(), e));
             }
             batch.insert(
                 b.block_hash().to_byte_array(),
@@ -3226,7 +3232,26 @@ pub fn check_block_proposal_with(
         &block.block_hash().to_byte_array(),
         mtp,
     );
+    // Structure counts legacy sigops only. Prevouts are already in hand, so
+    // P2SH and witness sigops count here (BIP141 limit, 80_000).
+    const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+    let mut sigops = rbitcoin_consensus::tx_sigop_cost(
+        &block.txdata[0],
+        &[],
+        flags.bip16_active,
+        flags.witness_active,
+    );
     for (tx, ins) in block.txdata.iter().skip(1).zip(prevouts) {
+        let prev_spks: Vec<&[u8]> = ins.iter().map(|o| o.script_pubkey.as_bytes()).collect();
+        sigops = sigops.saturating_add(rbitcoin_consensus::tx_sigop_cost(
+            tx,
+            &prev_spks,
+            flags.bip16_active,
+            flags.witness_active,
+        ));
+        if sigops > MAX_BLOCK_SIGOPS_COST {
+            return Err("bad-blk-sigops".into());
+        }
         rbitcoin_consensus::verify_tx_scripts_with_flags(ins, tx.clone(), flags)
             .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
     }
@@ -6321,6 +6346,84 @@ mod tests {
         assert_eq!(
             hub.check_block_proposal(&off_tip).unwrap_err(),
             "inconclusive-not-best-prevblk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_fault_during_header_check_is_not_a_failed_block() {
+        let hash = [0x11; 32];
+        let store = connect_failed_for_header(hash, NetError::Store("budget full: SQ".into()));
+        assert!(
+            matches!(store, NetError::Store(_)),
+            "a store fault must not name a block, got {store}"
+        );
+        let bad = connect_failed_for_header(hash, NetError::Consensus("bad-diffbits".into()));
+        match bad {
+            NetError::ConnectFailed { hash: h, msg } => {
+                assert_eq!(h, hash);
+                assert!(msg.contains("bad-diffbits"), "{msg}");
+            }
+            other => panic!("consensus header failure must name the block, got {other}"),
+        }
+    }
+
+    /// Witness sigops are not in the structure walk. Nine P2WSH inputs of
+    /// 10_000 `OP_CHECKSIG` each are over the 80_000 block limit.
+    #[test]
+    fn check_block_proposal_rejects_witness_sigops_over_the_limit() {
+        let (dir, hub) = tmp_hub();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(101, op_true.clone(), vec![])
+            .unwrap();
+        let ws = ScriptBuf::from_bytes(vec![0xac; 10_000]);
+        let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+        let cb = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let per = (50_0000_0000u64 - 1_000) / 9;
+        let fan = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: (0..9)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(per),
+                    script_pubkey: p2wsh.clone(),
+                })
+                .collect(),
+        };
+        let fan_id = fan.compute_txid();
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..9u32)
+                .map(|vout| TxIn {
+                    previous_output: OutPoint { txid: fan_id, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::from_slice(&[ws.as_bytes()]),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(per * 9 - 1_000),
+                script_pubkey: op_true.clone(),
+            }],
+        };
+        let block = hub
+            .assemble_block_to_script(op_true, vec![fan, spend])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-blk-sigops"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
