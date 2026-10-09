@@ -1,7 +1,6 @@
 Fixed
 
-- **Fee-flow buckets match the 0.1 sat/vB quote grid.**
-  Admit rates through 10 sat/vB are kept in 0.1 sat/vB steps, then at 20,
-  50, and 100 sat/vB. A 1.5 sat/vB inflow no longer shares a bucket with
-  1.0, and a 4.9 sat/vB inflow no longer quotes 2.0. The inclusion search
-  reads one suffix sum of those buckets.
+- **Fee-flow buckets follow a log grid from min relay through 1000 sat/vB.**
+  About 100 steps per decade. A 0.26 sat/vB inflow quotes its own step
+  instead of 0.2, and rates above 1000 sat/vB share one open bucket. The
+  inclusion search reads one suffix sum of those buckets.
