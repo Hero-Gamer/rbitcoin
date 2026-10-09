@@ -88,14 +88,14 @@ node logs when flow warms and how many targets' history is ready.
 | Admit EMA half-life | ~150 s |
 | Inflow horizon cap | 600 s |
 | Blend N0 | 6 blocks |
-| Fine candidates | 100 sat/kvB steps to 10 sat/vB |
+| Flow buckets and candidates | 100 sat/kvB steps through 10 sat/vB, then 20_000, 50_000, 100_000, plus an open top |
 | Warm | 60 s + 32 admits |
 | Historical confidence | 0.999 at N=1; 0.99 at N≥2 |
 | Analog lookback | `clamp(N/4, 3, 144)` hurdle blocks |
 | Analog band / min neighbors / ready | ×1.25 / 200 / 2000 windows |
 | History budget | 1 GiB of `txstat.body` cells |
 | History file | snapshot every 144 connects + per-connect journal |
-| Bucket edges (sat/kvB) | 100…100000 (+ open top) |
+
 
 ### Confirm-memory / block history
 

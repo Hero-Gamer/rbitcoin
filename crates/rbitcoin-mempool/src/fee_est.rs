@@ -23,14 +23,33 @@ pub const LAMBDA_AT_NEAR: f64 = 2.0;
 /// Inflow EMA multiplier at `CONFIDENCE_FAR`.
 pub const LAMBDA_AT_FAR: f64 = 1.0;
 
-/// Feerate bucket edges in sat/kvB (Libre min relay = 100). Last bucket is +∞.
-pub const FEE_BUCKET_EDGES_SAT_PER_KVB: &[u64] = &[
-    100, 200, 300, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000,
-];
+/// Admit-rate floors in sat/kvB. 0.1 sat/vB steps through 10 sat/vB, then
+/// 20, 50, and 100 sat/vB. The same grid is the inclusion-search ladder.
+/// The last bucket is everything above the final edge.
+const FLOW_BUCKET_EDGE_COUNT: usize = 103;
+
+const fn flow_bucket_edges() -> [u64; FLOW_BUCKET_EDGE_COUNT] {
+    let mut edges = [0u64; FLOW_BUCKET_EDGE_COUNT];
+    let mut i = 0usize;
+    let mut rate = 100u64;
+    while rate <= 10_000 {
+        edges[i] = rate;
+        i += 1;
+        rate += 100;
+    }
+    edges[i] = 20_000;
+    i += 1;
+    edges[i] = 50_000;
+    i += 1;
+    edges[i] = 100_000;
+    edges
+}
+
+pub const FEE_BUCKET_EDGES_SAT_PER_KVB: [u64; FLOW_BUCKET_EDGE_COUNT] = flow_bucket_edges();
 
 /// Index of the bucket that contains `rate_sat_per_kvb` (0 = lowest).
 pub fn bucket_index(rate_sat_per_kvb: u64) -> usize {
-    let edges = FEE_BUCKET_EDGES_SAT_PER_KVB;
+    let edges = &FEE_BUCKET_EDGES_SAT_PER_KVB;
     for (i, &edge) in edges.iter().enumerate() {
         if rate_sat_per_kvb < edge {
             return i.saturating_sub(1).min(edges.len());
@@ -107,33 +126,31 @@ pub fn effective_capacity_wu(n_blocks: u32) -> u64 {
     (capacity_wu(n_blocks) as f64 * fill).round() as u64
 }
 
-/// Projected weight arriving above rate R over horizon H.
-///
-/// `inflow_wu_per_s_by_bucket[i]` is λ for bucket i; buckets with min rate > R
-/// contribute.
-pub fn projected_inflow_wu_above(
-    inflow_wu_per_s_by_bucket: &[u64],
-    rate_sat_per_kvb: u64,
-    horizon_secs: u64,
-) -> u64 {
+/// Weight over `horizon_secs` from each bucket through the open top.
+/// `suffix[i]` is buckets `i..`, and `suffix[n]` is 0.
+fn inflow_suffix_wu(inflow_wu_per_s_by_bucket: &[u64], horizon_secs: u64) -> Vec<u64> {
     let n = bucket_count().min(inflow_wu_per_s_by_bucket.len());
-    let mut sum = 0u64;
-    for i in 0..n {
-        let bucket_lo = if i < FEE_BUCKET_EDGES_SAT_PER_KVB.len() {
-            FEE_BUCKET_EDGES_SAT_PER_KVB[i]
-        } else {
-            // Open top: treat as above last edge.
-            FEE_BUCKET_EDGES_SAT_PER_KVB
-                .last()
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1)
-        };
-        if bucket_lo > rate_sat_per_kvb {
-            sum = sum.saturating_add(inflow_wu_per_s_by_bucket[i].saturating_mul(horizon_secs));
-        }
+    let mut suffix = vec![0u64; n + 1];
+    for i in (0..n).rev() {
+        suffix[i] =
+            suffix[i + 1].saturating_add(inflow_wu_per_s_by_bucket[i].saturating_mul(horizon_secs));
     }
-    sum
+    suffix
+}
+
+/// First bucket whose floor is strictly above `rate`, or [`bucket_count`]
+/// when every floor is at or below it.
+fn first_bucket_above(rate_sat_per_kvb: u64) -> usize {
+    let edges = &FEE_BUCKET_EDGES_SAT_PER_KVB;
+    if let Some(i) = edges.iter().position(|&floor| floor > rate_sat_per_kvb) {
+        return i;
+    }
+    let open_floor = edges.last().copied().unwrap_or(0).saturating_add(1);
+    if open_floor > rate_sat_per_kvb {
+        edges.len()
+    } else {
+        edges.len().saturating_add(1)
+    }
 }
 
 /// Minimum feerate (sat/kvB) such that
@@ -154,10 +171,11 @@ where
     let cap = effective_capacity_wu(n_blocks);
     let h = inflow_horizon_secs(n_blocks);
     let lam = lambda_mult(inclusion_confidence(n_blocks));
+    let suffix = inflow_suffix_wu(inflow_wu_per_s_by_bucket, h);
     let mut best: Option<u64> = None;
     for &r in candidate_rates {
-        let inflow = projected_inflow_wu_above(inflow_wu_per_s_by_bucket, r, h);
-        let stressed = (inflow as f64 * lam).round() as u64;
+        let idx = first_bucket_above(r).min(suffix.len().saturating_sub(1));
+        let stressed = (suffix[idx] as f64 * lam).round() as u64;
         let load = stock_above(r).saturating_add(stressed);
         if load <= cap {
             best = Some(match best {
@@ -174,20 +192,9 @@ pub fn default_candidate_rates() -> Vec<u64> {
     FEE_BUCKET_EDGES_SAT_PER_KVB.to_vec()
 }
 
-/// 0.1 sat/vB steps through 10 sat/vB, then coarse high edges.
+/// Inclusion-search ladder. Same floors as the admit-rate buckets.
 pub fn fine_candidate_rates() -> Vec<u64> {
-    let mut v = Vec::with_capacity(120);
-    let mut r = MIN_CANDIDATE_SAT_PER_KVB;
-    while r <= 10_000 {
-        v.push(r);
-        r = r.saturating_add(100);
-    }
-    for &e in &[20_000u64, 50_000, 100_000] {
-        if v.last().copied().unwrap_or(0) < e {
-            v.push(e);
-        }
-    }
-    v
+    default_candidate_rates()
 }
 
 /// Trust admit-EMA at most this many seconds (≈ 4× 150s half-life).
@@ -196,7 +203,6 @@ pub const INFLOW_HORIZON_CAP_SECS: u64 = 600;
 pub const BLEND_N0: f64 = 6.0;
 /// Under-full pool may still answer min-relay when `blend_weight ≥` this (N=1–5).
 pub const NEAR_BLEND_FLOOR: f64 = 0.5;
-const MIN_CANDIDATE_SAT_PER_KVB: u64 = 100;
 
 /// Horizon used for inflow projection (capped; not N×10 minutes for N=144).
 pub fn inflow_horizon_secs(n_blocks: u32) -> u64 {
@@ -682,12 +688,28 @@ mod tests {
         assert_eq!(r, [5_000, 5_000, 2_000, 2_000]);
     }
 
+    /// A point mass is priced at its own 0.1 sat/vB step. 1.5 must not
+    /// collapse to 1.0, and 4.9 must not collapse to 2.0.
+    #[test]
+    fn point_mass_quotes_its_own_tenth() {
+        let stock = |_r: u64| 0u64;
+        let rates = fine_candidate_rates();
+        // 3_000 WU/s × 600 s × λ2 = 3.6e6 WU, over the 3.2e6 N=1 cap.
+        for rate in [1_500u64, 4_900] {
+            let mut inflow = vec![0u64; bucket_count()];
+            inflow[bucket_index(rate)] = 3_000;
+            let quoted = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
+            assert_eq!(quoted, rate, "bucket floors must be the candidate grid");
+        }
+    }
+
     #[test]
     fn inflow_horizon_is_capped() {
         assert_eq!(inflow_horizon_secs(1), 600);
         assert_eq!(inflow_horizon_secs(144), INFLOW_HORIZON_CAP_SECS);
-        assert!(fine_candidate_rates().len() > default_candidate_rates().len());
+        assert_eq!(fine_candidate_rates(), default_candidate_rates());
         assert_eq!(fine_candidate_rates()[0], 100);
+        assert_eq!(*fine_candidate_rates().last().unwrap(), 100_000);
     }
 
     #[test]
