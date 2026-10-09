@@ -2221,14 +2221,16 @@ impl Query {
         let mut children: ResumeChildMap = ResumeChildMap::default();
         let mut bits = vec![0u32; n as usize];
         let mut prevs = vec![0u64; n as usize];
-        store.headers.for_each_record(|fk, rec| {
+        store.headers.for_each_record_through(n, |fk, rec| {
             let i = (fk.0 - 1) as usize;
-            if let Some(slot) = bits.get_mut(i) {
-                *slot = rec.bits;
-            }
-            if let Some(slot) = prevs.get_mut(i) {
-                *slot = rec.prev_fk.0;
-            }
+            let Some(slot) = bits.get_mut(i) else {
+                return Err(StoreError::Corrupt("resume header fk"));
+            };
+            *slot = rec.bits;
+            let Some(slot) = prevs.get_mut(i) else {
+                return Err(StoreError::Corrupt("resume header fk"));
+            };
+            *slot = rec.prev_fk.0;
             if exclude.contains(&rec.hash) {
                 return Ok(());
             }

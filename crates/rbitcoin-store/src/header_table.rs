@@ -229,6 +229,9 @@ impl HeaderHead {
     }
 }
 
+#[cfg(any(test, feature = "body-gets"))]
+type BodyScanHook = Box<dyn Fn(&HeaderTable) + Send + Sync>;
+
 pub struct HeaderTable {
     body: TableFile,
     head: HeaderHead,
@@ -239,6 +242,10 @@ pub struct HeaderTable {
     /// Single-row `get` calls. A sequential scan does not increment this.
     #[cfg(any(test, feature = "body-gets"))]
     body_gets: std::sync::atomic::AtomicU64,
+    /// Runs once, at the start of the next body scan. Tests append a row
+    /// between the caller's count and the walk.
+    #[cfg(any(test, feature = "body-gets"))]
+    on_next_body_scan: Mutex<Option<BodyScanHook>>,
 }
 
 impl HeaderTable {
@@ -260,6 +267,8 @@ impl HeaderTable {
             put_lock: Mutex::new(()),
             #[cfg(any(test, feature = "body-gets"))]
             body_gets: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "body-gets"))]
+            on_next_body_scan: Mutex::new(None),
         })
     }
 
@@ -286,6 +295,8 @@ impl HeaderTable {
             put_lock: Mutex::new(()),
             #[cfg(any(test, feature = "body-gets"))]
             body_gets: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "body-gets"))]
+            on_next_body_scan: Mutex::new(None),
         })
     }
 
@@ -449,12 +460,23 @@ impl HeaderTable {
         Ok(())
     }
 
-    /// Every live row, in fk order, from large reads of `header.body`.
-    pub fn for_each_record<F>(&self, mut f: F) -> Result<(), StoreError>
+    /// Rows `1..=count` at the start of the call.
+    pub fn for_each_record<F>(&self, f: F) -> Result<(), StoreError>
     where
         F: FnMut(Fk, HeaderRecord) -> Result<(), StoreError>,
     {
         let n = self.count();
+        self.for_each_record_through(n, f)
+    }
+
+    /// Rows `1..=through`, and not a row appended after the caller sampled `through`.
+    pub fn for_each_record_through<F>(&self, through: u64, mut f: F) -> Result<(), StoreError>
+    where
+        F: FnMut(Fk, HeaderRecord) -> Result<(), StoreError>,
+    {
+        #[cfg(any(test, feature = "body-gets"))]
+        self.fire_scan_hook();
+        let n = self.count().min(through);
         const CHUNK: u64 = 1024;
         let mut buf = vec![0u8; CHUNK as usize * HEADER_RECORD_LEN];
         let mut id = 1u64;
@@ -473,18 +495,46 @@ impl HeaderTable {
         Ok(())
     }
 
-    /// `nBits` of every row. Index `fk - 1`.
+    /// `nBits` of rows `1..=count` sampled once. Index `fk - 1`.
     pub fn bits_in_fk_order(&self) -> Result<Vec<u32>, StoreError> {
         let n = self.count();
         let mut bits = vec![0u32; n as usize];
-        self.for_each_record(|fk, rec| {
+        let mut wrote = 0u64;
+        self.for_each_record_through(n, |fk, rec| {
             let i = (fk.0 - 1) as usize;
-            if let Some(slot) = bits.get_mut(i) {
-                *slot = rec.bits;
-            }
+            let slot = bits.get_mut(i).ok_or(StoreError::Corrupt("header fk"))?;
+            *slot = rec.bits;
+            wrote += 1;
             Ok(())
         })?;
+        if wrote != n {
+            return Err(StoreError::Corrupt("header bits short"));
+        }
         Ok(bits)
+    }
+
+    /// Append a row on the next body scan, then drop the hook.
+    #[cfg(any(test, feature = "body-gets"))]
+    pub fn on_next_body_scan<F>(&self, f: F)
+    where
+        F: Fn(&Self) + Send + Sync + 'static,
+    {
+        *self
+            .on_next_body_scan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+    }
+
+    #[cfg(any(test, feature = "body-gets"))]
+    fn fire_scan_hook(&self) {
+        let hook = self
+            .on_next_body_scan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook(self);
+        }
     }
 
     /// Rows loaded by [`Self::get`] since the last take.
@@ -766,6 +816,28 @@ mod tests {
             "C must not gain false children from poison puts"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn body_scan_stops_at_the_callers_count_and_bits_match_rows() {
+        let dir = tmp();
+        let t = HeaderTable::create_tiny(&dir).unwrap();
+        let bits = [0x207f_ffff, 0x1e0f_ffff, 0x1d00_ffff];
+        for (i, b) in bits.into_iter().enumerate() {
+            let mut rec = sample([i as u8 + 1; 32]);
+            rec.bits = b;
+            t.ensure(&rec).unwrap();
+        }
+        let mut seen = Vec::new();
+        t.for_each_record_through(2, |fk, rec| {
+            seen.push((fk.0, rec.bits));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(1, bits[0]), (2, bits[1])]);
+        let got = t.bits_in_fk_order().unwrap();
+        assert_eq!(got, bits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

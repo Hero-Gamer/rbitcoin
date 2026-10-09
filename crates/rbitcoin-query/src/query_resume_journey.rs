@@ -94,9 +94,10 @@ fn resume_most_work_header_path() {
     });
     assert_eq!(path.len(), 32, "capped walk length");
     assert_eq!((path[0].height, path[31].height), (1, 32));
-    assert!(
-        q.store().headers.take_body_gets() < 8,
-        "a long header band is ranked from one sequential read"
+    assert_eq!(
+        q.store().headers.take_body_gets(),
+        1,
+        "ranking reads the tip header once, not the band"
     );
 
     let mut children: crate::U64Map<Vec<(Fk, [u8; 32])>> = crate::U64Map::default();
@@ -113,5 +114,73 @@ fn resume_most_work_header_path() {
         .expect("a prev_fk cycle must not hang");
     assert!(memo.contains_key(&gfk.0) && memo.contains_key(&pfk.0));
     assert!(d >= 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A row appended after the caller's count is invisible to this scan.
+/// The next scan ranks it.
+#[test]
+fn resume_ignores_header_appended_during_the_scan() {
+    let (dir, q) = temp_query("resume-scan-snapshot");
+    let (g, tg) = coinbase_block(0, Fk::NULL, None);
+    let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
+    let (p, tp) = coinbase_block(1, gfk, Some(g.hash));
+    let pfk = q.connect_block(Height(1), &p, &[tp]).unwrap();
+    let (tip, tt) = coinbase_block(2, pfk, Some(p.hash));
+    let tip_fk = q.connect_block(Height(2), &tip, &[tt]).unwrap();
+    let before = q.resume_work_path_after_tip(tip.hash, 2, 8).unwrap();
+    assert!(before.is_empty());
+
+    let (mut extra, _) = coinbase_block(90, tip_fk, Some(tip.hash));
+    extra.bits = 0x1d00ffff;
+    rehash_header(&mut extra, &tip.hash);
+    let extra_hash = extra.hash;
+    q.store().headers.on_next_body_scan(move |table| {
+        table.ensure(&extra).unwrap();
+    });
+    let during = q.resume_work_path_after_tip(tip.hash, 2, 8).unwrap();
+    assert!(
+        during.is_empty(),
+        "a header born during the scan is not ranked yet"
+    );
+    assert!(q.get_header_by_hash(&extra_hash).unwrap().is_some());
+    let after = q.resume_work_path_after_tip(tip.hash, 2, 8).unwrap();
+    assert_eq!(after[0].hash, extra_hash);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// One hard header beats a longer run of easy headers.
+#[test]
+fn resume_shorter_heavier_header_beats_longer_easy_fork() {
+    use bitcoin::{CompactTarget, Target};
+    let (dir, q) = temp_query("resume-short-heavy");
+    let (g, tg) = coinbase_block(0, Fk::NULL, None);
+    let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
+    let (p, tp) = coinbase_block(1, gfk, Some(g.hash));
+    let pfk = q.connect_block(Height(1), &p, &[tp]).unwrap();
+    let (tip, tt) = coinbase_block(2, pfk, Some(p.hash));
+    q.connect_block(Height(2), &tip, &[tt]).unwrap();
+
+    let easy_bits = 0x207f_ffffu32;
+    let hard_bits = 0x1d00_ffffu32;
+    let easy = Target::from_compact(CompactTarget::from_consensus(easy_bits)).to_work();
+    let hard = Target::from_compact(CompactTarget::from_consensus(hard_bits)).to_work();
+    let mut easy_chain = easy;
+    for _ in 0..7 {
+        easy_chain = easy_chain + easy;
+    }
+    assert!(hard > easy_chain);
+
+    let long = put_header_fork(&q, (gfk, g.hash), 50, 8);
+    let (mut short, _) = coinbase_block(70, gfk, Some(g.hash));
+    short.bits = hard_bits;
+    rehash_header(&mut short, &g.hash);
+    q.put_header(&short).unwrap();
+
+    let path = q
+        .resume_work_path_after_tip_excluding(tip.hash, 2, 8, &[p.hash])
+        .unwrap();
+    assert_eq!(path[0].hash, short.hash);
+    assert_ne!(path[0].hash, long[0].hash);
     let _ = std::fs::remove_dir_all(dir);
 }
