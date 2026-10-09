@@ -4402,11 +4402,9 @@ async fn on_tx(
                                 follow.ban_score.saturating_add(tx_reject_ban_score(&e));
                             let id = session.map(|s| s.id).unwrap_or(0);
                             rbitcoin_log::info!(
-                                "{txid} (wtxid={}) from peer={id} was not accepted: {}",
-                                tx.compute_wtxid(),
+                                "txrelay: reject {txid} (wtxid={wtxid}) from peer={id} was not accepted: {}",
                                 e.mempool_reject_reason()
                             );
-                            rbitcoin_log::debug!("txrelay: reject {txid}: {e}");
                         }
                     }
                 }

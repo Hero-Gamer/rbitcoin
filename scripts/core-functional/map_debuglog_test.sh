@@ -81,6 +81,10 @@ run "parked orphan DEBUG maps to Core was-not-accepted and missingorspent" \
   "2026-01-01T00:00:00Z DEBUG txrelay: park 1111111111111111111111111111111111111111111111111111111111111111 missingorspent" \
   $'was not accepted\nmissingorspent'
 
+run "combined reject info is already the Core needle" \
+  "2026-01-01T00:00:00Z INFO txrelay: reject aabb (wtxid=ccdd) from peer=0 was not accepted: dust" \
+  ""
+
 run "CLI InitError maps peer-timeout to Core peertimeout" \
   "Error: peer-timeout must be a positive integer." \
   "Error: peertimeout must be a positive integer."
