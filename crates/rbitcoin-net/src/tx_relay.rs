@@ -2123,6 +2123,7 @@ impl MempoolHub {
             Ok(r) => {
                 self.trim_over_budget();
                 if !self.try_contains(&parent_res.txid) || !self.try_contains(&r.txid) {
+                    self.rollback_package_accepted(&[parent_res, r]);
                     self.publish_fee_floor();
                     return None;
                 }
@@ -2699,6 +2700,9 @@ impl MempoolHub {
         }
         self.trim_over_budget();
         if accepted.iter().any(|r| !self.try_contains(&r.txid)) {
+            // Trim dropped a member that had already replaced its conflicts.
+            // Put those conflicts back; the package itself does not stay.
+            self.rollback_package_accepted(&accepted);
             self.publish_fee_floor();
             let us = t0.elapsed().as_micros() as u64;
             self.meter_accept_stages(lock_us, stages);
