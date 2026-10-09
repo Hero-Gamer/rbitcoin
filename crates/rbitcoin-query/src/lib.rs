@@ -212,6 +212,13 @@ pub struct ResumeWorkEntry {
 type ResumeChildMap = U64Map<Vec<(Fk, [u8; 32])>>;
 type ResumeSibPick = (Fk, [u8; 32], bool, u32);
 
+/// One sequential pass over `header.body`: child edges, `nBits`, and `prev_fk`.
+struct ResumeHeaderIndex {
+    children: ResumeChildMap,
+    bits: Vec<u32>,
+    prevs: Vec<u64>,
+}
+
 /// Body-queue index plus decoded stash. Readers/writers share this one mutex.
 struct BodyQueueInner {
     q: rbitcoin_store::BlockQueue,
@@ -2191,7 +2198,7 @@ impl Query {
         if max == 0 {
             return Ok(Vec::new());
         }
-        let Some((tip_fk, tip_rec)) = self.get_header_by_hash(&tip_hash)? else {
+        let Some((tip_fk, _)) = self.get_header_by_hash(&tip_hash)? else {
             return Ok(Vec::new());
         };
         let n = self.store.header_count();
@@ -2199,82 +2206,79 @@ impl Query {
             return Ok(Vec::new());
         }
 
-        let children = Self::resume_index_children(&self.store, n, exclude)?;
+        let index = Self::resume_index_children(&self.store, n, exclude)?;
         let mut score_memo: U64Map<(bitcoin::Work, u32)> = U64Map::default();
-        let best_sib = self.resume_nearest_better_sib(
-            tip_fk,
-            tip_height,
-            &tip_rec,
-            &children,
-            &mut score_memo,
-        )?;
-        self.resume_walk_best_kids(
-            tip_fk,
-            tip_height,
-            max,
-            best_sib,
-            &children,
-            &mut score_memo,
-        )
+        let best_sib =
+            self.resume_nearest_better_sib(tip_fk, tip_height, &index, &mut score_memo)?;
+        self.resume_walk_best_kids(tip_fk, tip_height, max, best_sib, &index, &mut score_memo)
     }
 
     fn resume_index_children(
         store: &rbitcoin_store::Store,
         n: u64,
         exclude: &[[u8; 32]],
-    ) -> Result<ResumeChildMap, QueryError> {
+    ) -> Result<ResumeHeaderIndex, QueryError> {
         let mut children: ResumeChildMap = ResumeChildMap::default();
-        for id in 1..=n {
-            let fk = Fk(id);
-            let rec = store.get_header(fk)?;
+        let mut bits = vec![0u32; n as usize];
+        let mut prevs = vec![0u64; n as usize];
+        store.headers.for_each_record(|fk, rec| {
+            let i = (fk.0 - 1) as usize;
+            if let Some(slot) = bits.get_mut(i) {
+                *slot = rec.bits;
+            }
+            if let Some(slot) = prevs.get_mut(i) {
+                *slot = rec.prev_fk.0;
+            }
             if exclude.contains(&rec.hash) {
-                continue;
+                return Ok(());
             }
             let prev = rec.prev_fk.get().unwrap_or(0);
             children.entry(prev).or_default().push((fk, rec.hash));
-        }
-        Ok(children)
+            Ok(())
+        })?;
+        Ok(ResumeHeaderIndex {
+            children,
+            bits,
+            prevs,
+        })
+    }
+
+    fn resume_parent(index: &ResumeHeaderIndex, fk: Fk) -> Option<u64> {
+        let i = fk.0.checked_sub(1)? as usize;
+        Fk::new(*index.prevs.get(i)?).map(|p| p.0)
     }
 
     fn resume_nearest_better_sib(
         &self,
         tip_fk: Fk,
         tip_height: u32,
-        tip_rec: &rbitcoin_store::HeaderRecord,
-        children: &ResumeChildMap,
+        index: &ResumeHeaderIndex,
         score_memo: &mut U64Map<(bitcoin::Work, u32)>,
     ) -> Result<Option<ResumeSibPick>, QueryError> {
         const ANCESTOR_HOPS: u32 = 32;
         let mut best_sib: Option<ResumeSibPick> = None;
         let mut path_fk = tip_fk;
         let mut path_h = tip_height;
-        let mut path_rec = tip_rec.clone();
         for _ in 0..ANCESTOR_HOPS {
-            let Some(parent_fk) = path_rec.prev_fk.get() else {
+            let Some(parent_fk) = Self::resume_parent(index, path_fk) else {
                 break;
             };
-            let (path_sub_w, _path_sub_d) =
-                Self::resume_subtree_score(&self.store, children, path_fk, score_memo)?;
-            if let Some(sibs) = children.get(&parent_fk) {
+            let (path_sub_w, _path_sub_d) = Self::resume_subtree_score(index, path_fk, score_memo)?;
+            if let Some(sibs) = index.children.get(&parent_fk) {
                 for &(fk, hash) in sibs {
                     if fk == path_fk {
                         continue;
                     }
                     let has_body = self.store.header_txs.has_body(fk)?;
-                    let (sub_w, sub_d) =
-                        Self::resume_subtree_score(&self.store, children, fk, score_memo)?;
+                    let (sub_w, sub_d) = Self::resume_subtree_score(index, fk, score_memo)?;
                     if sub_w <= path_sub_w {
                         continue;
                     }
                     let take = match best_sib {
                         None => true,
                         Some((best_fk, _, best_body, _)) => {
-                            let (best_w, best_d) = Self::resume_subtree_score(
-                                &self.store,
-                                children,
-                                best_fk,
-                                score_memo,
-                            )?;
+                            let (best_w, best_d) =
+                                Self::resume_subtree_score(index, best_fk, score_memo)?;
                             if sub_w != best_w {
                                 sub_w > best_w
                             } else if sub_d != best_d {
@@ -2299,7 +2303,6 @@ impl Query {
             }
             path_h = path_h.saturating_sub(1);
             path_fk = Fk(parent_fk);
-            path_rec = self.store.get_header(path_fk)?;
         }
         Ok(best_sib)
     }
@@ -2310,7 +2313,7 @@ impl Query {
         tip_height: u32,
         max: usize,
         best_sib: Option<ResumeSibPick>,
-        children: &ResumeChildMap,
+        index: &ResumeHeaderIndex,
         score_memo: &mut U64Map<(bitcoin::Work, u32)>,
     ) -> Result<Vec<ResumeWorkEntry>, QueryError> {
         let mut out = Vec::with_capacity(max.min(4096));
@@ -2327,7 +2330,7 @@ impl Query {
         };
 
         while out.len() < max {
-            let Some(kids) = children.get(&cur_fk.0) else {
+            let Some(kids) = index.children.get(&cur_fk.0) else {
                 break;
             };
             if kids.is_empty() {
@@ -2336,8 +2339,7 @@ impl Query {
             let mut best: Option<(Fk, [u8; 32], bool, bitcoin::Work, u32)> = None;
             for &(fk, hash) in kids {
                 let has_body = self.store.header_txs.has_body(fk)?;
-                let (sub_work, depth) =
-                    Self::resume_subtree_score(&self.store, children, fk, score_memo)?;
+                let (sub_work, depth) = Self::resume_subtree_score(index, fk, score_memo)?;
                 let take = match best {
                     None => true,
                     Some((best_fk, _, best_body, best_w, best_d)) => {
@@ -2374,7 +2376,8 @@ impl Query {
     /// Max path work and depth under `root` (including root header work).
     ///
     /// Used by [`Self::resume_work_path_after_tip`] to prefer most-work children
-    /// over body-only archived losers.
+    /// over body-only archived losers. Work comes from `nBits` captured while
+    /// the child index was built.
     ///
     /// **Iterative** post-order walk into a **shared** `memo` (one map per resume).
     /// Recursive DFS stack-overflowed (SIGSEGV) on mid-IBD restart; a fresh memo
@@ -2384,8 +2387,7 @@ impl Query {
     /// Gray (`on_stack`) nodes are not re-pushed: a `prev_fk` cycle used to spin
     /// the IBD thread after `resume seed walk start` with no further log.
     pub(crate) fn resume_subtree_score(
-        store: &rbitcoin_store::Store,
-        children: &U64Map<Vec<(Fk, [u8; 32])>>,
+        index: &ResumeHeaderIndex,
         root: Fk,
         memo: &mut U64Map<(bitcoin::Work, u32)>,
     ) -> Result<(bitcoin::Work, u32), QueryError> {
@@ -2407,7 +2409,7 @@ impl Query {
                     continue;
                 }
                 stack.push((fk, true));
-                if let Some(kids) = children.get(&fk.0) {
+                if let Some(kids) = index.children.get(&fk.0) {
                     for &(ck, _) in kids {
                         if !memo.contains_key(&ck.0) && !on_stack.contains(&ck.0) {
                             stack.push((ck, false));
@@ -2417,11 +2419,16 @@ impl Query {
                 continue;
             }
             on_stack.remove(&fk.0);
-            let rec = store.get_header(fk)?;
-            let own = Target::from_compact(CompactTarget::from_consensus(rec.bits)).to_work();
+            let bits_i = (fk.0 - 1) as usize;
+            let bits = index
+                .bits
+                .get(bits_i)
+                .copied()
+                .ok_or(StoreError::Corrupt("resume header bits"))?;
+            let own = Target::from_compact(CompactTarget::from_consensus(bits)).to_work();
             let mut best_child_w = bitcoin::Work::from_be_bytes([0u8; 32]);
             let mut best_depth = 0u32;
-            if let Some(kids) = children.get(&fk.0) {
+            if let Some(kids) = index.children.get(&fk.0) {
                 for &(ck, _) in kids {
                     let Some(&(w, d)) = memo.get(&ck.0) else {
                         // Cycle / incomplete child — treat as zero (corrupt graph).

@@ -7,6 +7,11 @@ rust-version.workspace = true
 repository.workspace = true
 description = "Relational archive store (Class A/B/C; fd-only bulk IO)"
 
+[features]
+# Single-row header.body reads. Off in the node binary. Query and net tests
+# turn it on so a resume or chain-work fill can show it did not call `get`.
+body-gets = []
+
 [dependencies]
 rbitcoin-primitives = { workspace = true }
 rbitcoin-log = { workspace = true }

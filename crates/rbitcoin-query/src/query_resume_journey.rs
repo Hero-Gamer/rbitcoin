@@ -83,6 +83,7 @@ fn resume_most_work_header_path() {
     // band would overflow; the production walk is a heap stack.
     const DEEP: u32 = 256;
     put_header_fork(&q, (x_tip_fk, x_tip.hash), 1_000, DEEP);
+    let _ = q.store().headers.take_body_gets();
     let path = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(32 * 1024)
@@ -93,12 +94,22 @@ fn resume_most_work_header_path() {
     });
     assert_eq!(path.len(), 32, "capped walk length");
     assert_eq!((path[0].height, path[31].height), (1, 32));
+    assert!(
+        q.store().headers.take_body_gets() < 8,
+        "a long header band is ranked from one sequential read"
+    );
 
     let mut children: crate::U64Map<Vec<(Fk, [u8; 32])>> = crate::U64Map::default();
     children.insert(gfk.0, vec![(pfk, p.hash)]);
     children.insert(pfk.0, vec![(gfk, g.hash)]);
+    let n = q.store().header_count() as usize;
+    let index = crate::ResumeHeaderIndex {
+        children,
+        bits: vec![0x1d00ffff; n],
+        prevs: vec![0; n],
+    };
     let mut memo = crate::U64Map::default();
-    let (_w, d) = crate::Query::resume_subtree_score(q.store(), &children, gfk, &mut memo)
+    let (_w, d) = crate::Query::resume_subtree_score(&index, gfk, &mut memo)
         .expect("a prev_fk cycle must not hang");
     assert!(memo.contains_key(&gfk.0) && memo.contains_key(&pfk.0));
     assert!(d >= 1);

@@ -114,9 +114,9 @@ pub(crate) fn should_unlatch_headers_done(st: &IbdWorkState, tip_h: u32) -> bool
 /// Full `seed_work_path_from_store` (O(header_count) walk) while empty-lagging.
 ///
 /// Only when the ordered path is empty — a live queue already supplies locator
-/// tips. Must stay rare: the walk scans every header (~1M on mainnet, 0.5–1.2s).
-/// Same streak cadence as [`should_log_empty_headers_lag`] so getheaders can
-/// still fan out every 8.
+/// tips. Must stay rare: the walk still reads every header row. Same streak
+/// cadence as [`should_log_empty_headers_lag`] so getheaders can still fan
+/// out every 8.
 #[inline]
 pub(crate) fn should_reseed_work_path_on_empty_lag(streak: u32, ordered_empty: bool) -> bool {
     ordered_empty && should_log_empty_headers_lag(streak)

@@ -3089,6 +3089,11 @@ impl ChainHub {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_clear_chain_work_prefix(&self) {
+        self.chain_work_prefix.write().unwrap().clear();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_poison_chain_work_prefix_last(&self) {
         let mut p = self.chain_work_prefix.write().unwrap();
         if let Some(last) = p.last_mut() {
@@ -3157,13 +3162,13 @@ impl ChainHub {
             p.truncate(want);
             return Ok(());
         }
+        if p.is_empty() {
+            self.fill_chain_work_from_header_body(&mut p, want)?;
+            return Ok(());
+        }
         while p.len() < want {
             let h = p.len() as u32;
-            let hdr = self
-                .query
-                .wire_header_at_height(Height(h))
-                .map_err(NetError::store)?;
-            let w = hdr.work();
+            let w = self.header_work_at_height(h)?;
             let acc = match p.last() {
                 None => w,
                 Some(&prev) => prev + w,
@@ -3172,6 +3177,59 @@ impl ChainHub {
         }
         Ok(())
     }
+
+    /// First fill after process start. `nBits` is the whole work input, so
+    /// this is one sequential read of `header.body` plus the in-memory
+    /// confirmed fk array. Later heights append one record at a time.
+    fn fill_chain_work_from_header_body(
+        &self,
+        p: &mut Vec<Work>,
+        want: usize,
+    ) -> Result<(), NetError> {
+        let bits = self
+            .query
+            .store()
+            .headers
+            .bits_in_fk_order()
+            .map_err(NetError::store)?;
+        p.clear();
+        p.reserve(want);
+        for h in 0..want as u32 {
+            let fk = self
+                .query
+                .store()
+                .confirmed
+                .get(Height(h))
+                .map_err(NetError::store)?
+                .ok_or_else(|| NetError::store(rbitcoin_store::StoreError::NotFound))?;
+            let id = fk
+                .get()
+                .ok_or_else(|| NetError::store(rbitcoin_store::StoreError::InvalidFk))?;
+            let nbits = bits.get((id - 1) as usize).copied().ok_or_else(|| {
+                NetError::store(rbitcoin_store::StoreError::Corrupt("chain work header fk"))
+            })?;
+            let w = header_work_bits(nbits);
+            let acc = match p.last() {
+                None => w,
+                Some(&prev) => prev + w,
+            };
+            p.push(acc);
+        }
+        Ok(())
+    }
+
+    fn header_work_at_height(&self, h: u32) -> Result<Work, NetError> {
+        let (_, rec) = self
+            .query
+            .header_at_height(Height(h))
+            .map_err(NetError::store)?
+            .ok_or_else(|| NetError::store(rbitcoin_store::StoreError::NotFound))?;
+        Ok(header_work_bits(rec.bits))
+    }
+}
+
+fn header_work_bits(bits: u32) -> Work {
+    Target::from_compact(CompactTarget::from_consensus(bits)).to_work()
 }
 
 /// [`ChainHub::check_block_proposal`] on explicit inputs, for a caller that
@@ -4813,6 +4871,14 @@ mod tests {
         assert_eq!(tip_w, hub.work_through_height(2).unwrap());
         assert_eq!(hub.work_through_height(0).unwrap(), gwork);
         assert_eq!(tip_w - gwork, b1.header.work() + b2.header.work());
+        hub.test_clear_chain_work_prefix();
+        let _ = hub.query.store().headers.take_body_gets();
+        assert_eq!(hub.chain_work().unwrap(), tip_w);
+        assert_eq!(
+            hub.query.store().headers.take_body_gets(),
+            0,
+            "rebuilding chain work reads header.body once"
+        );
         let extra = mine(b2.block_hash(), 1_300_000_200, 3);
         assert_eq!(
             hub.work_with_header(&extra.header),

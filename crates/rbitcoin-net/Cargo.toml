@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 getrandom = "0.4"
 sha3 = "0.12"
 
+[dev-dependencies]
+rbitcoin-store = { workspace = true, features = ["body-gets"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # POLLRDHUP: peer FIN with unread bytes still in the receive buffer.
 libc = "0.2"

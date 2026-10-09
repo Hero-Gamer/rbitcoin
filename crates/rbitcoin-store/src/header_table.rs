@@ -236,6 +236,9 @@ pub struct HeaderTable {
     /// Serializes check-then-put so two threads cannot both miss and both append
     /// the same full hash (I1 + I4).
     put_lock: Mutex<()>,
+    /// Single-row `get` calls. A sequential scan does not increment this.
+    #[cfg(any(test, feature = "body-gets"))]
+    body_gets: std::sync::atomic::AtomicU64,
 }
 
 impl HeaderTable {
@@ -255,6 +258,8 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(0),
             put_lock: Mutex::new(()),
+            #[cfg(any(test, feature = "body-gets"))]
+            body_gets: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -279,6 +284,8 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(count),
             put_lock: Mutex::new(()),
+            #[cfg(any(test, feature = "body-gets"))]
+            body_gets: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -442,8 +449,54 @@ impl HeaderTable {
         Ok(())
     }
 
+    /// Every live row, in fk order, from large reads of `header.body`.
+    pub fn for_each_record<F>(&self, mut f: F) -> Result<(), StoreError>
+    where
+        F: FnMut(Fk, HeaderRecord) -> Result<(), StoreError>,
+    {
+        let n = self.count();
+        const CHUNK: u64 = 1024;
+        let mut buf = vec![0u8; CHUNK as usize * HEADER_RECORD_LEN];
+        let mut id = 1u64;
+        while id <= n {
+            let take = (n - id + 1).min(CHUNK);
+            let nbytes = take as usize * HEADER_RECORD_LEN;
+            let offset = FILE_HEADER_LEN as u64 + (id - 1) * HEADER_RECORD_LEN as u64;
+            self.body.read_at(offset, &mut buf[..nbytes])?;
+            for i in 0..take as usize {
+                let start = i * HEADER_RECORD_LEN;
+                let rec = HeaderRecord::decode(&buf[start..start + HEADER_RECORD_LEN])?;
+                f(Fk(id + i as u64), rec)?;
+            }
+            id += take;
+        }
+        Ok(())
+    }
+
+    /// `nBits` of every row. Index `fk - 1`.
+    pub fn bits_in_fk_order(&self) -> Result<Vec<u32>, StoreError> {
+        let n = self.count();
+        let mut bits = vec![0u32; n as usize];
+        self.for_each_record(|fk, rec| {
+            let i = (fk.0 - 1) as usize;
+            if let Some(slot) = bits.get_mut(i) {
+                *slot = rec.bits;
+            }
+            Ok(())
+        })?;
+        Ok(bits)
+    }
+
+    /// Rows loaded by [`Self::get`] since the last take.
+    #[cfg(any(test, feature = "body-gets"))]
+    pub fn take_body_gets(&self) -> u64 {
+        self.body_gets.swap(0, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn get(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {
         use std::sync::atomic::Ordering;
+        #[cfg(any(test, feature = "body-gets"))]
+        self.body_gets.fetch_add(1, Ordering::Relaxed);
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let count = self.count.load(Ordering::Acquire);
         if id == 0 || id > count {

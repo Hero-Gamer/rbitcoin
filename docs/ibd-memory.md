@@ -76,7 +76,7 @@ Not page cache. Caps on **decoded `Block` objects and live outbound sessions**:
 | **Query `sh_heads`** | **65_536** process-local SH body heads | Evict arbitrary key at cap (`keys().next()`). Miss path `locate_head`s. Catch-up and tip SH apply share this map. |
 | **getheaders continuation** | full 2000-header reply locates from last hash | Next batch after that hash, not a replay from our tip. |
 | **headers poll** | skip if `best_known` cannot beat our tip | 120s `getheaders` only for peers that can still add work. |
-| **Chainwork prefix** | `Vec<Work>` `prefix[h] = work through h` (~32 B × tip; ≈28–32 MiB at 900k) | Process cache. Extend/truncate to `query.tip_height()`. Not durable. Restart rebuilds on first `chain_work`. |
+| **Chainwork prefix** | `Vec<Work>` `prefix[h] = work through h` (~32 B × tip; ≈28–32 MiB at 900k) | Process cache. Extend/truncate to `query.tip_height()`. Not durable. Restart fills it with one sequential read of `header.body` (`nBits` only), then one height at a time. |
 | **Block index windows** | ≤ 3 windows (one being read, ≤2 queued) of ≤64 heights / ≤50k creates: block outputs, input edges, P2TR-output witnesses, spent parents (tens of MiB each at mainnet sizes) | Only while `rbtc-idx-wb` builds a watermark that is behind the tip. A committed window is dropped. |
 | **Confirm-batch index bytes** | One confirm batch of BIP158 filter bytes and BIP-352 tweak vecs while `index_live` is set | Drop with the batch at write. Not a cache. |
 | **Fee history** | ≤1008 `(height, p10)` entries (~16 KiB) | Read from the chain per connected block; backfilled over the newest 1008 blocks when relay turns on (`txstat` + `spent` span reads, no bodies). Not a cache: every entry is a chain fact. |
