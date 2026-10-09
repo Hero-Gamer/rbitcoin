@@ -301,6 +301,48 @@ fn blend_sat_kvb(flow: Option<u64>, hist: Option<u64>, n_blocks: u32) -> Option<
     }
 }
 
+/// `(1-α)·cold + α·warm`. `α` outside `0..=1` clamps.
+///
+/// A missing warm side leaves the cold quote. Flow with no history answers
+/// only at α = 1, so a thin pool cannot invent a rate.
+pub fn warmup_blend(alpha: f64, cold: Option<u64>, warm: Option<u64>) -> Option<u64> {
+    let alpha = if alpha.is_finite() {
+        alpha.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    match (cold, warm) {
+        (Some(c), Some(w)) => Some(((1.0 - alpha) * c as f64 + alpha * w as f64).round() as u64),
+        (Some(c), None) => (alpha < 1.0).then_some(c),
+        (None, Some(w)) => (alpha >= 1.0).then_some(w),
+        (None, None) => None,
+    }
+}
+
+/// One published depth: cold at α = 0, warm at α = 1.
+///
+/// The N=1 confirm-memory floor is part of the warm quote. α = 0 leaves it
+/// out, including when history and flow are both missing.
+pub fn published_depth_rate(
+    n_blocks: u32,
+    alpha: f64,
+    flow: Option<u64>,
+    frontier: Option<u64>,
+    hist: Option<u64>,
+    confirm_floor: Option<u64>,
+) -> Option<u64> {
+    let cold = depth_rate_sat_kvb(n_blocks, false, flow, frontier, hist);
+    let mut warm = depth_rate_sat_kvb(n_blocks, true, flow, frontier, hist);
+    if n_blocks <= 1 && alpha.is_finite() && alpha > 0.0 {
+        warm = match (warm, confirm_floor) {
+            (Some(rate), Some(floor)) => Some(rate.max(floor)),
+            (None, Some(floor)) => Some(floor),
+            (warm, None) => warm,
+        };
+    }
+    warmup_blend(alpha, cold, warm)
+}
+
 /// One target's rate (sat/kvB) before the monotone pass.
 ///
 /// Once flow is warm, the 1-block target is flow (history only when flow has
@@ -552,6 +594,67 @@ mod tests {
         assert_eq!(blend_sat_kvb(Some(9_000), None, 6), Some(9_000));
         assert_eq!(blend_sat_kvb(None, Some(3_000), 6), Some(3_000));
         assert_eq!(blend_sat_kvb(None, None, 6), None);
+    }
+
+    #[test]
+    fn warmup_blend_is_history_at_zero_and_flow_at_full() {
+        assert_eq!(warmup_blend(0.0, Some(4_000), Some(1_000)), Some(4_000));
+        assert_eq!(warmup_blend(1.0, Some(4_000), Some(1_000)), Some(1_000));
+        assert_eq!(warmup_blend(0.5, Some(1_000), Some(3_000)), Some(2_000));
+        assert_eq!(warmup_blend(0.0, Some(4_000), None), Some(4_000));
+        assert_eq!(warmup_blend(0.5, Some(4_000), None), Some(4_000));
+        assert_eq!(warmup_blend(1.0, Some(4_000), None), None);
+        assert_eq!(warmup_blend(0.0, None, Some(8_000)), None);
+        assert_eq!(warmup_blend(0.25, None, Some(8_000)), None);
+        assert_eq!(warmup_blend(1.0, None, Some(8_000)), Some(8_000));
+        assert_eq!(warmup_blend(0.0, None, None), None);
+    }
+
+    #[test]
+    fn published_rate_is_cold_at_zero_and_warm_at_full() {
+        // Frontier raises history. The confirm floor stays out at α = 0.
+        assert_eq!(
+            published_depth_rate(1, 0.0, Some(500), Some(2_000), Some(1_000), Some(9_000)),
+            Some(2_000)
+        );
+        // α = 1 is the warm flow quote, raised by the confirm floor.
+        assert_eq!(
+            published_depth_rate(1, 1.0, Some(500), Some(2_000), Some(1_000), Some(9_000)),
+            Some(9_000)
+        );
+        assert_eq!(
+            published_depth_rate(1, 1.0, Some(500), Some(2_000), Some(1_000), None),
+            Some(500)
+        );
+        // A missing cold quote does not invent the floor, or a thin flow rate.
+        assert_eq!(
+            published_depth_rate(1, 0.0, None, None, None, Some(9_000)),
+            None
+        );
+        assert_eq!(
+            published_depth_rate(1, 0.25, Some(500), None, None, None),
+            None
+        );
+        assert_eq!(
+            published_depth_rate(1, 1.0, Some(500), None, None, None),
+            Some(500)
+        );
+        assert_eq!(
+            published_depth_rate(1, 1.0, None, None, None, Some(9_000)),
+            Some(9_000)
+        );
+        // N=2 ignores the confirm floor. α = 0 is history; α = 1 is the blend.
+        assert_eq!(
+            published_depth_rate(2, 0.0, Some(1_000), Some(1_000), Some(5_000), Some(9_000)),
+            Some(5_000)
+        );
+        let warm = published_depth_rate(2, 1.0, Some(1_000), Some(1_000), Some(5_000), Some(9_000))
+            .unwrap();
+        assert!(warm > 1_000 && warm < 3_000, "{warm}");
+        assert_eq!(
+            published_depth_rate(1, 0.5, Some(1_000), None, Some(3_000), None),
+            Some(2_000)
+        );
     }
 
     #[test]
