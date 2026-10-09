@@ -440,8 +440,9 @@ impl Query {
             let _ = store.strong_tx.flush();
         }
         let store_path = store.path().to_path_buf();
-        let (sp_tweaks, sptweaks_origin) = if SpTweaksTable::files_present(&store_path) {
-            match SpTweaksTable::open(&store_path) {
+        let index_dir = store.cold_files_dir().to_path_buf();
+        let (sp_tweaks, sptweaks_origin) = if SpTweaksTable::files_present(&index_dir) {
+            match SpTweaksTable::open(&index_dir) {
                 Ok(t) => {
                     let origin = t.origin_height().0;
                     (Some(t), origin)

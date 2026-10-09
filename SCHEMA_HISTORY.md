@@ -50,7 +50,9 @@ unstamped). `input.body` is 8 B per input: parent `create_fk` u40 LE
 per-header blob (`txstat.ovf` + `txstat.blk`). `seqsigwit.*` is the renamed
 `inwit` stem (sequence, scriptSig, witness); open renames the files in place.
 `txstat.*` and `input.*` sit next to `seqsigwit` (cold when `--datadir-cold`
-is set). Open with no `input.loc` and a matching `seqsigwit` count backfills
+is set). `blockfilter.*` and `sp_tweaks.*` use that same directory once
+enabled. That placement is not a schema bump, and neither index is pruned.
+Open with no `input.loc` and a matching `seqsigwit` count backfills
 parent edges from `seqsigwit` prevouts. A four-ULEB cell that started with
 `n_in` is not detected; resync that experimental datadir. Occupied 24
 rewrites `meta` and extends zeros to `create.loc` count. `txout.body` is not

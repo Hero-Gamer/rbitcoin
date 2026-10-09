@@ -375,8 +375,10 @@ SV2: --sv2-tp-listen ADDR serves the Stratum v2 Template Distribution Protocol (
   --sv2-tp-fee-delta SATS pushes a same-tip template once its fees gain SATS over the last one sent (default 1000).\n\
   --sv2-tp-template-interval SECS checks for that gain every SECS, 1 to 86400 (default 5).\n\
 RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (default 127.0.0.1 and Core-matching port). Token {{datadir}}/rpc.token (Bearer); --rpc-cookie-file opts TCP into Core cookie HTTP Basic. No --rpcuser. --rest turns on unauthenticated /rest/ on those listeners (off unless set).\n\
-Cold files: --datadir-cold PATH puts Class A seqsigwit.body/idx under PATH/store (HDD).\n\
-  Default (flag omitted): hot and cold files both live under --datadir.\n\
+Cold files: --datadir-cold PATH puts append-only IBD files under PATH/store\n\
+  (seqsigwit, txstat, input, and blockfilter / sp_tweaks once enabled).\n\
+  Default (flag omitted): those files live under --datadir. --prune-seqsigwit\n\
+  is separate: it drops old seqsigwit and keeps a 288-height window on the hot store.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
 IBD densify: up to 1024 concurrent getdata, max 16 in transit per peer.\n\

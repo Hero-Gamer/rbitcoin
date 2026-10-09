@@ -165,7 +165,7 @@ in
     coldDataDir = mkOption {
       type = types.nullOr types.path;
       default = null;
-      description = "Optional directory for the large, rarely read Class A seqsigwit store.";
+      description = "Optional directory for append-only IBD files (seqsigwit, txstat, input, block filters, silent-payment tweaks).";
     };
 
     user = mkOption {

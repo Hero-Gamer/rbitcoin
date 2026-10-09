@@ -184,7 +184,7 @@ impl Query {
     fn ensure_sp_tweaks(&self, origin: Height) -> Result<(), QueryError> {
         let mut g = self.sp_tweaks.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_none() {
-            let t = SpTweaksTable::open_or_create(self.store.path(), origin)?;
+            let t = SpTweaksTable::open_or_create(self.store.cold_files_dir(), origin)?;
             self.repair_sp_tweaks(&t)?;
             *g = Some(t);
             self.sptweaks_origin
@@ -537,6 +537,31 @@ mod tests {
     use crate::testutil::FixtureChain;
     fn tmp_q() -> (crate::testutil::TempDir, Query) {
         crate::testutil::tiny_query_labeled("sptweaks")
+    }
+
+    #[test]
+    fn split_store_puts_blockfilter_and_sp_tweaks_on_cold() {
+        let root = crate::testutil::TempDir::labeled("cold-indexes").unwrap();
+        let hot = root.path().join("hot");
+        let cold = root.path().join("cold");
+        let layout = rbitcoin_store::StoreLayout::tiny(&hot).with_cold_dir(&cold);
+        let q = Query::open_or_create_layout(layout.clone()).unwrap();
+        q.set_block_filter_index(true).unwrap();
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        assert!(cold.join("blockfilter.idx").is_dir());
+        assert!(cold.join("blockfilter.body").is_dir());
+        assert!(cold.join("sp_tweaks.idx").is_dir());
+        assert!(cold.join("sp_tweaks.body").is_dir());
+        assert!(!hot.join("blockfilter.idx").exists());
+        assert!(!hot.join("blockfilter.body").exists());
+        assert!(!hot.join("sp_tweaks.idx").exists());
+        assert!(!hot.join("sp_tweaks.body").exists());
+        drop(q);
+        let q = Query::open_or_create_layout(layout).unwrap();
+        assert_eq!(q.sptweaks_next_height(), Some(Height(0)));
+        q.set_block_filter_index(true).unwrap();
+        assert!(!hot.join("blockfilter.idx").exists());
+        assert!(cold.join("blockfilter.idx").join("meta").is_file());
     }
 
     #[test]

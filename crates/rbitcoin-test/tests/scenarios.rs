@@ -327,6 +327,10 @@ fn pin_operator_smokes(td: &TestDatadir) {
     assert!(!hot.join("store/seqsigwit.body").exists());
     assert!(cold.join("store/seqsigwit.body").is_file());
     assert!(cold.join("store/seqsigwit.loc").is_file());
+    assert!(cold.join("store/txstat.body").is_file());
+    assert!(cold.join("store/input.body").is_file());
+    assert!(!hot.join("store/txstat.body").exists());
+    assert!(!hot.join("store/input.body").exists());
 
     let signet = td.path().join("custom-signet");
     assert!(exit_success(node(&[

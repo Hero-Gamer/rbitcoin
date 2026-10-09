@@ -225,11 +225,12 @@ itself changed.
     seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf       # Class A inputs+witness (cold loc)
     seqsigwit.prune                  # optional: u32 LE pruneheight sidecar (`--prune-seqsigwit`; missing = off)
     seqsigwit.window/                # optional prune window: one {height}.bin per kept height
-    seqsigwit.reloc                  # optional: seqsigwit lives under --datadir-cold/store
+    seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
+    input.loc / input.off / input.body               # spender → parent edges (schema 22–23)
     tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
@@ -257,12 +258,19 @@ itself changed.
 <datadir-cold>/                  # only when --datadir-cold is set
   store/
     seqsigwit.body / seqsigwit.loc / seqsigwit.off / seqsigwit.loc.ovf
+    txstat.body / txstat.ovf / txstat.blk
+    input.loc / input.off / input.body
+    blockfilter.idx/  blockfilter.body/   # when --block-filter-index has created them
+    sp_tweaks.idx/  sp_tweaks.body/       # when --sp-tweaks has created them
 ```
 
-`--datadir` holds both stems by default. `--datadir-cold PATH` places only
-`seqsigwit.body` + `seqsigwit.loc` (and `seqsigwit.off` / `seqsigwit.loc.ovf`) under `PATH/store/`
-(and writes `seqsigwit.reloc` in the hot store). Pin / SH / spend-annotate stay on
-the hot volume.
+`--datadir` holds every file by default. `--datadir-cold PATH` places the
+files the IBD pin path does not read under `PATH/store/` and writes
+`seqsigwit.reloc` in the hot store: `seqsigwit.*`, `txstat.*`, `input.*`,
+and, once those indexes exist, `blockfilter.*` and `sp_tweaks.*`. Pin / SH /
+spend-annotate stay on the hot volume. `--prune-seqsigwit` is separate: it
+drops historical `seqsigwit` below tip−288 and keeps that window on the hot
+store. `txstat`, `input`, block filters, and tweaks are not pruned.
 
 **Height → txs:** `confirmed[h]` → `header_fk` → contiguous Class A range  
 `[header_txs_first[h−1], header_txs_first[h−1] + header_txs_count[h−1])`.
