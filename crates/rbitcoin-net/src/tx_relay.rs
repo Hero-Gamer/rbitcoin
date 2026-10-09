@@ -14,8 +14,8 @@ use rbitcoin_mempool::{
     depth_rate_sat_kvb, fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth,
     frontier_feerate_from_chunks, hold_defined_then_monotone, min_rate_for_capacity,
     percentile_sat, weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool,
-    ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, SelectBudget, Selected, UtxoProvider,
-    BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, SelectBudget, Selected, StockAbove,
+    UtxoProvider, BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -2473,6 +2473,7 @@ impl MempoolHub {
             _ => None,
         };
         let candidates = fine_candidate_rates();
+        let stock = StockAbove::from_best_first(&chunks);
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
         let history = self.block_p10_history.lock().unwrap().rates();
@@ -2482,14 +2483,9 @@ impl MempoolHub {
         for &depth in FEE_SNAPSHOT_DEPTHS {
             let target_wu = u64::from(depth).saturating_mul(BLOCK_WEIGHT_WU);
             let frontier = frontier_feerate_from_chunks(&chunks, target_wu);
-            let projected = inflow.as_ref().and_then(|inf| {
-                min_rate_for_capacity(
-                    |r| weight_above_from_chunks(&chunks, r),
-                    inf,
-                    depth,
-                    &candidates,
-                )
-            });
+            let projected = inflow
+                .as_ref()
+                .and_then(|inf| min_rate_for_capacity(|r| stock.above(r), inf, depth, &candidates));
             let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
             let hist = history.get(&depth).copied().flatten();
             let mut rate = depth_rate_sat_kvb(depth, flow_warm, flow, frontier, hist);

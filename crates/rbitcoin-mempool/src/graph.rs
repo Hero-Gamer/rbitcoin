@@ -134,6 +134,42 @@ pub fn weight_above_from_chunks(chunks: &[Chunk], rate_sat_per_kvb: u64) -> u64 
         .sum()
 }
 
+/// Prefix of a best-first chunk list so each candidate rate is one search.
+///
+/// `chunks` must be ordered by descending feerate, the same order as
+/// [`frontier_feerate_from_chunks`].
+#[derive(Debug, Clone)]
+pub struct StockAbove {
+    /// Feerate of each chunk, descending.
+    rates: Vec<u64>,
+    /// `prefix[i]` is the weight of chunks `0..i`.
+    prefix: Vec<u64>,
+}
+
+impl StockAbove {
+    pub fn from_best_first(chunks: &[Chunk]) -> Self {
+        let mut rates = Vec::with_capacity(chunks.len());
+        let mut prefix = Vec::with_capacity(chunks.len() + 1);
+        prefix.push(0);
+        for ch in chunks {
+            rates.push(ch.fee_rate_sat_per_kvb());
+            let cum = prefix
+                .last()
+                .copied()
+                .unwrap_or(0u64)
+                .saturating_add(ch.weight);
+            prefix.push(cum);
+        }
+        Self { rates, prefix }
+    }
+
+    /// Weight of chunks whose feerate is strictly above `rate_sat_per_kvb`.
+    pub fn above(&self, rate_sat_per_kvb: u64) -> u64 {
+        let i = self.rates.partition_point(|&rate| rate > rate_sat_per_kvb);
+        self.prefix[i]
+    }
+}
+
 /// Cluster identity: sorted member set fingerprint (min txid as representative).
 #[derive(Debug, Clone)]
 pub struct Cluster {
@@ -1279,6 +1315,36 @@ mod tests {
         g.rebuild_from(vec![(ee, std::sync::Arc::new(e.clone()))]);
         assert_eq!(g.txid_for_wtxid(&we), Some(e.compute_txid()));
         assert!(!g.contains_wtxid(&wb));
+    }
+
+    #[test]
+    fn stock_above_matches_weight_above_on_best_first_chunks() {
+        let chunks = [
+            Chunk {
+                txids: vec![],
+                fee_sat: 5_000,
+                weight: 4_000,
+            },
+            Chunk {
+                txids: vec![],
+                fee_sat: 1_000,
+                weight: 8_000,
+            },
+            Chunk {
+                txids: vec![],
+                fee_sat: 100,
+                weight: 12_000,
+            },
+        ];
+        let stock = StockAbove::from_best_first(&chunks);
+        for rate in [0u64, 99, 100, 101, 999, 1_000, 1_001, 5_000, 5_001] {
+            assert_eq!(
+                stock.above(rate),
+                weight_above_from_chunks(&chunks, rate),
+                "rate {rate}"
+            );
+        }
+        assert_eq!(StockAbove::from_best_first(&[]).above(0), 0);
     }
 
     #[test]

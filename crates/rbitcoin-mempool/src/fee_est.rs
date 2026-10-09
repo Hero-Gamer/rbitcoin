@@ -23,55 +23,59 @@ pub const LAMBDA_AT_NEAR: f64 = 2.0;
 /// Inflow EMA multiplier at `CONFIDENCE_FAR`.
 pub const LAMBDA_AT_FAR: f64 = 1.0;
 
-/// Admit-rate floors in sat/kvB. 0.1 sat/vB steps through 10 sat/vB, then
-/// 20, 50, and 100 sat/vB. The same grid is the inclusion-search ladder.
-/// The last bucket is everything above the final edge.
-const FLOW_BUCKET_EDGE_COUNT: usize = 103;
+/// Admit-rate floors in sat/kvB. 100 geometric steps per decade from min
+/// relay (0.1 sat/vB) through 1000 sat/vB. The same grid is the
+/// inclusion-search ladder. The last bucket is everything above that.
+const FLOW_BUCKETS_PER_DECADE: usize = 100;
+const FLOW_BUCKET_DECADES: usize = 4;
+const FLOW_BUCKET_EDGE_COUNT: usize = FLOW_BUCKET_DECADES * FLOW_BUCKETS_PER_DECADE + 1;
 
 const fn flow_bucket_edges() -> [u64; FLOW_BUCKET_EDGE_COUNT] {
+    /// `ln(10) * 10^12`, truncated. The exp series below rounds each edge.
+    const SCALE: u128 = 1_000_000_000_000;
+    const LN10_SCALE: u128 = 2_302_585_092_994;
+    let min_relay = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB as u128;
     let mut edges = [0u64; FLOW_BUCKET_EDGE_COUNT];
     let mut i = 0usize;
-    let mut rate = 100u64;
-    while rate <= 10_000 {
-        edges[i] = rate;
+    while i < FLOW_BUCKET_EDGE_COUNT {
+        let y = (i as u128) * LN10_SCALE / (FLOW_BUCKETS_PER_DECADE as u128);
+        let mut term = SCALE;
+        let mut acc = term;
+        let mut n = 1u128;
+        while n < 40 {
+            term = term * y / (n * SCALE);
+            if term == 0 {
+                break;
+            }
+            acc += term;
+            n += 1;
+        }
+        let mut rate = (min_relay * acc + SCALE / 2) / SCALE;
+        if i > 0 && rate <= edges[i - 1] as u128 {
+            rate = edges[i - 1] as u128 + 1;
+        }
+        edges[i] = rate as u64;
         i += 1;
-        rate += 100;
     }
-    edges[i] = 20_000;
-    i += 1;
-    edges[i] = 50_000;
-    i += 1;
-    edges[i] = 100_000;
     edges
 }
 
 pub const FEE_BUCKET_EDGES_SAT_PER_KVB: [u64; FLOW_BUCKET_EDGE_COUNT] = flow_bucket_edges();
 
 /// Index of the bucket that contains `rate_sat_per_kvb` (0 = lowest).
+///
+/// A rate below the first edge shares that bucket. A rate strictly above
+/// the last edge is the open top (`edges.len()`).
 pub fn bucket_index(rate_sat_per_kvb: u64) -> usize {
     let edges = &FEE_BUCKET_EDGES_SAT_PER_KVB;
-    for (i, &edge) in edges.iter().enumerate() {
-        if rate_sat_per_kvb < edge {
-            return i.saturating_sub(1).min(edges.len());
-        }
-        if rate_sat_per_kvb == edge {
-            return i;
-        }
+    let at_or_below = edges.partition_point(|&edge| edge <= rate_sat_per_kvb);
+    if at_or_below == 0 {
+        return 0;
     }
-    // rate >= last edge → top open bucket (index == edges.len())
-    // For rates in [edge[i], edge[i+1]) use i; rate >= last → edges.len()
-    let mut idx = 0usize;
-    for (i, &edge) in edges.iter().enumerate() {
-        if rate_sat_per_kvb >= edge {
-            idx = i;
-        }
-    }
-    // Open top: rates strictly above last edge stay at last index for closed
-    // buckets; treat last edge and above as last closed + one open.
-    if rate_sat_per_kvb > *edges.last().unwrap_or(&0) {
+    if rate_sat_per_kvb > edges[edges.len() - 1] {
         edges.len()
     } else {
-        idx
+        at_or_below - 1
     }
 }
 
@@ -444,14 +448,15 @@ mod tests {
         let mut inflow = vec![0u64; bucket_count()];
         // Massive inflow in high-rate buckets (index for 50k+).
         let hi = bucket_index(50_000);
+        let floor = FEE_BUCKET_EDGES_SAT_PER_KVB[hi];
         inflow[hi] = 50_000; // WU/s → over 600s = 30e6 WU >> 4e6
         let rates = default_candidate_rates();
         let cold = min_rate_for_capacity(stock, &vec![0u64; bucket_count()], 1, &rates).unwrap();
         let hot = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
         assert!(hot >= cold, "hot={hot} cold={cold}");
         assert!(
-            hot >= 50_000,
-            "should clear high-inflow competitors, got {hot}"
+            hot >= floor,
+            "should clear high-inflow competitors, got {hot} floor {floor}"
         );
     }
 
@@ -470,10 +475,13 @@ mod tests {
 
     #[test]
     fn bucket_index_edges() {
-        assert_eq!(bucket_index(100), 0);
-        assert_eq!(bucket_index(150), 0);
-        assert_eq!(bucket_index(200), 1);
-        assert!(bucket_index(1_000_000) >= FEE_BUCKET_EDGES_SAT_PER_KVB.len() - 1);
+        let edges = &FEE_BUCKET_EDGES_SAT_PER_KVB;
+        assert_eq!(bucket_index(edges[0] - 1), 0);
+        assert_eq!(bucket_index(edges[0]), 0);
+        assert_eq!(bucket_index(edges[1] - 1), 0);
+        assert_eq!(bucket_index(edges[1]), 1);
+        assert_eq!(bucket_index(edges[edges.len() - 1]), edges.len() - 1);
+        assert_eq!(bucket_index(edges[edges.len() - 1] + 1), edges.len());
     }
 
     #[test]
@@ -688,18 +696,63 @@ mod tests {
         assert_eq!(r, [5_000, 5_000, 2_000, 2_000]);
     }
 
-    /// A point mass is priced at its own 0.1 sat/vB step. 1.5 must not
-    /// collapse to 1.0, and 4.9 must not collapse to 2.0.
+    /// Geometric buckets: min relay through 1000 sat/vB, ~100 edges per decade.
     #[test]
-    fn point_mass_quotes_its_own_tenth() {
+    fn log_buckets_span_min_relay_through_1000_sat_vb() {
+        let edges = &FEE_BUCKET_EDGES_SAT_PER_KVB;
+        assert_eq!(edges[0], 100, "starts at min relay");
+        assert_eq!(*edges.last().unwrap(), 1_000_000, "reaches 1000 sat/vB");
+        for w in edges.windows(2) {
+            assert!(w[0] < w[1], "edges must rise: {} then {}", w[0], w[1]);
+        }
+        for (lo, hi) in [
+            (100u64, 1_000),
+            (1_000, 10_000),
+            (10_000, 100_000),
+            (100_000, 1_000_000),
+        ] {
+            let n = edges.iter().filter(|e| (lo..hi).contains(e)).count();
+            assert!(
+                (90..=110).contains(&n),
+                "decade {lo}..{hi} has {n} edges, want about 100"
+            );
+        }
+        for anchor in [100u64, 1_000, 10_000, 100_000, 1_000_000] {
+            assert!(edges.contains(&anchor), "decade anchor {anchor} missing");
+        }
+    }
+
+    /// A point mass quotes its own log step. 0.26 sat/vB must not fall to 0.2,
+    /// and 4.9 must not fall to 2.0.
+    #[test]
+    fn point_mass_quotes_its_log_step() {
+        let stock = |_r: u64| 0u64;
+        let rates = fine_candidate_rates();
+        // 3_000 WU/s × 600 s × λ2 = 3.6e6 WU, over the 3.2e6 N=1 cap.
+        for (rate, lo, hi) in [(260u64, 200u64, 300u64), (4_900, 2_000, 4_900)] {
+            let mut inflow = vec![0u64; bucket_count()];
+            inflow[bucket_index(rate)] = 3_000;
+            let quoted = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
+            assert!(
+                quoted > lo && quoted <= hi,
+                "rate {rate} quoted {quoted}, want ({lo}, {hi}]"
+            );
+        }
+    }
+
+    /// A point mass quotes the greatest edge at or below its rate.
+    #[test]
+    fn point_mass_quotes_its_bucket_floor() {
         let stock = |_r: u64| 0u64;
         let rates = fine_candidate_rates();
         // 3_000 WU/s × 600 s × λ2 = 3.6e6 WU, over the 3.2e6 N=1 cap.
         for rate in [1_500u64, 4_900] {
             let mut inflow = vec![0u64; bucket_count()];
+            let floor = FEE_BUCKET_EDGES_SAT_PER_KVB[bucket_index(rate)];
             inflow[bucket_index(rate)] = 3_000;
             let quoted = min_rate_for_capacity(stock, &inflow, 1, &rates).unwrap();
-            assert_eq!(quoted, rate, "bucket floors must be the candidate grid");
+            assert_eq!(quoted, floor, "rate {rate}");
+            assert!(quoted <= rate);
         }
     }
 
@@ -709,7 +762,7 @@ mod tests {
         assert_eq!(inflow_horizon_secs(144), INFLOW_HORIZON_CAP_SECS);
         assert_eq!(fine_candidate_rates(), default_candidate_rates());
         assert_eq!(fine_candidate_rates()[0], 100);
-        assert_eq!(*fine_candidate_rates().last().unwrap(), 100_000);
+        assert_eq!(*fine_candidate_rates().last().unwrap(), 1_000_000);
     }
 
     #[test]

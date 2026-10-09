@@ -88,7 +88,7 @@ node logs when flow warms and how many targets' history is ready.
 | Admit EMA half-life | ~150 s |
 | Inflow horizon cap | 600 s |
 | Blend N0 | 6 blocks |
-| Flow buckets and candidates | 100 sat/kvB steps through 10 sat/vB, then 20_000, 50_000, 100_000, plus an open top |
+| Flow buckets and candidates | 100 geometric steps per decade from min relay through 1000 sat/vB, plus an open top |
 | Warm | 60 s + 32 admits |
 | Historical confidence | 0.999 at N=1; 0.99 at N≥2 |
 | Analog lookback | `clamp(N/4, 3, 144)` hurdle blocks |
