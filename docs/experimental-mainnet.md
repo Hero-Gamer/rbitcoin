@@ -115,7 +115,8 @@ header merkle fails or `blocktxn` does not complete the holes. We serve `getbloc
 cap) is on; `--prefill-compact=0` is coinbase-only. Generate / submit / full-block
 NewPoWValid pack txs that were not in the live mempool without delaying
 forward. A PoW-valid header that
-extends our tip is announced as `cmpctblock` to other HB peers **before**
+extends our tip is announced as `cmpctblock` to peers who sent
+`sendcmpct` announce=1 and already have the parent **before**
 connect (Core `NewPoWValidBlock`); connect failure does not take that back.
 
 **WTx (BIP339):** handshake sends `wtxidrelay` (protocol ≥70016). When the peer
