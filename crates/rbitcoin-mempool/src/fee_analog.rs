@@ -19,6 +19,8 @@ pub const ANALOG_BAND: f64 = 1.25;
 pub const ANALOG_MIN_NEIGHBORS: usize = 200;
 /// Pairs a target needs before it answers.
 pub const ANALOG_READY_PAIRS: usize = 2_000;
+/// Quantile for targets past one block. Flow fill and λ keep 0.99.
+pub const HISTORICAL_CONFIDENCE_FAR: f64 = 0.95;
 
 /// Lookback length for target N: `clamp(N/4, 3, 144)` hurdle blocks. On a
 /// mainnet backtest a 3-block floor tracked the current level closer than 6
@@ -182,9 +184,24 @@ impl AnalogHistory {
                 .map(|&(_, ahead)| ahead)
                 .collect();
         }
-        let i = ((confidence * outcomes.len() as f64).ceil() as usize).saturating_sub(1);
-        Some(*outcomes.select_nth_unstable(i).1)
+        Some(log_quantile(&mut outcomes, confidence))
     }
+}
+
+/// Log-rate interpolation between the two order statistics around `confidence`.
+/// A rank that lands on one hurdle, including a repeated one, stays there.
+fn log_quantile(outcomes: &mut [u64], confidence: f64) -> u64 {
+    let n = outcomes.len();
+    outcomes.sort_unstable();
+    let rank = (confidence * n as f64).clamp(1.0, n as f64);
+    let lo = rank.floor() as usize - 1;
+    let hi = rank.ceil() as usize - 1;
+    if lo == hi || outcomes[lo] == outcomes[hi] {
+        return outcomes[lo];
+    }
+    let frac = rank - rank.floor();
+    let blended = (1.0 - frac) * (outcomes[lo] as f64).ln() + frac * (outcomes[hi] as f64).ln();
+    blended.exp().round() as u64
 }
 
 #[cfg(test)]
@@ -207,6 +224,45 @@ mod tests {
         h.hurdles = VecDeque::from([now, now, now]);
         h.depths[0].pairs = pairs.into_iter().collect();
         h
+    }
+
+    #[test]
+    fn far_quantile_separates_a_short_window_from_a_long_one() {
+        let n = 2_500;
+        // Pairs of the higher hurdle, then three of the common one. Short
+        // windows are often entirely higher; a 10-block window always sees
+        // the common hurdle.
+        let hurdles = (0..n).map(|i| if i % 5 < 2 { 1_200 } else { 1_000 });
+        let h = history(&[2, 10], hurdles);
+        let short = h.rate_sat_kvb(2, 0.95).unwrap();
+        let long = h.rate_sat_kvb(10, 0.95).unwrap();
+        assert!(short > long, "2-block {short} vs 10-block {long}");
+
+        // About 6% of blocks are cheaper. That is too rare to move the
+        // 10-block 95% off the common hurdle.
+        let hurdles = (0..n).map(|i| if i % 17 == 0 { 800 } else { 1_000 });
+        let h = history(&[10], hurdles);
+        assert_eq!(h.rate_sat_kvb(10, 0.95), Some(1_000));
+
+        let flat = history(&[2, 6, 10], std::iter::repeat_n(1_000u64, n));
+        let rates = [2u32, 6, 10].map(|d| flat.rate_sat_kvb(d, 0.95).unwrap());
+        assert_eq!(rates, [1_000, 1_000, 1_000]);
+    }
+
+    #[test]
+    fn quantile_interpolates_in_log_rate_between_adjacent_hurdles() {
+        let now = 1_000u64;
+        let center = (now as f64).ln();
+        let n = ANALOG_READY_PAIRS;
+        let split = std::iter::repeat_n((center, 1_000u64), 1_900)
+            .chain(std::iter::repeat_n((center, 2_000u64), n - 1_900));
+        let h = paired_history(now, split);
+        let rate = h.rate_sat_kvb(1, 0.95025).unwrap();
+        let expect = (1_000f64 * 2_000f64).sqrt().round() as u64;
+        assert_eq!(rate, expect, "halfway in log rate");
+
+        let flat = paired_history(now, std::iter::repeat_n((center, 1_000u64), n));
+        assert_eq!(flat.rate_sat_kvb(1, 0.95025), Some(1_000));
     }
 
     #[test]

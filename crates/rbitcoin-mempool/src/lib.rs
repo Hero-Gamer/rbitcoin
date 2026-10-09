@@ -49,7 +49,7 @@ pub use accept::{
     DEFAULT_MAX_MEMPOOL_WEIGHT, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
 };
 pub use error::MempoolError;
-pub use fee_analog::AnalogHistory;
+pub use fee_analog::{AnalogHistory, HISTORICAL_CONFIDENCE_FAR};
 pub use fee_est::{
     block_individual_p10_sat_kvb, default_candidate_rates, depth_rate_sat_kvb,
     enforce_monotone_desc, fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth,

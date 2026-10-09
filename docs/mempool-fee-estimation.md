@@ -98,7 +98,7 @@ node logs when the flow-fullness decile changes and how many targets' history is
 | Blend N0 | 6 blocks |
 | Flow buckets and candidates | 100 geometric steps per decade from min relay through 1000 sat/vB, plus an open top |
 | Flow fullness | decayed admitted WU / ~1.44e6 WU (150 s half-life) |
-| Historical confidence | 0.999 at N=1; 0.99 at N≥2 |
+| Historical confidence | 0.999 at N=1; 0.95 at N≥2, interpolated in log-rate |
 | Analog lookback | `clamp(N/4, 3, 144)` hurdle blocks |
 | Analog band / min neighbors / ready | ×1.25 / 200 / 2000 windows |
 | History budget | 1 GiB of `txstat.body` cells |
@@ -124,8 +124,12 @@ unanswerable about half the time.
 median hurdle of the `L = clamp(N/4, 3, 144)` blocks before it with the lowest
 hurdle inside it (a tx at that rate would have beaten some block's p10). An
 estimate keeps the windows whose lookback median is within ×1.25 of the
-current lookback median (at least the 200 nearest) and takes the 99% quantile
-of their lowest hurdles (99.9% at N=1). Windows that started inside a spike
+current lookback median (at least the 200 nearest) and takes the 95% quantile
+of their lowest hurdles (99.9% at N=1). When that percentile falls between two
+adjacent hurdles, the rate is the log-rate interpolation, rounded to the
+nearest sat/kvB. A repeated hurdle stays that hurdle. Targets 4 through 10
+publish the same rate when most blocks share one: a longer window's minimum
+moves only after a cheaper hurdle is common. Windows that started inside a spike
 stop steering a calm market, and a spike in progress finds the windows that
 started inside past spikes. A target answers once it holds 2000 windows: at
 least 2000 + L + N − 1 hurdle blocks.
@@ -134,6 +138,7 @@ On a mainnet backtest over ~2.9 years of `txstat` (every 36 blocks, each
 estimate from the 1 GiB before it, scored against the next N hurdle blocks),
 analog windows covered 99.1–99.5% at 2–144 blocks and 99.91% at 1 block
 (99.9% target), at a median 2.0–3.3× the realized hurdle (7.1× at 1 block).
+Those far-target multiples are the previous 99% quantile.
 Flat quantiles over the same history covered 98.5–99.8% at 9–20× (46× at 1
 block), because a spike kept steering estimates for months. Long targets
 (504/1008) cover ~97.7%; their windows overlap so heavily that about a
