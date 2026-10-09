@@ -217,6 +217,10 @@ pub struct QueryUtxoProvider<'a> {
     need_create_mtp: AtomicBool,
     meter_get_coin: Option<&'a AtomicU64>,
     meter_create_mtp: Option<&'a AtomicU64>,
+    /// Test seam for the Class C coinbase read. `0` uses the store.
+    /// `1` is `Ok(false)`, `2` is `Ok(true)`, anything else is a read error.
+    #[cfg(test)]
+    coinbase_read: std::sync::atomic::AtomicU8,
 }
 
 impl<'a> QueryUtxoProvider<'a> {
@@ -226,7 +230,28 @@ impl<'a> QueryUtxoProvider<'a> {
             need_create_mtp: AtomicBool::new(false),
             meter_get_coin: None,
             meter_create_mtp: None,
+            #[cfg(test)]
+            coinbase_read: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Class C coinbase bit for `fk` at `create_height`.
+    ///
+    /// `Ok(false)` is a height with no coinbase row. `Err` is a failed read;
+    /// the caller leaves the coin unavailable.
+    fn coinbase_flag(
+        &self,
+        fk: Fk,
+        create_height: u32,
+    ) -> Result<bool, rbitcoin_query::QueryError> {
+        #[cfg(test)]
+        match self.coinbase_read.load(Ordering::Relaxed) {
+            0 => {}
+            1 => return Ok(false),
+            2 => return Ok(true),
+            _ => return Err(rbitcoin_store::StoreError::Corrupt("coinbase table")),
+        }
+        self.query.is_coinbase_create(fk, create_height)
     }
 }
 
@@ -275,10 +300,10 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         } else {
             Amount::from_sat(out.value as u64)
         };
-        let is_coinbase = self
-            .query
-            .is_coinbase_create(fk, create_height)
-            .unwrap_or(false);
+        let is_coinbase = match self.coinbase_flag(fk, create_height) {
+            Ok(flag) => flag,
+            Err(_) => return ChainPrevout::KnownUnavailable,
+        };
         let create_mtp = if create_height == 0 || !self.need_create_mtp.load(Ordering::Relaxed) {
             0
         } else {
@@ -5027,6 +5052,47 @@ mod tests {
             (100_000, 16_004)
         );
         let _ = std::fs::remove_dir_all(&mp);
+    }
+
+    /// A Class C coinbase read that errors is not "not a coinbase". The
+    /// genesis coinbase is unspent; forcing that read to fail must make the
+    /// prevout unavailable, while `Ok(false)` still returns the coin.
+    #[test]
+    fn coinbase_table_error_makes_the_prevout_unavailable() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_mempool::{ChainPrevout, UtxoProvider};
+        use rbitcoin_primitives::Height;
+
+        let dir = tmp();
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let op = OutPoint {
+            txid: genesis.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let provider = QueryUtxoProvider::new(&q);
+        provider.coinbase_read.store(3, Ordering::Relaxed);
+        assert!(
+            matches!(provider.chain_prevout(&op), ChainPrevout::KnownUnavailable),
+            "a failed Class C coinbase read must not admit the coin"
+        );
+        provider.coinbase_read.store(1, Ordering::Relaxed);
+        match provider.chain_prevout(&op) {
+            ChainPrevout::Unspent(coin) => {
+                assert!(!coin.is_coinbase, "Ok(false) stays not a coinbase");
+            }
+            ChainPrevout::KnownUnavailable => panic!("Ok(false) must still return the coin"),
+            ChainPrevout::Unknown => panic!("genesis coinbase is a known create"),
+        }
+        provider.coinbase_read.store(0, Ordering::Relaxed);
+        match provider.chain_prevout(&op) {
+            ChainPrevout::Unspent(coin) => assert!(coin.is_coinbase, "genesis is the coinbase"),
+            ChainPrevout::KnownUnavailable => panic!("genesis coinbase is unspent"),
+            ChainPrevout::Unknown => panic!("genesis coinbase is a known create"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Non-coinbase, no BIP68 time-lock: one packed body decode per coin
