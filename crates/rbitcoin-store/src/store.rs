@@ -3468,7 +3468,10 @@ mod tests {
         let h1_a = crate::address_head::h1_in_page(&mix_a, bits);
         let mut b = [0xBBu8; 32];
         let mut found = false;
-        for i in 0u64..500_000 {
+        // Tiny heads take page and h1 from 16 mixed bits (1 in 65536).
+        // Half a million draws misses often enough to fail CI; the cap is
+        // many times the mean, and the loop stops at the first hit.
+        for i in 0u64..8_000_000 {
             b[24..32].copy_from_slice(&i.to_le_bytes());
             let mix_b = s.txs.secret.mix_txid(&b);
             if crate::address_head::page_base_for_txid(&mix_b, bits) == page_a

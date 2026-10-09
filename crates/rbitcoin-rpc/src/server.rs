@@ -598,6 +598,10 @@ async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
                 .into_response();
         }
     };
+    // Tests arm a hold keyed by this listener's log path so a probe can
+    // observe the permit while it is still taken. Unarmed calls return.
+    #[cfg(test)]
+    tests::hold_work_queue(&state.ctx.logpath).await;
     let joined = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         if waited {
@@ -853,6 +857,70 @@ fn authorized(auth: &RpcAuth, cookie: Option<&RpcCookie>, headers: &HeaderMap) -
 mod tests {
     use super::*;
     use rbitcoin_primitives::Network;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::watch;
+
+    struct WorkQueueHold {
+        entered: Arc<AtomicBool>,
+        release_rx: watch::Receiver<bool>,
+    }
+
+    static WORK_QUEUE_HOLDS: Mutex<Option<HashMap<String, WorkQueueHold>>> = Mutex::new(None);
+
+    fn work_queue_holds() -> std::sync::MutexGuard<'static, Option<HashMap<String, WorkQueueHold>>>
+    {
+        WORK_QUEUE_HOLDS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Hold the next RPC on `logpath` after it takes a work-queue permit.
+    pub(super) fn arm_work_queue_hold(logpath: &str) -> (Arc<AtomicBool>, watch::Sender<bool>) {
+        let entered = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = watch::channel(false);
+        work_queue_holds().get_or_insert_with(HashMap::new).insert(
+            logpath.to_string(),
+            WorkQueueHold {
+                entered: Arc::clone(&entered),
+                release_rx,
+            },
+        );
+        (entered, release_tx)
+    }
+
+    pub(super) fn clear_work_queue_hold(logpath: &str) {
+        if let Some(holds) = work_queue_holds().as_mut() {
+            holds.remove(logpath);
+        }
+    }
+
+    /// Sends `true` on drop so a failed assert cannot leave the handler parked.
+    struct ReleaseHold(watch::Sender<bool>);
+
+    impl Drop for ReleaseHold {
+        fn drop(&mut self) {
+            let _ = self.0.send(true);
+        }
+    }
+
+    pub(super) async fn hold_work_queue(logpath: &str) {
+        let held = {
+            let holds = work_queue_holds();
+            holds
+                .as_ref()
+                .and_then(|m| m.get(logpath))
+                .map(|h| (Arc::clone(&h.entered), h.release_rx.clone()))
+        };
+        let Some((entered, mut release_rx)) = held else {
+            return;
+        };
+        entered.store(true, Ordering::SeqCst);
+        while !*release_rx.borrow() {
+            if release_rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
 
     #[test]
     fn work_queue_zero_and_omitted_are_the_default() {
@@ -1704,50 +1772,43 @@ mod tests {
             .expect("batch json");
         assert_eq!(arr.len(), 2, "{body:?}");
 
-        // One POST holds the only permit for every call in the batch.
-        let mut calls = Vec::new();
-        for i in 0..256 {
-            calls.push(serde_json::json!({
-                "jsonrpc": "1.0",
-                "id": i,
-                "method": "getblockcount"
-            }));
-        }
-        let hold = serde_json::Value::Array(calls).to_string();
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Hold the only permit across an await the probe can observe.
+        // A fast getblockcount batch used to finish before the probe ran,
+        // so every status was 200.
+        let logpath = dir.path().join("debug.log").display().to_string();
+        let (entered, release) = arm_work_queue_hold(&logpath);
+        let _release_on_drop = ReleaseHold(release.clone());
         let holder = {
             let addr = tcp_addr(&handle);
             let auth = handle.auth.clone();
-            let done = std::sync::Arc::clone(&done);
             tokio::spawn(async move {
-                let result = post_raw(addr, &auth, hold.as_bytes()).await;
-                done.store(true, std::sync::atomic::Ordering::SeqCst);
-                result
+                post_raw(
+                    addr,
+                    &auth,
+                    br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
+                )
+                .await
             })
         };
-        let mut hits = Vec::new();
-        while !done.load(std::sync::atomic::Ordering::SeqCst) {
-            let (st, _) = post_raw(
-                tcp_addr(&handle),
-                &handle.auth,
-                br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
-            )
-            .await;
-            hits.push(st);
-            if hits.len() > 32 {
-                break;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "handler never took the work-queue permit"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let (hold_st, _) = holder.await.unwrap();
-        hits.push(hold_st);
-        assert!(
-            hits.contains(&503),
-            "full permit must HTTP 503, got {hits:?}"
-        );
-        assert!(
-            hits.contains(&200),
-            "some occupancy must still succeed, got {hits:?}"
-        );
+        let (st, body) = post_raw(
+            tcp_addr(&handle),
+            &handle.auth,
+            br#"{"jsonrpc":"1.0","id":2,"method":"getblockcount"}"#,
+        )
+        .await;
+        assert_eq!(st, 503, "full permit must HTTP 503, got {st} {body:?}");
+        release.send(true).expect("hold release");
+        let (hold_st, hold_body) = holder.await.unwrap();
+        assert_eq!(hold_st, 200, "held call still completes: {hold_body:?}");
+        clear_work_queue_hold(&logpath);
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

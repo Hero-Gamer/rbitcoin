@@ -2832,6 +2832,58 @@ async fn write_peer_msg(raw: &mut V2PlainSession, msg: NetworkMessage) {
         .unwrap();
 }
 
+/// Unknown BIP324 short id on a live follow session counts as `*other*`
+/// and the peer stays up (Core `test_msgtype`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_v2_short_id_counts_other_and_stays() {
+    let mut t = paused_serve("bad-short-id", 0, &["/rbitcoin:test(badtype)/"]).await;
+    let (raw, sess) = &mut t.clients[0];
+    let id = sess.id;
+    let first_ping = loop {
+        if let NetworkMessage::Ping(n) = next_peer_msg(raw).await.unwrap() {
+            break n;
+        }
+    };
+    write_peer_msg(raw, NetworkMessage::Pong(first_ping)).await;
+    // short id 99 + compact-size string "d" (Core `msg_unrecognized`).
+    let unknown = [99u8, 1, b'd'];
+    raw.write_contents(&unknown).await.unwrap();
+    raw.write_contents(&unknown).await.unwrap();
+    let want = crate::v2::v2_other_recv_bytes(unknown.len()) * 2;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let other = loop {
+        let snap = t.node.peers.snapshot();
+        let n = snap
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.bytesrecv_per_msg.get("*other*"))
+            .copied();
+        if n == Some(want) {
+            break want;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unknown short id was not counted as *other*, last={n:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    assert_eq!(other, want);
+    write_peer_msg(raw, NetworkMessage::Ping(9)).await;
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let NetworkMessage::Pong(n) = next_peer_msg(raw).await.unwrap() {
+                return n;
+            }
+        }
+    })
+    .await
+    .expect("session stays up after an unknown short id");
+    assert_eq!(pong, 9);
+    assert!(t.node.peers.snapshot().iter().any(|p| p.id == id));
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+}
+
 fn getdata_msg(hashes: &[BlockHash]) -> NetworkMessage {
     NetworkMessage::GetData(hashes.iter().map(|h| Inventory::WitnessBlock(*h)).collect())
 }
