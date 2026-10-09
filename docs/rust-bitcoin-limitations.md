@@ -7,7 +7,8 @@ Two jobs:
    because Bitcoin Core consensus requires something else.
 2. **Upstream queue.** The same facts, grouped by who would be hurt, so a
    later session can open rust-bitcoin issues or PRs without re-auditing.
-   Nothing in the queue has been filed. The comparison is crate **0.32.102**
+   Three false-reject bugs are filed: RB-004, RB-015, and RB-019. The rest
+   of the queue has not been filed. The comparison is crate **0.32.102**
    as locked in this workspace, not rust-bitcoin `master` and not the open
    issue list. Re-check both before posting.
 
@@ -45,7 +46,7 @@ Core, **fix the engine** before commit.
 | RB-001 | `transaction::Version` | Core `nVersion` is **unsigned**; rust-bitcoin `Version(i32)`. Signed `< 2` skips BIP68 at wire `0xFFFFFFFF` (`i32` −1). | `(tx.version.0 as u32) >= 2` via `bip68_active_for_tx`; CSV same cast | `crates/rbitcoin-consensus/src/block/mod.rs` (`bip68_active_for_tx`); `script/interpreter.rs` CSV | mitigated | Finding [003](./external_findings/003-bip68-version-signedness-consensus-split.md); unit `bip68_enforced_when_version_high_bit_set` |
 | RB-002 | ECDSA sighash type | `EcdsaSighashType::from_consensus(0)` maps **0 → ALL(1)**; mainnet has hashtype **0**. | Parse raw type as `u32`; hash with raw byte; do not round-trip through `from_consensus` | `script/mod.rs` `crypto::parse_der_sig`; `crypto::bip143_signature_hash` writes `raw_ty` | mitigated | Mainnet e.g. block 110300 era. Their own docs say the mapping does not round-trip |
 | RB-003 | P2WPKH / P2WSH sighash helper | `p2wpkh_signature_hash` / `segwit_v0_encode_signing_data_to` hash `EcdsaSighashType::to_u32()`, so non-standard **0x65** (and raw 0) change the digest | Consensus path uses raw hashtype | `script/tests_verify.rs` `mainnet_508011_nested_p2wpkh_raw_sighash_0x65`; `crypto::bip143_*` | mitigated | Mainnet block 508011 nested P2SH-P2WPKH. `legacy_signature_hash` already takes a raw `u32` |
-| RB-004 | DER parse (libsecp) | `from_der` can return **Ok with wrong (R,S)** on some pre-BIP66 encodings; Core uses **lax** then optional strict check | Always `from_der_lax`; when BIP66, strict encoding check **before** lax parse | `script/mod.rs` `crypto::parse_der_sig`, `is_valid_signature_encoding` | mitigated | e.g. mainnet block 140493-style encodings |
+| RB-004 | DER parse (libsecp) | `from_der` can return **Ok with wrong (R,S)** on some pre-BIP66 encodings; Core uses **lax** then optional strict check | Always `from_der_lax`; when BIP66, strict encoding check **before** lax parse | `script/mod.rs` `crypto::parse_der_sig`, `is_valid_signature_encoding` | mitigated | e.g. mainnet block 140493-style encodings. Filed [rust-secp256k1#1010](https://git.rust-bitcoin.org/rust-bitcoin/rust-secp256k1/issues/1010) |
 | RB-005 | Soft-fork heights | `Params::REGTEST` still has historical Core heights (BIP34 = 100_000_000, BIP65 = 1351, BIP66 = 1251). `Params` has no CSV, segwit, or taproot height | Own `ChainParams`: overwrite the three regtest fields; store the buried heights `Params` lacks | `params.rs` | mitigated | Finding [021](./external_findings/021-regtest-activation-heights.md). Current Core regtest is BIP34/65/66/CSV = 1, segwit = 0 |
 | RB-006 | PoW formula | Compact target / retarget multiply-and-clamp lives in rust-bitcoin and matches Core | `CompactTarget::from_next_work_required` via `next_work_bits`. We do not reimplement that math | `header.rs`; [consensus-tests H7](./consensus-tests.md) | delegated | The *scheduler* around the formula is RB-018, not this row |
 | RB-007 | BIP331 / package wire types | Package relay messages are not in the crate yet | No private stand-in. Track in COMPAT until upstream has types | `COMPAT.md`, `experimental-mainnet.md` | open | Quality **Q-48** |
@@ -56,11 +57,11 @@ Core, **fix the engine** before commit.
 | RB-012 | Merkle mutation | `merkle_tree::calculate_root` duplicates an odd tail and returns only the root. Core also returns the CVE-2012-2459 mutation bit | `merkle_root_mutated` sets the bit when a level pairs two equal hashes, before odd-padding | `store/integrity.rs`; consensus `merkle_root_bytes` | mitigated | `PartialMerkleTree` is the BIP37 merkleblock, not an Electrum sibling list. That branch is `merkle_branch` |
 | RB-013 | BIP34 height parser | `Block::bip34_block_height` accepts only a minimal `PushBytes` and requires `version >= 2`. Core encodes height 0 as `OP_0` and heights 1..=16 as `OP_1`..=`OP_16` | `bip34_height_script` builds that byte string; connect checks the coinbase scriptSig prefix | `block/mod.rs` `check_bip34_coinbase` | mitigated | Mainnet BIP34 starts at height 227931 (a 3-byte push), so this shows up on regtest, signet, and any chain that activates below height 17 |
 | RB-014 | Script integers | `read_scriptint` / `read_scriptint_non_minimal` reject a slice longer than 4 bytes. CLTV and CSV use a 5-byte `CScriptNum` | `scriptnum_decode_width(v, max_len, require_minimal)` | `rbitcoin-primitives/src/scriptnum.rs` | mitigated | Finding [004](./external_findings/004-csv-nop-and-scriptnum-width.md). The 4-byte readers are the right arithmetic helper |
-| RB-015 | Sigop cost | `Transaction::total_sigop_cost` always adds P2SH and witness sigops. Its P2SH path counts a redeem script even when the scriptSig contains an opcode above `OP_16`. Core counts that input as 0, and gates the two classes on the script flags | `tx_sigop_cost` / `last_script_push` | `block/mod.rs`; `primitives/script_sigops.rs` | mitigated | Consensus-tests S11, S12 |
+| RB-015 | Sigop cost | `Transaction::total_sigop_cost` always adds P2SH and witness sigops. Its P2SH path counts a redeem script even when the scriptSig contains an opcode above `OP_16`. Core counts that input as 0, and gates the two classes on the script flags | `tx_sigop_cost` / `last_script_push` | `block/mod.rs`; `primitives/script_sigops.rs` | mitigated | Consensus-tests S11, S12. Filed [rust-bitcoin#7020](https://github.com/rust-bitcoin/rust-bitcoin/issues/7020) |
 | RB-016 | Absolute lock in a block | `LockTime::is_satisfied_by` is `n <= height` / `n <= time`. That matches CLTV against `tx.nLockTime`. Core `IsFinalTx` is strict `<` against the block height or the cutoff time | `is_final_tx` | `block/mod.rs` | mitigated | Do not ask upstream to change `<=`. Ask for an `IsFinalTx` helper if anything |
 | RB-017 | BIP68 sequence locks | `relative::LockTime::is_satisfied_by` is one input, `<=`, with no disable bit and no median-time past | `sequence_locks_satisfied` (Core `EvaluateSequenceLocks`) plus the unsigned version gate from RB-001 | `block/mod.rs` | mitigated | |
 | RB-018 | Difficulty scheduler | `from_next_work_required` is the 2016-block multiply-and-clamp only. It does not apply "retarget only on the boundary" or the testnet walk back across min-difficulty blocks | `next_work_bits` / `min_diff_bits` call the crate formula on a boundary and walk `bits_at` otherwise | `header.rs` | mitigated | Test `testnet_min_difficulty_after_20_minute_gap` |
-| RB-019 | Taproot key-spend helper | `taproot_key_spend_signature_hash` hardcodes `annex = None`. A key-path spend with an annex is consensus-valid; that helper hashes the wrong message. `taproot_script_spend_signature_hash` also drops the annex and pins the codeseparator at `0xFFFFFFFF`. `TapSighashType::from_consensus_u8(0x00)` is `Default`, so a 65-byte signature ending in `0x00` must be rejected before the parser | Key path and script path call in-tree `tap_signature_hash` (annex included; `leaf` absent on key path). They do not call the two wrappers. An explicit `0x00` type byte is rejected. The `0x00 → Default` mapping itself is correct | `script/p2tr.rs` `verify_key_path`, `verify_script_path`; tapscript `checksig_schnorr` | mitigated | Finding [008](./external_findings/008-p2tr-keypath-sighash-zero.md). Mainnet annex key-path example: block 896078 |
+| RB-019 | Taproot key-spend helper | `taproot_key_spend_signature_hash` hardcodes `annex = None`. A key-path spend with an annex is consensus-valid; that helper hashes the wrong message. `taproot_script_spend_signature_hash` also drops the annex and pins the codeseparator at `0xFFFFFFFF`. `TapSighashType::from_consensus_u8(0x00)` is `Default`, so a 65-byte signature ending in `0x00` must be rejected before the parser | Key path and script path call in-tree `tap_signature_hash` (annex included; `leaf` absent on key path). They do not call the two wrappers. An explicit `0x00` type byte is rejected. The `0x00 → Default` mapping itself is correct | `script/p2tr.rs` `verify_key_path`, `verify_script_path`; tapscript `checksig_schnorr` | mitigated | Finding [008](./external_findings/008-p2tr-keypath-sighash-zero.md). Mainnet annex key-path example: block 896078. Filed [rust-bitcoin#7019](https://github.com/rust-bitcoin/rust-bitcoin/issues/7019) |
 | RB-020 | Witness decode allocation | `Witness::consensus_decode` allows a stack count up to `MAX_VEC_SIZE` (4_000_000), then allocates `count * 4 + 128` bytes before reading any element length. A short `tx`, `block`, `cmpctblock`, or `blocktxn` whose count is 4_000_000 zeros about 16 MB and then fails | Allocation-free pre-walk in `try_decode`. A count that cannot fit in the remaining bytes (an element is at least one byte) is `MessageTooLarge`, which the peer loop scores. Relay `tx`, `block`, `cmpctblock`, and `blocktxn` then walk inputs, outputs, and witnesses a second time inside `consensus_decode`. IBD block frames skip the pre-walk | `net/src/codec.rs` `walk_witness` | mitigated | `short_tx_witness_count_is_message_too_large` and the `block`, `cmpctblock`, and `blocktxn` siblings. A real witness payload still decodes |
 | RB-021 | `merkleblock` bit vector | `PartialMerkleTree::consensus_decode` reads a flag-byte compact-size capped at 4_000_000, then allocates `vec![false; n * 8]` before reading those bytes. At the cap that is 32 MB of bools. This node never asks for or handles a merkle block | The command is `Unknown` before `consensus_decode`. An unrecognized command stays `Unknown` | `net/src/codec.rs` `decode_cmd_payload` | mitigated | `short_merkleblock_is_unknown_without_decoding`. Esplora still builds a `MerkleBlock` itself for `/tx/:txid/merkleblock-proof` |
 
@@ -68,6 +69,7 @@ Core, **fix the engine** before commit.
 
 Suggested titles are drafts. Confirm the behavior on current upstream
 `master`, then search the issue tracker, before opening anything.
+A row marked **Filed** already has an issue. Do not open a second one.
 
 ### Bugs that can hit ordinary rust-bitcoin users
 
@@ -99,7 +101,8 @@ regtest harnesses included.
   used for Bitcoin signatures. Do not change `from_der` to be lax; strict
   DER is what BIP66 requires, and the two steps are intentionally split.
   **Title:** "`from_der` can succeed with the wrong (R, S) on pre-BIP66
-  signatures."
+  signatures." **Filed:**
+  [rust-secp256k1#1010](https://git.rust-bitcoin.org/rust-bitcoin/rust-secp256k1/issues/1010).
 
 - **RB-005 (regtest numbers only). `Params::REGTEST` does not match Core.**
   0.32.102 still has BIP34 = 100_000_000, BIP65 = 1351, BIP66 = 1251, with
@@ -138,7 +141,8 @@ regtest harnesses included.
   **Ask:** document the key-spend helper as annex-free, or take an
   `Option<Annex>`. Same for the script-spend wrapper (annex and
   codeseparator). Do not change `from_consensus_u8(0)`. **Title:**
-  "`taproot_key_spend_signature_hash` ignores the annex."
+  "`taproot_key_spend_signature_hash` ignores the annex." **Filed:**
+  [rust-bitcoin#7019](https://github.com/rust-bitcoin/rust-bitcoin/issues/7019).
 
 - **RB-020. Witness decode allocates from the element count.**
   `Witness::consensus_decode` accepts a stack count up to `MAX_VEC_SIZE`
@@ -222,7 +226,8 @@ untrusted blocks the way Core does will, if it uses the obvious helper.
   A helper that skipped them and kept the previous push would drift.
   **Ask:** a cost function that takes the BIP16 and WITNESS booleans and
   uses Core's push-only rule. **Title:** "`total_sigop_cost` does not
-  match Core's block sigop cost."
+  match Core's block sigop cost." **Filed:**
+  [rust-bitcoin#7020](https://github.com/rust-bitcoin/rust-bitcoin/issues/7020).
 
 - **RB-016. No `IsFinalTx`.**
   `is_satisfied_by` uses `<=` and its docs define CLTV satisfaction
