@@ -325,14 +325,6 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
     let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
-    let (hex, _spend) = spend_generated_coinbase(
-        &ctx,
-        1,
-        50_0000_0000 - 1_000,
-        ScriptBuf::from_bytes(vec![0x51]),
-    );
-    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
-    let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
     ctx.query.set_block_filter_index(true).unwrap();
     assert_eq!(ctx.query.filter_index_next(), Some(0));
 
@@ -340,53 +332,29 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     assert_eq!(missing["code"], ERR_INVALID_ADDRESS_OR_KEY);
     assert_eq!(missing["message"], "Block not found");
 
+    let tip = dispatch(&ctx, "getbestblockhash", vec![]).unwrap();
+    let behind = dispatch(&ctx, "getblockfilter", vec![tip]).unwrap_err();
+    assert_eq!(behind["code"], ERR_MISC);
+    assert_eq!(
+        behind["message"],
+        "Filter not found. Block filters are still in the process of being indexed."
+    );
+
     let genesis = dispatch(&ctx, "getblockhash", vec![json!(0)]).unwrap();
     let height1 = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
     let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
     let g = dispatch(&ctx, "getblockfilter", vec![genesis.clone()]).unwrap();
-    let one_before = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap();
-    let two_before = dispatch(&ctx, "getblockfilter", vec![height2]).unwrap();
-    let tip_before = dispatch(&ctx, "getblockfilter", vec![tip.clone()]).unwrap();
-    assert!(
-        tip_before["filter"].as_str().unwrap().len() > 2,
-        "{tip_before}"
-    );
     let zero = "00".repeat(32);
     assert_eq!(
         g["header"],
         json!(filter_header_hex(g["filter"].as_str().unwrap(), &zero)),
         "genesis filter header chains from the zero prev-header"
     );
+    let gap = dispatch(&ctx, "getblockfilter", vec![height1.clone()]).unwrap_err();
     assert_eq!(
-        one_before["header"],
-        json!(filter_header_hex(
-            one_before["filter"].as_str().unwrap(),
-            g["header"].as_str().unwrap(),
-        )),
-        "height 1 chains from the genesis filter header before anything is sealed, got {one_before}"
-    );
-    assert_eq!(
-        two_before["header"],
-        json!(filter_header_hex(
-            two_before["filter"].as_str().unwrap(),
-            one_before["header"].as_str().unwrap(),
-        )),
-        "height 2 chains through an unsealed parent, got {two_before}"
-    );
-    let tip_block = dispatch(&ctx, "getblock", vec![tip.clone()]).unwrap();
-    let parent_before = dispatch(
-        &ctx,
-        "getblockfilter",
-        vec![tip_block["previousblockhash"].clone()],
-    )
-    .unwrap();
-    assert_eq!(
-        tip_before["header"],
-        json!(filter_header_hex(
-            tip_before["filter"].as_str().unwrap(),
-            parent_before["header"].as_str().unwrap(),
-        )),
-        "tip chains from its unsealed parent, got {tip_before}"
+        gap["message"],
+        "Filter not found. Block filters are still in the process of being indexed.",
+        "{gap}"
     );
 
     let body = rbitcoin_primitives::hex_decode(g["filter"].as_str().unwrap()).unwrap();
@@ -403,25 +371,64 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
             .unwrap(),
         1
     );
-    let g_sealed = dispatch(&ctx, "getblockfilter", vec![genesis]).unwrap();
-    assert_eq!(g_sealed, g, "sealed genesis filter must match the rebuild");
-
     let one = dispatch(&ctx, "getblockfilter", vec![height1]).unwrap();
-    assert_eq!(one["filter"], one_before["filter"]);
     assert_eq!(
-        one["header"], one_before["header"],
-        "sealing the parent must not change the child filter header"
+        one["header"],
+        json!(filter_header_hex(
+            one["filter"].as_str().unwrap(),
+            g["header"].as_str().unwrap(),
+        )),
+        "height 1 is built once its parent filter header is sealed, got {one}"
+    );
+    let still = dispatch(&ctx, "getblockfilter", vec![height2.clone()]).unwrap_err();
+    assert_eq!(
+        still["message"],
+        "Filter not found. Block filters are still in the process of being indexed.",
+        "{still}"
     );
 
-    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
-    let stale = dispatch(&ctx, "getblockfilter", vec![tip]).unwrap();
+    // Height 3's parent is height 2. Invalidating height 2 leaves both stale,
+    // forked from height 1, whose filter is not sealed yet.
+    let height3 = dispatch(&ctx, "getblockhash", vec![json!(3)]).unwrap();
+    dispatch(&ctx, "invalidateblock", vec![height2.clone()]).unwrap();
+    let stale_gap = dispatch(&ctx, "getblockfilter", vec![height3.clone()]).unwrap_err();
     assert_eq!(
-        stale["filter"], tip_before["filter"],
-        "a stored block off the best chain still has a basic filter"
+        stale_gap["message"],
+        "Filter not found. Block filters are still in the process of being indexed.",
+        "{stale_gap}"
     );
+
+    let one_body = rbitcoin_primitives::hex_decode(one["filter"].as_str().unwrap()).unwrap();
+    let one_fk = ctx
+        .query
+        .store()
+        .confirmed
+        .get(Height(1))
+        .unwrap()
+        .expect("height 1 header");
     assert_eq!(
-        stale["header"], tip_before["header"],
-        "a stale block keeps the same BIP157 header, got {stale}"
+        ctx.query
+            .commit_window_filters(1, &[(BlockFilter::new(&one_body), one_fk)])
+            .unwrap(),
+        1
+    );
+    let stale_two = dispatch(&ctx, "getblockfilter", vec![height2]).unwrap();
+    assert_eq!(
+        stale_two["header"],
+        json!(filter_header_hex(
+            stale_two["filter"].as_str().unwrap(),
+            one["header"].as_str().unwrap(),
+        )),
+        "a stale block builds from its sealed best-chain parent, got {stale_two}"
+    );
+    let stale_three = dispatch(&ctx, "getblockfilter", vec![height3]).unwrap();
+    assert_eq!(
+        stale_three["header"],
+        json!(filter_header_hex(
+            stale_three["filter"].as_str().unwrap(),
+            stale_two["header"].as_str().unwrap(),
+        )),
+        "a stale grandchild walks back to the sealed fork point, got {stale_three}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2635,7 +2642,22 @@ fn mempool_under_pressure() {
         assert_eq!(v["error"], json!("package-not-validated"), "{sub}");
     }
 
+    // Height 3's coinbase is one block short of maturity on the 101-block pad.
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     pressure_admit_then_cluster(&ctx, &spk);
+
+    // Parent is under the relay floor alone. The pool is already heavier than
+    // the package, and the cap fits the package only. Trimming between the
+    // two members used to evict the parent and answer `mempool full`.
+    let (low_hex, low_parent) = spend_generated_coinbase(&ctx, 3, 50_0000_0000 - 1, spk.clone());
+    let low_child = child_of(&low_parent, 80_000);
+    let low_child_hex = hex_encode(serialize(&low_child));
+    let mp = ctx.mempool.as_ref().unwrap();
+    mp.set_max_weight(low_parent.weight().to_wu() + low_child.weight().to_wu());
+    let kept = dispatch(&ctx, "submitpackage", vec![json!([low_hex, low_child_hex])]).unwrap();
+    assert_eq!(kept["package_msg"], "success", "{kept}");
+    assert!(mp.contains(&low_parent.compute_txid()));
+    assert!(mp.contains(&low_child.compute_txid()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5426,14 +5448,9 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         "getblockfilter",
         vec![json!(hub.tip_hash().unwrap().to_string())],
     )
-    .unwrap();
+    .unwrap_err();
     assert!(
-        tip_filter["filter"].as_str().unwrap_or("").len() > 2,
-        "an unsealed tip is built on demand: {tip_filter}"
-    );
-    assert_eq!(
-        tip_filter["header"].as_str().unwrap_or("").len(),
-        64,
+        rpc_message(&tip_filter).contains("still in the process of being indexed"),
         "{tip_filter}"
     );
     let unknown_filter = dispatch(

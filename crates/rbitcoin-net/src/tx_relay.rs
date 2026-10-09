@@ -2088,7 +2088,7 @@ impl MempoolHub {
         let sample_p = self.sample_chain_coins(&parent, utxo);
         let parent_commit = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, false, &sample_p)
+            Self::commit_rechecked(&mut g, &parent, prep_p, utxo, true, &sample_p)
         };
         let (parent_res, prevouts_p) = match parent_commit.result {
             Ok(r) => (r, parent_commit.prevouts),
@@ -2116,11 +2116,17 @@ impl MempoolHub {
         let sample_c = self.sample_chain_coins(child, utxo);
         let child_commit = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, child, prep_c, utxo, false, &sample_c)
+            Self::commit_rechecked(&mut g, child, prep_c, utxo, true, &sample_c)
         };
         self.meter_accept_stages(lock_us, stages);
         match child_commit.result {
             Ok(r) => {
+                self.trim_over_budget();
+                if !self.try_contains(&parent_res.txid) || !self.try_contains(&r.txid) {
+                    self.rollback_package_accepted(&[parent_res, r]);
+                    self.publish_fee_floor();
+                    return None;
+                }
                 self.publish_admitted(&parent, &parent_res, &prevouts_p, utxo);
                 self.publish_admitted(child, &r, &child_commit.prevouts, utxo);
                 let _ = self.expire_stale();
@@ -2669,7 +2675,7 @@ impl MempoolHub {
             let committed = {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
-                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, false, &sample);
+                let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, true, &sample);
                 stages = g.last_accept_stages;
                 committed
             };
@@ -2691,6 +2697,18 @@ impl MempoolHub {
                     return Err(self.finish_accept_err(us, e).unwrap_err());
                 }
             }
+        }
+        self.trim_over_budget();
+        if accepted.iter().any(|r| !self.try_contains(&r.txid)) {
+            // Trim dropped a member that had already replaced its conflicts.
+            // Put those conflicts back; the package itself does not stay.
+            self.rollback_package_accepted(&accepted);
+            self.publish_fee_floor();
+            let us = t0.elapsed().as_micros() as u64;
+            self.meter_accept_stages(lock_us, stages);
+            return Err(self
+                .finish_accept_err(us, AcceptError::Policy("mempool full"))
+                .unwrap_err());
         }
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
@@ -3463,6 +3481,11 @@ impl MempoolHub {
     /// Core `-bytespersigop` overlay: `0` disables sigop-adjusted sizing.
     pub fn set_bytes_per_sigop(&self, bytes_per_sigop: u64) {
         self.lock_write().set_bytes_per_sigop(bytes_per_sigop);
+    }
+
+    /// Weight budget in WU.
+    pub fn set_max_weight(&self, wu: u64) {
+        self.lock_write().max_weight = wu;
     }
 
     /// Min-relay overlay (sat/kvB). `0` admits any non-negative fee.
@@ -5430,6 +5453,46 @@ mod tests {
         assert!(
             !hub.sh_index.lock().unwrap().by_tx.contains_key(&victim_id),
             "1p1c rollback must unindex the parent's eviction"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The orphan 1p1c path commits both members before the trim. When the
+    /// trim drops them, the conflict the parent replaced comes back.
+    #[test]
+    fn failed_1p1c_trim_restores_the_conflict() {
+        let (_store, q, cbs) = pad_cbs(3);
+        let spk = ScriptBuf::from_bytes(vec![0x51]);
+        let victim = spend_true(cbs[0], 1_000, spk.clone());
+        let victim_id = victim.compute_txid();
+        let dir = tmp();
+        let hub = MempoolHub::open_with_weight(&dir, q, victim.weight().to_wu() + 400).unwrap();
+        hub.set_relay_enabled(true);
+        hub.accept_tx(&victim).expect("victim");
+        let parent = spend_true(cbs[0], 20_000, spk.clone());
+        let parent_id = parent.compute_txid();
+        assert!(hub.try_note_extra_compact(&parent));
+        let mut child = spend_vout(
+            OutPoint {
+                txid: parent_id,
+                vout: 0,
+            },
+            parent.output[0].value.to_sat() - 5_000,
+        );
+        child.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x51; 4_000]);
+        let err = hub.accept_tx(&child);
+        assert!(
+            err.is_err(),
+            "an over-budget 1p1c must not stay, got {err:?}"
+        );
+        assert!(
+            !hub.contains(&parent_id),
+            "trimmed parent must be rolled back"
+        );
+        assert!(!hub.contains(&child.compute_txid()));
+        assert!(
+            hub.contains(&victim_id),
+            "the conflict the parent replaced must be restored"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -5,12 +5,13 @@ Fixed
   challenge is exactly `OP_TRUE` (signet bits, empty BIP325 solution).
   `getblockchaininfo.signet_challenge` is present on signet. A signet
   solution failure is reported as `bad-signet-blksig`.
-- **`getblockfilter` serves a stored block that is not sealed yet.** A
-  best-chain height already in the index still uses that row. A known
-  block that is stale or not sealed is rebuilt from the body, and its
-  header is the BIP157 chain from the last sealed header or from genesis.
-  An unknown `filtertype` is `-5`. REST `/rest/blockfilter/` stays
-  watermark-only.
+- **`getblockfilter` serves a sealed row, or one block past a sealed
+  parent.** A best-chain height already in the index uses that row. A
+  block whose parent filter header is sealed, including a stale branch
+  walked back to that fork point, is rebuilt from the body. An unsealed
+  best-chain gap is “Filter not found. Block filters are still in the
+  process of being indexed.” An unknown `filtertype` is `-5`. REST
+  `/rest/blockfilter/` stays watermark-only.
 - **`submitpackage` package-evaluates a child-with-parents remainder.**
   Members that failed static min relay, the dynamic mempool floor, or
   missing inputs are retried together, including when the child spends a

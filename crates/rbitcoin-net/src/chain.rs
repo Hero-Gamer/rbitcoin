@@ -249,6 +249,15 @@ pub(crate) fn reject_is_mutated(reason: &str) -> bool {
 
 /// Core logs a contextual header reject (`bad-version`, `time-too-new`) with
 /// its reason. The returned error keeps the store-facing Display string.
+/// A consensus header failure names the block so it can be marked invalid.
+/// A store fault stays a store fault: it must not be cached as `BLOCK_FAILED`.
+fn connect_failed_for_header(hash: [u8; 32], e: NetError) -> NetError {
+    match e {
+        NetError::Consensus(msg) => NetError::ConnectFailed { hash, msg },
+        other => other,
+    }
+}
+
 fn header_reject(header: &Header, e: &rbitcoin_consensus::ConsensusError) -> NetError {
     if let rbitcoin_consensus::ConsensusError::Store(se) = e {
         return NetError::store(se);
@@ -349,6 +358,22 @@ pub struct ChainTipInfo {
     pub hash: BlockHash,
     pub branchlen: u32,
     pub status: &'static str,
+}
+
+/// Equal total work prefers the precious tip, then the earlier held tip.
+/// A precious hash missing from the hold map has sequence `u64::MAX`; the
+/// precious bit wins before that comparison.
+fn held_branch_beats(
+    candidate: Work,
+    candidate_precious: bool,
+    candidate_seq: u64,
+    incumbent: Work,
+    incumbent_precious: bool,
+    incumbent_seq: u64,
+) -> bool {
+    let tie = !work_better(incumbent, candidate);
+    work_better(candidate, incumbent)
+        || (tie && !incumbent_precious && (candidate_precious || candidate_seq < incumbent_seq))
 }
 
 impl ChainHub {
@@ -1937,17 +1962,19 @@ impl ChainHub {
     }
 
     /// After invalidate, activate the remaining fork (held or archive) with
-    /// the most total chain work. Equal work keeps the first-seen held tip.
+    /// the most total chain work. Equal work prefers precious, then the
+    /// first-seen held tip.
     fn try_apply_after_invalidate(&self) -> Result<Option<AcceptOutcome>, NetError> {
         let inv = self.invalidated.set.read().unwrap().clone();
+        let precious = *self.precious.read().unwrap();
         let mut starts: Vec<BlockHash> = self.fork_tips.read().unwrap().iter().copied().collect();
         starts.extend(self.held_bodies.read().unwrap().keys());
-        if let Some(p) = *self.precious.read().unwrap() {
+        if let Some(p) = precious {
             if !starts.contains(&p) {
                 starts.push(p);
             }
         }
-        let mut best: Option<(bitcoin::Work, u64, Vec<Block>)> = None;
+        let mut best: Option<(bitcoin::Work, bool, u64, Vec<Block>)> = None;
         for start in starts {
             if inv.contains(&start) {
                 continue;
@@ -1962,18 +1989,17 @@ impl ChainHub {
             let Ok(w) = self.branch_chain_work(&branch) else {
                 continue;
             };
+            let is_p = Some(tip) == precious;
             let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, bseq, _)) => {
-                    work_better(w, *bw) || (w.to_be_bytes() == bw.to_be_bytes() && seq < *bseq)
-                }
+                Some((bw, was_p, bseq, _)) => held_branch_beats(w, is_p, seq, *bw, *was_p, *bseq),
             };
             if take {
-                best = Some((w, seq, branch));
+                best = Some((w, is_p, seq, branch));
             }
         }
-        let Some((_, _, branch)) = best else {
+        let Some((_, _, _, branch)) = best else {
             return Ok(None);
         };
         match self.accept_branch_inner(&branch) {
@@ -2263,6 +2289,7 @@ impl ChainHub {
         if self.accept_branch_weaker(blocks, old_work)? {
             return Ok((AcceptOutcome::IgnoredWeaker, None));
         }
+        self.accept_branch_check_headers(blocks, fork_height)?;
         let old_path = self.accept_branch_collect_old(fork_height)?;
         self.accept_branch_disconnect(fork_height)?;
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
@@ -2403,6 +2430,49 @@ impl ChainHub {
             old_path.push(b);
         }
         Ok(old_path)
+    }
+
+    /// Hash and bits for every header before any `disconnect_to`. The first
+    /// block's parent is on the best chain. Later parents are this branch.
+    fn accept_branch_check_headers(
+        &self,
+        blocks: &[Block],
+        fork_height: Option<u32>,
+    ) -> Result<(), NetError> {
+        let Some(fork_h) = fork_height else {
+            return Ok(());
+        };
+        let mut batch = HashMap::with_capacity(blocks.len());
+        for (i, b) in blocks.iter().enumerate() {
+            let height = fork_h.saturating_add(1).saturating_add(i as u32);
+            let checked = if i == 0 {
+                validate_header(self.query.as_ref(), &self.params, Height(height), &b.header)
+                    .map_err(|e| header_reject(&b.header, &e))
+            } else {
+                let parent = &blocks[i - 1].header;
+                let mtp = self.mtp_off_tip(parent, &batch);
+                let expected = self.expected_bits_off_tip(
+                    &b.header,
+                    parent,
+                    height.saturating_sub(1),
+                    &batch,
+                )?;
+                validate_header_on_parent(&self.params, Height(height), &b.header, mtp, expected)
+                    .map_err(|e| header_reject(&b.header, &e))
+            };
+            if let Err(e) = checked {
+                return Err(connect_failed_for_header(b.block_hash().to_byte_array(), e));
+            }
+            batch.insert(
+                b.block_hash().to_byte_array(),
+                HeaderSyncNode {
+                    fk: Fk(0),
+                    header: b.header,
+                    height: Some(height),
+                },
+            );
+        }
+        Ok(())
     }
 
     fn accept_branch_disconnect(&self, fork_height: Option<u32>) -> Result<(), NetError> {
@@ -2778,10 +2848,7 @@ impl ChainHub {
             let seq = self.held_bodies.read().unwrap().seq(tip);
             let take = match &best {
                 None => true,
-                Some((bw, was_p, bseq, _)) => {
-                    let tie = !work_better(*bw, w);
-                    work_better(w, *bw) || (tie && !*was_p && (is_p || seq < *bseq))
-                }
+                Some((bw, was_p, bseq, _)) => held_branch_beats(w, is_p, seq, *bw, *was_p, *bseq),
             };
             if take {
                 best = Some((w, is_p, seq, branch));
@@ -3147,28 +3214,60 @@ pub fn check_block_proposal_with(
     if let Err(e) = rbitcoin_consensus::validate_block_structure(block, &vctx) {
         return Err(rbitcoin_consensus::block_reject_reason(&e));
     }
-    let fees = proposal_connect(query, block, height, mtp, params.coinbase_maturity())?;
+    let (fees, prevouts) = proposal_connect(query, block, height, mtp, params.coinbase_maturity())?;
     let subsidy = rbitcoin_consensus::block_subsidy(height, params) as u64;
-    let coinbase_out = block.txdata[0]
-        .output
-        .iter()
-        .fold(0u64, |acc, o| acc.saturating_add(o.value.to_sat()));
-    if coinbase_out > subsidy.saturating_add(fees) {
+    let mut coinbase_out = 0u64;
+    for o in &block.txdata[0].output {
+        coinbase_out = coinbase_out
+            .checked_add(o.value.to_sat())
+            .ok_or("bad-txns-txouttotal-toolarge")?;
+    }
+    let allowed = subsidy.checked_add(fees).ok_or("bad-txns-fee-outofrange")?;
+    if coinbase_out > allowed {
         return Err("bad-cb-amount".into());
+    }
+    let flags = rbitcoin_consensus::ScriptVerifyFlags::for_block(
+        params,
+        height,
+        &block.block_hash().to_byte_array(),
+        mtp,
+    );
+    // Structure counts legacy sigops only. Prevouts are already in hand, so
+    // P2SH and witness sigops count here (BIP141 limit, 80_000).
+    const MAX_BLOCK_SIGOPS_COST: u64 = 80_000;
+    let mut sigops = rbitcoin_consensus::tx_sigop_cost(
+        &block.txdata[0],
+        &[],
+        flags.bip16_active,
+        flags.witness_active,
+    );
+    for (tx, ins) in block.txdata.iter().skip(1).zip(prevouts) {
+        let prev_spks: Vec<&[u8]> = ins.iter().map(|o| o.script_pubkey.as_bytes()).collect();
+        sigops = sigops.saturating_add(rbitcoin_consensus::tx_sigop_cost(
+            tx,
+            &prev_spks,
+            flags.bip16_active,
+            flags.witness_active,
+        ));
+        if sigops > MAX_BLOCK_SIGOPS_COST {
+            return Err("bad-blk-sigops".into());
+        }
+        rbitcoin_consensus::verify_tx_scripts_with_flags(ins, tx.clone(), flags)
+            .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
     }
     Ok(fees)
 }
 
 /// Resolves every spend against the block and the confirmed chain. `Ok` is
-/// the fee total over the non-coinbase txs. Caller has already passed
-/// [`rbitcoin_consensus::validate_block_structure`].
+/// the fee total and the prevouts already resolved for each non-coinbase tx.
+/// Caller has already passed [`rbitcoin_consensus::validate_block_structure`].
 fn proposal_connect(
     query: &Query,
     block: &Block,
     height: u32,
     mtp: u32,
     maturity: u32,
-) -> Result<u64, String> {
+) -> Result<(u64, Vec<Vec<TxOut>>), String> {
     if block.txdata.is_empty() {
         return Err("bad-blk-length".into());
     }
@@ -3182,6 +3281,7 @@ fn proposal_connect(
     // Dropped when the check returns. The fk resolve does not decode the body.
     let mut parents: HashMap<Txid, (Fk, Vec<TxOut>)> = HashMap::new();
     let mut fees = 0u64;
+    let mut prevouts = Vec::with_capacity(block.txdata.len().saturating_sub(1));
     for (i, tx) in block.txdata.iter().enumerate() {
         if !rbitcoin_consensus::is_final_tx(tx, height, mtp.max(block.header.time)) {
             return Err("bad-txns-nonfinal".into());
@@ -3199,6 +3299,7 @@ fn proposal_connect(
             continue;
         }
         let mut in_val = 0u64;
+        let mut tx_prevouts = Vec::with_capacity(tx.input.len());
         for inp in &tx.input {
             let op = inp.previous_output;
             if !spent.insert(op) {
@@ -3219,13 +3320,24 @@ fn proposal_connect(
             } else {
                 return Err("bad-txns-inputs-missingorspent".into());
             };
-            in_val = in_val.saturating_add(txout.value.to_sat());
+            in_val = in_val
+                .checked_add(txout.value.to_sat())
+                .ok_or("bad-txns-inputvalues-outofrange")?;
+            tx_prevouts.push(txout);
         }
-        let out_val: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let mut out_val = 0u64;
+        for o in &tx.output {
+            out_val = out_val
+                .checked_add(o.value.to_sat())
+                .ok_or("bad-txns-txouttotal-toolarge")?;
+        }
         if out_val > in_val {
             return Err("bad-txns-in-belowout".into());
         }
-        fees = fees.saturating_add(in_val - out_val);
+        fees = fees
+            .checked_add(in_val - out_val)
+            .ok_or("bad-txns-fee-outofrange")?;
+        prevouts.push(tx_prevouts);
         let tid = tx.compute_txid();
         for (vout, o) in tx.output.iter().enumerate() {
             created.insert(
@@ -3237,7 +3349,7 @@ fn proposal_connect(
             );
         }
     }
-    Ok(fees)
+    Ok((fees, prevouts))
 }
 
 /// `op`'s unspent confirmed output. `parents` holds each parent's create fk
@@ -6234,6 +6346,84 @@ mod tests {
         assert_eq!(
             hub.check_block_proposal(&off_tip).unwrap_err(),
             "inconclusive-not-best-prevblk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn store_fault_during_header_check_is_not_a_failed_block() {
+        let hash = [0x11; 32];
+        let store = connect_failed_for_header(hash, NetError::Store("budget full: SQ".into()));
+        assert!(
+            matches!(store, NetError::Store(_)),
+            "a store fault must not name a block, got {store}"
+        );
+        let bad = connect_failed_for_header(hash, NetError::Consensus("bad-diffbits".into()));
+        match bad {
+            NetError::ConnectFailed { hash: h, msg } => {
+                assert_eq!(h, hash);
+                assert!(msg.contains("bad-diffbits"), "{msg}");
+            }
+            other => panic!("consensus header failure must name the block, got {other}"),
+        }
+    }
+
+    /// Witness sigops are not in the structure walk. Nine P2WSH inputs of
+    /// 10_000 `OP_CHECKSIG` each are over the 80_000 block limit.
+    #[test]
+    fn check_block_proposal_rejects_witness_sigops_over_the_limit() {
+        let (dir, hub) = tmp_hub();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(101, op_true.clone(), vec![])
+            .unwrap();
+        let ws = ScriptBuf::from_bytes(vec![0xac; 10_000]);
+        let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
+        let cb = hub
+            .query
+            .reconstruct_block_at_height(Height(1))
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        let per = (50_0000_0000u64 - 1_000) / 9;
+        let fan = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid: cb, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: (0..9)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(per),
+                    script_pubkey: p2wsh.clone(),
+                })
+                .collect(),
+        };
+        let fan_id = fan.compute_txid();
+        let spend = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..9u32)
+                .map(|vout| TxIn {
+                    previous_output: OutPoint { txid: fan_id, vout },
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::from_slice(&[ws.as_bytes()]),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(per * 9 - 1_000),
+                script_pubkey: op_true.clone(),
+            }],
+        };
+        let block = hub
+            .assemble_block_to_script(op_true, vec![fan, spend])
+            .unwrap();
+        assert_eq!(
+            hub.check_block_proposal(&block).unwrap_err(),
+            "bad-blk-sigops"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

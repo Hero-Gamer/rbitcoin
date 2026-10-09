@@ -145,8 +145,9 @@ If the endpoint or the credential is wrong, Wasabi keeps loading filters
 from its own backend and shows the RPC status as disconnected. That
 fallback is Wasabi's. The node is in use when the status bar says the
 RPC is connected. Filters are absent until `--block-filter-index` has
-sealed the heights Wasabi asks for. `getblockfilter` on a known block
-that is not sealed yet is rebuilt from the stored body. REST
+sealed the heights Wasabi asks for. `getblockfilter` refuses a
+best-chain block whose parent filter is not sealed yet. A stale branch
+is rebuilt only back to a sealed fork point. REST
 `/rest/blockfilter/` and P2P stay watermark-only.
 
 ## Core-wallet applications

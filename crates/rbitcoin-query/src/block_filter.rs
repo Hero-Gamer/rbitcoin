@@ -18,6 +18,10 @@ use crate::{Query, QueryError};
 use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex};
 
+/// Core `getblockfilter` when the index has not reached this block.
+const FILTER_STILL_INDEXING: &str =
+    "Filter not found. Block filters are still in the process of being indexed.";
+
 /// BIP158 basic filter Golomb-Rice parameters (`M`, `P`).
 const BASIC_FILTER_M: u64 = 784_931;
 const BASIC_FILTER_P: u8 = 19;
@@ -224,10 +228,11 @@ impl Query {
 
     /// Filter bytes and header for `hash`.
     ///
-    /// Best-chain heights use the sealed index when the watermark has caught
-    /// up. A hash that is stored but not on the best chain (or not sealed
-    /// yet) is built from the Class A body: non-`OP_RETURN` output scripts,
-    /// then each spent prevout script.
+    /// A sealed best-chain row is that row. Otherwise the parent filter
+    /// header is resolved first: a sealed best-chain parent, the zero
+    /// genesis header, or a stale branch walked back to that sealed fork
+    /// point. An unsealed best-chain gap is refused before the body is
+    /// rebuilt.
     pub fn basic_filter_for_hash(
         &self,
         hash: &[u8; 32],
@@ -236,15 +241,23 @@ impl Query {
             if let Some(row) = self.basic_filter_at(h.0)? {
                 return Ok(Some(row));
             }
-            let block = self.reconstruct_block_at_height(h)?;
-            return Ok(Some(self.basic_filter_from_wire_block(&block)?));
         }
-        let Some(block) = self.reconstruct_archived_block(hash)? else {
+        let Some(prev) = self.header_prev_hash(hash)? else {
             return Ok(None);
         };
-        Ok(Some(self.basic_filter_from_wire_block(&block)?))
+        let parent_header = self.parent_basic_filter_header(&prev)?;
+        let Some(block) = self.block_body_for_filter(hash)? else {
+            return Ok(None);
+        };
+        let spent = self.spent_scripts(&block)?;
+        let filter = self.basic_filter_content(&block, &spent)?;
+        Ok(Some((
+            filter.content.clone(),
+            filter.filter_header(&parent_header),
+        )))
     }
 
+    #[cfg(test)]
     fn basic_filter_from_wire_block(
         &self,
         block: &Block,
@@ -271,9 +284,9 @@ impl Query {
         basic_filter_from_scripts(&hash, outputs, spent_refs)
     }
 
-    /// Header of `prev_hash`. Zeros are only the genesis prev-header. A sealed
-    /// best-chain row is that row; every other stored block is rebuilt back
-    /// to the last sealed header, or to genesis, and linked in chain order.
+    /// Header of `prev_hash`. Zeros are the genesis prev-header. A sealed
+    /// best-chain block is that row. A stale block is rebuilt back to the
+    /// best-chain fork point, and only when that fork point is sealed.
     fn parent_basic_filter_header(&self, prev_hash: &[u8; 32]) -> Result<FilterHeader, QueryError> {
         if *prev_hash == [0u8; 32] {
             return Ok(FilterHeader::from_byte_array([0u8; 32]));
@@ -289,6 +302,7 @@ impl Query {
                 if let Some((_, header)) = self.basic_filter_at(h.0)? {
                     break header;
                 }
+                return Err(StoreError::Rejected(FILTER_STILL_INDEXING));
             }
             if !seen.insert(cursor) {
                 return Err(StoreError::Corrupt("invariant: blockfilter header cycle"));
@@ -298,7 +312,11 @@ impl Query {
         };
         let mut header = anchor;
         for hash in pending.iter().rev() {
-            let block = self.block_for_basic_filter(hash)?;
+            let Some(block) = self.block_body_for_filter(hash)? else {
+                return Err(StoreError::Corrupt(
+                    "invariant: blockfilter parent body missing",
+                ));
+            };
             let spent = self.spent_scripts(&block)?;
             let filter = self.basic_filter_content(&block, &spent)?;
             header = filter.filter_header(&header);
@@ -306,26 +324,27 @@ impl Query {
         Ok(header)
     }
 
-    fn prev_header_hash(&self, hash: &[u8; 32]) -> Result<[u8; 32], QueryError> {
+    fn header_prev_hash(&self, hash: &[u8; 32]) -> Result<Option<[u8; 32]>, QueryError> {
         let Some((_, rec)) = self.get_header_by_hash(hash)? else {
-            return Err(StoreError::Corrupt(
-                "invariant: blockfilter parent header missing",
-            ));
+            return Ok(None);
         };
         if rec.prev_fk.is_null() {
-            return Ok([0u8; 32]);
+            return Ok(Some([0u8; 32]));
         }
-        Ok(self.get_header(rec.prev_fk)?.hash)
+        Ok(Some(self.get_header(rec.prev_fk)?.hash))
     }
 
-    fn block_for_basic_filter(&self, hash: &[u8; 32]) -> Result<Block, QueryError> {
+    fn prev_header_hash(&self, hash: &[u8; 32]) -> Result<[u8; 32], QueryError> {
+        self.header_prev_hash(hash)?.ok_or(StoreError::Corrupt(
+            "invariant: blockfilter parent header missing",
+        ))
+    }
+
+    fn block_body_for_filter(&self, hash: &[u8; 32]) -> Result<Option<Block>, QueryError> {
         if let Some(h) = self.height_of_hash(hash)? {
-            return self.reconstruct_block_at_height(h);
+            return Ok(Some(self.reconstruct_block_at_height(h)?));
         }
-        self.reconstruct_archived_block(hash)?
-            .ok_or(StoreError::Corrupt(
-                "invariant: blockfilter parent body missing",
-            ))
+        self.reconstruct_archived_block(hash)
     }
 
     fn spent_scripts(&self, block: &Block) -> Result<Vec<Vec<u8>>, QueryError> {
