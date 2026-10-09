@@ -216,8 +216,11 @@ pub struct QueryUtxoProvider<'a> {
     pub query: &'a Query,
     need_create_mtp: AtomicBool,
     meter_get_coin: Option<&'a AtomicU64>,
-    meter_block_tx_fks: Option<&'a AtomicU64>,
     meter_create_mtp: Option<&'a AtomicU64>,
+    /// Test seam for the Class C coinbase read. `0` uses the store.
+    /// `1` is `Ok(false)`, `2` is `Ok(true)`, anything else is a read error.
+    #[cfg(test)]
+    coinbase_read: std::sync::atomic::AtomicU8,
 }
 
 impl<'a> QueryUtxoProvider<'a> {
@@ -226,9 +229,29 @@ impl<'a> QueryUtxoProvider<'a> {
             query,
             need_create_mtp: AtomicBool::new(false),
             meter_get_coin: None,
-            meter_block_tx_fks: None,
             meter_create_mtp: None,
+            #[cfg(test)]
+            coinbase_read: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Class C coinbase bit for `fk` at `create_height`.
+    ///
+    /// `Ok(false)` is a height with no coinbase row. `Err` is a failed read;
+    /// the caller leaves the coin unavailable.
+    fn coinbase_flag(
+        &self,
+        fk: Fk,
+        create_height: u32,
+    ) -> Result<bool, rbitcoin_query::QueryError> {
+        #[cfg(test)]
+        match self.coinbase_read.load(Ordering::Relaxed) {
+            0 => {}
+            1 => return Ok(false),
+            2 => return Ok(true),
+            _ => return Err(rbitcoin_store::StoreError::Corrupt("coinbase table")),
+        }
+        self.query.is_coinbase_create(fk, create_height)
     }
 }
 
@@ -254,10 +277,8 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             m.fetch_add(1, Ordering::Relaxed);
         }
         let tid = op.txid.to_byte_array();
-        let Some((fk, rec)) = self.query.get_tx_by_txid(&tid).ok().flatten() else {
-            return ChainPrevout::Unknown;
-        };
-        let Some(create_height) = self.query.store().tx_height_get(fk).ok().flatten() else {
+        let Some((fk, create_height, outs)) = self.query.connected_tx_outputs(&tid).ok().flatten()
+        else {
             return ChainPrevout::Unknown;
         };
         let Some(tip) = self.query.tip_height().map(|h| h.0) else {
@@ -271,12 +292,7 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
             Ok(false) => {}
             Err(_) => return ChainPrevout::KnownUnavailable,
         }
-        let Some(out) = self
-            .query
-            .tx_output_at_fk(fk, op.vout)
-            .ok()
-            .or_else(|| self.query.tx_output(&rec, op.vout).ok())
-        else {
+        let Some(out) = outs.into_iter().nth(op.vout as usize) else {
             return ChainPrevout::KnownUnavailable;
         };
         let value = if out.value < 0 {
@@ -284,20 +300,9 @@ impl UtxoProvider for QueryUtxoProvider<'_> {
         } else {
             Amount::from_sat(out.value as u64)
         };
-        let is_coinbase = match self.query.tx_input_at_fk(fk, &rec, 0) {
-            Ok(i) => i.is_coinbase() || i.prev_index == u32::MAX,
-            Err(_) => {
-                if let Some(m) = self.meter_block_tx_fks {
-                    m.fetch_add(1, Ordering::Relaxed);
-                }
-                create_height > 0
-                    && self
-                        .query
-                        .block_tx_fks(Height(create_height))
-                        .ok()
-                        .and_then(|fks| fks.first().copied())
-                        == Some(fk)
-            }
+        let is_coinbase = match self.coinbase_flag(fk, create_height) {
+            Ok(flag) => flag,
+            Err(_) => return ChainPrevout::KnownUnavailable,
         };
         let create_mtp = if create_height == 0 || !self.need_create_mtp.load(Ordering::Relaxed) {
             0
@@ -465,8 +470,6 @@ pub struct MempoolPerfSample {
     pub tip_mtp: u64,
     /// `QueryUtxoProvider::get_coin` calls on the hub provider.
     pub get_coin: u64,
-    /// `block_tx_fks` from `get_coin` (missing input-0 record only).
-    pub get_coin_block_tx_fks: u64,
     /// Create-block MTP from `get_coin` (BIP68 time-lock spends only).
     pub get_coin_create_mtp: u64,
 }
@@ -605,7 +608,6 @@ pub struct MempoolHub {
     meter_expire_full_scans: AtomicU64,
     meter_tip_mtp: AtomicU64,
     meter_get_coin: AtomicU64,
-    meter_get_coin_block_tx_fks: AtomicU64,
     meter_get_coin_create_mtp: AtomicU64,
     /// Live mempool txs by Electrum scripthash (updated on accept/remove).
     sh_index: Mutex<MempoolShIndex>,
@@ -813,7 +815,6 @@ impl MempoolHub {
             meter_expire_full_scans: AtomicU64::new(0),
             meter_tip_mtp: AtomicU64::new(0),
             meter_get_coin: AtomicU64::new(0),
-            meter_get_coin_block_tx_fks: AtomicU64::new(0),
             meter_get_coin_create_mtp: AtomicU64::new(0),
             sh_index: Mutex::new(MempoolShIndex::new()),
             unbroadcast: Mutex::new(unbroadcast),
@@ -976,7 +977,6 @@ impl MempoolHub {
     fn utxo_provider(&self) -> QueryUtxoProvider<'_> {
         let mut p = QueryUtxoProvider::new(self.query.as_ref());
         p.meter_get_coin = Some(&self.meter_get_coin);
-        p.meter_block_tx_fks = Some(&self.meter_get_coin_block_tx_fks);
         p.meter_create_mtp = Some(&self.meter_get_coin_create_mtp);
         p
     }
@@ -1130,7 +1130,6 @@ impl MempoolHub {
             expire_full_scans: self.meter_expire_full_scans.swap(0, Ordering::Relaxed),
             tip_mtp: self.meter_tip_mtp.swap(0, Ordering::Relaxed),
             get_coin: self.meter_get_coin.swap(0, Ordering::Relaxed),
-            get_coin_block_tx_fks: self.meter_get_coin_block_tx_fks.swap(0, Ordering::Relaxed),
             get_coin_create_mtp: self.meter_get_coin_create_mtp.swap(0, Ordering::Relaxed),
         }
     }
@@ -5055,10 +5054,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&mp);
     }
 
-    /// Non-coinbase, no BIP68 time-lock: no `block_tx_fks` and no create MTP.
+    /// A Class C coinbase read that errors is not "not a coinbase". The
+    /// genesis coinbase is unspent; forcing that read to fail must make the
+    /// prevout unavailable, while `Ok(false)` still returns the coin.
+    #[test]
+    fn coinbase_table_error_makes_the_prevout_unavailable() {
+        use rbitcoin_consensus::{accept_and_connect_block, ChainParams, Milestone};
+        use rbitcoin_mempool::{ChainPrevout, UtxoProvider};
+        use rbitcoin_primitives::Height;
+
+        let dir = tmp();
+        let q = Query::open_or_create_tiny(&dir).unwrap();
+        let params = ChainParams::regtest();
+        let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, Milestone::NONE).unwrap();
+        let op = OutPoint {
+            txid: genesis.txdata[0].compute_txid(),
+            vout: 0,
+        };
+        let provider = QueryUtxoProvider::new(&q);
+        provider.coinbase_read.store(3, Ordering::Relaxed);
+        assert!(
+            matches!(provider.chain_prevout(&op), ChainPrevout::KnownUnavailable),
+            "a failed Class C coinbase read must not admit the coin"
+        );
+        provider.coinbase_read.store(1, Ordering::Relaxed);
+        match provider.chain_prevout(&op) {
+            ChainPrevout::Unspent(coin) => {
+                assert!(!coin.is_coinbase, "Ok(false) stays not a coinbase");
+            }
+            ChainPrevout::KnownUnavailable => panic!("Ok(false) must still return the coin"),
+            ChainPrevout::Unknown => panic!("genesis coinbase is a known create"),
+        }
+        provider.coinbase_read.store(0, Ordering::Relaxed);
+        match provider.chain_prevout(&op) {
+            ChainPrevout::Unspent(coin) => assert!(coin.is_coinbase, "genesis is the coinbase"),
+            ChainPrevout::KnownUnavailable => panic!("genesis coinbase is unspent"),
+            ChainPrevout::Unknown => panic!("genesis coinbase is a known create"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Non-coinbase, no BIP68 time-lock: one packed body decode per coin
+    /// lookup and no create MTP. The parent has two outputs with distinct
+    /// values and the child spends vout 1, so the fee pins the vout index.
+    /// A spend of the tip coinbase is `ImmatureCoinbase`: coinbase-ness comes
+    /// from the Class C coinbase table, not the parent's inputs.
     /// A satisfied time-lock spend must survive `evict_after_reorg`.
     #[test]
-    fn get_coin_skips_block_tx_fks_and_mtp_without_time_lock() {
+    fn get_coin_decodes_once_and_skips_mtp_without_time_lock() {
         let (store, owned_q, owned_cbs) = copy_maturity_pad(3);
         let q = &owned_q;
         let cbs = owned_cbs.as_slice();
@@ -5073,7 +5117,18 @@ mod tests {
         let tip = bitcoin::BlockHash::from_byte_array(rec.hash);
         let next = tip_h + 1;
         let spk = ScriptBuf::from_bytes(vec![0x51]);
-        let confirmed = spend_true(cbs[0], 1_000, spk.clone());
+        let mut confirmed = spend_true(cbs[0], 1_000, spk.clone());
+        let total = confirmed.output[0].value.to_sat();
+        confirmed.output = vec![
+            TxOut {
+                value: Amount::from_sat(5_000),
+                script_pubkey: spk.clone(),
+            },
+            TxOut {
+                value: Amount::from_sat(total - 5_000),
+                script_pubkey: spk.clone(),
+            },
+        ];
         let b = rbitcoin_consensus::mine_regtest_paying(
             tip,
             rec.timestamp + 600,
@@ -5093,18 +5148,24 @@ mod tests {
             input: vec![TxIn {
                 previous_output: OutPoint {
                     txid: confirmed.compute_txid(),
-                    vout: 0,
+                    vout: 1,
                 },
                 script_sig: ScriptBuf::new(),
                 sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
                 witness: Witness::new(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(confirmed.output[0].value.to_sat() - 1_000),
+                value: Amount::from_sat(confirmed.output[1].value.to_sat() - 1_000),
                 script_pubkey: spk.clone(),
             }],
         };
+        let _ = q.store().txs.sample_reset_body_decodes();
         hub.accept_tx(&child).expect("non-coinbase chain spend");
+        assert_eq!(
+            hub.get_live_meta(&child.compute_txid()).map(|(fee, _)| fee),
+            Some(1_000),
+            "the coin is vout 1's value; vout 0 holds 5_000 sat"
+        );
         let s = hub.sample_reset_perf();
         assert_eq!(
             s.get_coin, 2,
@@ -5112,12 +5173,19 @@ mod tests {
             s.get_coin
         );
         assert_eq!(
-            s.get_coin_block_tx_fks, 0,
-            "non-coinbase get_coin must not call block_tx_fks"
+            q.store().txs.sample_reset_body_decodes(),
+            s.get_coin,
+            "one packed body decode per get_coin; the fk resolve verifies txid.body only"
         );
         assert_eq!(
             s.get_coin_create_mtp, 0,
             "no BIP68 time-lock must not compute create MTP"
+        );
+        let immature = spend_true(b.txdata[0].compute_txid(), 1_000, spk.clone());
+        let err = hub.accept_tx(&immature).unwrap_err();
+        assert!(
+            matches!(err, AcceptError::ImmatureCoinbase),
+            "the tip coinbase is inside the maturity window, got {err}"
         );
         assert!(
             !hub.scripthash_mempool(&script_hash(spk.as_bytes()))

@@ -2065,6 +2065,31 @@ impl Query {
         outs.get(vout as usize).cloned().ok_or(StoreError::NotFound)
     }
 
+    /// A parent on the connected chain for a prevout reader: tip-only fk
+    /// resolve (`txid.body` verify, no decode) that also yields the create
+    /// height, then one packed outs decode for every output. `None` when
+    /// `txid` has no row on the best chain or the tx index is off. Mempool
+    /// accept and the block proposal check share this.
+    pub fn connected_tx_outputs(
+        &self,
+        txid: &[u8; 32],
+    ) -> Result<Option<(Fk, u32, Vec<OutputRecord>)>, QueryError> {
+        if !self.tx_index_enabled() {
+            return Ok(None);
+        }
+        let Some((fk, height)) = self.store.get_fk_by_txid_tip_height(txid)? else {
+            return Ok(None);
+        };
+        let (_, outs) = self.store.get_tx_meta_and_outputs(fk)?;
+        Ok(Some((fk, height, outs)))
+    }
+
+    /// Core's coinbase test for a create on the best chain: `fk` is the first
+    /// tx of the block at `height`. Class C dense tables only; no body read.
+    pub fn is_coinbase_create(&self, fk: Fk, height: u32) -> Result<bool, QueryError> {
+        Ok(self.store.coinbase_fk_at_heights(&[height])?.get(&height) == Some(&fk))
+    }
+
     /// Strong (best-chain confirmed) spenders only.
     pub fn spenders(
         &self,
