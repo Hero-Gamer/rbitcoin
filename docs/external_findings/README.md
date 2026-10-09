@@ -7,20 +7,20 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 |----|----------|--------|--------|----------------------|
 | [001](./001-disconnect-on-invalid-block.md) | medium | Peer disconnect on invalid relayed block (BIP-152) | fixed | `rbitcoin-net` `peer::tests::cmpct_helpers_without_mempool_and_queue_out_closed` |
 | [002](./002-store-corrupt-record-on-invalid-block.md) | low | Invalid block misclassified as store corrupt | fixed | `rbitcoin-consensus` `error::tests::archive_unresolved_parent_is_missing_prevout_not_corrupt` |
-| [003](./003-bip68-version-signedness-consensus-split.md) | high | BIP68 skipped for version with bit 31 set | fixed | `block::tests::bip68_enforced_when_version_high_bit_set` |
+| [003](./003-bip68-version-signedness-consensus-split.md) | high | BIP68 skipped for version with bit 31 set | fixed | `block::finality_tests::bip68_enforced_when_version_high_bit_set` |
 | [004](./004-csv-nop-and-scriptnum-width.md) | high | CSV v1 no-op; CLTV/CSV 4-byte scriptnum | fixed | `script::interpreter::tests::csv_fails_when_tx_version_below_2` + Core script corpus |
 | [005](./005-non-topological-block-accepted.md) | high | Non-topological same-block spends accepted | fixed | `rbitcoin-test` `consensus_rules::header_and_spending_boundaries` |
 | [006](./006-p2sh-scriptsig-push-size.md) | medium | P2SH scriptSig pushes not limited to 520 bytes | fixed | `script::nested::tests::p2sh_scriptsig_push_over_520_rejected` |
 | [007](./007-p2sh-nested-witness-exactness.md) | medium | P2SH nested-witness scriptSig exactness / program rules | fixed | `script::nested` nested-witness malleation tests |
 | [008](./008-p2tr-keypath-sighash-zero.md) | medium | P2TR key-path 65-byte sig with sighash byte 0x00 | fixed | `script::p2tr::tests::key_path_rejects_65_byte_sighash_byte_zero` |
-| [009](./009-witness-commitment-reserved.md) | medium | Witness commitment empty/multi-item coinbase witness | fixed | `block::tests::s8_rejects_empty_or_multi_item_coinbase_witness_reserved` |
+| [009](./009-witness-commitment-reserved.md) | medium | Witness commitment empty/multi-item coinbase witness | fixed | `block::structure_rule_tests::s8_rejects_empty_or_multi_item_coinbase_witness_reserved` |
 | [010](./010-mempool-confirmed-spentness.md) | medium | Mempool no confirmed-chain spentness check | fixed | `rbitcoin-mempool` `accept::tests::reject_when_provider_has_no_unspent_coin` |
 | [011](./011-mempool-structural-chain-context.md) | medium | Mempool no structural chain-context validation | fixed | `accept::tests::reject_non_final_locktime_height`, `reject_immature_coinbase` |
 | [012](./012-p2sh-redeem-not-executed.md) | high | P2SH redeem skipped when BIP16 looks off | fixed | `bip16_from_prev_mtp_exception_and_time` |
 | [013](./013-bip68-unresolved-age-fail-open.md) | high | BIP68 unresolved coin age fails open | fixed | `bip68_unresolved_coin_age_fails_closed` |
 | [014](./014-stranded-on-peer-reorg.md) | high | Stranded when peer reorgs (sync) | fixed | `peer_catchup_compact_reorg` |
 | [015](./015-spend-rejected-block-outputs.md) | high | Spend outputs of a rejected block | fixed | cluster 017/019 + structural fail-closed |
-| [016](./016-unknown-taproot-leaf-rejected.md) | critical | Unknown tapleaf version rejected | fixed | `script_path_accepts_unknown_taproot_leaf_version` |
+| [016](./016-unknown-taproot-leaf-rejected.md) | critical | Unknown tapleaf version rejected | fixed | `script_path_accepts_leaf_0x50_with_annex_and_0xc2` |
 | [017](./017-duplicate-txid-unconnected-instance.md) | medium | Txid resolve hits unconnected instance | fixed | `resolve_txid_prefers_connected_over_newer_unconnected` |
 | [018](./018-compact-block-duplicate-tx.md) | high | Compact block duplicates a tx | fixed | `repeated_short_id_is_requested_not_duplicated` |
 | [019](./019-bip30-not-enforced.md) | critical | BIP30 not enforced | fixed | cluster 015/017 + BIP34-gated batch |
@@ -47,7 +47,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
 | [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `mempool_under_pressure` |
-| [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed (block limit, not 16k) | `reject_tx_over_block_sigop_budget`, `mempool_under_pressure` |
+| [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed (block limit, not 16k) | `mempool_accept_life` (`sigop_block_budget`), `mempool_under_pressure` |
 | [049](./049-rolling-min-fee.md) | medium | Full-mempool fee floor is a static bump | fixed | `mempool_under_pressure` |
 | [050](./050-cluster-once.md) | low | Cluster rebuild once per input | fixed | `mempool_under_pressure` |
 | [051](./051-rbfr-direct-set.md) | low | RBFR uses the direct conflict set | won't-fix | `mempool_accept_life` |
@@ -74,9 +74,9 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [067](./067-fuse8-segment.md) | medium | fuse8 segment length must be a power of two | fixed | `fuse8_segment_length_must_be_power_of_two` |
 | [068](./068-published-end.md) | medium | Body reads compare the caller's published end | fixed | `body_read_past_published_end_is_corrupt` |
 | [069](./069-uring-drop-drain.md) | high | io_uring drop does not free a buffer still in the kernel | fixed | `drain_guard_drop_with_leftover_pending_does_not_abort` |
-| [070](./070-manifest-length.md) | low | Manifest and txstat lengths must fit the file | fixed | `manifest_length_past_the_file_is_corrupt` |
+| [070](./070-manifest-length.md) | low | Manifest and txstat lengths must fit the file | fixed | `map_prefix_longer_than_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt` |
 | [071](./071-datadir-lock-symlink.md) | low | Datadir lock does not follow a symlink | fixed | `lock_file_does_not_follow_a_symlink` |
-| [072](./072-pool-write-slice.md) | low | Pool write jobs use a shared slice | fixed | `pool write arm uses a shared slice` |
+| [072](./072-pool-write-slice.md) | low | Pool write jobs use a shared slice | fixed | `io_session_pool` write arm (`from_raw_parts`) |
 | [073](./073-testnet-milestone-scripts.md) | medium | Omitted testnet milestone checks every script | fixed | `p3_default_milestone_heights` |
 | [074](./074-tip-body-orphan-bytes.md) | medium | Tip-follow bodies and one peer's orphans are bounded | fixed | `pending_block_over_four_megabytes_is_not_parked` |
 | [075](./075-secret-debug.md) | low | Secret debug output is redacted | fixed | `debug_does_not_print_secret_bytes` |

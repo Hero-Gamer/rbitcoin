@@ -68,7 +68,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_HEAD_SLOTS_TX` | Deleted; `tx.head` is segmented address head |
 | `RBITCOIN_SH_MAX_DIRECT_MERGE` | Deleted; catalog k-way materialize removed (unsorted shards are the tip path) |
 | `RBITCOIN_SH_MATERIALIZE` | Deleted; unsorted-shard collect/pack is the default (was env-select vs k-way) |
-| `RBITCOIN_SH_RECOLLECT_WORKERS` | Deleted; unsorted collect is always nCPU |
+| `RBITCOIN_SH_RECOLLECT_WORKERS` | Deleted; collect and pack share `RBITCOIN_SH_MERGE_WORKERS` (1.5 GiB per worker) |
 | `RBITCOIN_SH_RECOLLECT_SPILL_BYTES` | Deleted; catalog recollect/spill is gone (unsorted shards) |
 | `RBITCOIN_SH_TARGET_RUN_BYTES` | Deleted; catalog recollect/spill is gone |
 | `RBITCOIN_SH_MERGE_FANIN` | Deleted; no fan-in reduce |

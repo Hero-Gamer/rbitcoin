@@ -6,4 +6,4 @@
 
 The background IO worker formed a mutable slice for every job, including writes that only read the caller buffer. A write uses a shared slice. A read still uses a mutable slice.
 
-**Regression:** `rbitcoin-store` pool write arm uses a shared slice.
+**Regression:** no named unit test. The write arm in `rbitcoin-store` `io_session_pool` builds the caller buffer with `from_raw_parts` (shared); reads still use `from_raw_parts_mut`.

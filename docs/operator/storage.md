@@ -2,9 +2,9 @@
 
 ## Bulk store IO backends
 
-**Bulk batch** uses a **single** switch: `RBITCOIN_IO=uring|pread` (default uring
+**Bulk batch** uses a **single** switch: `RBITCOIN_IO=uring|pool|iocp|pread` (default uring
 when available). Table transport is always **fd pread/pwrite**. Compact Class C
-is L2 write-behind; see [`docs/io-modality.md`](docs/io-modality.md). Per-path
+is L2 write-behind; see [`docs/io-modality.md`](../io-modality.md). Per-path
 env overrides are **removed**. If `uring` is selected but setup fails, demote to
 **pread** / **pwrite**. If a live ring stops completing (`drain slow`, then abort),
 restart with **`RBITCOIN_IO=pread`** — the process does not switch backends itself.
@@ -13,24 +13,24 @@ restart with **`RBITCOIN_IO=pread`** — the process does not switch backends it
 |-----|--------|------|
 | **`RBITCOIN_IO`** | `uring` \| `pool` \| `iocp` \| `pread` | Only bulk switch |
 
-Inventory / survivors: [`docs/env-knobs.md`](docs/env-knobs.md).
-Token meanings and ring depth: [`docs/io-modality.md`](docs/io-modality.md).
-`RWF_DONTCACHE` is not used ([`SCHEMA.md`](SCHEMA.md) Schema 17 freeze).
+Inventory / survivors: [`docs/env-knobs.md`](../env-knobs.md).
+Token meanings and ring depth: [`docs/io-modality.md`](../io-modality.md).
+`RWF_DONTCACHE` is not used ([`SCHEMA.md`](../../SCHEMA.md) Schema 17 freeze).
 
 ## Defaults and memory budgets
 
 | Knob | Default | Override |
 |------|---------|----------|
 | IBD concurrent getdata | **1024** | code `IbdConfig::window` |
-| Blocks in transit / peer | **16** | `IbdConfig::per_peer` |
+| Blocks in transit / peer | **64** | `IbdConfig::per_peer` (16 MiB payload cap per peer) |
 | Live IBD peers | **16** | `--max-outbound` |
 | Inbound P2P sessions | **125** | `--max-inbound`. At capacity, unprotected inbounds are evicted. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
 | Milestone (script skip) | mainnet anchor **840000**, testnet3 anchor **2500000**, signet **0**, regtest 0 | `--milestone` (`0` = full scripts; explicit height is height-only) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
-| Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only. Matrix: [`docs/io-modality.md`](docs/io-modality.md) |
-| Archive Class A append | **pwrite** (always) | `txout` / `seqsigwit` / `spent` + `*.idx` |
-| `tx.head` (segmented) | fixed geometry | Default **25-bit**. Rebuild env: [`docs/env-knobs.md`](docs/env-knobs.md). Bytes: [`SCHEMA.md`](SCHEMA.md) / [`docs/heads.md`](docs/heads.md). Legacy mono-head datadirs require reindex |
-| Confirm stages | **lookup · load · scripts · write** | Queues and pack/wave: [`docs/concurrency.md`](docs/concurrency.md). RAM: [`docs/ibd-memory.md`](docs/ibd-memory.md) |
+| Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only. Matrix: [`docs/io-modality.md`](../io-modality.md) |
+| Archive Class A append | **pwrite** (always) | `txout` / `seqsigwit` / `spent` plus `create.loc` / `seqsigwit.loc` |
+| `tx.head` (segmented) | fixed geometry | Default **25-bit**. Rebuild env: [`docs/env-knobs.md`](../env-knobs.md). Bytes: [`SCHEMA.md`](../../SCHEMA.md) / [`docs/heads.md`](../heads.md). Legacy mono-head datadirs require reindex |
+| Confirm stages | **lookup · load · scripts · write** | Queues and pack/wave: [`docs/concurrency.md`](../concurrency.md). RAM: [`docs/ibd-memory.md`](../ibd-memory.md) |
 | Confirm batch inputs | **8000** soft | Hardcoded. Live line: `h= n= in=` (**n** = blocks in pack, **in** = Σ inputs) |
 | Mempool weight budget | **~300e6 WU** | `--mempool-size-mb N` (maps N×1e6 WU) |
 | Inhibit auto-suspend | **off** | `--inhibit-suspend` (uses `systemd-inhibit` if available) |
@@ -50,7 +50,7 @@ without clearing known flags. New writes are `rbitcoin-peers-v2` (IPv4, IPv6,
 and Tor v3 `.onion:port` tokens). `rbitcoin-peers-v1` IPv4/IPv6 files still
 load.
 
-**Index modes:** Direct vs Tip: [`docs/concurrency.md`](docs/concurrency.md).
+**Index modes:** Direct vs Tip: [`docs/concurrency.md`](../concurrency.md).
 IBD finishes Class A + `tx.head` + spend annotations **before** tip; tip entry
 does not backfill them. Scripthash: durable head stays Tip write-behind;
 no head means Direct defers SH until a Class A collect + unsorted pack at
@@ -59,7 +59,7 @@ horizon. Confirm does **not** enqueue SH during Direct.
 SIGINT keeps every sealed SH head; resume packs only unsealed shards (holes
 stay; missing `DONE` restarts collect). `RBITCOIN_SH_FORCE_REBUILD=1` wipes the
 head and does a full Class A collect + unsorted pack — unset after success
-([`docs/env-knobs.md`](docs/env-knobs.md)). Missing `include_hwm` bootstraps
+([`docs/env-knobs.md`](../env-knobs.md)). Missing `include_hwm` bootstraps
 from SEAL (never clamp SEAL→0). Clearing residual run files **preserves
 `SEAL`**. **SIGINT** mid cold keeps finished prefix shards
 (`scripthash.cold_progress`). Materialize status logs ~**every 10s**.
@@ -68,7 +68,7 @@ On enter Direct, leftover `ibd_utxo.map` / `point.runs` / `tx.runs` from old
 Catchup datadirs are removed — prefer a **fresh datadir**. Layout, shard
 counts, ingest OA, and refuse lines: [`SCHEMA.md`](../../SCHEMA.md) and
 [Schema upgrade](#schema-upgrade). Working-set sizes: SCHEMA census and
-[`docs/ibd-memory.md`](docs/ibd-memory.md).
+[`docs/ibd-memory.md`](../ibd-memory.md).
 
 ## Schema upgrade
 
@@ -127,7 +127,7 @@ Class C. Restart the same binary: `tx.head` rebuilds from Class A; with
 `--sh-index`, SH rematerializes. Do **not** `rm -rf store/`.
 
 **Kill-9 / crash is not a schema upgrade.** Open follows
-[`docs/crash-recovery.md`](docs/crash-recovery.md) (tip-as-commit, Class C
+[`docs/crash-recovery.md`](../crash-recovery.md) (tip-as-commit, Class C
 repair above tip). Prefer SIGTERM ([Resume / clean stop](#resume--clean-stop)).
 A corrupt file still means wipe/reindex — not an in-process repair.
 
@@ -140,7 +140,7 @@ Core `-txindex` (we always keep Class A + `tx.head` for by-txid lookup).
 | Mode | Behavior |
 |------|----------|
 | **off (default)** | No SH run enqueue during IBD; no tip bulk materialize. Tip follow + mempool relay + JSON-RPC work without SH. |
-| **on** (`--sh-index` / `sh_index=1`) | Direct IBD SH runs + tip bulk materialize; address/scripthash Electrum/Esplora methods work. |
+| **on** (`--sh-index` / `sh_index=1`) | Direct IBD defers SH. Tip entry runs two Class A scans, then pack and seal; write-behind follows. Address/scripthash Electrum/Esplora methods work after that seal. |
 
 Electrum/Esplora **start without** `--sh-index`. Address/scripthash methods then fail closed (`scripthash index disabled`). Txid/outpoint/block/fees still work. Matrix: [`docs/lightning.md`](../../docs/lightning.md).
 
@@ -168,7 +168,7 @@ Tip-follow readiness is **independent** of SH materialize (`tip_follow_ready` �
 Keep **`store/scripthash.unsorted/`** until every shard has
 `scripthash.head/NN.packed`. That mark is the pack commit. Pass-1
 `.mphf`+`.val` without it is not sealed. Resume rules:
-[`docs/crash-recovery.md`](docs/crash-recovery.md) (scripthash cold resume).
+[`docs/crash-recovery.md`](../crash-recovery.md) (scripthash cold resume).
 Extra disk during build is **`SHKSP01` spills** plus **`SHPST01` post spills**.
 Restart with the same `--datadir --sh-index`. Do not delete unsorted files
 to start over unless you intend a full Class A collect
@@ -182,12 +182,12 @@ to start over unless you intend a full Class A collect
 | `DONE.post`, some `.packed` | Pack only the unmarked shards. |
 | All `.packed` | Tip write-behind. A second start does not collect. Electrum stays down until `include_hwm` covers the tip, then this process binds it. |
 | Complete head, no marks, no extract | Soft-migrate: write `.packed`. Missing `include_hwm` is set from the create count. |
-| Kill-9 mid pack | Unfinished shard is redone. Open follows [`docs/crash-recovery.md`](docs/crash-recovery.md). |
+| Kill-9 mid pack | Unfinished shard is redone. Open follows [`docs/crash-recovery.md`](../crash-recovery.md). |
 | Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. |
 
 Electrum waits until SH is tip-ready. Do **not** `rm -rf store/` for an SH
 abort. Force-rebuild sticky env (`RBITCOIN_SH_FORCE_REBUILD`) must never redo
-multi-hour Class A work casually — [`docs/env-knobs.md`](docs/env-knobs.md).
+multi-hour Class A work casually — [`docs/env-knobs.md`](../env-knobs.md).
 
 ## Silent payment tweaks (`--sp-tweaks`)
 

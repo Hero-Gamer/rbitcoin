@@ -95,7 +95,7 @@ Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 
 ### App DoS floor (always on)
 
-Shared [`ServeLimits`](crates/rbitcoin-electrum) defaults (also the future Esplora
+Shared [`ServeLimits`](../../crates/rbitcoin-electrum) defaults (also the future Esplora
 floor). Excess connections are **rejected immediately** (no hang); oversize lines
 and idle clients fail closed.
 
@@ -202,7 +202,7 @@ Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) f
 TCP Esplora does not keep a mempool of `Arc<Transaction>`. `GET /mempool` loads
 the fee snapshot (count/vsize/total_fee + histogram). Unix `/internal` mempool-tx
 pages lazy-build one published body snapshot (JSON `OnceLock` per live tx after
-the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](docs/ibd-memory.md).
+the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](../ibd-memory.md).
 
 | Feature | Behavior |
 |---------|----------|

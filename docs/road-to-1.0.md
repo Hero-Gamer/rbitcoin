@@ -27,7 +27,7 @@ Core clone, not a soak badge, not a desktop wallet.
 | **Datadir** | Every **1.x.x** opens a **1.0.0** store. No silent wipe. |
 | **Chain** | No known consensus divergences from Core. |
 | **Wallets** | Electrum / Esplora work for the clients we claim, on a node that finished IBD + SH index. |
-| **Index time** | `--shindex` after IBD is a known, resume-safe wait — not an unbounded hour-loss. Faster than 0.5 is the point. |
+| **Index time** | `--sh-index` after IBD is a known, resume-safe wait — not an unbounded hour-loss. Faster than 0.5 is the point. |
 | **IBD** | Typical block connect about **1 s** on a laptop-class SSD. |
 | **RAM** | **2 GiB** process RSS is enough for IBD, SH build, and tip-follow (knobs may trade wall time, e.g. serial SH build). Heap, not “the disk is in page cache.” |
 | **Fees** | The 10-minute inclusion estimate is aimed at txs that actually get in, not Core’s historical estimator. |
@@ -61,7 +61,7 @@ taking on for 1.0. `--prune-seqsigwit` is in (seqsigwit-window prune,
 
 COMPAT **done** RPCs, P2P, and mempool should be covered by the Core
 functional harness **or** an explicit “we differ on purpose” note (fee
-product, error codes, our mempool files). First green was 9 scripts; **71**
+product, error codes, our mempool files). First green was 9 scripts; **74**
 unmodified v31.1 scripts `run` now. Remaining growth is claimed
 wallet-client / P2P / mempool / buried-activation scripts, not the
 product-never skips (`no-wallet`, prune, v1). `getnetworkhashps` is Core
@@ -72,7 +72,7 @@ Owner: [`core-functional.md`](./core-functional.md).
 | Done | Step |
 |:----:|------|
 | [x] | Harness + inventory + nightly / labeled `core-functional` job |
-| [x] | 71 unmodified v31.1 scripts `run` (was 9) |
+| [x] | 74 unmodified v31.1 scripts `run` (was 9) |
 | [ ] | Claimed COMPAT-done surface is `run` or an explicit dialect/differ note (**Q-41**) |
 
 ### Fuzz until junk input is boring
@@ -110,7 +110,7 @@ Store, P2P, RPC, Electrum server, the node — stay in this repo. Revisit
 
 ### Faster scripthash, less RAM
 
-Operators feel **wall-clock after IBD** (`--shindex`) and **RSS** while
+Operators feel **wall-clock after IBD** (`--sh-index`) and **RSS** while
 syncing, while building the index, and at tip with wallets connected.
 Target **2 GiB** process RSS in all three phases; knobs may slow the
 machine to hit it. Measure on a real SSD. Page cache is not a leak
@@ -118,8 +118,8 @@ machine to hit it. Measure on a real SSD. Page cache is not a leak
 
 Resume is already the contract: SIGINT keeps sealed SH heads; restart
 packs unsealed shards only ([`OPERATOR.md`](../OPERATOR.md) § Scripthash).
-Pack workers auto-tune to **one per 2 GiB** host free RAM (`RBITCOIN_SH_MERGE_WORKERS`
-override). Collect is nCPU. `tx.head` wipe-rebuild is one worker per 1 GiB.
+Collect and pack share `sh_extract_workers()`: at most **one per 1.5 GiB** host free RAM (`RBITCOIN_SH_MERGE_WORKERS`
+override). `tx.head` wipe-rebuild is one worker per 1 GiB.
 Operator copy still says post-IBD SH is **tens of minutes to a few hours**;
 enable-after-tip is often multi-hour. 1.0 needs a named host number that
 beats 0.5, not a new resume design.
@@ -127,7 +127,7 @@ beats 0.5, not a new resume design.
 | Done | Step |
 |:----:|------|
 | [x] | Resume-safe SH materialize (sealed heads kept; unsealed shards only) |
-| [x] | Auto-tune SH pack workers: at most **one per 2 GiB** host free RAM (Linux / Darwin / Windows; env still overrides) |
+| [x] | Auto-tune SH extract workers: at most **one per 1.5 GiB** host free RAM (collect and pack; Linux / Darwin / Windows; env still overrides) |
 | [x] | Auto-tune `tx.head` wipe-rebuild: one worker per **1 GiB** free RAM |
 | [ ] | 2 GiB process RSS in IBD, SH build, and tip-follow (host measure) |
 | [ ] | Named post-IBD SH wall-clock on laptop SSD, faster than 0.5 |

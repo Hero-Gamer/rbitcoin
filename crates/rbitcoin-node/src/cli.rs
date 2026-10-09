@@ -336,7 +336,7 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
   (skip only on that header path, and only when header work meets that network's min chain work),\n\
   signet 0, regtest 0. Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
-Mempool: --mempool-size-mb (default ~300 MiB weight budget).\n\
+Mempool: --mempool-size-mb (default 300 → 300e6 WU; N × 1_000_000 weight, not MiB).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
   --proxy HOST:PORT SOCKS5 for all P2P outbound; --onion HOST:PORT SOCKS for onion (02).\n\
   --proxy-randomize (default on) uses a fresh SOCKS username per peer (Tor circuit isolation).\n\

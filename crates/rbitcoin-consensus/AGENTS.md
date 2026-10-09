@@ -17,8 +17,8 @@ Open the row that matches the change. Leave the other owners closed.
 ## Where
 
 - Scripts: `src/script/` (`interpreter.rs` is the opcode match)
-- Confirm: `src/confirm_run.rs`
-- Headers and blocks: `src/header.rs`, `src/block.rs`
+- Confirm: `src/confirm_run/`
+- Headers and blocks: `src/header.rs`, `src/block/`
 - Worker pool: `src/script_pool.rs`
 
 ## Verify

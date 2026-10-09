@@ -22,7 +22,6 @@ NULLFAIL, LOW_S, and CLEANSTACK stay at the flags production script verify
 already uses: NULLFAIL and LOW_S are off, and witness programs already
 require a clean true stack. Block validation does not gain those flags.
 
-**Regression:** `rbitcoin-mempool`
-`accept::tests::reject_tx_over_block_sigop_budget`,
-`accept::tests::mempool_under_pressure`,
+**Regression:** `rbitcoin-mempool` `mempool_accept_life` (`sigop_block_budget`),
+`rbitcoin-net` `tx_relay` `mempool_under_pressure`,
 `rbitcoin-net` `peer::tests::invalid_script_is_scored_and_policy_is_not`.

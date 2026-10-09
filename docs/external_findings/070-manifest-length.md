@@ -6,4 +6,4 @@
 
 A sorted-run manifest and a txstat blob trusted a length and allocated it before noticing the file was shorter. A length past the remaining file or the fixed ceiling is corrupt and is not allocated.
 
-**Regression:** `rbitcoin-store` `manifest_length_past_the_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt`.
+**Regression:** `rbitcoin-store` `map_prefix_longer_than_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt`.

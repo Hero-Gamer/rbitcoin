@@ -51,7 +51,7 @@ RPC auth is a unix socket (`--rpc`) or Bearer `{datadir}/rpc.token` (TCP).
 There is no `--rpcuser` / `--rpcpassword`.
 Core names (`-maxconnections`, `-whitelist`, `-blocksonly`,
 `-minimumchainwork`, …) are translated by the functional `bitcoind` shim only
-([`docs/core-functional.md`](docs/core-functional.md)).
+([`docs/core-functional.md`](../core-functional.md)).
 
 Clean smoke:
 
@@ -84,7 +84,7 @@ Clean smoke:
 | `--milestone HEIGHT` | `milestone=` | mainnet anchor at 840000; testnet3 anchor at 2500000; signet 0; explicit height is height-only |
 | `--max-outbound N` | `max_outbound=` | 16 live download peers |
 | `--max-inbound N` | `max_inbound=` | 125 inbound sessions; **0** = no inbound slots (outbound-only) |
-| `--mempool-size-mb N` | `mempool_size_mb=` | ~300 MiB weight |
+| `--mempool-size-mb N` | `mempool_size_mb=` | **300** → 300e6 WU (`N × 1_000_000` weight, not MiB) |
 | `--conf FILE` | | none |
 | `--log-level LEVEL` | `log_level=` | `info` |
 | `--api-log PATH` | `api_log=` | off — JSONL of Electrum / Esplora / RPC calls |
@@ -292,14 +292,14 @@ tip: best=<hash> height=<n> version=<v> tx=<n> date=<unix>
 Emitted from the tip-follow / wire accept path (`ChainHub::connect_at`). IBD bulk
 confirm does **not** spam this line per block — use the periodic IBD status below.
 Core functional tests still grep `UpdateTip: …` via the debug.log map
-([`docs/core-functional.md`](docs/core-functional.md)).
+([`docs/core-functional.md`](../core-functional.md)).
 
 ### Tip-follow status lines (after catch-up + tip SH ready)
 
 | Line | Level | Use |
 |------|-------|-----|
 | `tip: perf` | DEBUG | One JSON object every ~5s: follow peers, blocks this window, mempool accept/reject + wall µs, inv/getdata/announce, Esplora/Electrum req counts + avg/max µs, historical block serve (`serve_n`, `serve_bytes`, `serve_tx`, `serve_avg_us`, `serve_max_us`), and SV2 (`sv2_checks`, `sv2_builds`, `sv2_build_avg_us`, `sv2_build_max_us`; zeros without `--sv2-tp-listen`) |
-| `tip: accept` | INFO | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
+| `tip: accept` | DEBUG | Per accepted tip block: wall/load/script/class_a/class_c/SH plus lookup/struct/drain/mp_strip/other (not emitted on reject) |
 | `tip: best=` | INFO | New best hash/height after connect |
 | `cmpct reconstruct` | INFO | Per compact reconstruct: fill sources (`prefill`/`mempool`/`extra`/`orphan`) and `fetched=` `blocktxn` count/bytes. `fetched=0/0` means no getblocktxn round-trip. Getdata fallback: `getdata missing=` |
 | `node: tip=…` | DEBUG | Same height change plus `follow_live` (use `tip: best=` at info) |
@@ -319,10 +319,10 @@ Requires **tip mode** (`node: catch-up complete … tip tracking`). During IBD u
 
 | Line | Level | Use |
 |------|-------|-----|
-| `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A / `tx.idx` count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window, at/over 1 GiB assign-stop holes within that window and not past fetched_hi) |
+| `ibd: progress` | INFO | Tip rate, `loadq`/`scriptq`/`writeq`, `txs=` (Class A create count), horizon, tip ETA, **`bq soft=n/win RAM=`** (in-RAM body queue; soft densify: under ~100 MiB free ahead, over that only ~1 min confirm window, at/over 1 GiB assign-stop holes within that window and not past fetched_hi) |
 | `ibd: perf` | DEBUG | One JSON object of the 5s sample (inflight, queues, stage times, RSS, work path, confirm pipe). Zeros are included. `load_ms` is pin+assemble only |
 
-Default INFO is `ibd: progress` only. `--log-level debug` adds the JSON sample. `tip: accept` is the same kind of JSON line at DEBUG; `tip: best` stays INFO. Pipeline roles: [`docs/concurrency.md`](docs/concurrency.md). Head files: [`docs/heads.md`](docs/heads.md).
+Default INFO is `ibd: progress` only. `--log-level debug` adds the JSON sample. `tip: accept` is the same kind of JSON line at DEBUG; `tip: best` stays INFO. Pipeline roles: [`docs/concurrency.md`](../concurrency.md). Head files: [`docs/heads.md`](../heads.md).
 
 `pin_txid%` is stamp `txid→create_fk` from the load-batch skeleton vs leftover `tx.head` (IBD skeleton path should stay at 100%). `pin_hit%` is load outs adopt/plan reuse — this-window range-fills are `pin_new` only.
 
@@ -350,9 +350,9 @@ from the race who still owe it. When
 `hole=` is 0, at most one extra racer is added on the first later gap in the
 32-window, and only if that owner is missing, has held the hash ≥30s, or
 ≤ pack-median/4.
-Densify default is 8 in-flight hashes per peer (none while a quarter-full tip
-hole is open, so getdata queues can drain for tip+1);
-16 only for an EWMA outlier at ≥ 2× pack median. WARN
+Densify default is 32 in-flight hashes per peer (half of the 64-block
+per-peer ceiling; none while a quarter-full tip hole is open, so getdata
+queues can drain for tip+1); 64 only for an EWMA outlier at ≥ 2× pack median. WARN
 `ibd: peer[…] stalled` is 30s without qualifying rx (≥64 KiB stream or a
 block / decode-fail / NotFound event) after work start. WARN
 `ibd: peer[…] relative-slow` is a quarter-median outlier (cluster gate keeps a
@@ -370,7 +370,7 @@ uniformly slow pack). Slow or constrained uplinks: [Slow / constrained uplink
 (deepest-cand-first).
 **Class A `txout` / `seqsigwit` / `spent` + `create.loc` / `seqsigwit.loc`, `tx.head`, header head,
 SH head/body, and spenders are fd pread/pwrite**.
-Full modality matrix: [`docs/io-modality.md`](docs/io-modality.md).
+Full modality matrix: [`docs/io-modality.md`](../io-modality.md).
 
 ## Health probes and metrics
 
@@ -547,9 +547,9 @@ scrape_configs:
 | Script templates | allow if consensus-valid (within weight/CPU) |
 | RBF | **full RBF** (no BIP125 signaling required) |
 | Annex | empty OK; non-empty only if first data byte after `0x50` is `0x00` |
-| Cluster caps | 64 txs / 101 kWU |
+| Cluster caps | 64 txs / 101 kvB (404 kWU) |
 | Eviction | worst linearization **chunk** when over weight budget |
-| Fee estimate | **10-minute inclusion** (cluster-chunk frontier + confirm-memory floor); see [`docs/mempool-fee-estimation.md`](docs/mempool-fee-estimation.md) |
+| Fee estimate | **10-minute inclusion** (cluster-chunk frontier + confirm-memory floor); see [`docs/mempool-fee-estimation.md`](../mempool-fee-estimation.md) |
 | Compaction | DEAD slots reclaimed when wasteful (auto after confirm removes) |
 | Slot table | **131 072** initial records (grows by doubling to 1 048 576); free-slot ensure **before** append |
 
@@ -575,8 +575,8 @@ not a full reindex. Widespread mid-chain header graph poison still means a
 clean datadir.
 
 **Mempool recovery:** `{datadir}/mempool/` is a private sidecar (not Class A),
-schema **2**. Leftover schema **1** (pre-packed `fee‖weight‖bitcoin-serialize`)
-converts to packed on the next open (Class A untouched). Wipe `{datadir}/mempool/`
+schema **3**. Leftover schema **1** (pre-packed `fee‖weight‖bitcoin-serialize`)
+or **2** converts to schema 3 on the next open (Class A untouched). Wipe `{datadir}/mempool/`
 only if the sidecar is damaged or an unknown schema/old 4k-slot table was left
 wedged — the next start recreates it empty and redownloads unconfirmed txs.
 Do **not** wipe `store/` for mempool slot/full/schema errors.
@@ -589,7 +589,7 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
   is on DEBUG `tip: perf` (`serve_n`, `serve_bytes`, `serve_tx`, `serve_avg_us`, `serve_max_us`), not a
   per-block line. Host throughput probe:
   `python3 scripts/ibd-serve-bench.py 127.0.0.1:8333` (needs `cryptography`
-  and a BIP324 client; see [`TESTING.md`](TESTING.md) § P2P serve bench).
+  and a BIP324 client; see [`TESTING.md`](../../TESTING.md) § P2P serve bench).
 - **Discovery** queries Core DNS seeds for `NETWORK|WITNESS|P2P_V2`
   (`x809.<seed>` first; the bare seed name only if that returns nothing).
   Learned `addr` / `addrv2` is ingested only when the row advertises `P2P_V2`

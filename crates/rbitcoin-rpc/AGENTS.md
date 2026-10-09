@@ -2,7 +2,7 @@
 
 Core-class JSON-RPC subset. Not full Core parity. Depends on query, store,
 net, and consensus. The HTTP server is `src/server.rs`; methods are
-`src/methods.rs`.
+`src/methods/`.
 
 ## Read first
 

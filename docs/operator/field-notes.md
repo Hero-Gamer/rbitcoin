@@ -76,9 +76,10 @@ non-empty `header.body` is refused (wipe those files and reindex).
 
 `--max-outbound` / `max_outbound` is the IBD download peer count (default **16**).
 IBD `target_peers` is that value clamped to **8..=32**, so `--max-outbound 4`
-still dials 8 catch-up peers. Concurrent block getdata is about `N × 16`
-(`IbdConfig::per_peer` is code-only 16, Core-like; there is no
-`--maxblocksperpeer`).
+still dials 8 catch-up peers. Concurrent block getdata is about `N × 64`
+(`IbdConfig::per_peer` is code-only 64; a 16 MiB payload cap stops one
+peer holding 64 large bodies; the 1024-hash window still bounds the total;
+there is no `--maxblocksperpeer`).
 
 On a typical home uplink use **8**. That is also the floor on a tight link:
 more peers will not raise a saturated wire and can make `relative-slow` peel a

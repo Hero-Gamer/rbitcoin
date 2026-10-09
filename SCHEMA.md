@@ -101,8 +101,9 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (25). Schemas 18–24 already
-shipped; they are open rules above and history in
+the `SCHEMA_VERSION` at the top of this file (26). Schemas 18–26 already
+shipped. Meta 22–26 is what this binary opens (rules above). Earlier
+layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
 from that live constant
 ([Changing durable bytes](#changing-durable-bytes)). It does not target
@@ -230,7 +231,7 @@ itself changed.
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
-    input.loc / input.off / input.body               # spender → parent edges (schema 22–23)
+    input.loc / input.off / input.body               # spender → parent edges (8 B/input) + n_in (2 B/create)
     tx.head/                     # meta + open OA NNNNNN; sealed NNNNNN.mphf|.fuse8
     spent.ovf                    # multi-spender overflow (was spenders.body)
     confirmed.body               # Class C: height → header_fk
@@ -284,7 +285,7 @@ store. `txstat`, `input`, block filters, and tweaks are not pruned.
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **25** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **13–25** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **26** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–26** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
@@ -314,6 +315,7 @@ store. `txstat`, `input`, block filters, and tweaks are not pruned.
 | 21 | txstat per-header locator (`txstat.blk`, 16 B/header) |
 | 22 | inputs (`input.body`, 8 B/input) |
 | 23 | inputs loc (`input.loc`, 2 B/create `n_in`) |
+| 24 | blockfilter (`blockfilter.body`) |
 
 ---
 
@@ -609,7 +611,7 @@ Contiguous assignment required: block membership is an arithmetic range.
 ### Optional BIP-352 thin tweaks (`sp_tweaks.*`)
 
 Schema **17** side product. Soft-open: missing dirs are empty (not `Corrupt`,
-not a head recreate). Created when `--sptweaks` is on.
+not a head recreate). Created when `--sp-tweaks` is on.
 
 **Tip / strong height only** — no `header_fk` in the idx. A reorg truncates
 above the new tip and those heights are written again. `put` requires
@@ -629,7 +631,7 @@ slot in that file, or that file’s HWM). `n_tx` comes from
 
 Leftover **files** `store/sp_tweaks.idx` and `store/sp_tweaks.body` (schema 14
 single-file, `header_fk` + absolute off) are unlinked on store open.
-`--sptweaks` backfill regenerates. Not a Class A wipe.
+`--sp-tweaks` backfill regenerates. Not a Class A wipe.
 
 Reorg: truncate slots above the new tip (same era as SH HWM).
 
@@ -860,9 +862,10 @@ Schema 15 leftover `tx_height.body` is unlinked on open (logged).
 
 ### Commit order (confirm)
 
-1. `strong_tx` (may lead tip after kill)
-2. Thin scripthash creates (may lead tip)
-3. **`confirmed[]` tip advance** ← **commit**, then fence extend
+1. `strong_tx` (may lead tip after kill, before the barrier)
+2. Height-fence extend (RAM), then **`confirmed[]` tip advance** ← **commit**
+3. `flush_class_c_tip` (headers, then `strong_tx`, `header_txs`, `confirmed[]` last)
+4. Scripthash write-behind enqueue (after tip). Direct IBD defers SH until tip entry
 
 `is_confirmed_strong(tx)` ⇔ strong ∧ fence contains the fk (implies height ≤ tip
 and membership in `confirmed[h]` header_txs).  

@@ -5,7 +5,7 @@
 **Severity:** medium — consensus accept-invalid
 **Status:** fixed — consensus reject on shipped path (2026-08-10)
 
-**Regression:** `rbitcoin-consensus` `block::tests::s8_rejects_empty_or_multi_item_coinbase_witness_reserved`.
+**Regression:** `rbitcoin-consensus` `block::structure_rule_tests::s8_rejects_empty_or_multi_item_coinbase_witness_reserved`.
 **Found by:** redteam-ecosystem harness (static analysis / code-review)
 
 ## Summary

@@ -126,7 +126,7 @@ main/L1 writes `BDZ3`: 3-partite peel, 2-bit `g`, occupancy rank (RAM on
 open), then mix64 tags + pack8 `.val`. Occupied schema 18/19 `tx.head` or
 `scripthash*` is refused (wipe those dirs, keep Class A). Empty indexes
 rewrite `meta` to 22; `tx.head` rebuilds from `txid.body`; SH rematerializes
-with `--shindex`. Open OA is still 4 B rel.
+with `--sh-index`. Open OA is still 4 B rel.
 
 ## v19 (megakey extent)
 
@@ -178,7 +178,7 @@ since shipped.
 single-file `sp_tweaks.idx` / `sp_tweaks.body` (schema 17 tweaks are
 `sp_tweaks.idx/` + `sp_tweaks.body/` directories: tip-only `off:u32`
 slots, original `0`/`33` body, new segment when the next start would
-exceed `u32::MAX`). `--sptweaks` backfill regenerates the index.
+exceed `u32::MAX`). `--sp-tweaks` backfill regenerates the index.
 
 ### Side product: `sp_tweaks.*` (schema 17 dirs)
 
@@ -360,8 +360,9 @@ log a one-line warn, migrate or refuse with a clear message — do not silently
 - Rehash at load **7/8** (earlier eras rehashed more aggressively, e.g. ~1/2).
   Current writer: insert past 7/8 is full; `header.head` rolls `header.head.gN`
   instead of rewriting occupied slots. Open-grow of an undersized single gen
-  deletes the OA file and recreates it at the create target (exclusive, no
-  concurrent probes; `.mlt` kept).
+  writes `header.head.grow`, fsyncs, then renames over the live file
+  (exclusive, no concurrent probes; `.mlt` kept). A crash during the rewrite
+  leaves the previous OA.
 
 ### Why
 
