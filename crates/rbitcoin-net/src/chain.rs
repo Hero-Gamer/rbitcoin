@@ -3265,8 +3265,10 @@ pub fn check_block_proposal_with(
 /// only the parent outputs this block spends with their parent's fk and
 /// height, O(block outputs + block inputs), dropped at return; the returned
 /// prevouts are those spent outputs in block order. CPU: each distinct
-/// parent's packed body is decoded once and its fence height read once;
-/// spentness is still probed per input, never served from that map.
+/// parent's packed body is decoded once. The pre-pass reads the fence once
+/// to cache the create height; each confirmed spend reads that fence again,
+/// and a missing or moved height is `bad-txns-inputs-missingorspent`.
+/// Spentness is still probed per input, never served from that map.
 fn proposal_connect(
     query: &Query,
     block: &Block,
@@ -3416,6 +3418,11 @@ fn confirmed_parent_outputs(
 
 /// Core `CheckTxInputs`: the creating tx is the coinbase at its height and
 /// `spend_height` is still inside the maturity window.
+///
+/// `created_h` is the height the parent memo cached. The fence is read again
+/// here: a disconnect after that cache leaves no height, and that spend is
+/// `bad-txns-inputs-missingorspent` even when the cached height is already
+/// past maturity.
 fn coinbase_spend_is_immature(
     query: &Query,
     create_fk: Fk,
@@ -3423,6 +3430,11 @@ fn coinbase_spend_is_immature(
     spend_height: u32,
     maturity: u32,
 ) -> Result<bool, String> {
+    match query.store().tx_height_get(create_fk) {
+        Ok(Some(h)) if h == created_h => {}
+        Ok(_) => return Err("bad-txns-inputs-missingorspent".into()),
+        Err(e) => return Err(e.to_string()),
+    }
     if spend_height >= created_h.saturating_add(maturity) {
         return Ok(false);
     }
@@ -6340,6 +6352,36 @@ mod tests {
         );
         assert_eq!(hub.tip_hash(), Some(honest.block_hash()));
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A cached create height is not spendable once the fence drops that fk.
+    /// The maturity short-circuit must not run on a height the best chain no
+    /// longer has: a disconnect between the parent memo and this check is
+    /// `bad-txns-inputs-missingorspent`.
+    #[test]
+    fn coinbase_spend_rejects_cached_height_after_disconnect() {
+        let (dir, hub) = tmp_hub();
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(1, op_true, vec![]).unwrap();
+        let fk = hub.query.block_tx_fks(Height(1)).unwrap()[0];
+        let created_h = hub.query.store().tx_height_get(fk).unwrap().unwrap();
+        assert_eq!(created_h, 1);
+        hub.invalidate_block(hub.tip_hash().unwrap()).unwrap();
+        assert_eq!(
+            hub.query.store().tx_height_get(fk).unwrap(),
+            None,
+            "invalidate drops the create off the fence"
+        );
+        let err = coinbase_spend_is_immature(
+            hub.query.as_ref(),
+            fk,
+            created_h,
+            created_h.saturating_add(100),
+            100,
+        )
+        .expect_err("a disconnected create is not a mature input");
+        assert_eq!(err, "bad-txns-inputs-missingorspent");
         let _ = std::fs::remove_dir_all(dir);
     }
 
