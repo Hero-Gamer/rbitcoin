@@ -141,7 +141,7 @@ Replace the hostname and email, then apply authentication and network policy to
 RPC for your deployment. nginx `virtualHosts` proxy HTTP; `streamConfig`
 proxies the Electrum TCP protocol.
 
-Use `coldDataDir` to place the large `seqsigwit` store on another volume. The
+Use `coldDataDir` to place the append-only store (`seqsigwit`, `txstat`, `input`, and the block-filter and tweak indexes) on another volume. The
 service creates the directory but does not mount or size the volume. Use
 `environment` for documented advanced `RBITCOIN_*` settings and `extraArgs`
 for daemon flags not represented by module options.

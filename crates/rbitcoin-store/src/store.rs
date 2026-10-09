@@ -12,14 +12,23 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-/// Sidecar in the hot `{datadir}/store`: `seqsigwit.body` / `seqsigwit.loc` live under
-/// `{datadir-cold}/store`. Presence-only (path always comes from the operator).
+/// Sidecar in the hot `{datadir}/store`. Present when the append-only files live
+/// under `{datadir-cold}/store`. Presence-only (the path comes from the operator).
 pub const SEQSIGWIT_RELOC_NAME: &str = "seqsigwit.reloc";
+
+/// Index directories that live next to seqsigwit when the store is split.
+const COLD_INDEX_DIRS: &[&str] = &[
+    "blockfilter.idx",
+    "blockfilter.body",
+    "sp_tweaks.idx",
+    "sp_tweaks.body",
+];
 
 /// Where a store’s files live, plus open-time head geometry.
 ///
-/// `dir` is `{datadir}/store`. When `cold_dir` is set and distinct, Class A
-/// `seqsigwit.body` + `seqsigwit.loc` live there (bulk / HDD). Everything else stays
+/// `dir` is `{datadir}/store`. When `cold_dir` is set and distinct, the
+/// append-only IBD files live there: `seqsigwit.*`, `txstat.*`, `input.*`,
+/// and (once enabled) `blockfilter.*` and `sp_tweaks.*`. The pin set stays
 /// in `dir`.
 ///
 /// [`Self::single`] / [`Self::with_cold`] are **Mainnet** scale (production).
@@ -179,6 +188,29 @@ pub(crate) fn rename_legacy_inwit_files(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn refuse_cold_index_dirs(hot: &Path, cold: &Path) -> Result<(), StoreError> {
+    for name in COLD_INDEX_DIRS {
+        let on_hot = hot.join(name);
+        let on_cold = cold.join(name);
+        if !on_hot.is_dir() {
+            continue;
+        }
+        if on_cold.exists() {
+            return Err(StoreError::Layout(format!(
+                "{name} exists in both {} and {}; keep it only under the cold store",
+                hot.display(),
+                cold.display()
+            )));
+        }
+        return Err(StoreError::Layout(format!(
+            "{name} is still in {}; move it next to seqsigwit under {}",
+            hot.display(),
+            cold.display()
+        )));
+    }
+    Ok(())
+}
+
 fn seqsigwit_files_present(dir: &Path) -> bool {
     dir.join("seqsigwit.body").exists()
         || dir.join("seqsigwit.loc").exists()
@@ -262,7 +294,7 @@ fn write_seqsigwit_reloc(hot: &Path) -> Result<(), StoreError> {
 /// Top-level store handle for a datadir `store/` directory.
 pub struct Store {
     path: PathBuf,
-    /// `{datadir-cold}/store` when seqsigwit is split; `None` = seqsigwit in [`Self::path`].
+    /// `{datadir-cold}/store` when append-only files are split; `None` = they live in [`Self::path`].
     cold_path: Option<PathBuf>,
     head_scale: HeadScale,
     pub headers: HeaderTable,
@@ -441,6 +473,9 @@ impl Store {
         crate::scripthash::unlink_scripthash_run_leftovers(&path)?;
         open_layout_rewrite_current(&path, meta_ver)?;
         let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
+        if layout.is_split() {
+            refuse_cold_index_dirs(&path, &seqsigwit_dir)?;
+        }
         let txs = TxTable::open_seqsigwit(&path, &seqsigwit_dir, layout.open_opts())?;
         if layout.is_split() {
             write_seqsigwit_reloc(&path)?;
@@ -499,13 +534,20 @@ impl Store {
         &self.path
     }
 
-    /// Cold store directory when seqsigwit is split (`{datadir-cold}/store`).
+    /// Cold store directory when the append-only files are split
+    /// (`{datadir-cold}/store`).
     pub fn cold_path(&self) -> Option<&Path> {
         self.cold_path.as_deref()
     }
 
+    /// Where IBD append-only files live. The cold store when split, otherwise
+    /// [`Self::path`].
+    pub fn cold_files_dir(&self) -> &Path {
+        self.cold_path.as_deref().unwrap_or(&self.path)
+    }
+
     /// Sum of regular file lengths under the hot store and, when split, the
-    /// cold seqsigwit directory. Used by `getblockchaininfo.size_on_disk`.
+    /// cold store. Used by `getblockchaininfo.size_on_disk`.
     pub fn datadir_bytes(&self) -> u64 {
         let mut n = dir_file_bytes(&self.path);
         if let Some(cold) = &self.cold_path {
@@ -4188,6 +4230,44 @@ mod tests {
             Ok(_) => panic!("must refuse dual seqsigwit copies"),
             Err(err) => {
                 let msg = err.to_string();
+                assert!(msg.contains("both"), "{msg}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_refuses_blockfilter_left_in_hot() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        Store::create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+        std::fs::create_dir_all(hot.join("blockfilter.idx")).unwrap();
+        match Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)) {
+            Ok(_) => panic!("must refuse blockfilter left on the hot store"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("blockfilter.idx"), "{msg}");
+                assert!(msg.contains("move"), "{msg}");
+                assert!(msg.contains(cold.to_str().unwrap()), "{msg}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn split_refuses_sp_tweaks_in_both_dirs() {
+        let root = tmp();
+        let hot = root.join("hot");
+        let cold = root.join("cold");
+        Store::create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+        std::fs::create_dir_all(hot.join("sp_tweaks.body")).unwrap();
+        std::fs::create_dir_all(cold.join("sp_tweaks.body")).unwrap();
+        match Store::open_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)) {
+            Ok(_) => panic!("must refuse sp_tweaks in both stores"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(msg.contains("sp_tweaks.body"), "{msg}");
                 assert!(msg.contains("both"), "{msg}");
             }
         }

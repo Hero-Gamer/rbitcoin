@@ -187,10 +187,10 @@ touches. Census: [`SCHEMA.md`](../SCHEMA.md) (tip 962298, 1.42 B creates).
 
 | Mode | Must stay hot | Approx | Cold (fault OK) |
 |------|---------------|--------|-----------------|
-| **Tip follow / Electrum serve** | Open `tx.head` + recent `txout`/`spent`/`txid` tails + SH main idx + mempool | **8–16 GiB** page cache + **~2–3 GiB** process | `seqsigwit` (except `getrawtransaction`), sealed `tx.head` older than fuse-skip, archive `txout` |
-| **Comfortable serve** (busy wallets, Electrum tweaks, RPC reconstruct) | Above + more `txout` + SH body slabs + `txid.body` | **16–32 GiB** | `seqsigwit` except rawtx |
-| **IBD pin+annotate (no thrash)** | **All** `txout` + **all** `spent` + `create.loc` (~3 GiB) + `txid.body` + `tx.head` | **~221 GiB** | **`seqsigwit` (~486 GiB)** — wire still holds witness |
-| **IBD + reconstruct/getdata** | Previous + `seqsigwit` | **~710 GiB** (same order as old packed `tx.body`) | — |
+| **Tip follow / Electrum serve** | Open `tx.head` + recent `txout`/`spent`/`txid` tails + SH main idx + mempool | **8–16 GiB** page cache + **~2–3 GiB** process | `seqsigwit` (except `getrawtransaction`), `txstat`, `input` (except a served block), sealed `tx.head` older than fuse-skip, archive `txout` |
+| **Comfortable serve** (busy wallets, Electrum tweaks, RPC reconstruct) | Above + more `txout` + SH body slabs + `txid.body` | **16–32 GiB** | `seqsigwit` except rawtx; `txstat` except fee history / `getblockstats`; block filters and `sp_tweaks` except a serve of those indexes |
+| **IBD pin+annotate (no thrash)** | **All** `txout` + **all** `spent` + `create.loc` (~3 GiB) + `txid.body` + `tx.head` | **~221 GiB** | **`seqsigwit` (~486 GiB)**, **`txstat` (~11 GiB)**, **`input` (~29 GiB)** — wire still holds witness. Optional `blockfilter` / `sp_tweaks` append here and are not read back |
+| **IBD + reconstruct/getdata** | Previous + `seqsigwit` + `input` | **~740 GiB** | `txstat`, block filters, `sp_tweaks` |
 | **SH tip materialize** | Two `txout` scans (16 MiB libc `pread` spans + 1 MiB write buffers); extract workers min(CPUs, free RAM / 1.5 GiB); ingest OA **~768 MiB** (2²⁵×24 B) | **~1.5 GiB** heap per extract worker (BDZ `g` + fuse + maps); pack ~8 MiB packed `g` + 16 MiB `body_buf` | No catalog k-way pages; no 64 × `.val` random-read set on the scan |
 
 Packed schema 13/14 needed the whole **`tx.body` (~663 GiB)** hot for the same

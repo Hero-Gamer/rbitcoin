@@ -62,7 +62,7 @@ Clean smoke:
 | Flag | Conf | Default |
 |------|------|---------|
 | `--datadir PATH` | `datadir=` | cwd `datadir` (`./datadir` Unix, `.\datadir` Windows) |
-| `--datadir-cold PATH` | `datadir_cold=` | unset — Class A `seqsigwit.body` / `seqsigwit.loc` under `{PATH}/store`; everything else stays in `--datadir` |
+| `--datadir-cold PATH` | `datadir_cold=` | unset — append-only IBD files under `{PATH}/store`: `seqsigwit.*`, `txstat.*`, `input.*`, and (once created) `blockfilter.*` and `sp_tweaks.*`. The pin set stays in `--datadir` |
 | `--network NET` | `network=` | `mainnet` |
 | `--signet-challenge HEX` | `signet_challenge=` | default global Signet challenge |
 | `--signet-block-time SECS` | `signet_block_time=` | 600; requires a custom challenge |
@@ -216,31 +216,51 @@ cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
 `After`/`Wants` `cjdns.service`. Do not start a cjdns router from this module.
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`). After a listener binds, `{datadir}/run/{health,electrum,esplora,rpc}.addr` is that socket (the kernel port when the configured port is 0).
-Omit `--datadir-cold` and cold files live there too. Set it to put the large
-rarely-read Class A **seqsigwit** stem (`seqsigwit.body` + `seqsigwit.loc`, ~486 GiB + loc
-on mainnet) on another volume. Pin / spend-annotate / Electrum / tweaks do not
-read seqsigwit; reconstruct / `getrawtransaction` / block serve do.
+Omit `--datadir-cold` and the append-only files live there too. Set it to put
+those files on another volume. The confirm pin path does not read them. At the
+2026-08-13 census that is `seqsigwit.body` + `seqsigwit.loc` (~486 GiB + loc),
+`txstat.*` (~11 GiB), and `input.*` (~29 GiB). Optional `blockfilter.*` and
+`sp_tweaks.*` are created on that same volume when the indexes are enabled.
+Reconstruct / `getrawtransaction` / block serve read `seqsigwit` and `input`.
+Fee history and `getblockstats` read `txstat`. Filter and tweak serve read
+their own indexes.
 
 ```
 --datadir /mnt/nvme/rbtc --datadir-cold /mnt/hdd/rbtc-cold
-# hot:  /mnt/nvme/rbtc/store/txout.body  (and the rest)
+# hot:  /mnt/nvme/rbtc/store/txout.body  (pin set, heads, Class C, scripthash)
 # cold: /mnt/hdd/rbtc-cold/store/seqsigwit.body
 #       /mnt/hdd/rbtc-cold/store/seqsigwit.loc
+#       /mnt/hdd/rbtc-cold/store/txstat.body
+#       /mnt/hdd/rbtc-cold/store/input.body
+#       /mnt/hdd/rbtc-cold/store/blockfilter.body   # if the index exists
+#       /mnt/hdd/rbtc-cold/store/sp_tweaks.body     # if the index exists
 ```
 
 A hot-store sidecar `seqsigwit.reloc` records the split. Opening without
-`--datadir-cold` then refuses. Do not leave `seqsigwit.*` in both places.
-`--prune-seqsigwit` writes `{store}/seqsigwit.prune` (the pruneheight) and
-keeps the 288-height window at `{store}/seqsigwit.window/{height}.bin` on the
-hot store, including when `seqsigwit.body` is on `--datadir-cold`. A datadir
-that already has that sidecar refuses to start unless the flag is set again
+`--datadir-cold` then refuses. Do not leave a cold file in both places.
+`--prune-seqsigwit` is not this split. It writes `{store}/seqsigwit.prune`
+(the pruneheight) and keeps the 288-height window at
+`{store}/seqsigwit.window/{height}.bin` on the **hot** store, including when
+`seqsigwit.body` is on `--datadir-cold`. It does not delete `txstat`, `input`,
+block filters, or tweaks. A datadir that already has the prune sidecar refuses
+to start unless the flag is set again
 (`datadir is pruned-seqsigwit; restart with --prune-seqsigwit enabled`).
 Disconnect at or below that pruneheight fails closed. Moving an
 existing datadir is operator `mv` (or copy+remove cross-device):
 
 ```
 mkdir -p /mnt/hdd/rbtc-cold/store
-mv /mnt/nvme/rbtc/store/seqsigwit.body /mnt/nvme/rbtc/store/seqsigwit.loc /mnt/nvme/rbtc/store/seqsigwit.off /mnt/nvme/rbtc/store/seqsigwit.loc.ovf /mnt/hdd/rbtc-cold/store/
+mv /mnt/nvme/rbtc/store/seqsigwit.body /mnt/nvme/rbtc/store/seqsigwit.loc \
+   /mnt/nvme/rbtc/store/seqsigwit.off /mnt/nvme/rbtc/store/seqsigwit.loc.ovf \
+   /mnt/nvme/rbtc/store/txstat.body /mnt/nvme/rbtc/store/txstat.ovf \
+   /mnt/nvme/rbtc/store/txstat.blk \
+   /mnt/nvme/rbtc/store/input.loc /mnt/nvme/rbtc/store/input.off \
+   /mnt/nvme/rbtc/store/input.body \
+   /mnt/hdd/rbtc-cold/store/
+# only when those indexes already exist:
+mv /mnt/nvme/rbtc/store/blockfilter.idx /mnt/nvme/rbtc/store/blockfilter.body \
+   /mnt/nvme/rbtc/store/sp_tweaks.idx /mnt/nvme/rbtc/store/sp_tweaks.body \
+   /mnt/hdd/rbtc-cold/store/
 ```
 
 **Advanced** IO/perf tunables may still use `RBITCOIN_*` (see below); they are

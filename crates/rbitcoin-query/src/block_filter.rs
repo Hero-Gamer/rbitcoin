@@ -169,7 +169,7 @@ impl Query {
     /// disconnect and its filter truncate, or a torn slot).
     pub fn set_block_filter_index(&self, enabled: bool) -> Result<(), QueryError> {
         if enabled && self.block_filters.get().is_none() {
-            let table = BlockFilterTable::open_or_create(self.store.path())?;
+            let table = BlockFilterTable::open_or_create(self.store.cold_files_dir())?;
             self.trim_block_filters_to_best_chain(&table)?;
             let _ = self.block_filters.set(table);
         }
