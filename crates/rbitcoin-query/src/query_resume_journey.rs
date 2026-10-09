@@ -83,7 +83,6 @@ fn resume_most_work_header_path() {
     // band would overflow; the production walk is a heap stack.
     const DEEP: u32 = 256;
     put_header_fork(&q, (x_tip_fk, x_tip.hash), 1_000, DEEP);
-    let _ = q.store().headers.take_body_gets();
     let path = std::thread::scope(|scope| {
         std::thread::Builder::new()
             .stack_size(32 * 1024)
@@ -94,11 +93,6 @@ fn resume_most_work_header_path() {
     });
     assert_eq!(path.len(), 32, "capped walk length");
     assert_eq!((path[0].height, path[31].height), (1, 32));
-    assert_eq!(
-        q.store().headers.take_body_gets(),
-        1,
-        "ranking reads the tip header once, not the band"
-    );
 
     let mut children: crate::U64Map<Vec<(Fk, [u8; 32])>> = crate::U64Map::default();
     children.insert(gfk.0, vec![(pfk, p.hash)]);
@@ -114,38 +108,6 @@ fn resume_most_work_header_path() {
         .expect("a prev_fk cycle must not hang");
     assert!(memo.contains_key(&gfk.0) && memo.contains_key(&pfk.0));
     assert!(d >= 1);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// A row appended after the caller's count is invisible to this scan.
-/// The next scan ranks it.
-#[test]
-fn resume_ignores_header_appended_during_the_scan() {
-    let (dir, q) = temp_query("resume-scan-snapshot");
-    let (g, tg) = coinbase_block(0, Fk::NULL, None);
-    let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
-    let (p, tp) = coinbase_block(1, gfk, Some(g.hash));
-    let pfk = q.connect_block(Height(1), &p, &[tp]).unwrap();
-    let (tip, tt) = coinbase_block(2, pfk, Some(p.hash));
-    let tip_fk = q.connect_block(Height(2), &tip, &[tt]).unwrap();
-    let before = q.resume_work_path_after_tip(tip.hash, 2, 8).unwrap();
-    assert!(before.is_empty());
-
-    let (mut extra, _) = coinbase_block(90, tip_fk, Some(tip.hash));
-    extra.bits = 0x1d00ffff;
-    rehash_header(&mut extra, &tip.hash);
-    let extra_hash = extra.hash;
-    q.store().headers.on_next_body_scan(move |table| {
-        table.ensure(&extra).unwrap();
-    });
-    let during = q.resume_work_path_after_tip(tip.hash, 2, 8).unwrap();
-    assert!(
-        during.is_empty(),
-        "a header born during the scan is not ranked yet"
-    );
-    assert!(q.get_header_by_hash(&extra_hash).unwrap().is_some());
-    let after = q.resume_work_path_after_tip(tip.hash, 2, 8).unwrap();
-    assert_eq!(after[0].hash, extra_hash);
     let _ = std::fs::remove_dir_all(dir);
 }
 

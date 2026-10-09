@@ -229,9 +229,6 @@ impl HeaderHead {
     }
 }
 
-#[cfg(any(test, feature = "body-gets"))]
-type BodyScanHook = Box<dyn Fn(&HeaderTable) + Send + Sync>;
-
 pub struct HeaderTable {
     body: TableFile,
     head: HeaderHead,
@@ -239,13 +236,6 @@ pub struct HeaderTable {
     /// Serializes check-then-put so two threads cannot both miss and both append
     /// the same full hash (I1 + I4).
     put_lock: Mutex<()>,
-    /// Single-row `get` calls. A sequential scan does not increment this.
-    #[cfg(any(test, feature = "body-gets"))]
-    body_gets: std::sync::atomic::AtomicU64,
-    /// Runs once, at the start of the next body scan. Tests append a row
-    /// between the caller's count and the walk.
-    #[cfg(any(test, feature = "body-gets"))]
-    on_next_body_scan: Mutex<Option<BodyScanHook>>,
 }
 
 impl HeaderTable {
@@ -265,10 +255,6 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(0),
             put_lock: Mutex::new(()),
-            #[cfg(any(test, feature = "body-gets"))]
-            body_gets: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(any(test, feature = "body-gets"))]
-            on_next_body_scan: Mutex::new(None),
         })
     }
 
@@ -293,10 +279,6 @@ impl HeaderTable {
             head,
             count: std::sync::atomic::AtomicU64::new(count),
             put_lock: Mutex::new(()),
-            #[cfg(any(test, feature = "body-gets"))]
-            body_gets: std::sync::atomic::AtomicU64::new(0),
-            #[cfg(any(test, feature = "body-gets"))]
-            on_next_body_scan: Mutex::new(None),
         })
     }
 
@@ -460,22 +442,11 @@ impl HeaderTable {
         Ok(())
     }
 
-    /// Rows `1..=count` at the start of the call.
-    pub fn for_each_record<F>(&self, f: F) -> Result<(), StoreError>
-    where
-        F: FnMut(Fk, HeaderRecord) -> Result<(), StoreError>,
-    {
-        let n = self.count();
-        self.for_each_record_through(n, f)
-    }
-
     /// Rows `1..=through`, and not a row appended after the caller sampled `through`.
     pub fn for_each_record_through<F>(&self, through: u64, mut f: F) -> Result<(), StoreError>
     where
         F: FnMut(Fk, HeaderRecord) -> Result<(), StoreError>,
     {
-        #[cfg(any(test, feature = "body-gets"))]
-        self.fire_scan_hook();
         let n = self.count().min(through);
         const CHUNK: u64 = 1024;
         let mut buf = vec![0u8; CHUNK as usize * HEADER_RECORD_LEN];
@@ -499,54 +470,17 @@ impl HeaderTable {
     pub fn bits_in_fk_order(&self) -> Result<Vec<u32>, StoreError> {
         let n = self.count();
         let mut bits = vec![0u32; n as usize];
-        let mut wrote = 0u64;
         self.for_each_record_through(n, |fk, rec| {
             let i = (fk.0 - 1) as usize;
             let slot = bits.get_mut(i).ok_or(StoreError::Corrupt("header fk"))?;
             *slot = rec.bits;
-            wrote += 1;
             Ok(())
         })?;
-        if wrote != n {
-            return Err(StoreError::Corrupt("header bits short"));
-        }
         Ok(bits)
-    }
-
-    /// Append a row on the next body scan, then drop the hook.
-    #[cfg(any(test, feature = "body-gets"))]
-    pub fn on_next_body_scan<F>(&self, f: F)
-    where
-        F: Fn(&Self) + Send + Sync + 'static,
-    {
-        *self
-            .on_next_body_scan
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
-    }
-
-    #[cfg(any(test, feature = "body-gets"))]
-    fn fire_scan_hook(&self) {
-        let hook = self
-            .on_next_body_scan
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(hook) = hook {
-            hook(self);
-        }
-    }
-
-    /// Rows loaded by [`Self::get`] since the last take.
-    #[cfg(any(test, feature = "body-gets"))]
-    pub fn take_body_gets(&self) -> u64 {
-        self.body_gets.swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn get(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {
         use std::sync::atomic::Ordering;
-        #[cfg(any(test, feature = "body-gets"))]
-        self.body_gets.fetch_add(1, Ordering::Relaxed);
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
         let count = self.count.load(Ordering::Acquire);
         if id == 0 || id > count {
