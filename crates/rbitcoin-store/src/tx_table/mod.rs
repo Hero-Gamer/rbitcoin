@@ -585,6 +585,13 @@ pub struct TxTable {
     rebuild_seal_bits: u32,
     rebuild_workers: usize,
     prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
+    /// Per-fk packed `txout` decodes for an outs reader
+    /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
+    /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
+    /// the confirm write stage's decoder and is not counted; span and pin
+    /// machines decode raw spans and are not counted. One Relaxed add per
+    /// decode.
+    body_decodes: std::sync::atomic::AtomicU64,
 }
 
 /// Structural-meta backend from env hierarchy.
@@ -901,6 +908,7 @@ impl TxTable {
             input: crate::input::Input::create(seqsigwit_dir)?,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
+            body_decodes: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
@@ -1132,6 +1140,7 @@ impl TxTable {
             input,
             secret,
             pending_head: pending_head::PendingHeadInserts::new(),
+            body_decodes: std::sync::atomic::AtomicU64::new(0),
             rebuild_seal_bits: seal_bits,
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
@@ -1518,21 +1527,10 @@ impl TxTable {
         self.body.reserve_append(body_bytes, n_records)
     }
 
+    /// Meta by fk: the same packed decode as [`Self::get_meta_and_outputs`]
+    /// with the outs dropped (`txout` never carries ins).
     pub fn get(&self, fk: Fk) -> Result<TxRecord, StoreError> {
-        let pair = self
-            .create_loc_range_batch(&[fk])?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or(StoreError::NotFound)?;
-        let raw = self
-            .body
-            .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
-        let (mut tx, _, _, _) =
-            decode_packed_tx_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
-        tx.txid = self.txids.get(fk)?;
-        self.overlay_stamped_n_in(fk, &mut tx)?;
-        Ok(tx)
+        self.get_meta_and_outputs(fk).map(|(tx, _)| tx)
     }
 
     /// Read create identity from **`txid.body`** (schema 13+).
@@ -2219,11 +2217,19 @@ impl TxTable {
         let raw = self
             .body
             .with_bytes_at(pair.txout.0, pair.txout.1, |b| Ok(b.to_vec()))?;
+        self.body_decodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (mut tx, outs, _) =
             decode_packed_tx_outs_with_spender_rels_secret(&raw, pair.n_out, Some(&self.secret))?;
         tx.txid = self.txids.get(fk)?;
         self.overlay_stamped_n_in(fk, &mut tx)?;
         Ok((tx, outs))
+    }
+
+    /// Sample-and-reset per-fk packed body decodes (instance stats).
+    pub fn sample_reset_body_decodes(&self) -> u64 {
+        self.body_decodes
+            .swap(0, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Walk create_fks `first..=last` from a coalesced `txout.body` span (one idx
@@ -2634,20 +2640,18 @@ impl TxTable {
     /// All Class A fks whose body txid equals `txid` (BIP30: more than one).
     ///
     /// Order is **newest-first** (deepest probe match first), matching
-    /// [`Self::probe_body_match_fk`].
-    pub fn get_all_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<(Fk, TxRecord)>, StoreError> {
-        let mut out: Vec<(Fk, TxRecord)> = Vec::new();
+    /// [`Self::probe_body_match_fk`]. Verifies `txid.body` only; no packed
+    /// decode.
+    pub(crate) fn fks_by_txid(&self, txid: &[u8; 32]) -> Result<Vec<Fk>, StoreError> {
+        let mut out: Vec<Fk> = Vec::new();
         let mixed = self.secret.mix_txid(txid);
         // probe_candidates already open-first then sealed newest→oldest, deep-first within.
         let cands = self.head.probe_candidates(&mixed)?;
         for fk in cands {
-            if out.iter().any(|(have, _)| have.0 == fk.0) {
+            if out.contains(&fk) || self.body_txid(fk)? != *txid {
                 continue;
             }
-            if self.body_txid(fk)? != *txid {
-                continue;
-            }
-            out.push((fk, self.get(fk)?));
+            out.push(fk);
         }
         Ok(out)
     }

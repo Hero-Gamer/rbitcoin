@@ -3497,10 +3497,10 @@ fn bip30_duplicate_txid_seal_succeeds_and_resolves() {
     // Newest BIP30 create wins (deeper probe).
     let hit = t.probe_body_match_fk(&shared).unwrap();
     assert_eq!(hit, Some(fks[1]), "newest same-txid create");
-    let all = t.get_all_by_txid(&shared).unwrap();
+    let all = t.fks_by_txid(&shared).unwrap();
     assert_eq!(all.len(), 2, "both BIP30 creates body-verify");
-    assert_eq!(all[0].0, fks[1]);
-    assert_eq!(all[1].0, fks[0]);
+    assert_eq!(all[0], fks[1]);
+    assert_eq!(all[1], fks[0]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -4044,10 +4044,10 @@ fn rebuild_head_direct_mphf_bip30_newest_first() {
             let t = open_tiny_rebuild(&dir, 6, 2);
             let mut shared = [0u8; 32];
             shared[0..8].copy_from_slice(&1u64.to_le_bytes());
-            let all = t.get_all_by_txid(&shared).unwrap();
+            let all = t.fks_by_txid(&shared).unwrap();
             assert_eq!(all.len(), 2, "both BIP30 creates");
-            assert_eq!(all[0].0, Fk(2), "newest first {all:?}");
-            assert_eq!(all[1].0, Fk(1));
+            assert_eq!(all[0], Fk(2), "newest first {all:?}");
+            assert_eq!(all[1], Fk(1));
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
