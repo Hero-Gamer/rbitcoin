@@ -598,10 +598,6 @@ async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
                 .into_response();
         }
     };
-    // Tests arm a hold keyed by this listener's log path so a probe can
-    // observe the permit while it is still taken. Unarmed calls return.
-    #[cfg(test)]
-    tests::hold_work_queue(&state.ctx.logpath).await;
     let joined = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         if waited {
@@ -857,70 +853,8 @@ fn authorized(auth: &RpcAuth, cookie: Option<&RpcCookie>, headers: &HeaderMap) -
 mod tests {
     use super::*;
     use rbitcoin_primitives::Network;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use tokio::sync::watch;
-
-    struct WorkQueueHold {
-        entered: Arc<AtomicBool>,
-        release_rx: watch::Receiver<bool>,
-    }
-
-    static WORK_QUEUE_HOLDS: Mutex<Option<HashMap<String, WorkQueueHold>>> = Mutex::new(None);
-
-    fn work_queue_holds() -> std::sync::MutexGuard<'static, Option<HashMap<String, WorkQueueHold>>>
-    {
-        WORK_QUEUE_HOLDS.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Hold the next RPC on `logpath` after it takes a work-queue permit.
-    pub(super) fn arm_work_queue_hold(logpath: &str) -> (Arc<AtomicBool>, watch::Sender<bool>) {
-        let entered = Arc::new(AtomicBool::new(false));
-        let (release_tx, release_rx) = watch::channel(false);
-        work_queue_holds().get_or_insert_with(HashMap::new).insert(
-            logpath.to_string(),
-            WorkQueueHold {
-                entered: Arc::clone(&entered),
-                release_rx,
-            },
-        );
-        (entered, release_tx)
-    }
-
-    pub(super) fn clear_work_queue_hold(logpath: &str) {
-        if let Some(holds) = work_queue_holds().as_mut() {
-            holds.remove(logpath);
-        }
-    }
-
-    /// Sends `true` on drop so a failed assert cannot leave the handler parked.
-    struct ReleaseHold(watch::Sender<bool>);
-
-    impl Drop for ReleaseHold {
-        fn drop(&mut self) {
-            let _ = self.0.send(true);
-        }
-    }
-
-    pub(super) async fn hold_work_queue(logpath: &str) {
-        let held = {
-            let holds = work_queue_holds();
-            holds
-                .as_ref()
-                .and_then(|m| m.get(logpath))
-                .map(|h| (Arc::clone(&h.entered), h.release_rx.clone()))
-        };
-        let Some((entered, mut release_rx)) = held else {
-            return;
-        };
-        entered.store(true, Ordering::SeqCst);
-        while !*release_rx.borrow() {
-            if release_rx.changed().await.is_err() {
-                return;
-            }
-        }
-    }
+    use std::sync::Arc;
 
     #[test]
     fn work_queue_zero_and_omitted_are_the_default() {
@@ -1771,46 +1705,35 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("batch json");
         assert_eq!(arr.len(), 2, "{body:?}");
-
-        // Hold the only permit across an await the probe can observe.
-        // A fast getblockcount batch used to finish before the probe ran,
-        // so every status was 200.
-        let logpath = dir.path().join("debug.log").display().to_string();
-        let (entered, release) = arm_work_queue_hold(&logpath);
-        let _release_on_drop = ReleaseHold(release.clone());
-        let holder = {
-            let addr = tcp_addr(&handle);
-            let auth = handle.auth.clone();
-            tokio::spawn(async move {
-                post_raw(
-                    addr,
-                    &auth,
-                    br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#,
-                )
-                .await
-            })
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !entered.load(Ordering::SeqCst) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "handler never took the work-queue permit"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        let (st, body) = post_raw(
-            tcp_addr(&handle),
-            &handle.auth,
-            br#"{"jsonrpc":"1.0","id":2,"method":"getblockcount"}"#,
-        )
-        .await;
-        assert_eq!(st, 503, "full permit must HTTP 503, got {st} {body:?}");
-        release.send(true).expect("hold release");
-        let (hold_st, hold_body) = holder.await.unwrap();
-        assert_eq!(hold_st, 200, "held call still completes: {hold_body:?}");
-        clear_work_queue_hold(&logpath);
         handle.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `work_queue: Some(0)` is the default depth, so a live listener cannot
+    /// start with an empty queue. Call the handler with zero tickets.
+    #[tokio::test]
+    async fn empty_work_queue_is_http_503() {
+        let (ctx, dir) = http_wait_ctx();
+        let state = AppState {
+            ctx,
+            auth: RpcAuth::new("test-token"),
+            cookie: None,
+            work_queue: Arc::new(Semaphore::new(0)),
+            rest_queue: Arc::new(Semaphore::new(1)),
+            rest: false,
+            require_auth: true,
+        };
+        let response = rpc_post(
+            State(state),
+            Bytes::from_static(br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .expect("503 body");
+        assert_eq!(&body[..], b"Work queue depth exceeded\n");
+        let _ = std::fs::remove_dir_all(dir.path());
     }
 
     #[allow(clippy::cognitive_complexity)] // one listener, envelope junk table
