@@ -300,9 +300,9 @@ pub struct LivePeer {
     send_resume: tokio::sync::Notify,
     /// Inbound `getaddr` is answered once per connection.
     getaddr_answered: AtomicBool,
-    /// We announce new tips as `cmpctblock` to this peer (`sendcmpct` they sent).
+    /// We sent `sendcmpct(1)`: this peer should announce compact blocks to us.
     pub hb_to: AtomicBool,
-    /// They announce new tips as `cmpctblock` to us (`sendcmpct` they sent).
+    /// They sent `sendcmpct(1)`: we announce compact blocks to this peer.
     pub hb_from: AtomicBool,
     /// Session should send `sendcmpct` (`PendingSendCmpct` as u8).
     pub pending_sendcmpct: std::sync::atomic::AtomicU8,

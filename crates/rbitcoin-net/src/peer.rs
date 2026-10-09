@@ -4569,11 +4569,14 @@ fn cmpct_announce_msg(
     cmpct_announce_from_block(hub, &block, cmpct_version)
 }
 
-/// Send `cmpctblock` to HB peers as soon as a reconstructed/received body has
-/// a PoW-valid header that extends our tip, **before** `tip-accept` connect.
-/// Does not mark the block connected.
+/// Send `cmpctblock` to peers who asked for high-bandwidth announcements
+/// (`hb_from`: they sent `sendcmpct` announce=1) as soon as a reconstructed
+/// or received body has a PoW-valid header that extends our tip, **before**
+/// `tip-accept` connect. Does not mark the block connected.
 ///
-/// Only the current tip-child (not a reorg branch). Sender is skipped.
+/// Core `NewPoWValidBlock`: the peer already has the parent header and not
+/// this one. `hb_to` is the opposite direction (we asked them to announce
+/// to us). Only the current tip-child (not a reorg branch). Sender is skipped.
 fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate::peers::LivePeer>) {
     if !hub.meets_minimum_chain_work() {
         return;
@@ -4603,10 +4606,16 @@ fn relay_new_pow_valid_block(hub: &ChainHub, block: &Block, from: Option<&crate:
         if from_id == Some(s.id) {
             continue;
         }
-        if !s.hb_to.load(Ordering::Relaxed) {
+        if !s.hb_from.load(Ordering::Relaxed) {
             continue;
         }
         if s.conn_type == crate::peers::PeerConnType::BlockRelay {
+            continue;
+        }
+        let (sent, known) = s.header_marks();
+        if peer_has_header(hub, sent, known, hash)
+            || !peer_has_header(hub, sent, known, block.header.prev_blockhash)
+        {
             continue;
         }
         let Some(out) = s.writer() else {

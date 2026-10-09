@@ -687,8 +687,10 @@ async fn tip_announce_prefill_knob() {
     assert_eq!(prefilled_n(&off_again), 1);
 }
 
-/// PoW-valid compact is relayed to other HB peers before connect. An invalid
-/// body does not become tip, and the sender is not announced back to.
+/// PoW-valid compact is relayed before connect to peers who asked for it
+/// (`sendcmpct` announce=1) and already have the parent. A peer we only
+/// selected as a compact source, a peer still missing the parent, and the
+/// sender do not get that announce. An invalid body does not become tip.
 #[tokio::test]
 async fn tip_announce_hb_relays_before_connect() {
     let (_dir, hub) = open_tip_announce_hub("tip-hb-relays-before-connect");
@@ -723,14 +725,25 @@ async fn tip_announce_hb_relays_before_connect() {
     let pref: Vec<usize> = (0..block.txdata.len()).collect();
     let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &pref).expect("hsi");
 
+    let parent = hub.tip_hash().unwrap();
     let peers = crate::peers::PeerHub::new();
     let a = live_peer(&peers, 18449, 6, false);
-    let b = live_peer(&peers, 18450, 7, false);
-    b.set_hb_to(true);
+    let asked = live_peer(&peers, 18450, 7, false);
+    asked.set_hb_from(true);
+    asked.note_best_known(parent);
+    let selected = live_peer(&peers, 18451, 8, false);
+    selected.set_hb_to(true);
+    selected.note_best_known(parent);
+    let behind = live_peer(&peers, 18452, 9, false);
+    behind.set_hb_from(true);
     let (a_tx, mut a_rx) = mpsc::unbounded_channel();
-    let (b_tx, mut b_rx) = mpsc::unbounded_channel();
+    let (asked_tx, mut asked_rx) = mpsc::unbounded_channel();
+    let (selected_tx, mut selected_rx) = mpsc::unbounded_channel();
+    let (behind_tx, mut behind_rx) = mpsc::unbounded_channel();
     a.attach_out(a_tx.clone());
-    b.attach_out(b_tx);
+    asked.attach_out(asked_tx);
+    selected.attach_out(selected_tx);
+    behind.attach_out(behind_tx);
     let mut follow = hb_follow();
     follow.wtxid_relay = true;
     handle_peer_frame(
@@ -746,8 +759,16 @@ async fn tip_announce_hb_relays_before_connect() {
     .expect("invalid compact must keep the session");
     assert_ne!(hub.tip_hash(), Some(hash), "non-final body must not become tip");
     assert!(
-        cmpct_of(&take_msgs(&mut b_rx)).contains(&hash),
-        "HB peer must get cmpctblock before/without successful connect"
+        cmpct_of(&take_msgs(&mut asked_rx)).contains(&hash),
+        "peer who sent sendcmpct(1) and has the parent must get cmpctblock before connect"
+    );
+    assert!(
+        cmpct_of(&take_msgs(&mut selected_rx)).is_empty(),
+        "a peer we only selected with sendcmpct(1) is a source, not an announce target"
+    );
+    assert!(
+        cmpct_of(&take_msgs(&mut behind_rx)).is_empty(),
+        "sendcmpct(1) without the parent header is not a compact tip announce"
     );
     assert!(
         cmpct_of(&take_msgs(&mut a_rx)).is_empty(),
