@@ -137,8 +137,17 @@ pub struct DiffPad {
 pub enum CompareOne {
     NotABlock,
     Skipped,
-    Agreed { accept: bool },
-    Disagreed { ours: bool, core: bool, hex: String },
+    Agreed {
+        accept: bool,
+    },
+    Disagreed {
+        ours: bool,
+        core: bool,
+        hex: String,
+        /// Core `submitblock` reason when this split came from a reply.
+        /// Empty when the split has no oracle string.
+        reason: String,
+    },
     Harness(&'static str),
 }
 
@@ -966,6 +975,7 @@ pub fn compare_tx_bytes(hub: &ChainHub, oracle: &dyn BlockOracle, raw: &[u8]) ->
                 ours: ours == DiffVerdict::Accept,
                 core: core == DiffVerdict::Accept,
                 hex,
+                reason: String::new(),
             }
         }
     }
@@ -1016,6 +1026,7 @@ pub fn compare_mempool_one(
                 ours: ours == DiffVerdict::Accept,
                 core: core == DiffVerdict::Accept,
                 hex,
+                reason: String::new(),
             }
         }
     }
@@ -1066,6 +1077,7 @@ pub fn compare_script_verify_one(
                 ours: ours == DiffVerdict::Accept,
                 core: core == DiffVerdict::Accept,
                 hex: hex2,
+                reason: String::new(),
             }
         }
     }
@@ -1752,6 +1764,7 @@ fn finish_reorg_compare(
                 ours: true,
                 core: false,
                 hex,
+                reason: String::new(),
             }
         }
         (DiffVerdict::Reject, DiffVerdict::Reject) => {
@@ -1767,6 +1780,7 @@ fn finish_reorg_compare(
                 ours: false,
                 core: true,
                 hex,
+                reason: String::new(),
             }
         }
         (DiffVerdict::Reject, DiffVerdict::Skip) => {
@@ -1833,11 +1847,13 @@ pub fn honest_replay_verdict(ours: DiffVerdict, core: DiffVerdict) -> CompareOne
             ours: false,
             core: true,
             hex: String::new(),
+            reason: String::new(),
         },
         (DiffVerdict::Accept, DiffVerdict::Reject) => CompareOne::Disagreed {
             ours: true,
             core: false,
             hex: String::new(),
+            reason: String::new(),
         },
         (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
         (DiffVerdict::Skip, _) | (_, DiffVerdict::Skip) => CompareOne::Skipped,
@@ -1877,6 +1893,7 @@ fn replay_honest_twin(
             ours: true,
             core: true,
             hex,
+            reason: String::new(),
         };
     }
     match honest_replay_verdict(ours, core) {
@@ -1887,7 +1904,12 @@ fn replay_honest_twin(
                 let _ = hub.rewind_to_height(keep);
             }
             let _ = oracle.core_rewind_to_height(keep);
-            CompareOne::Disagreed { ours, core, hex }
+            CompareOne::Disagreed {
+                ours,
+                core,
+                hex,
+                reason: String::new(),
+            }
         }
         other => {
             if ours == DiffVerdict::Accept {
@@ -1991,6 +2013,7 @@ fn combine(
                 ours: true,
                 core: false,
                 hex: hex.to_string(),
+                reason: String::new(),
             }
         }
         (DiffVerdict::Reject, DiffVerdict::Reject) => CompareOne::Agreed { accept: false },
@@ -1998,6 +2021,7 @@ fn combine(
             ours: false,
             core: true,
             hex: hex.to_string(),
+            reason: String::new(),
         },
         (DiffVerdict::Reject, DiffVerdict::Skip) => CompareOne::Skipped,
         (DiffVerdict::Skip, DiffVerdict::Accept) => {
@@ -2199,6 +2223,7 @@ mod tests {
                 ours: false,
                 core: true,
                 hex: String::new(),
+                reason: String::new(),
             }
         );
     }

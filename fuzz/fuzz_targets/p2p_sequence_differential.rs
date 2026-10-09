@@ -430,7 +430,9 @@ fuzz_target!(|data: &[u8]| {
                 match compare_one(&b.hub, &mut tip, &b.core.rpc, body) {
                     CompareOne::Agreed { .. } => note_comparison(),
                     CompareOne::NotABlock | CompareOne::Skipped => {}
-                    CompareOne::Disagreed { ours, core, hex } => {
+                    CompareOne::Disagreed {
+                        ours, core, hex, ..
+                    } => {
                         panic!("p2p-sequence block: ours={ours} core={core} hex={hex}");
                     }
                     CompareOne::Harness(msg) if msg == "oracle dead" => {}
@@ -440,7 +442,9 @@ fuzz_target!(|data: &[u8]| {
             P2pSeqKind::Tx => match compare_tx_bytes(&b.hub, &b.core.rpc, &step.payload) {
                 CompareOne::Agreed { .. } => note_comparison(),
                 CompareOne::NotABlock | CompareOne::Skipped => {}
-                CompareOne::Disagreed { ours, core, hex } => {
+                CompareOne::Disagreed {
+                    ours, core, hex, ..
+                } => {
                     panic!("p2p-sequence tx: ours={ours} core={core} hex={hex}");
                 }
                 CompareOne::Harness(msg) if msg == "oracle dead" => {}

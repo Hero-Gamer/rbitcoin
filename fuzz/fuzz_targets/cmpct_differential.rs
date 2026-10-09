@@ -229,8 +229,15 @@ fn send_one(b: &Base, data: &[u8]) -> SendOutcome {
             if let Some(fate) = follow_reconstructed_cmpct(&b.hub, &b.core.rpc, &case) {
                 match fate {
                     CompareOne::Harness(msg) => harness_failure(msg),
-                    CompareOne::Disagreed { ours, core, hex } => {
-                        panic!("cmpct follow split ours={ours} core={core} hex={hex}");
+                    CompareOne::Disagreed {
+                        ours,
+                        core,
+                        reason,
+                        hex,
+                    } => {
+                        panic!(
+                            "cmpct follow split ours={ours} core={core} reason={reason} hex={hex}"
+                        );
                     }
                     CompareOne::Agreed { accept: true } => {
                         if b.hub.rewind_to_height(0).is_err() {

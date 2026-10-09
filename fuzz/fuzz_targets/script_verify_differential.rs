@@ -86,7 +86,9 @@ fuzz_target!(|data: &[u8]| {
             ORACLE_DOWN_STREAK.store(0, Ordering::Relaxed);
         }
         CompareOne::Agreed { .. } => note_comparison(),
-        CompareOne::Disagreed { ours, core, hex } => {
+        CompareOne::Disagreed {
+            ours, core, hex, ..
+        } => {
             eprintln!("=== SCRIPT-VERIFY-DIFFERENTIAL FUZZ CONSENSUS DIVERGENCE ===");
             eprintln!("ours_accept={ours} core_accept={core}");
             eprintln!("tx_hex={hex}");
