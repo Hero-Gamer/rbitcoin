@@ -98,6 +98,24 @@ pub fn cmpct_hsi_regtest_connectable(hsi: &HeaderAndShortIds) -> bool {
         .is_ok()
 }
 
+/// Core's compact job sets mocktime to regtest genesis and rejects a header
+/// more than two hours later (`time-too-new`). Fold the mix into
+/// genesis + one regtest interval through that cap so stamps stay unique.
+fn cmpct_header_time(genesis_time: u32, extra: u32) -> u32 {
+    const MAX_FUTURE: u32 = 2 * 60 * 60;
+    let earliest = genesis_time.saturating_add(REGTEST_BLOCK_SPACING);
+    let latest = genesis_time.saturating_add(MAX_FUTURE);
+    let span = latest.saturating_sub(earliest).saturating_add(1);
+    earliest.saturating_add(extra % span)
+}
+
+/// Hub accept uses this clock. Wall time would accept a 2011 stamp Core's
+/// mocktime calls `time-too-new`.
+fn pin_cmpct_hub_clock(hub: &ChainHub) {
+    let t = genesis_block(&ChainParams::regtest()).header.time;
+    hub.clock.set_mock(i64::from(t));
+}
+
 /// Decode a compact announcement and restamp a unique grinded height-1 header.
 pub fn prepare_cmpct_fuzz_hsi(data: &[u8]) -> Option<HeaderAndShortIds> {
     let mut hsi = decode_cmpct_hsi(data)?;
@@ -106,11 +124,7 @@ pub fn prepare_cmpct_fuzz_hsi(data: &[u8]) -> Option<HeaderAndShortIds> {
     hsi.header.bits = genesis.header.bits;
     let mix = sha256::Hash::hash(data);
     let extra = u32::from_le_bytes(mix.to_byte_array()[..4].try_into().ok()?);
-    hsi.header.time = genesis
-        .header
-        .time
-        .saturating_add(REGTEST_BLOCK_SPACING)
-        .saturating_add(extra % 10_000);
+    hsi.header.time = cmpct_header_time(genesis.header.time, extra);
     grind_regtest_pow(&mut hsi.header);
     cmpct_hsi_regtest_connectable(&hsi).then_some(hsi)
 }
@@ -213,7 +227,7 @@ fn follow_core_verdict(
     oracle: &dyn BlockOracle,
     hex: &str,
     hash: &str,
-) -> Result<DiffVerdict, CompareOne> {
+) -> Result<(DiffVerdict, String), CompareOne> {
     let reply = submit_clearing_invalidate(oracle, hex, hash)?;
     if matches!(reply, OracleReply::Dead)
         || (matches!(reply, OracleReply::RpcError) && !oracle.liveness_ok())
@@ -221,16 +235,16 @@ fn follow_core_verdict(
         return Err(CompareOne::Harness("oracle dead"));
     }
     let reason = match &reply {
-        OracleReply::Reason(s) => s.as_str(),
-        _ => "",
+        OracleReply::Reason(s) => s.clone(),
+        _ => String::new(),
     };
     if matches!(reply, OracleReply::NullAccept) || reason == "duplicate" {
-        return Ok(DiffVerdict::Accept);
+        return Ok((DiffVerdict::Accept, String::new()));
     }
     if reason == "duplicate-invalid" || reason == "duplicate-inconclusive" {
-        return Ok(DiffVerdict::Reject);
+        return Ok((DiffVerdict::Reject, reason));
     }
-    Ok(verdict_from_core_reply(&reply))
+    Ok((verdict_from_core_reply(&reply), reason))
 }
 
 /// Mutated compact body, then the honest block for that header, both through
@@ -242,6 +256,7 @@ pub fn follow_invalid_cmpct(
     mutated: bitcoin::Block,
     successor: bitcoin::Block,
 ) -> CompareOne {
+    pin_cmpct_hub_clock(hub);
     let succ_hash = successor.block_hash();
     if let Err(e) = drain_one(hub, mutated) {
         return if cmpct_drain_harness(&e) {
@@ -251,6 +266,7 @@ pub fn follow_invalid_cmpct(
                 ours: false,
                 core: true,
                 hex: String::new(),
+                reason: String::new(),
             }
         };
     }
@@ -263,12 +279,13 @@ pub fn follow_invalid_cmpct(
                 ours: false,
                 core: true,
                 hex: String::new(),
+                reason: String::new(),
             };
         }
     }
     let hash = succ_hash.to_string();
     let hex = hex_encode(serialize(&successor));
-    let core = match follow_core_verdict(oracle, &hex, &hash) {
+    let (core, reason) = match follow_core_verdict(oracle, &hex, &hash) {
         Ok(v) => v,
         Err(fate) => return fate,
     };
@@ -280,11 +297,13 @@ pub fn follow_invalid_cmpct(
             ours: true,
             core: false,
             hex,
+            reason,
         },
         (false, DiffVerdict::Accept) => CompareOne::Disagreed {
             ours: false,
             core: true,
             hex,
+            reason,
         },
         (_, DiffVerdict::Skip) => CompareOne::Skipped,
     }
@@ -390,11 +409,7 @@ fn structured_cmpct_case(data: &[u8]) -> CmpctFuzzCase {
     };
     let genesis = genesis_block(&ChainParams::regtest());
     let extra_time = u32::from_le_bytes(mix.to_byte_array()[..4].try_into().unwrap_or([0; 4]));
-    let time = genesis
-        .header
-        .time
-        .saturating_add(REGTEST_BLOCK_SPACING)
-        .saturating_add(extra_time % 10_000);
+    let time = cmpct_header_time(genesis.header.time, extra_time);
     let block = mine_regtest_paying(
         genesis.block_hash(),
         time,
@@ -634,8 +649,57 @@ mod tests {
             ),
             "{fate:?}"
         );
+        assert!(format!("{fate:?}").contains("bad-txnmrklroot"), "{fate:?}");
         assert!(oracle.reconsidered.get());
         assert_eq!(oracle.submits.get(), 2);
+    }
+
+    /// `[1, 0, 0, 0]` and the overnight crasher `[253, 16]` both hash to a
+    /// stamp past genesis + 2h. Core's mocktime is genesis.
+    #[test]
+    fn prepare_cmpct_stamp_stays_inside_core_mock_window() {
+        let genesis = genesis_block(&ChainParams::regtest());
+        let cap = genesis.header.time + 2 * 60 * 60;
+        for data in [&[1u8, 0, 0, 0][..], &[253, 16][..]] {
+            let case = prepare_cmpct_fuzz_case(data).expect("case");
+            assert!(case.hsi.header.time > genesis.header.time, "{data:?}");
+            assert!(
+                case.hsi.header.time <= cap,
+                "{data:?} time {} past cap {cap}",
+                case.hsi.header.time
+            );
+        }
+    }
+
+    #[test]
+    fn follow_past_mock_window_rejects_with_core() {
+        use rbitcoin_consensus::{genesis_block, mine_regtest_paying, Milestone};
+        use rbitcoin_net::ChainHub;
+
+        let oracle = StickyInvalidate {
+            reconsidered: std::cell::Cell::new(false),
+            submits: std::cell::Cell::new(0),
+            before: "time-too-new",
+            after: OracleReply::Reason("time-too-new".into()),
+        };
+        let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("cmpct-follow-future");
+        let params = crate::block_diff::diff_regtest_params();
+        let hub = ChainHub::new(q, params.clone(), Milestone::NONE);
+        hub.ensure_genesis().unwrap();
+        let genesis = genesis_block(&params);
+        let honest = mine_regtest_paying(
+            genesis.block_hash(),
+            genesis.header.time + 2 * 60 * 60 + 60,
+            1,
+            ScriptBuf::from_bytes(vec![0x51]),
+            vec![],
+        );
+        let mutated = same_hash_merkle_mutant(&honest).expect("mutant");
+        let fate = follow_invalid_cmpct(&hub, &oracle, mutated, honest);
+        assert!(
+            matches!(fate, CompareOne::Agreed { accept: false }),
+            "{fate:?}"
+        );
     }
 
     #[test]

@@ -526,6 +526,10 @@ count, prefill mask, fill/duplicate/corrupt flags, nonce) then encodes a
 well-formed `cmpctblock`. `data[0] % 8 == 7` is the raw-wire arm
 (`prepare_cmpct_fuzz_hsi` restamp; malformed decode is skip). Each case
 grinds a unique header (prev = genesis) so Core treats it as a new compact.
+The stamp folds a mix of the input into genesis + 600 through genesis + 2
+hours: this job's `setmocktime` is genesis, and a later header is
+`time-too-new` on Core. The follow accept pins the hub clock to that same
+mocktime. A split panic includes Core's `submitblock` reason.
 Spawn `setmocktime`s Core to regtest genesis time (`CanDirectFetch`).
 P2P `bitcoind` also gets `-maxtipage=999999999` so Core v31's IBD latch
 (`UpdateIBDStatus` on `LoadChainTip`, not `setmocktime`) leaves IBD at
