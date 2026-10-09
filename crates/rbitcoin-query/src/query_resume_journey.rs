@@ -97,10 +97,52 @@ fn resume_most_work_header_path() {
     let mut children: crate::U64Map<Vec<(Fk, [u8; 32])>> = crate::U64Map::default();
     children.insert(gfk.0, vec![(pfk, p.hash)]);
     children.insert(pfk.0, vec![(gfk, g.hash)]);
+    let n = q.store().header_count() as usize;
+    let index = crate::ResumeHeaderIndex {
+        children,
+        bits: vec![0x1d00ffff; n],
+        prevs: vec![0; n],
+    };
     let mut memo = crate::U64Map::default();
-    let (_w, d) = crate::Query::resume_subtree_score(q.store(), &children, gfk, &mut memo)
+    let (_w, d) = crate::Query::resume_subtree_score(&index, gfk, &mut memo)
         .expect("a prev_fk cycle must not hang");
     assert!(memo.contains_key(&gfk.0) && memo.contains_key(&pfk.0));
     assert!(d >= 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// One hard header beats a longer run of easy headers.
+#[test]
+fn resume_shorter_heavier_header_beats_longer_easy_fork() {
+    use bitcoin::{CompactTarget, Target};
+    let (dir, q) = temp_query("resume-short-heavy");
+    let (g, tg) = coinbase_block(0, Fk::NULL, None);
+    let gfk = q.connect_block(Height(0), &g, &[tg]).unwrap();
+    let (p, tp) = coinbase_block(1, gfk, Some(g.hash));
+    let pfk = q.connect_block(Height(1), &p, &[tp]).unwrap();
+    let (tip, tt) = coinbase_block(2, pfk, Some(p.hash));
+    q.connect_block(Height(2), &tip, &[tt]).unwrap();
+
+    let easy_bits = 0x207f_ffffu32;
+    let hard_bits = 0x1d00_ffffu32;
+    let easy = Target::from_compact(CompactTarget::from_consensus(easy_bits)).to_work();
+    let hard = Target::from_compact(CompactTarget::from_consensus(hard_bits)).to_work();
+    let mut easy_chain = easy;
+    for _ in 0..7 {
+        easy_chain = easy_chain + easy;
+    }
+    assert!(hard > easy_chain);
+
+    let long = put_header_fork(&q, (gfk, g.hash), 50, 8);
+    let (mut short, _) = coinbase_block(70, gfk, Some(g.hash));
+    short.bits = hard_bits;
+    rehash_header(&mut short, &g.hash);
+    q.put_header(&short).unwrap();
+
+    let path = q
+        .resume_work_path_after_tip_excluding(tip.hash, 2, 8, &[p.hash])
+        .unwrap();
+    assert_eq!(path[0].hash, short.hash);
+    assert_ne!(path[0].hash, long[0].hash);
     let _ = std::fs::remove_dir_all(dir);
 }

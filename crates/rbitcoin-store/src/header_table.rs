@@ -442,6 +442,43 @@ impl HeaderTable {
         Ok(())
     }
 
+    /// Rows `1..=through`, and not a row appended after the caller sampled `through`.
+    pub fn for_each_record_through<F>(&self, through: u64, mut f: F) -> Result<(), StoreError>
+    where
+        F: FnMut(Fk, HeaderRecord) -> Result<(), StoreError>,
+    {
+        let n = self.count().min(through);
+        const CHUNK: u64 = 1024;
+        let mut buf = vec![0u8; CHUNK as usize * HEADER_RECORD_LEN];
+        let mut id = 1u64;
+        while id <= n {
+            let take = (n - id + 1).min(CHUNK);
+            let nbytes = take as usize * HEADER_RECORD_LEN;
+            let offset = FILE_HEADER_LEN as u64 + (id - 1) * HEADER_RECORD_LEN as u64;
+            self.body.read_at(offset, &mut buf[..nbytes])?;
+            for i in 0..take as usize {
+                let start = i * HEADER_RECORD_LEN;
+                let rec = HeaderRecord::decode(&buf[start..start + HEADER_RECORD_LEN])?;
+                f(Fk(id + i as u64), rec)?;
+            }
+            id += take;
+        }
+        Ok(())
+    }
+
+    /// `nBits` of rows `1..=count` sampled once. Index `fk - 1`.
+    pub fn bits_in_fk_order(&self) -> Result<Vec<u32>, StoreError> {
+        let n = self.count();
+        let mut bits = vec![0u32; n as usize];
+        self.for_each_record_through(n, |fk, rec| {
+            let i = (fk.0 - 1) as usize;
+            let slot = bits.get_mut(i).ok_or(StoreError::Corrupt("header fk"))?;
+            *slot = rec.bits;
+            Ok(())
+        })?;
+        Ok(bits)
+    }
+
     pub fn get(&self, fk: Fk) -> Result<HeaderRecord, StoreError> {
         use std::sync::atomic::Ordering;
         let id = fk.get().ok_or(StoreError::InvalidFk)?;
@@ -713,6 +750,28 @@ mod tests {
             "C must not gain false children from poison puts"
         );
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn body_scan_stops_at_the_callers_count_and_bits_match_rows() {
+        let dir = tmp();
+        let t = HeaderTable::create_tiny(&dir).unwrap();
+        let bits = [0x207f_ffff, 0x1e0f_ffff, 0x1d00_ffff];
+        for (i, b) in bits.into_iter().enumerate() {
+            let mut rec = sample([i as u8 + 1; 32]);
+            rec.bits = b;
+            t.ensure(&rec).unwrap();
+        }
+        let mut seen = Vec::new();
+        t.for_each_record_through(2, |fk, rec| {
+            seen.push((fk.0, rec.bits));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![(1, bits[0]), (2, bits[1])]);
+        let got = t.bits_in_fk_order().unwrap();
+        assert_eq!(got, bits);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

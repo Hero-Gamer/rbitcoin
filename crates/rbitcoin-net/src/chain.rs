@@ -3089,6 +3089,11 @@ impl ChainHub {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_clear_chain_work_prefix(&self) {
+        self.chain_work_prefix.write().unwrap().clear();
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_poison_chain_work_prefix_last(&self) {
         let mut p = self.chain_work_prefix.write().unwrap();
         if let Some(last) = p.last_mut() {
@@ -3157,13 +3162,13 @@ impl ChainHub {
             p.truncate(want);
             return Ok(());
         }
+        if p.is_empty() {
+            self.fill_chain_work_from_header_body(&mut p, want)?;
+            return Ok(());
+        }
         while p.len() < want {
             let h = p.len() as u32;
-            let hdr = self
-                .query
-                .wire_header_at_height(Height(h))
-                .map_err(NetError::store)?;
-            let w = hdr.work();
+            let w = self.header_work_at_height(h)?;
             let acc = match p.last() {
                 None => w,
                 Some(&prev) => prev + w,
@@ -3172,6 +3177,59 @@ impl ChainHub {
         }
         Ok(())
     }
+
+    /// First fill after process start. `nBits` is the whole work input, so
+    /// this is one sequential read of `header.body` plus the in-memory
+    /// confirmed fk array. Later heights append one record at a time.
+    fn fill_chain_work_from_header_body(
+        &self,
+        p: &mut Vec<Work>,
+        want: usize,
+    ) -> Result<(), NetError> {
+        let bits = self
+            .query
+            .store()
+            .headers
+            .bits_in_fk_order()
+            .map_err(NetError::store)?;
+        let mut built = Vec::with_capacity(want);
+        for h in 0..want as u32 {
+            let fk = self
+                .query
+                .store()
+                .confirmed
+                .get(Height(h))
+                .map_err(NetError::store)?
+                .ok_or_else(|| NetError::store(rbitcoin_store::StoreError::NotFound))?;
+            let id = fk
+                .get()
+                .ok_or_else(|| NetError::store(rbitcoin_store::StoreError::InvalidFk))?;
+            let nbits = bits.get((id - 1) as usize).copied().ok_or_else(|| {
+                NetError::store(rbitcoin_store::StoreError::Corrupt("chain work header fk"))
+            })?;
+            let w = header_work_bits(nbits);
+            let acc = match built.last() {
+                None => w,
+                Some(&prev) => prev + w,
+            };
+            built.push(acc);
+        }
+        *p = built;
+        Ok(())
+    }
+
+    fn header_work_at_height(&self, h: u32) -> Result<Work, NetError> {
+        let (_, rec) = self
+            .query
+            .header_at_height(Height(h))
+            .map_err(NetError::store)?
+            .ok_or_else(|| NetError::store(rbitcoin_store::StoreError::NotFound))?;
+        Ok(header_work_bits(rec.bits))
+    }
+}
+
+fn header_work_bits(bits: u32) -> Work {
+    Target::from_compact(CompactTarget::from_consensus(bits)).to_work()
 }
 
 /// [`ChainHub::check_block_proposal`] on explicit inputs, for a caller that
@@ -4813,6 +4871,8 @@ mod tests {
         assert_eq!(tip_w, hub.work_through_height(2).unwrap());
         assert_eq!(hub.work_through_height(0).unwrap(), gwork);
         assert_eq!(tip_w - gwork, b1.header.work() + b2.header.work());
+        hub.test_clear_chain_work_prefix();
+        assert_eq!(hub.chain_work().unwrap(), tip_w);
         let extra = mine(b2.block_hash(), 1_300_000_200, 3);
         assert_eq!(
             hub.work_with_header(&extra.header),
@@ -4823,6 +4883,92 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    /// A failed rebuild must not leave a prefix the next call will extend.
+    #[test]
+    fn chain_work_error_leaves_prefix_empty() {
+        let (dir, hub) = tmp_hub();
+        hub.ensure_genesis().unwrap();
+        let b1 = mine(hub.tip_hash().unwrap(), 1_300_000_000, 1);
+        hub.accept_block(b1).unwrap();
+        hub.test_clear_chain_work_prefix();
+        hub.query
+            .store()
+            .confirmed
+            .set(rbitcoin_primitives::Height(1), Fk(9_000))
+            .unwrap();
+        assert!(hub.chain_work().is_err());
+        assert_eq!(
+            hub.test_chain_work_prefix_len(),
+            0,
+            "a failed chain-work fill does not keep the heights already summed"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Shifted `nBits` must not still sum, so the three headers use different targets.
+    #[test]
+    fn chain_work_sums_distinct_header_bits() {
+        use rbitcoin_query::testutil::FixtureChain;
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        let (dir, hub) = tmp_hub();
+        let targets = [0x207f_ffffu32, 0x1e0f_ffff, 0x1d00_ffff];
+        let works: Vec<_> = targets.iter().copied().map(header_work_bits).collect();
+        assert_ne!(works[0], works[1]);
+        assert_ne!(works[1], works[2]);
+        let mut prev_fk = Fk::NULL;
+        let mut parent = [0u8; 32];
+        let mut sum = Work::from_be_bytes([0u8; 32]);
+        for (h, &bits) in targets.iter().enumerate() {
+            sum = sum + works[h];
+            let label = h as u32;
+            let mut merkle = [0u8; 32];
+            merkle[0..4].copy_from_slice(&label.to_le_bytes());
+            let hash = if h == 0 {
+                merkle
+            } else {
+                rbitcoin_store::block_header_hash(1, &parent, &merkle, label + 1, bits, label)
+            };
+            let rec = HeaderRecord {
+                prev_fk,
+                version: 1,
+                timestamp: label + 1,
+                bits,
+                nonce: label,
+                merkle_root: merkle,
+                hash,
+                ..HeaderRecord::default()
+            };
+            let mut txid = [0u8; 32];
+            txid[31] = label as u8;
+            prev_fk = hub
+                .query
+                .connect_block(
+                    Height(label),
+                    &rec,
+                    &[TxApply {
+                        tx: TxRecord {
+                            txid,
+                            version: 1,
+                            locktime: 0,
+                            input_start_fk: Fk::NULL,
+                            input_count: 1,
+                            output_start_fk: Fk::NULL,
+                            output_count: 1,
+                        },
+                        inputs: vec![InputRecord::coinbase(u32::MAX, vec![label as u8], vec![])],
+                        outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
+                    }],
+                )
+                .unwrap();
+            parent = hash;
+        }
+        hub.test_clear_chain_work_prefix();
+        assert_eq!(hub.chain_work().unwrap(), sum);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Multi-peer concurrent accept of the same tip block: exactly one Accepted,
