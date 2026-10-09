@@ -44,17 +44,10 @@ const fn flow_bucket_edges() -> [u64; FLOW_BUCKET_EDGE_COUNT] {
         let mut n = 1u128;
         while n < 40 {
             term = term * y / (n * SCALE);
-            if term == 0 {
-                break;
-            }
             acc += term;
             n += 1;
         }
-        let mut rate = (min_relay * acc + SCALE / 2) / SCALE;
-        if i > 0 && rate <= edges[i - 1] as u128 {
-            rate = edges[i - 1] as u128 + 1;
-        }
-        edges[i] = rate as u64;
+        edges[i] = ((min_relay * acc + SCALE / 2) / SCALE) as u64;
         i += 1;
     }
     edges
