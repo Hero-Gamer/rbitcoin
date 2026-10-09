@@ -3,7 +3,7 @@
 **Component:** `rbitcoin-consensus` (`script/p2tr.rs::verify_script_path`)
 **Audit pin:** fuzzamoto report 005 / rbitcoin `8f3990f`
 **Severity:** critical — stalls on a block Core accepts (upgrade path)
-**Status:** fixed — `script_path_accepts_unknown_taproot_leaf_version`
+**Status:** fixed — `script_path_accepts_leaf_0x50_with_annex_and_0xc2` (leaf `0xc2` succeeds)
 **Found by:** fuzzamoto
 
 ## Summary

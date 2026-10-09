@@ -1,20 +1,20 @@
 # SV2 template provider (TDP server)
 
-Roadmap for **Q-64**: three plans, each one PR
-([`how-we-plan.md`](./how-we-plan.md#checklist-for-authors-and-agents)).
-Cycle and step shape: [agent contract](./how-we-plan.md#agent-contract). Do
-not start a plan before the previous one is merged, or a step before the
-previous slice is committed.
+Design record for **Q-64**. Plans A–C are in tree
+([`quality.md`](./quality.md) keeps Q-64 off the open list). The steps
+below are how they landed, not work left to start.
+Cycle and step shape: [agent contract](./how-we-plan.md#agent-contract).
 
 | Plan | Outcome | Ships flags |
 |------|---------|-------------|
 | **A** | Landed. GBT and `generate` build from `MempoolHub::select_block_template` | none |
-| **B** | A Job Declarator Client mines a block through the node's TP | `--sv2-tp-listen`, `--sv2-tp-authority-sec` / `--sv2-tp-authority-sec-file`, `--sv2-tp-cert-validity`, `--sv2-tp-stale-grace` |
-| **C** | Templates refresh on fee gain with the tip unchanged | `--sv2-tp-fee-delta`, `--sv2-tp-template-interval` |
+| **B** | Landed. A Job Declarator Client mines a block through the node's TP | `--sv2-tp-listen`, `--sv2-tp-authority-sec` / `--sv2-tp-authority-sec-file`, `--sv2-tp-cert-validity`, `--sv2-tp-stale-grace` |
+| **C** | Landed. Templates refresh on fee gain with the tip unchanged | `--sv2-tp-fee-delta`, `--sv2-tp-template-interval` |
 
-B is not split further: a listener that serves templates without
+B was not split further: a listener that serves templates without
 tip-change push or `SubmitSolution` makes miners work stale tips or lose
-found blocks. The smallest safe operator surface is B whole.
+found blocks. The smallest safe operator surface is B whole. Live flags:
+[`OPERATOR.md`](../OPERATOR.md) and [`COMPAT.md`](../COMPAT.md).
 
 ## Goal
 

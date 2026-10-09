@@ -29,14 +29,14 @@ steps.
 | L4 | low | Empty median time panics | fixed | `empty_median_time_is_an_error` ([077](./077-empty-median.md)) |
 | L5 | low | Version nonce is not a CSPRNG | fixed | `rand_nonce_changes` ([078](./078-version-nonce.md)) |
 | L6 | low | Recent-reject set clears at the cap | fixed | `recent_reject_at_the_cap_does_not_clear` ([079](./079-recent-reject-cap.md)) |
-| L8 | low | Manifest and txstat lengths allocate before a size check | fixed | `manifest_length_past_the_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt` ([070](./070-manifest-length.md)) |
+| L8 | low | Manifest and txstat lengths allocate before a size check | fixed | `map_prefix_longer_than_file_is_corrupt`, `txstat_blob_longer_than_the_file_is_corrupt` ([070](./070-manifest-length.md)) |
 | L9 | low | Tor control password on argv | fixed | `tor_control_password_rejects_a_line_break` ([080](./080-tor-control-password.md)) |
 | L10 | low | Datadir lock follows a symlink | fixed | `lock_file_does_not_follow_a_symlink` ([071](./071-datadir-lock-symlink.md)) |
 | L11 | low | Conf parse errors echo the raw line | fixed | `conf_error_names_the_file_and_line` ([081](./081-conf-error-line.md)) |
 | L12 | low | Invalid-hash set grows without a cap | fixed | `invalid_hash_set_stops_at_the_cap` ([082](./082-invalid-hash-cap.md)) |
 | L13 | low | Rate window grants two budgets at the boundary | fixed | `rate_limiter_boundary_does_not_grant_a_second_budget` ([059](./059-rate-window-boundary.md)) |
 | L14 | low | Mempool expiry runs only on admission | fixed | `expire_stale_drops_old_tx_without_a_new_accept`, `hub_live_journey` ([083](./083-mempool-expiry-cursor.md)) |
-| L15 | low | Write jobs form a mutable slice over a shared buffer | fixed | pool write arm uses a shared slice ([072](./072-pool-write-slice.md)) |
+| L15 | low | Write jobs form a mutable slice over a shared buffer | fixed | `io_session_pool` write arm (`from_raw_parts`) ([072](./072-pool-write-slice.md)) |
 | L2 | — | P2PKH fast path skips FindAndDelete | rejected | The fast path is the 25-byte template. A DER signature does not fit in that scriptCode, so FindAndDelete cannot change it. |
 | L3 | — | Witness-v0 strict DER independent of BIP66 | rejected | BIP141 witness verification is strict DER. Mainnet, testnet, signet, and regtest are unaffected. |
 | L7 | low | Rewind deeper than 1024 is refused | won't-fix | `REWIND_MAX_DEPTH` is a deliberate denial-of-service cap. Removing it needs an operator decision. No new knob. |

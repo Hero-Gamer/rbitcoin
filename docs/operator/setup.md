@@ -14,8 +14,8 @@ full scripts. Signet’s default is **0** (every script, slower on purpose).
 
 Architecture and confirm pipeline: [`docs/architecture.md`](../../docs/architecture.md),
 [`docs/concurrency.md`](../../docs/concurrency.md). Download defaults to **1024**
-concurrent getdata (not a tip-distance cap), max **16** blocks in transit per
-peer.
+concurrent getdata (not a tip-distance cap), max **64** blocks in transit per
+peer (a 16 MiB payload cap stops one peer holding 64 large bodies).
 
 ## Build
 
@@ -161,7 +161,7 @@ store IO, mmap sealed fuse, a few-block query confirm, `--smoke`);
 they do not upload binaries. Local Linux `target/release/` install is still
 `nix build .#rbitcoin-musl` on a clean master tree. Windows IoRing is not
 supported. Darwin/Windows are not Nix packages — see
-[`docs/reproducible-builds.md`](docs/reproducible-builds.md).
+[`docs/reproducible-builds.md`](../reproducible-builds.md).
 
 **Darwin Gatekeeper:** the Darwin binaries are ad-hoc signed (`codesign -s -`), not
 notarized. If Finder or a browser sets quarantine and the binary is killed

@@ -1,8 +1,8 @@
 # rbitcoin-esplora
 
-Esplora-compatible REST. Depends on query, store,
-net, and mempool. Electrum is a sibling crate (`rbitcoin-electrum`); both
-need `--sh-index`.
+Esplora-compatible REST. Depends on query, store, electrum,
+net, and consensus. Electrum is a sibling crate (`rbitcoin-electrum`); both
+need `--sh-index` for address history.
 
 ## Read first
 

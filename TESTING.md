@@ -168,7 +168,7 @@ absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 
 **Baseline (agent VM, warm test profile, 2026-08-07):** full `cargo test --workspace` was **~1000 s (~17 min)** before store fan-in scale fixes. After parameterizing fan-in targets and shrinking SH head default benches (`6588b62` era): `rbitcoin-store --lib` serial **~26 s** (was **~498 s**); `sorted_run` module **~1 s** (was **~191 s**).
 
-**CI-class (2026-08-17):** required GitHub Actions `test` job (`ubuntu-24.04`, `cargo test --workspace` + node/cli build) is **~85 s** (PR 85). That meets the ≤3 min budget and the **&lt;2 min** stretch on CI hardware. Do **not** re-run multi-minute full-suite timing loops as a planning spike; package walls below are still the local budget if a change feels slow.
+**CI-class (2026-08-17):** required GitHub Actions `test` job (`ubuntu-latest`, `cargo test --workspace` + node/cli build) is **~85 s** (PR 85). That meets the ≤3 min budget and the **&lt;2 min** stretch on CI hardware. Do **not** re-run multi-minute full-suite timing loops as a planning spike; package walls below are still the local budget if a change feels slow.
 
 **Agent VM (2026-10-03, warm test profile, tmpfs runner):** `cargo test --workspace` was **199.3 s** on `1d2f8896` and **117.2 s** / **118.5 s** after this cut, rebased onto current master. `end_of_ibd` went from **83.8 s** to **~23 s** (the work-fork journey was two 30 s stall waits, then **~5 s**). `cross_surface` went from **19.3 s** to **~9.5 s**. `integration_multinode` stayed **~32 s**.
 
@@ -252,7 +252,7 @@ All workspace members that contain production code:
 - `rbitcoin-primitives`, `rbitcoin-store`, `rbitcoin-query`
 - `rbitcoin-consensus`, `rbitcoin-mempool`, `rbitcoin-net`
 - `rbitcoin-electrum`, `rbitcoin-esplora`, `rbitcoin-log`
-- `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`
+- `rbitcoin-rpc`, `rbitcoin-cli`, `rbitcoin-node`, `rbitcoin-sv2`
 
 **Excluded by default:** third-party crates, `src/main.rs` trampolines, test
 modules (`*_tests.rs`, `tests.rs`, crate `/tests/`, `testutil.rs`,
@@ -465,7 +465,7 @@ API.
 ./scripts/fuzz-run.sh v2_session                # live Core v2 peer, ping/pong compare, ASan
 ./scripts/fuzz-run.sh cmpct_differential        # compact missing indexes vs getblocktxn, ASan
 ./scripts/fuzz-run.sh block_differential        # fetch bitcoind, --sanitizer none
-./scripts/fuzz-run.sh block_spend_differential  # 100-block pad; weekdays --sanitizer none -timeout=180; Sunday address -timeout=30
+./scripts/fuzz-run.sh block_spend_differential  # 100-block pad; weekdays --sanitizer none -timeout=180; Sunday address -timeout=90
 ./scripts/fuzz-run.sh script_differential       # mutate executed scriptPubKey, --sanitizer none
 ./scripts/fuzz-run.sh block_fork_differential   # pad+stem, 2-block fork, --sanitizer none
 ./scripts/fuzz-run.sh cmpct_reorg_differential  # child-first drain_pending vs Core

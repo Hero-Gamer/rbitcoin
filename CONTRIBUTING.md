@@ -269,7 +269,7 @@ does not apply to them.
 Humans who want the same gates offline (Nix optional; rustup 1.95 is enough):
 
 ```bash
-# nix develop   # Linux only — pin via flake.lock; or rustup + rust-toolchain.toml
+# nix develop   # Linux and aarch64-darwin — pin via flake.lock; or rustup + rust-toolchain.toml
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$PWD/target/dev}"
 cargo fmt --all -- --check                 # includes nested fuzz/ crate
 # rustc warnings are denied via workspace.lints (+ RUSTFLAGS=-Dwarnings in the Nix shell)

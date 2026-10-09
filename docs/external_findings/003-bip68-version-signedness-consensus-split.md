@@ -8,7 +8,7 @@ invalid.
 `oracle_consensus`)
 **Status:** fixed — BIP68 version gate uses unsigned compare (`bip68_active_for_tx`)
 
-**Regression:** `rbitcoin-consensus` `block::tests::bip68_enforced_when_version_high_bit_set` — BIP68 active when version high bit set (`bip68_active_for_tx` unsigned compare).
+**Regression:** `rbitcoin-consensus` `block::finality_tests::bip68_enforced_when_version_high_bit_set` — BIP68 active when version high bit set (`bip68_active_for_tx` unsigned compare).
 
 ## Summary
 

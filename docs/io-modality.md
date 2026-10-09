@@ -41,7 +41,7 @@ Unknown tokens (including deleted `mmap`) fall through to the platform default.
 | `iocp` | Windows IOCP (Windows **default**) |
 | `pread` / `fd` / `libc` / `pwrite` | Disable session; libc positional IO (+ workers for reads) |
 
-**Defaults:** Linux `io_uring` if the ring opens, else pool. Darwin **pool**.
+**Defaults:** Linux `io_uring` if the ring opens, else libc **pread** (session off). Darwin **pool**.
 Windows **IOCP**. Windows IoRing is not supported.
 
 **Windows table handles** are `FILE_FLAG_OVERLAPPED` so IOCP can bind.
@@ -149,7 +149,7 @@ RAM fence (~15 MiB at 1M blocks), not a file.
 | Block index build (filters + tweaks) | `RBITCOIN_IO` | `read_index_window`: one held TLS session per window, four stages (`create.loc` / `input.loc` / `seqsigwit.loc` windows → block `txout` / `input.body` / `txid.body` spans → parent `create.loc` + P2TR-output `seqsigwit.body` + parent `txid.body` → parent `txout`), offsets from RAM checkpoints so nothing nests. Parents read once per window. Short/errno on a live session libc-completes; no session → serial pread through the same stages. Writes are not on the ring: one filter put and one tweak put per window. |
 | SP-tweak hole serve | `RBITCOIN_IO` | `tweaks_for_height` for heights the index has not sealed: idx ranges **before** TLS ring; uring/pread `txout.body`, then `seqsigwit` + parent `txout` for P2TR only. |
 
-Default: Linux uring if the ring opens else pool; Darwin pool; Windows
+Default: Linux uring if the ring opens else libc pread; Darwin pool; Windows
 IOCP. Ring depth **128** (merge may grow). `RBITCOIN_IO=pread` forces libc.
 
 ### Table transport (all fd)

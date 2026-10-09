@@ -55,7 +55,7 @@ later Core RPC is present, including descriptor-wallet calls from 0.21
 | `--rpc-listen [ADDR]` / conf `rpc_listen=` | **off** | TCP JSON-RPC; omit ADDR → `127.0.0.1` and Core-matching port (8332 / 18332 / 38332 / 18443). Implies `--rpc`. |
 | `--rpc-token-file PATH` | `{datadir}/rpc.token` | CSPRNG hex token; TCP `Authorization: Bearer` |
 | `--rpc-cookie-file PATH` / conf `rpc_cookie_file=` | **off** | Existing Core-format `username:password` file (no trailing newline) accepted as TCP HTTP Basic in addition to Bearer; it is never created or logged |
-| `--sh-index` | **off** | Class B scripthash (Electrum/Esplora only; RPC by height/hash/txid does not need it) |
+| `--sh-index` | **off** | Class B scripthash for Electrum/Esplora address history and RPC `scantxoutset`. RPC by height/hash/txid does not need it |
 | `--block-filter-index` | **off** | BIP158 basic. IBD seals them when the flag is on from the start. A later enable still materializes after catch-up. `NODE_COMPACT_FILTERS` is advertised once filters first reach the tip (`getnetworkinfo` lists `COMPACT_FILTERS`), then for the life of the process. `getblockfilter` serves a sealed height, one block whose parent filter is already sealed, and a stale branch back to that sealed fork point. An unsealed best-chain gap is refused. `/rest/blockfilter/` and P2P still serve only heights the watermark covers. Independent of `--sh-index` |
 | `--rpc-work-queue N` | **16** | In-flight HTTP RPC (Core `-rpcworkqueue`). One POST is one slot (a JSON-RPC array is still one slot). Full permit is HTTP **503** `Work queue depth exceeded`. **0** is the default queue of 16. |
 | `--rest` / conf `rest=` | **off** | Unauthenticated `/rest/` on the RPC listener. Own queue, same depth as `--rpc-work-queue`'s default. The body is read before that permit is taken. Without the flag those paths are 404. |
@@ -116,7 +116,7 @@ rbitcoin-cli --network regtest --rpc-url http://127.0.0.1:18443 getblockchaininf
 |------------|----------------------|-------------|
 | IBD, tip follow, P2P, mempool relay | Yes | Yes |
 | Node JSON-RPC (by height/hash/txid) | Yes | Yes |
-| Electrum / Esplora listen | **Refuse start** | Yes after SH tip-ready |
+| Electrum / Esplora listen | Start; address methods fail closed (`scripthash index disabled`) | Yes after SH tip-ready |
 | SH run enqueue / tip bulk | **Skip** | On |
 
 Tip-follow readiness is **independent** of scripthash materialize. Electrum/Esplora
