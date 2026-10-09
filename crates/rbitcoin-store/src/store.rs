@@ -1518,6 +1518,9 @@ impl Store {
     }
 
     /// True if any annotated spender for this outpoint is confirmed-strong.
+    /// The create is the connected row for `out_txid`: a strong spender
+    /// always hangs off it, so a newer never-connected row for the same txid
+    /// cannot hide a confirmed spend.
     pub fn has_confirmed_strong_spender(
         &self,
         out_txid: &[u8; 32],
@@ -1534,7 +1537,7 @@ impl Store {
         out_index: u32,
         tip: Option<u32>,
     ) -> Result<bool, StoreError> {
-        let Some(create_fk) = self.txs.probe_body_match_fk(out_txid)? else {
+        let Some(create_fk) = self.get_fk_by_txid_tip(out_txid)? else {
             return Ok(false);
         };
         let mut found = false;
@@ -1580,13 +1583,14 @@ impl Store {
         Ok(out)
     }
 
-    /// All annotated spenders (including non-strong / reorg history).
+    /// All annotated spenders on the connected create (including non-strong /
+    /// reorg history). A txid with no connected row has none.
     pub fn spenders_raw(
         &self,
         out_txid: &[u8; 32],
         out_index: u32,
     ) -> Result<Vec<PointRecord>, StoreError> {
-        let Some(create_fk) = self.txs.probe_body_match_fk(out_txid)? else {
+        let Some(create_fk) = self.get_fk_by_txid_tip(out_txid)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
@@ -3790,6 +3794,15 @@ mod tests {
         assert!(none.is_empty());
     }
 
+    /// Two Class A rows for one txid, the older connected and the newer not
+    /// (a competing block at the same height, archived and then reorged
+    /// away): the tip resolvers pick the connected row and the any-row
+    /// resolve the newest. The last beat stamps a connected spender on the
+    /// connected row's vout 0 at height 1; the newer row has no spenders, so
+    /// the spentness probe and the spender walk must read the connected row.
+    /// A store unit, not a journey: the result is pure (which row each reader
+    /// picks), and reaching two rows for one txid through a session needs a
+    /// competing stale block, a fixture cost with no extra observation.
     #[test]
     fn resolve_txid_prefers_connected_over_newer_unconnected() {
         let dir = tmp();
@@ -3842,6 +3855,46 @@ mod tests {
             .get_fk_by_txid_batch_mode(&[txid], TxidResolveMode::TipThenAny)
             .unwrap();
         assert_eq!(batch_any[0].1.map(|(f, _)| f), Some(old));
+
+        let spender = s
+            .put_tx_full_batch_indexed(
+                &[(
+                    TxRecord {
+                        txid: [0xBAu8; 32],
+                        version: 1,
+                        locktime: 0,
+                        input_start_fk: Fk::NULL,
+                        input_count: 1,
+                        output_start_fk: Fk::NULL,
+                        output_count: 1,
+                    },
+                    vec![InputRecord {
+                        prev_txid: txid,
+                        create_fk: old,
+                        prev_index: 0,
+                        sequence: u32::MAX,
+                        script_sig: vec![],
+                        witness: vec![],
+                    }],
+                    vec![OutputRecord::unspent(1, vec![0x51])],
+                )],
+                true,
+            )
+            .unwrap()[0];
+        s.header_txs.put_range(Fk(2), spender, 1).unwrap();
+        s.confirmed.set(Height(1), Fk(2)).unwrap();
+        s.strong_tx.set_strong(spender, Fk(2)).unwrap();
+        s.rebuild_height_fence().unwrap();
+        s.put_spend_create(old, 0, spender, 0).unwrap();
+        assert!(
+            s.has_confirmed_strong_spender(&txid, 0).unwrap(),
+            "spentness is probed on the connected create, not the newest row"
+        );
+        assert_eq!(
+            s.spenders(&txid, 0).unwrap()[0].spending_tx_fk,
+            spender,
+            "spenders walk the connected create"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
