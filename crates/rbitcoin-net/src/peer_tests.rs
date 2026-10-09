@@ -1477,11 +1477,23 @@ fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
         .unwrap();
         let first = rbitcoin_log::take_logs();
         rbitcoin_log::capture_logs(false);
+        let needle = format!(
+            "txrelay: reject {txid} (wtxid={wtxid}) from peer=0 was not accepted: coinbase"
+        );
         assert!(
-            first.iter().any(|(_, m)| m.contains(&format!(
-                "{txid} (wtxid={wtxid}) from peer=0 was not accepted: coinbase"
-            ))),
-            "first reject must log ATMP, got {first:?}"
+            first
+                .iter()
+                .filter(|(level, m)| *level == rbitcoin_log::Level::Info && m.contains(&needle))
+                .count()
+                == 1,
+            "first reject must be one info line, got {first:?}"
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|(level, m)| *level == rbitcoin_log::Level::Debug
+                    && m.contains("txrelay: reject")),
+            "reject must not also log at debug, got {first:?}"
         );
 
         rbitcoin_log::capture_logs(true);
