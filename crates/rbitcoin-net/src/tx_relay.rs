@@ -11,11 +11,11 @@ use arc_swap::ArcSwap;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_mempool::{
-    depth_rate_sat_kvb, fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth,
-    frontier_feerate_from_chunks, hold_defined_then_monotone, min_rate_for_capacity,
-    percentile_sat, weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool,
-    ChainPrevout, ChainTipCtx, Chunk, Coin, FeeFlowMeter, SelectBudget, Selected, UtxoProvider,
-    BLOCK_WEIGHT_WU, MAX_PACKAGE_COUNT,
+    fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth, frontier_feerate_from_chunks,
+    hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, published_depth_rate,
+    weight_above_from_chunks, AcceptError, AcceptResult, ActiveMempool, ChainPrevout, ChainTipCtx,
+    Chunk, Coin, FeeFlowMeter, SelectBudget, Selected, StockAbove, UtxoProvider, BLOCK_WEIGHT_WU,
+    MAX_PACKAGE_COUNT,
 };
 use rbitcoin_primitives::{Fk, Height};
 use rbitcoin_query::Query;
@@ -570,7 +570,7 @@ pub struct MempoolHub {
     block_p10_history: Mutex<FeeHistory>,
     /// Open once a preload wrote a snapshot. Lock order: this, then history.
     fee_journal: Mutex<Option<FeeJournal>>,
-    /// Last logged `(flow warm << 16) | ready targets`, to log changes once.
+    /// Last logged `(flow fullness decile << 16) | ready targets`.
     fee_readiness: AtomicU32,
     /// Process-local admit/confirm/evict EMA for flow-aware fee estimates.
     fee_flow: Mutex<FeeFlowMeter>,
@@ -2468,42 +2468,33 @@ impl MempoolHub {
         };
 
         let now = Instant::now();
-        let inflow = match self.fee_flow.lock() {
-            Ok(mut flow) if flow.is_warm(now) => Some(flow.admit_rates_wu_s(now)),
-            _ => None,
+        let (inflow, alpha) = match self.fee_flow.lock() {
+            Ok(mut flow) => {
+                let alpha = flow.fullness(now);
+                (Some(flow.admit_rates_wu_s(now)), alpha)
+            }
+            Err(_) => (None, 0.0),
         };
         let candidates = fine_candidate_rates();
+        let stock = StockAbove::from_best_first(&chunks);
         let min_r = rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB;
         let confirm_floor = self.confirm_memory_floor_sat_per_kvb();
         let history = self.block_p10_history.lock().unwrap().rates();
-        let flow_warm = inflow.is_some();
 
         let mut ordered: Vec<(u32, Option<u64>)> = Vec::with_capacity(FEE_SNAPSHOT_DEPTHS.len());
         for &depth in FEE_SNAPSHOT_DEPTHS {
             let target_wu = u64::from(depth).saturating_mul(BLOCK_WEIGHT_WU);
             let frontier = frontier_feerate_from_chunks(&chunks, target_wu);
-            let projected = inflow.as_ref().and_then(|inf| {
-                min_rate_for_capacity(
-                    |r| weight_above_from_chunks(&chunks, r),
-                    inf,
-                    depth,
-                    &candidates,
-                )
-            });
+            let projected = inflow
+                .as_ref()
+                .and_then(|inf| min_rate_for_capacity(|r| stock.above(r), inf, depth, &candidates));
             let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
             let hist = history.get(&depth).copied().flatten();
-            let mut rate = depth_rate_sat_kvb(depth, flow_warm, flow, frontier, hist);
-            if depth <= 1 && flow_warm {
-                rate = rate.or(confirm_floor);
-            }
-            if depth <= 1 {
-                if let (Some(r), Some(floor)) = (rate, confirm_floor) {
-                    rate = Some(r.max(floor));
-                }
-            }
+            let rate = published_depth_rate(depth, alpha, flow, frontier, hist, confirm_floor);
             ordered.push((depth, rate.map(|r| r.max(min_r))));
         }
-        self.log_fee_readiness(flow_warm, &history);
+        let decile = (alpha * 10.0).floor().clamp(0.0, 10.0) as u32;
+        self.log_fee_readiness(decile, &history);
         let mut held: Vec<Option<u64>> = ordered.iter().map(|(_, r)| *r).collect();
         hold_defined_then_monotone(&mut held);
 
@@ -4126,14 +4117,13 @@ impl MempoolHub {
             .insert_if_absent(height, block, hash);
     }
 
-    /// Log when flow warms up or a target's history becomes ready.
-    fn log_fee_readiness(&self, flow_warm: bool, history: &HashMap<u32, Option<u64>>) {
+    /// Log when the flow-fullness decile changes or a target's history becomes ready.
+    fn log_fee_readiness(&self, fullness_decile: u32, history: &HashMap<u32, Option<u64>>) {
         let ready = history.values().filter(|r| r.is_some()).count() as u32;
-        let code = (u32::from(flow_warm) << 16) | ready;
+        let code = (fullness_decile << 16) | ready;
         if self.fee_readiness.swap(code, Ordering::Relaxed) != code {
             rbitcoin_log::info!(
-                "mempool: fee estimates: flow {}, history ready for {ready}/{} targets",
-                if flow_warm { "warm" } else { "cold" },
+                "mempool: fee estimates: flow fullness {fullness_decile}/10, history ready for {ready}/{} targets",
                 history.len()
             );
         }

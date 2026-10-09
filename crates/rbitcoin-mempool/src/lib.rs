@@ -49,17 +49,17 @@ pub use accept::{
     DEFAULT_MAX_MEMPOOL_WEIGHT, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
 };
 pub use error::MempoolError;
-pub use fee_analog::AnalogHistory;
+pub use fee_analog::{AnalogHistory, HISTORICAL_CONFIDENCE_FAR};
 pub use fee_est::{
     block_individual_p10_sat_kvb, default_candidate_rates, depth_rate_sat_kvb,
     enforce_monotone_desc, fee_at_target_sat_kvb, fine_candidate_rates, flow_for_depth,
-    hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, BLOCK_WEIGHT_WU,
-    CONFIDENCE_FAR, CONFIDENCE_NEAR,
+    hold_defined_then_monotone, min_rate_for_capacity, percentile_sat, published_depth_rate,
+    warmup_blend, BLOCK_WEIGHT_WU, CONFIDENCE_FAR, CONFIDENCE_NEAR,
 };
 pub use fee_flow::FeeFlowMeter;
 pub use graph::{
     frontier_feerate_from_chunks, weight_above_from_chunks, Chunk, Cluster, MempoolGraphStats,
-    SelectBudget, Selected, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE,
+    SelectBudget, Selected, StockAbove, TxEntry, TxGraph, MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE,
 };
 pub use orphanage::{OrphanSnapshot, Orphanage};
 pub use packed::VinAux;

@@ -5,7 +5,7 @@
 //! coinbase-only block, or every tx below min relay) is held for the byte
 //! and reorg bookkeeping but is not an observation.
 
-use rbitcoin_mempool::{AnalogHistory, CONFIDENCE_FAR, CONFIDENCE_NEAR};
+use rbitcoin_mempool::{AnalogHistory, CONFIDENCE_NEAR, HISTORICAL_CONFIDENCE_FAR};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
@@ -142,7 +142,7 @@ impl FeeHistory {
     }
 
     /// Historical rate per target (1 block at [`CONFIDENCE_NEAR`], farther at
-    /// [`CONFIDENCE_FAR`]); None while a target is not ready.
+    /// [`HISTORICAL_CONFIDENCE_FAR`]); None while a target is not ready.
     pub(crate) fn rates(&mut self) -> HashMap<u32, Option<u64>> {
         if let Some(rates) = &self.rates {
             return rates.clone();
@@ -159,7 +159,7 @@ impl FeeHistory {
                 let confidence = if n <= 1 {
                     CONFIDENCE_NEAR
                 } else {
-                    CONFIDENCE_FAR
+                    HISTORICAL_CONFIDENCE_FAR
                 };
                 (n, self.analog.rate_sat_kvb(n, confidence))
             })
@@ -182,7 +182,7 @@ impl FeeHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rbitcoin_mempool::AnalogHistory;
+    use rbitcoin_mempool::{AnalogHistory, CONFIDENCE_FAR};
 
     fn block(rate: Option<u64>, bytes: u64) -> HistoricalFeeBlock {
         HistoricalFeeBlock {
@@ -193,6 +193,25 @@ mod tests {
 
     fn calm(i: u32) -> u64 {
         1_000 + (u64::from(i) * 7_919) % 200
+    }
+
+    #[test]
+    fn farther_targets_use_the_interpolated_95_percent() {
+        let targets = [1u32, 2, 10];
+        let mut history = FeeHistory::new(u64::MAX, &targets);
+        // Twelve higher hurdles in each hundred. Short windows clear the
+        // 95% on that run; a 10-block window does so only about 3% of the
+        // time, under 95% and over 99%.
+        for height in 0..2_500u32 {
+            let hurdle = if height % 100 < 12 { 1_200 } else { 1_000 };
+            history.insert(height, block(Some(hurdle), 8), None);
+        }
+        let rates = history.rates();
+        let short = rates[&2].unwrap();
+        let long = rates[&10].unwrap();
+        assert!(short > long, "published 2-block {short} vs 10-block {long}");
+        assert_eq!(rates[&10], history.analog.rate_sat_kvb(10, 0.95));
+        assert_ne!(rates[&10], history.analog.rate_sat_kvb(10, CONFIDENCE_FAR));
     }
 
     #[test]

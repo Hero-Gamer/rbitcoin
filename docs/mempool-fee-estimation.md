@@ -13,12 +13,17 @@ The **default** fee estimate this node advertises answers:
 | Esplora fee endpoints (primary) | Same |
 | Optional target-depth knobs | **Near:** flow invert. **Far:** block history. Blended. |
 
-Once flow is warm, the 1-block target is live stock and capped admit-EMA at
-99.9% confidence, conditional on the next block arriving within 10 minutes;
-history answers only when flow has nothing to say. Targets from 2 blocks blend
-the flow rate with the 99% historical rate as `w·R_flow + (1-w)·R_hist`,
-`w(N)=exp(-(N-1)/6)`, so neither is a floor for the other (`w(2)≈0.85`). While
-flow is cold, history answers alone and the live pool may only raise it.
+The published rate blends a cold quote and a warm quote by flow fullness α.
+α = 0 is history, raised by the live frontier when the pool reaches that
+depth. α = 1 is the warm quote: the 1-block target is live stock and capped
+admit-EMA at 99.9% confidence, conditional on the next block arriving within
+10 minutes, and history answers only when flow has nothing to say. Targets
+from 2 blocks blend the flow rate with the historical rate as
+`w·R_flow + (1-w)·R_hist`, `w(N)=exp(-(N-1)/6)`, so neither is a floor for
+the other (`w(2)≈0.85`). In between, the quote is `(1-α)·cold + α·warm`.
+A missing warm side leaves the cold quote. Flow with no history answers
+only at α = 1, so a thin pool cannot invent a rate. The N=1 confirm-memory
+floor is inside the warm quote only.
 
 ## Non-blocking vs accept (published snapshot)
 
@@ -59,10 +64,13 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
    (64-sample ring; not max-of-64), and falls back to it when neither flow nor
    history has a rate. Long N does not.
 
-**Cold start:** until the flow meter is warm (≥60 s wall and ≥32 admits), a
-restarted pool can be thin or missing what peers relayed while the node was
-down, so each target is `R_hist`, raised to the frontier when the pool reaches
-that deep, and never lowered by the pool. A target whose history is not ready
+**Flow fullness.** α is decayed admitted weight divided by the weight a full
+block every 10 minutes leaves in the 150 s half-life (~1.44e6 WU). It starts
+at 0, so time in IBD does not age it, and it falls back toward 0 when admits
+stop. The scalar adds each admit's weight. It does not use the per-bucket
+time-gap update, so one transaction after a long pause does not mark the
+meter full. A catch-up faster than one block per 10 minutes fills α sooner.
+The meter is not persisted. A target whose history is not ready
 has no rate. The refresh evaluates eleven depths (1, 2, 3, 4, 5, 6, 10, 20,
 144, 504, 1008) and no others. If **no** depth has a rate, APIs return
 insufficient (RPC / Electrum `-1`; Esplora leaves the target out and answers
@@ -74,7 +82,7 @@ in whole sat/kvB (nearest, halves away from zero, kept between the two rates).
 A target past the last defined depth holds that rate. A target before every
 defined depth stays insufficient. Esplora `/fee-estimates` answers each integer
 from 1 through 25, plus 144, 504, and 1008, when that target has a rate. The
-node logs when flow warms and how many targets' history is ready.
+node logs when the flow-fullness decile changes and how many targets' history is ready.
 
 ### Parameters (code constants, not env)
 
@@ -88,9 +96,9 @@ node logs when flow warms and how many targets' history is ready.
 | Admit EMA half-life | ~150 s |
 | Inflow horizon cap | 600 s |
 | Blend N0 | 6 blocks |
-| Flow buckets and candidates | 100 sat/kvB steps through 10 sat/vB, then 20_000, 50_000, 100_000, plus an open top |
-| Warm | 60 s + 32 admits |
-| Historical confidence | 0.999 at N=1; 0.99 at N≥2 |
+| Flow buckets and candidates | 100 geometric steps per decade from min relay through 1000 sat/vB, plus an open top |
+| Flow fullness | decayed admitted WU / ~1.44e6 WU (150 s half-life) |
+| Historical confidence | 0.999 at N=1; 0.95 at N≥2, interpolated in log-rate |
 | Analog lookback | `clamp(N/4, 3, 144)` hurdle blocks |
 | Analog band / min neighbors / ready | ×1.25 / 200 / 2000 windows |
 | History budget | 1 GiB of `txstat.body` cells |
@@ -116,8 +124,12 @@ unanswerable about half the time.
 median hurdle of the `L = clamp(N/4, 3, 144)` blocks before it with the lowest
 hurdle inside it (a tx at that rate would have beaten some block's p10). An
 estimate keeps the windows whose lookback median is within ×1.25 of the
-current lookback median (at least the 200 nearest) and takes the 99% quantile
-of their lowest hurdles (99.9% at N=1). Windows that started inside a spike
+current lookback median (at least the 200 nearest) and takes the 95% quantile
+of their lowest hurdles (99.9% at N=1). When that percentile falls between two
+adjacent hurdles, the rate is the log-rate interpolation, rounded to the
+nearest sat/kvB. A repeated hurdle stays that hurdle. Targets 4 through 10
+publish the same rate when most blocks share one: a longer window's minimum
+moves only after a cheaper hurdle is common. Windows that started inside a spike
 stop steering a calm market, and a spike in progress finds the windows that
 started inside past spikes. A target answers once it holds 2000 windows: at
 least 2000 + L + N − 1 hurdle blocks.
@@ -126,6 +138,7 @@ On a mainnet backtest over ~2.9 years of `txstat` (every 36 blocks, each
 estimate from the 1 GiB before it, scored against the next N hurdle blocks),
 analog windows covered 99.1–99.5% at 2–144 blocks and 99.91% at 1 block
 (99.9% target), at a median 2.0–3.3× the realized hurdle (7.1× at 1 block).
+Those far-target multiples are the previous 99% quantile.
 Flat quantiles over the same history covered 98.5–99.8% at 9–20× (46× at 1
 block), because a spike kept steering estimates for months. Long targets
 (504/1008) cover ~97.7%; their windows overlap so heavily that about a
