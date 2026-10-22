@@ -1119,6 +1119,10 @@ fn chain_ops_mocktime(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wpkh: &S
     );
     let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&far))]).unwrap();
     assert_eq!(r, "time-too-new", "future header vs mock now");
+    dispatch(ctx, "setmocktime", vec![json!(mock + 3 * 3600)]).unwrap();
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&far))]).unwrap();
+    assert!(r.is_null(), "same block once the clock catches up: {r}");
+    assert_eq!(best_hash(ctx), json!(far.block_hash().to_string()));
     dispatch(ctx, "setmocktime", vec![json!(0)]).unwrap();
 }
 
