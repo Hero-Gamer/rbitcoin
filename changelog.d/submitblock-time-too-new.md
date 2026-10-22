@@ -6,4 +6,5 @@ Fixed
   later submit of the same block answered `duplicate-invalid` and its
   children were refused until restart. As in Core, `time-too-new` is no
   longer remembered, and the same block is accepted once its time is
-  within two hours of the clock.
+  within two hours of the clock. A block on a side branch is answered
+  `time-too-new` too, not `bad header: timestamp too far in future`.
