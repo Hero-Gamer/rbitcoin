@@ -123,6 +123,9 @@ pub mod uring_session;
 #[doc(hidden)]
 pub mod var_table;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use crate::array_table::bind_tip_flush_hold;
 pub use crate::array_table::ClassCWrite;
 pub use crate::chain::HeaderTxsTable;
 pub use crate::compact::output_flags;

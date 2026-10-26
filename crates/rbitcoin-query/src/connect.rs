@@ -279,11 +279,12 @@ impl Query {
             .name("rbtc-tip-flush".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
+                    // Pause after the flush excludes stores, not before it starts.
                     #[cfg(debug_assertions)]
-                    while hold.load(Ordering::Acquire) {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
+                    rbitcoin_store::bind_tip_flush_hold(Some(Arc::clone(&hold)));
                     let result = store.flush_class_c_tip();
+                    #[cfg(debug_assertions)]
+                    rbitcoin_store::bind_tip_flush_hold(None);
                     let _ = job.reply.send(result);
                     job.done.store(true, Ordering::Release);
                 }

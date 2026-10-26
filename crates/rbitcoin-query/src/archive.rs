@@ -1720,6 +1720,9 @@ impl Query {
     ) -> Result<(bool, Vec<rbitcoin_store::CreateLocPair>), QueryError> {
         let (committed, loc, ranges) = self.archive_commit_plan_defer_head_parents(plan)?;
         if !ranges.is_empty() {
+            // Class A append above overlaps the in-flight tip flush. This put
+            // is Class C, so it waits until that flush stops excluding stores.
+            let _commit = self.lock_tip_commit()?;
             let t = std::time::Instant::now();
             let write = rbitcoin_store::ClassCWrite::new();
             self.store.header_txs.put_ranges_batch(&write, &ranges)?;
@@ -1734,9 +1737,9 @@ impl Query {
     /// planner). A non-empty plan whose vectors do not match `packed` is
     /// corrupt. This function does not walk prevouts. It does not store
     /// header ranges: the returned list is Class C. [`Self::archive_commit_plan_defer_head`]
-    /// stores it immediately. The confirm-write path stores it after
-    /// `tip_commit` joins the in-flight tip flush, including when a later
-    /// phase of that write rejects the batch. `header_txs` is what a retry
+    /// stores it after `tip_commit` joins the in-flight tip flush. The
+    /// confirm-write path does the same put after that join, including when a
+    /// later phase of that write rejects the batch. `header_txs` is what a retry
     /// uses to skip a second body append.
     pub fn archive_commit_plan_defer_head_parents(
         &self,

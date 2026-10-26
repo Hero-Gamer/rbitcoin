@@ -16,6 +16,40 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Debug builds pause the IBD tip-flush thread here when a test armed the hold.
+/// The pause is after `seq_arm`, so a store on another thread sees `flushing`.
+#[cfg(debug_assertions)]
+mod flush_hold {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    thread_local! {
+        static HOLD: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn bind(hold: Option<Arc<AtomicBool>>) {
+        HOLD.with(|slot| *slot.borrow_mut() = hold);
+    }
+
+    pub(super) fn wait() {
+        let Some(hold) = HOLD.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        while hold.load(Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+/// Install the IBD tip-flush hold on this thread. [`ArrayTable::flush`] waits
+/// after it excludes stores. Release builds have no hold.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn bind_tip_flush_hold(hold: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) {
+    flush_hold::bind(hold);
+}
+
 /// Minted on the storing thread (`!Send` + `!Sync`). A shared store cannot
 /// carry this value onto another thread. It does not stop that thread from
 /// minting its own. The sequence counter's even-to-odd exchange is what keeps
@@ -847,6 +881,9 @@ impl ArrayTable {
         }
         between(self, FlushStep::Admit);
         seq_arm(&self.seq, &self.flushing);
+        // After stores are excluded. A test hold pauses the tip flush here.
+        #[cfg(debug_assertions)]
+        flush_hold::wait();
         let from = self.unstored_from.load(Ordering::Acquire);
         let n = self.len.load(Ordering::Acquire);
         let disk = self.disk_len.load(Ordering::Acquire);

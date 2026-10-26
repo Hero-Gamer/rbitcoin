@@ -6,10 +6,11 @@ use rbitcoin_query::Query;
 use rbitcoin_store::StoreError;
 use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn coinbase_block(
     h: u32,
@@ -167,6 +168,43 @@ fn finalize_sh_runs_empty_head_leftover_seal_is_wiped() {
     assert_eq!(q.sh_run.sealed_max_create_fk(), 0);
     assert_eq!(load_seal(&runs_dir), 0);
     assert_eq!(q.scripthash_run_count(), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The next Class A commit stores `header_txs` while the previous tip flush
+/// can still be excluding stores. That put has to wait the flush out.
+#[test]
+fn class_a_header_store_waits_out_the_tip_flush() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("q-sh-flush-wait");
+    q.enter_direct_index_mode().unwrap();
+    let (h0, ta0) = coinbase_block(0, Fk::NULL, None);
+    let prev = q.connect_block(Height(0), &h0, &[ta0]).unwrap();
+    let _commit = q.lock_tip_commit().unwrap();
+    drop(_commit);
+    let hold = q.hold_tip_flushes();
+    let (h1, ta1) = coinbase_block(1, prev, Some(h0.hash));
+    let prev = q.commit_class_a_only(&h1, &[ta1]).unwrap();
+    q.flush_tip(Some(Height(0))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !q.store.header_txs.first.flushing.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "tip flush did not exclude header_txs stores"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    let hold2 = Arc::clone(&hold);
+    let releaser = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        hold2.store(false, Ordering::SeqCst);
+    });
+    let (h2, ta2) = coinbase_block(2, prev, Some(h1.hash));
+    let h2_fk = q
+        .commit_class_a_only(&h2, &[ta2])
+        .expect("header range put waits for the tip flush");
+    releaser.join().unwrap();
+    assert!(q.store.header_txs.has_body(h2_fk).unwrap());
+    drop(q);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
