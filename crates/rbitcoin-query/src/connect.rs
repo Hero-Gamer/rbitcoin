@@ -46,13 +46,46 @@ pub struct ConfirmPrepared {
     pub hash: [u8; 32],
 }
 
-/// IBD tip barrier. At most one runs; the next `tip_commit` taker joins it.
+/// IBD tip barrier. One `rbtc-tip-flush` thread runs each barrier; the next
+/// `tip_commit` taker waits for the in-flight one.
 #[derive(Default)]
 pub enum TipFlush {
     #[default]
     Idle,
-    Running(std::thread::JoinHandle<Result<(), StoreError>>),
+    Running(InflightFlush),
     Failed,
+}
+
+pub struct InflightFlush {
+    rx: std::sync::mpsc::Receiver<Result<(), StoreError>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InflightFlush {
+    fn still_running(&self) -> bool {
+        !self.done.load(Ordering::Acquire)
+    }
+}
+
+pub struct TipFlushJob {
+    reply: std::sync::mpsc::Sender<Result<(), StoreError>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The confirm engine's Class C barrier thread. Tests start it on the first
+/// IBD flush. Tip mode does not use it.
+pub struct TipFlushWorker {
+    tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<TipFlushJob>>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Default for TipFlushWorker {
+    fn default() -> Self {
+        Self {
+            tx: std::sync::Mutex::new(None),
+            thread: std::sync::Mutex::new(None),
+        }
+    }
 }
 
 impl Query {
@@ -126,7 +159,7 @@ impl Query {
         };
         let running = matches!(
             &*self.tip_flush.lock().unwrap_or_else(|e| e.into_inner()),
-            TipFlush::Running(h) if !h.is_finished()
+            TipFlush::Running(job) if job.still_running()
         );
         if running || self.join_tip_flush().is_err() {
             return None;
@@ -147,7 +180,8 @@ impl Query {
             TipFlush::Running(flush) => {
                 let t = std::time::Instant::now();
                 let r = flush
-                    .join()
+                    .rx
+                    .recv()
                     .unwrap_or(Err(StoreError::Corrupt("IBD tip flush thread panicked")));
                 crate::note_confirm(
                     &self.confirm_stats().write_tip_flush_wait_ns,
@@ -179,41 +213,101 @@ impl Query {
 
     /// IBD: the next batch's archive and checks run while this batch's
     /// barrier syncs. That batch's commit joins it first, so the disk order
-    /// stays the same.
+    /// stays the same. One thread serves every barrier.
     #[doc(hidden)]
     pub fn spawn_tip_flush(&self) -> Result<(), QueryError> {
-        let store = Arc::clone(&self.store);
-        #[cfg(debug_assertions)]
-        let hold = Arc::clone(&self.tip_flush_hold);
-        let flush = if self.tip_flush_spawn_fails() {
-            Err(std::io::Error::other("test hook: no tip flush thread"))
-        } else {
-            std::thread::Builder::new()
-                .name("rbtc-tip-flush".into())
-                .spawn(move || {
-                    #[cfg(debug_assertions)]
-                    while hold.load(Ordering::Acquire) {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                    }
-                    store.flush_class_c_tip()
-                })
+        if self.tip_flush_spawn_fails() {
+            return self.flush_tip_inline("test hook: no tip flush thread");
+        }
+        self.ensure_tip_flush_worker();
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let job = TipFlushJob {
+            reply: reply_tx,
+            done: Arc::clone(&done),
         };
-        let mut state = self.tip_flush.lock().unwrap_or_else(|e| e.into_inner());
-        let e = match flush {
-            Ok(f) => {
-                *state = TipFlush::Running(f);
-                return Ok(());
+        let sent = {
+            let tx = self
+                .tip_flush_worker
+                .tx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match tx.as_ref() {
+                Some(tx) => tx.send(job).is_ok(),
+                None => false,
             }
-            Err(e) => e,
         };
-        // The batch is already committed in RAM: flush it here, and a failure
-        // sticks like a background one.
-        rbitcoin_log::warn!("store: no IBD tip flush thread ({e}); flushing inline");
+        if sent {
+            let mut state = self.tip_flush.lock().unwrap_or_else(|e| e.into_inner());
+            *state = TipFlush::Running(InflightFlush { rx: reply_rx, done });
+            return Ok(());
+        }
+        self.flush_tip_inline("rbtc-tip-flush is not running")
+    }
+
+    fn flush_tip_inline(&self, why: &str) -> Result<(), QueryError> {
+        rbitcoin_log::warn!("store: no IBD tip flush thread ({why}); flushing inline");
+        let mut state = self.tip_flush.lock().unwrap_or_else(|e| e.into_inner());
         let inline = self.store.flush_class_c_tip();
         if inline.is_err() {
             *state = TipFlush::Failed;
         }
         inline
+    }
+
+    /// Start the IBD barrier thread if this query does not already have one.
+    #[doc(hidden)]
+    pub fn ensure_tip_flush_worker(&self) {
+        let mut slot = self
+            .tip_flush_worker
+            .thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self
+            .tip_flush_worker
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        let store = Arc::clone(&self.store);
+        #[cfg(debug_assertions)]
+        let hold = Arc::clone(&self.tip_flush_hold);
+        let handle = std::thread::Builder::new()
+            .name("rbtc-tip-flush".into())
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    #[cfg(debug_assertions)]
+                    while hold.load(Ordering::Acquire) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    let result = store.flush_class_c_tip();
+                    let _ = job.reply.send(result);
+                    job.done.store(true, Ordering::Release);
+                }
+            })
+            .expect("rbtc-tip-flush thread");
+        *slot = Some(handle);
+    }
+
+    /// Drop the job sender and join the barrier thread.
+    #[doc(hidden)]
+    pub fn stop_tip_flush_worker(&self) {
+        let mut slot = self
+            .tip_flush_worker
+            .thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *self
+            .tip_flush_worker
+            .tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        if let Some(handle) = slot.take() {
+            let _ = handle.join();
+        }
     }
 
     #[cfg(debug_assertions)]

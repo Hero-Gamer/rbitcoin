@@ -1978,6 +1978,7 @@ pub fn spawn_confirm_engine(
     // last_loaded so re-lookup after Class A partial commit does not drift
     // next_tx_start. A re-arm resets load through the lookup generation.
     let load_ahead_reset = Arc::new(AtomicBool::new(false));
+    hub.query.ensure_tip_flush_worker();
 
     let hub_wb = Arc::clone(&hub);
     let feed_wb = Arc::clone(&feed);
@@ -3071,6 +3072,7 @@ pub fn spawn_confirm_engine(
             }
             feed.notify();
             let _ = load_join.join();
+            hub.query.stop_tip_flush_worker();
             info!("ibd: confirm lookup exit");
         })
         .expect("spawn ibd-confirm-lookup");
