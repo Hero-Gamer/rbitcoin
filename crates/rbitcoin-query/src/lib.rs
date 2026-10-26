@@ -2452,6 +2452,10 @@ impl Query {
     }
 
     pub fn clear_archived_body(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
+        debug_assert!(
+            !rbitcoin_store::coord_shared_lock_held(),
+            "archived clear waits while the coordinator holds shared"
+        );
         let tx = self
             .confirm_write
             .lock()

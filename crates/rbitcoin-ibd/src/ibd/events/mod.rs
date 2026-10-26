@@ -1164,6 +1164,31 @@ pub fn apply_confirm_events(
     last_progress: &mut Instant,
     feed: Option<&super::confirm::ConfirmFeed>,
 ) {
+    let pending = take_confirm_events(
+        st,
+        hub,
+        rx,
+        archive_write_next,
+        max_ready_shared,
+        last_progress,
+        feed,
+    );
+    debug_assert!(
+        pending.is_empty(),
+        "coordinator must release shared around an archived clear"
+    );
+}
+
+pub(crate) fn take_confirm_events(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    rx: &std::sync::mpsc::Receiver<super::confirm::ConfirmEvent>,
+    archive_write_next: &AtomicU32,
+    max_ready_shared: &AtomicU32,
+    last_progress: &mut Instant,
+    feed: Option<&super::confirm::ConfirmFeed>,
+) -> Vec<DeferredArchivedClear> {
+    let mut deferred = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
             super::confirm::ConfirmEvent::Accepted { hash } => {
@@ -1188,7 +1213,7 @@ pub fn apply_confirm_events(
                 sender,
                 parent,
             } => {
-                apply_confirm_reject(
+                if let Some(item) = apply_confirm_reject_pending(
                     st,
                     height,
                     hash,
@@ -1200,7 +1225,9 @@ pub fn apply_confirm_events(
                     feed,
                     sender,
                     parent,
-                );
+                ) {
+                    deferred.push(item);
+                }
             }
         }
     }
@@ -1210,6 +1237,7 @@ pub fn apply_confirm_events(
         }
         st.confirm_quiesce = false;
     }
+    deferred
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -1226,6 +1254,29 @@ pub fn apply_confirm_reject(
     sender: Option<usize>,
     parent: super::confirm::RejectParent,
 ) {
+    let pending = apply_confirm_reject_pending(
+        st, height, hash, class, err, query, hub, batch_len, feed, sender, parent,
+    );
+    debug_assert!(
+        pending.is_none(),
+        "coordinator must release shared around an archived clear"
+    );
+}
+
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
+pub(crate) fn apply_confirm_reject_pending(
+    st: &mut IbdWorkState,
+    height: u32,
+    hash: BlockHash,
+    class: super::confirm::ConfirmRejectClass,
+    err: &str,
+    query: Option<&rbitcoin_query::Query>,
+    hub: Option<&rbitcoin_net::chain::ChainHub>,
+    batch_len: usize,
+    feed: Option<&super::confirm::ConfirmFeed>,
+    sender: Option<usize>,
+    parent: super::confirm::RejectParent,
+) -> Option<DeferredArchivedClear> {
     use super::confirm::ConfirmRejectClass;
     let sent = class;
     let class = if class == ConfirmRejectClass::ConsensusInvalid {
@@ -1245,8 +1296,7 @@ pub fn apply_confirm_reject(
     if super::reorg::is_bad_prev_err(err)
         && bad_prev_parent(st, hub, hash, height) == BadPrevParent::OffPath
     {
-        apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
-        return;
+        return apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
     }
     if class == ConfirmRejectClass::Cascade && batch_len > 1 {
         if let Some(f) = feed {
@@ -1255,8 +1305,7 @@ pub fn apply_confirm_reject(
         }
     }
     if class.is_soft() {
-        apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
-        return;
+        return apply_soft_wire_reject(st, height, hash, err, query, hub, sender);
     }
     match class {
         ConfirmRejectClass::Cancelled => {
@@ -1276,56 +1325,53 @@ pub fn apply_confirm_reject(
             apply_consensus_invalid_reject(st, height, hash, err, query, hub);
         }
     }
+    None
 }
 
-#[doc(hidden)]
-pub fn apply_soft_wire_reject(
-    st: &mut IbdWorkState,
+/// Mutated clear that must wait until the coordinator has dropped `shared`.
+pub(crate) struct DeferredArchivedClear {
+    pub height: u32,
+    pub hash: BlockHash,
+    pub err: String,
+    pub sender: Option<usize>,
+    pub parent: BadPrevParent,
+    pub retry_tip_child: bool,
+    pub bad_prev: bool,
+    /// This hash occupied `height` after the pre-clear updates.
+    pub was_occupant: bool,
+}
+
+pub(crate) fn note_archived_body_clear(
     height: u32,
     hash: BlockHash,
-    err: &str,
-    query: Option<&rbitcoin_query::Query>,
-    hub: Option<&rbitcoin_net::chain::ChainHub>,
-    sender: Option<usize>,
+    result: Result<bool, rbitcoin_query::QueryError>,
 ) {
-    let bad_prev = super::reorg::is_bad_prev_err(err);
-    // A BadPrev whose parent is the current tip is a missing header slot,
-    // and one whose parent is still committing is a stale stamp. Neither is
-    // a competing fork. Keep the hash so densify asks for it again.
-    let parent = if bad_prev {
-        bad_prev_parent(st, hub, hash, height)
-    } else {
-        BadPrevParent::OffPath
-    };
-    let retry_tip_child = parent != BadPrevParent::OffPath;
-    if bad_prev {
-        st.headers_done = false;
-        if let Some(h) = hub {
-            st.reorg
-                .register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(hash));
-            let rewound = super::reorg::maybe_rewind_to_best_work(st, h).unwrap_or(false);
-            if rewound {
-                return;
-            }
+    match result {
+        Ok(true) => {
+            warn!("ibd: cleared corrupt Class A body for {hash} @{height} (mutated body)")
         }
-        if !retry_tip_child && st.height_to_hash.get(&height) == Some(&hash) {
-            let q = query.or_else(|| hub.map(|h| h.query.as_ref()));
-            evict_off_path_suffix(st, height, q);
-        }
+        Ok(false) => {}
+        Err(e) => warn!("ibd: clear Class A body {hash} @{height}: {e}"),
     }
-    clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    if let Some(q) = query {
-        let _ = q.block_queue_dequeue_height(height);
-        if rbitcoin_net::chain::reject_is_mutated(err) {
-            match q.clear_archived_body(hash.as_byte_array()) {
-                Ok(true) => {
-                    warn!("ibd: cleared corrupt Class A body for {hash} @{height} (mutated body)")
-                }
-                Ok(false) => {}
-                Err(e) => warn!("ibd: clear Class A body {hash} @{height}: {e}"),
-            }
-        }
+}
+
+/// Post-clear reject updates. Skips them when `height` changed hands while
+/// the coordinator lock was down, so the new occupant is not marked missing.
+pub(crate) fn finish_deferred_archived_clear(
+    st: &mut IbdWorkState,
+    hub: Option<&rbitcoin_net::chain::ChainHub>,
+    item: &DeferredArchivedClear,
+) {
+    if item.was_occupant && st.height_to_hash.get(&item.height) != Some(&item.hash) {
+        return;
     }
+    let height = item.height;
+    let hash = item.hash;
+    let err = item.err.as_str();
+    let sender = item.sender;
+    let parent = item.parent;
+    let retry_tip_child = item.retry_tip_child;
+    let bad_prev = item.bad_prev;
     if !bad_prev || retry_tip_child {
         // `isolate_if_batched` leaves SoftWire only for a one-block wave, so
         // `hash` is the block that failed and `sender` sent that copy. The
@@ -1372,6 +1418,67 @@ pub fn apply_soft_wire_reject(
             "ibd: confirm reject BadPrev @{height} {hash}: {err} (slot evicted, not re-get same hash)"
         );
     }
+}
+
+#[doc(hidden)]
+pub(crate) fn apply_soft_wire_reject(
+    st: &mut IbdWorkState,
+    height: u32,
+    hash: BlockHash,
+    err: &str,
+    query: Option<&rbitcoin_query::Query>,
+    hub: Option<&rbitcoin_net::chain::ChainHub>,
+    sender: Option<usize>,
+) -> Option<DeferredArchivedClear> {
+    let bad_prev = super::reorg::is_bad_prev_err(err);
+    // A BadPrev whose parent is the current tip is a missing header slot,
+    // and one whose parent is still committing is a stale stamp. Neither is
+    // a competing fork. Keep the hash so densify asks for it again.
+    let parent = if bad_prev {
+        bad_prev_parent(st, hub, hash, height)
+    } else {
+        BadPrevParent::OffPath
+    };
+    let retry_tip_child = parent != BadPrevParent::OffPath;
+    if bad_prev {
+        st.headers_done = false;
+        if let Some(h) = hub {
+            st.reorg
+                .register_explore(std::iter::empty::<bitcoin::BlockHash>(), Some(hash));
+            let rewound = super::reorg::maybe_rewind_to_best_work(st, h).unwrap_or(false);
+            if rewound {
+                return None;
+            }
+        }
+        if !retry_tip_child && st.height_to_hash.get(&height) == Some(&hash) {
+            let q = query.or_else(|| hub.map(|h| h.query.as_ref()));
+            evict_off_path_suffix(st, height, q);
+        }
+    }
+    clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
+    if let Some(q) = query {
+        let _ = q.block_queue_dequeue_height(height);
+    }
+    let item = DeferredArchivedClear {
+        height,
+        hash,
+        err: err.to_string(),
+        sender,
+        parent,
+        retry_tip_child,
+        bad_prev,
+        was_occupant: st.height_to_hash.get(&height) == Some(&hash),
+    };
+    if query.is_some() && rbitcoin_net::chain::reject_is_mutated(err) {
+        if rbitcoin_store::coord_shared_lock_held() {
+            return Some(item);
+        }
+        if let Some(q) = query {
+            note_archived_body_clear(height, hash, q.clear_archived_body(hash.as_byte_array()));
+        }
+    }
+    finish_deferred_archived_clear(st, hub, &item);
+    None
 }
 
 /// Drop the work path and body queue from `height` upward.
