@@ -3688,6 +3688,51 @@ fn store_fault_applying_held_child_does_not_cache_block_invalid() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A tip-connect store fault must not stick the hash in `asked_blocks`.
+/// The session stays up and the block is not cached invalid.
+#[test]
+fn store_fault_on_block_releases_the_body_ask() {
+    let (dir, hub, b1, t2) = hub_with_truncated_body();
+    let b3 = spend_block(t2.block_hash(), t2.header.time + 600, 3, coinbase_out(&b1));
+    let hash = b3.block_hash();
+    assert!(hub.claim_block_ask(&hash));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("on_block runtime");
+    rt.block_on(async {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut follow = rbitcoin_net::peer::PeerFollowState::new();
+        follow.requested_blocks.insert(hash);
+        rbitcoin_net::peer::on_block(&hub, &tx, &mut follow, None, &b3)
+            .await
+            .expect("store fault keeps the session");
+    });
+    assert!(
+        !hub.is_block_invalid(&hash),
+        "store fault is not a block verdict"
+    );
+    assert_eq!(hub.tip_hash(), Some(t2.block_hash()));
+    assert!(
+        hub.claim_block_ask(&hash),
+        "on_block store fault must release the body ask"
+    );
+
+    let mut pending = rbitcoin_net::peer::PendingBlocks::new();
+    pending.insert(hash, b3);
+    let mut headers = HashMap::new();
+    rt.block_on(async {
+        rbitcoin_net::peer::drain_pending_once(&hub, &mut pending, &mut headers, None)
+            .await
+            .expect("drain keeps the session");
+    });
+    assert!(
+        hub.claim_block_ask(&hash),
+        "drain_pending store fault must release the body ask"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // one hub: tip rejects, 64-byte body, in-block duplicates
 #[test]
 fn hostile_peer_session() {

@@ -4325,6 +4325,13 @@ pub fn on_block_unrequested_skip(
     Ok(false)
 }
 
+/// Local IO fault: keep the session, and release the hub body ask so a later
+/// getdata can claim the same hash. The block is not a verdict.
+fn note_store_fault_keep_session(hub: &ChainHub, hash: BlockHash, e: &NetError) {
+    rbitcoin_log::warn!("p2p: accept dropped {hash} (local fault — keep session): {e}");
+    hub.forget_asked_block(&hash);
+}
+
 pub async fn on_block_accept(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -4359,7 +4366,7 @@ pub async fn on_block_accept(
             .await
         }
         Err(e @ NetError::Store(_)) => {
-            rbitcoin_log::warn!("p2p: accept dropped {hash} (local fault — keep session): {e}");
+            note_store_fault_keep_session(hub, hash, &e);
             Ok(())
         }
         Err(e) => {
@@ -6109,6 +6116,9 @@ pub async fn drain_pending_once(
                         "p2p: accept dropped {} (store not found — keep session): {e}",
                         h
                     );
+                }
+                Err(e @ NetError::Store(_)) => {
+                    note_store_fault_keep_session(hub, h, &e);
                 }
                 Err(e) => {
                     rbitcoin_log::warn!(
