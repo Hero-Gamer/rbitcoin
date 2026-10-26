@@ -86,7 +86,7 @@ fn strong_flush_writes_live_bytes_and_refuses_a_store() {
 }
 
 /// A failed bit-image `write_at` leaves that range dirty. The retry writes it.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn strong_failed_write_keeps_the_range_dirty() {
     use rbitcoin_store::array_table::FlushStep;

@@ -219,7 +219,7 @@ fn same_length_rewrite_publishes_logical_len() {
 
 /// A failed `write_at` leaves the recorded range dirty. The retry writes
 /// those slots and does not truncate the table.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn failed_write_keeps_the_range_dirty() {
     let path = tmp_path();

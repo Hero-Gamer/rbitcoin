@@ -1,11 +1,11 @@
 /// Points an open file descriptor at `/dev/full` until dropped.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub struct DevFull {
     fd: std::os::fd::RawFd,
     saved: std::os::fd::RawFd,
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl DevFull {
     pub fn on(file: &std::fs::File) -> Self {
         use std::os::fd::AsRawFd;
@@ -25,7 +25,7 @@ impl DevFull {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 impl Drop for DevFull {
     fn drop(&mut self) {
         // SAFETY: `saved` is the duplicate from `on`. Restore `fd`, then close that duplicate.
