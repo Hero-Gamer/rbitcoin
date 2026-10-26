@@ -146,7 +146,7 @@ impl StrongTxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         let file = TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?;
         Ok(Self {
-            table: ArrayTable::bit_image(file, 0),
+            table: ArrayTable::bit_image(file, 0)?,
             n_bits: AtomicU64::new(0),
         })
     }
@@ -158,9 +158,9 @@ impl StrongTxTable {
         if body > 0 {
             bits.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
         }
-        let table = ArrayTable::bit_image(bits, body);
+        let table = ArrayTable::bit_image(bits, body)?;
         if body > 0 {
-            table.slots.grow((body as usize).div_ceil(8));
+            table.slots.grow((body as usize).div_ceil(8))?;
             Self::copy_bytes_in(table.slots.slots(Ordering::Relaxed), &bytes);
         }
         Ok(Self {
@@ -169,14 +169,15 @@ impl StrongTxTable {
         })
     }
 
-    fn ensure_held(&self, need_bits: u64) {
+    fn ensure_held(&self, need_bits: u64) -> Result<(), StoreError> {
         if need_bits <= self.n_bits.load(Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
         let need_bytes = need_bits.div_ceil(8) as usize;
-        self.table.slots.grow(need_bytes.div_ceil(8));
+        self.table.slots.grow(need_bytes.div_ceil(8))?;
         self.table.len.store(need_bytes as u64, Ordering::Relaxed);
         self.n_bits.store(need_bits, Ordering::Relaxed);
+        Ok(())
     }
 
     fn for_each_mask(start: u64, end: u64, mut f: impl FnMut(usize, u64)) {
@@ -240,7 +241,7 @@ impl StrongTxTable {
             return Ok(());
         }
         let _odd = self.table.begin_store()?;
-        self.ensure_held(need_bits);
+        self.ensure_held(need_bits)?;
         Ok(())
     }
 
@@ -270,6 +271,12 @@ impl StrongTxTable {
     /// In-RAM L2 bit-image bytes.
     pub fn l2_resident_bytes(&self) -> u64 {
         self.table.l2_resident_bytes()
+    }
+
+    /// Bytes committed for the bit image. The logical body can be shorter.
+    #[doc(hidden)]
+    pub fn committed_bytes(&self) -> u64 {
+        self.table.slots.committed_bytes()
     }
 
     /// Set one live body byte without the sequence counter. Flush tests use
@@ -325,7 +332,7 @@ impl StrongTxTable {
             return Ok(());
         }
         let _odd = self.table.begin_store()?;
-        self.ensure_held(end);
+        self.ensure_held(end)?;
         self.apply_bits(start, end, on);
         self.mark_dirty_bit(start);
         Ok(())

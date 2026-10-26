@@ -279,7 +279,7 @@ and a release store of the flag do not exclude each other, and a `SeqCst`
 access is not that fence. The flag clears with `SeqCst` after the disk length
 and the clean mark, which stay release stores. The flush does not bump the
 counter, so a get during the flush does not retry because of the flush. Readers stay up
-during IBD. Growth keeps the previous buffer until the table is dropped. A
+during IBD. Slot-table growth keeps the previous buffer until the table is dropped. `strong_tx` is one anonymous reservation of the 256 MiB cap: a grow commits the used prefix and does not keep a second image. A
 get retries when the length it sampled does not fit the buffer it loaded. A
 bulk bit scan rechecks the counter once at the end.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.

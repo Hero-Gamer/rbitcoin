@@ -22,8 +22,10 @@ Changed
   flag is sequentially consistent in both directions, with a sequentially
   consistent fence between the odd bit and the flag, so a store cannot
   pass the flag and still be marked clean. The flush does not bump the
-  counter. Growth keeps the previous buffer. A get retries when the
-  length it sampled does not fit that buffer.
+  counter. Slot-table growth keeps the previous buffer. A get retries when
+  the length it sampled does not fit that buffer. `strong_tx` is one
+  anonymous 256 MiB reservation; a grow commits the used prefix and does
+  not keep a retired copy.
 - **A script-pool claim release-publishes `next` after `in_wave`.**
   `is_complete` acquire-loads `next`, so it does not drop the wave under
   a claim that still applies.

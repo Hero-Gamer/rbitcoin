@@ -1,7 +1,8 @@
 //! Growable dense array of little-endian `u64` values, 0-based.
 //!
 //! `confirmed` and `header_txs_*` load into RAM up to [`class_c_inram_max_bytes`];
-//! `strong_tx` is always in RAM. Stores update live slots. `flush` writes those
+//! `strong_tx` is one anonymous reservation of that cap and commits the used
+//! prefix. Stores update live slots. `flush` writes those
 //! slots in [`FLUSH_SCRATCH`] chunks and clears the unstored mark only after the
 //! persist succeeds. A clean table returns before new stores are excluded. Over
 //! the cap, tables stay fd write-through. In-RAM gets take no reader-writer lock.
@@ -91,13 +92,26 @@ struct Buf {
     prev: Option<Box<Buf>>,
 }
 
-/// In-RAM `u64` slots. Growth keeps the previous buffer on the new box.
+/// In-RAM `u64` slots. A slot table keeps the previous buffer on the new box.
+/// `strong_tx` uses [`BitReserve`] instead: one mapping, no retired copy.
 pub(crate) struct RamSlots {
     ptr: AtomicPtr<Buf>,
+    reserve: Option<BitReserve>,
+}
+
+/// Anonymous reservation for the strong-bit image. The base does not move.
+struct BitReserve {
+    base: AtomicPtr<u8>,
+    cap: usize,
+    committed: AtomicUsize,
 }
 
 impl Drop for RamSlots {
     fn drop(&mut self) {
+        if let Some(reserve) = self.reserve.take() {
+            release_reserve(reserve.base.load(Ordering::Relaxed), reserve.cap);
+            return;
+        }
         let p = self.ptr.load(Ordering::Relaxed);
         if p.is_null() {
             return;
@@ -112,6 +126,7 @@ impl RamSlots {
     pub(crate) fn empty() -> Self {
         Self {
             ptr: AtomicPtr::new(std::ptr::null_mut()),
+            reserve: None,
         }
     }
 
@@ -122,17 +137,35 @@ impl RamSlots {
         });
         Self {
             ptr: AtomicPtr::new(Box::into_raw(buf)),
+            reserve: None,
         }
     }
 
-    pub(crate) fn grow(&self, need: usize) {
+    /// Reserve `cap` bytes. Nothing is committed until [`Self::grow`].
+    pub(crate) fn reserve(cap: usize) -> Result<Self, StoreError> {
+        let cap = cap.max(page_size());
+        let base = map_reserve(cap)?;
+        Ok(Self {
+            ptr: AtomicPtr::new(std::ptr::null_mut()),
+            reserve: Some(BitReserve {
+                base: AtomicPtr::new(base),
+                cap,
+                committed: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    pub(crate) fn grow(&self, need: usize) -> Result<(), StoreError> {
+        if let Some(reserve) = &self.reserve {
+            return reserve.commit_words(need);
+        }
         let cur = self.ptr.load(Ordering::Relaxed);
         // SAFETY: `cur` is null or a box this writer published. The copy finishes
         // before `from_raw` moves that box onto the new buffer.
         let old = unsafe { cur.as_ref().map(|buf| &buf.slots[..]) };
         let cap = old.map_or(0, |slots| slots.len());
         if old.is_some() && need <= cap {
-            return;
+            return Ok(());
         }
         let new_cap = if cap == 0 {
             need.max(1).next_power_of_two()
@@ -153,24 +186,215 @@ impl RamSlots {
         });
         let buf = Box::into_raw(Box::new(Buf { slots, prev }));
         self.ptr.store(buf, Ordering::Release);
+        Ok(())
     }
 
     /// Writer (Relaxed) or flush (Acquire), after the buffer covers the index.
     pub(crate) fn slots(&self, order: Ordering) -> &[AtomicU64] {
+        if let Some(reserve) = &self.reserve {
+            return reserve.words(order);
+        }
         let ptr = self.ptr.load(order);
         // SAFETY: caller indexes a buffer this table still owns.
         unsafe { &(*ptr).slots }
     }
 
+    /// Committed bytes of a strong-bit reservation, or the published box.
+    pub(crate) fn committed_bytes(&self) -> u64 {
+        if let Some(reserve) = &self.reserve {
+            return reserve.committed.load(Ordering::Relaxed) as u64;
+        }
+        let ptr = self.ptr.load(Ordering::Relaxed);
+        if ptr.is_null() {
+            return 0;
+        }
+        // SAFETY: `ptr` is a box this table published.
+        let slots = unsafe { &(*ptr).slots };
+        slots.len() as u64 * 8
+    }
+
     /// `None` when the published buffer is missing or shorter than `need`.
     /// A torn length can name a slot this buffer does not have.
     pub(crate) fn try_slots(&self, need: usize) -> Option<&[AtomicU64]> {
+        if let Some(reserve) = &self.reserve {
+            let words = reserve.words(Ordering::Acquire);
+            return (words.len() >= need).then_some(words);
+        }
         let ptr = self.ptr.load(Ordering::Acquire);
         // SAFETY: growth keeps every published buffer until this table drops.
         let buf = unsafe { ptr.as_ref() }?;
         (buf.slots.len() >= need).then_some(&buf.slots)
     }
 }
+
+impl BitReserve {
+    fn commit_words(&self, need_words: usize) -> Result<(), StoreError> {
+        let page = page_size();
+        let bytes = need_words.saturating_mul(8);
+        let bytes = bytes.div_ceil(page).saturating_mul(page);
+        let cur = self.committed.load(Ordering::Relaxed);
+        if bytes <= cur {
+            return Ok(());
+        }
+        if bytes > self.cap {
+            return Err(StoreError::Corrupt(
+                "strong bit image exceeds the reservation",
+            ));
+        }
+        commit_prefix(self.base.load(Ordering::Relaxed), bytes)?;
+        self.committed.store(bytes, Ordering::Release);
+        Ok(())
+    }
+
+    fn words(&self, order: Ordering) -> &[AtomicU64] {
+        let n = self.committed.load(order) / 8;
+        if n == 0 {
+            return &[];
+        }
+        let base = self.base.load(Ordering::Relaxed) as *const AtomicU64;
+        // SAFETY: `commit_words` published `n` aligned words at `base`. The
+        // mapping lives until this table drops, and the base does not move.
+        unsafe { std::slice::from_raw_parts(base, n) }
+    }
+}
+
+/// Page size the strong-bit reservation commits in.
+#[doc(hidden)]
+pub fn class_c_commit_quantum() -> u64 {
+    page_size() as u64
+}
+
+fn page_size() -> usize {
+    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: `sysconf` takes a constant and returns the page size.
+            let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if n <= 0 {
+                4096
+            } else {
+                n as usize
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            4096
+        }
+    })
+}
+
+#[cfg(unix)]
+fn map_reserve(cap: usize) -> Result<*mut u8, StoreError> {
+    // SAFETY: anonymous private mapping. Pages stay inaccessible until commit.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            cap,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(StoreError::Corrupt("strong bit reservation failed"));
+    }
+    Ok(ptr.cast())
+}
+
+#[cfg(unix)]
+fn commit_prefix(base: *mut u8, bytes: usize) -> Result<(), StoreError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    // SAFETY: `base`/`bytes` is a page-aligned prefix of this reservation.
+    let rc = unsafe { libc::mprotect(base.cast(), bytes, libc::PROT_READ | libc::PROT_WRITE) };
+    if rc != 0 {
+        return Err(StoreError::Corrupt("strong bit commit failed"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn release_reserve(base: *mut u8, cap: usize) {
+    if base.is_null() || cap == 0 {
+        return;
+    }
+    // SAFETY: `base`/`cap` came from `map_reserve` for this table.
+    unsafe {
+        libc::munmap(base.cast(), cap);
+    }
+}
+
+#[cfg(windows)]
+fn map_reserve(cap: usize) -> Result<*mut u8, StoreError> {
+    // SAFETY: reserve the address range. Commit happens in `commit_prefix`.
+    let ptr = unsafe { VirtualAlloc(std::ptr::null_mut(), cap, MEM_RESERVE, PAGE_NOACCESS) };
+    if ptr.is_null() {
+        return Err(StoreError::Corrupt("strong bit reservation failed"));
+    }
+    Ok(ptr.cast())
+}
+
+#[cfg(windows)]
+fn commit_prefix(base: *mut u8, bytes: usize) -> Result<(), StoreError> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    // SAFETY: `base` is inside the reservation. `bytes` is page-aligned.
+    let ptr = unsafe { VirtualAlloc(base.cast(), bytes, MEM_COMMIT, PAGE_READWRITE) };
+    if ptr.is_null() {
+        return Err(StoreError::Corrupt("strong bit commit failed"));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn release_reserve(base: *mut u8, _cap: usize) {
+    if base.is_null() {
+        return;
+    }
+    // SAFETY: `base` came from `VirtualAlloc` with `MEM_RESERVE`.
+    unsafe {
+        VirtualFree(base.cast(), 0, MEM_RELEASE);
+    }
+}
+
+#[cfg(windows)]
+const MEM_COMMIT: u32 = 0x1000;
+#[cfg(windows)]
+const MEM_RESERVE: u32 = 0x2000;
+#[cfg(windows)]
+const MEM_RELEASE: u32 = 0x8000;
+#[cfg(windows)]
+const PAGE_NOACCESS: u32 = 0x01;
+#[cfg(windows)]
+const PAGE_READWRITE: u32 = 0x04;
+
+#[cfg(windows)]
+extern "system" {
+    fn VirtualAlloc(
+        addr: *mut std::ffi::c_void,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> *mut std::ffi::c_void;
+    fn VirtualFree(addr: *mut std::ffi::c_void, size: usize, free_type: u32) -> i32;
+}
+
+#[cfg(not(any(unix, windows)))]
+fn map_reserve(_cap: usize) -> Result<*mut u8, StoreError> {
+    Err(StoreError::Corrupt("strong bit reservation failed"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn commit_prefix(_base: *mut u8, _bytes: usize) -> Result<(), StoreError> {
+    Err(StoreError::Corrupt("strong bit commit failed"))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn release_reserve(_base: *mut u8, _cap: usize) {}
 
 /// Evens the counter on drop. The raw pointer keeps the guard from holding
 /// a field borrow across the slot stores. An fd-only store holds `None`.
@@ -318,8 +542,11 @@ impl ArrayTable {
     }
 
     /// In-RAM bit image. `bytes` is the body length and is not rounded to a word.
-    pub(crate) fn bit_image(file: TableFile, bytes: u64) -> Self {
-        Self::new(file, None, bytes, true)
+    /// The mapping is the 256 MiB cap. A grow commits the used prefix only.
+    pub(crate) fn bit_image(file: TableFile, bytes: u64) -> Result<Self, StoreError> {
+        let mut table = Self::new(file, None, bytes, true);
+        table.slots = RamSlots::reserve(DEFAULT_CLASS_C_INRAM_MAX_BYTES as usize)?;
+        Ok(table)
     }
 
     fn new(file: TableFile, data: Option<Vec<u64>>, n: u64, byte_body: bool) -> Self {
@@ -485,8 +712,7 @@ impl ArrayTable {
             }
             return Ok(());
         }
-        self.store_ram(min_idx, max_idx, pairs, zero_gap);
-        Ok(())
+        self.store_ram(min_idx, max_idx, pairs, zero_gap)
     }
 
     /// An append must name every index from `len` through `max`. Overwrites
@@ -512,8 +738,14 @@ impl ArrayTable {
 
     /// Release-store each slot, then the length. A relaxed slot store can move
     /// one header column while that pair's counter still looks even.
-    fn store_ram(&self, min_idx: u64, max_idx: u64, pairs: &[(u64, u64)], zero_gap: bool) {
-        self.slots.grow(max_idx as usize + 1);
+    fn store_ram(
+        &self,
+        min_idx: u64,
+        max_idx: u64,
+        pairs: &[(u64, u64)],
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        self.slots.grow(max_idx as usize + 1)?;
         let slots = self.slots.slots(Ordering::Relaxed);
         let len_now = self.len.load(Ordering::Relaxed);
         let mark = if zero_gap {
@@ -532,6 +764,7 @@ impl ArrayTable {
         let len = len_now.max(max_idx + 1);
         self.len.store(len, Ordering::Relaxed);
         self.mark_unstored(mark);
+        Ok(())
     }
 
     pub fn truncate(&self, _write: &ClassCWrite, new_len: u64) -> Result<(), StoreError> {

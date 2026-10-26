@@ -15,6 +15,54 @@ fn tmp() -> std::path::PathBuf {
     p
 }
 
+/// Growing the bit image keeps one committed prefix. Earlier bits stay.
+#[test]
+fn strong_commit_is_the_used_prefix_not_a_second_image() {
+    let dir = tmp();
+    let t = StrongTxTable::create(&dir).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.set_bit(&write, 0, true).unwrap();
+    t.set_bit(&write, 1_000, true).unwrap();
+    let bytes = 4 * 1024 * 1024 + 100;
+    t.ensure_bits(&write, bytes * 8).unwrap();
+    assert!(t.get_bit(0).unwrap());
+    assert!(t.get_bit(1_000).unwrap());
+    let page = rbitcoin_store::array_table::class_c_commit_quantum();
+    let words = bytes.div_ceil(8);
+    let expect = words.saturating_mul(8).div_ceil(page) * page;
+    let committed = t.committed_bytes();
+    assert_eq!(committed, expect, "committed {committed} prefix {expect}");
+    let pow2 = words.next_power_of_two() * 8;
+    assert_ne!(committed, pow2, "prefix is not the next power of two");
+    assert!(
+        t.l2_resident_bytes() == bytes,
+        "meter stays the logical body"
+    );
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A bit past the 256 MiB reservation is corrupt and does not commit that range.
+#[test]
+fn strong_bit_past_the_reservation_is_corrupt() {
+    use rbitcoin_store::array_table::DEFAULT_CLASS_C_INRAM_MAX_BYTES;
+    let dir = tmp();
+    let t = StrongTxTable::create(&dir).unwrap();
+    let err = t
+        .ensure_bits(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            (DEFAULT_CLASS_C_INRAM_MAX_BYTES + 1) * 8,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Corrupt(msg) if msg.contains("reservation")),
+        "{err:?}"
+    );
+    assert_eq!(t.committed_bytes(), 0);
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A bit store after the flush has noticed dirt, and before new stores are
 /// excluded, is still in this flush.
 #[test]
