@@ -473,8 +473,14 @@ fn plant_coinbase_with_outputs(
             true,
         )
         .unwrap()[0];
-    q.store().header_txs.put_range(Fk(1), fk, 1).unwrap();
-    q.store().confirmed.set(Height(0), Fk(1)).unwrap();
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), fk, 1)
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
     q.store().rebuild_height_fence().unwrap();
     (path, q, first, fk)
 }
@@ -491,7 +497,11 @@ fn plant_bip34_ancestor(q: &rbitcoin_query::Query, hash: [u8; 32]) {
         .unwrap();
     q.store()
         .confirmed
-        .set(Height(main.btc.bip34_height), hfk)
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Height(main.btc.bip34_height),
+            hfk,
+        )
         .unwrap();
     q.clear_bip34_ancestor();
 }
@@ -2387,10 +2397,19 @@ fn plant_confirmed_spend(
             true,
         )
         .unwrap()[0];
-    q.store().header_txs.put_range(Fk(2), spender, 1).unwrap();
-    q.store().confirmed.set(Height(1), Fk(2)).unwrap();
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), spender, 1)
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+        .unwrap();
     q.store().rebuild_height_fence().unwrap();
-    q.store().strong_tx.set_strong(spender, Fk(2)).unwrap();
+    q.store()
+        .strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), spender, Fk(2))
+        .unwrap();
     q.store()
         .put_spend_create(create_fk, 0, spender, 0)
         .unwrap();
@@ -3395,10 +3414,20 @@ fn same_height_confirmed_spender_is_not_below_its_create() {
     let store = query.store();
     store
         .confirmed
-        .set(rbitcoin_primitives::Height(0), Fk(1))
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(0),
+            Fk(1),
+        )
         .unwrap();
-    store.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
-    store.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+    store
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+        .unwrap();
+    store
+        .strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+        .unwrap();
     store.rebuild_height_fence().unwrap();
     let mut scratch = rbitcoin_query::block_pipeline::StructuralScratch::default();
     scratch.height_by_id.insert(9, 0);

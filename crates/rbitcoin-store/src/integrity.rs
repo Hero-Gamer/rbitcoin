@@ -236,10 +236,11 @@ impl Store {
         if let Some(h) = self.confirmed.tip_height() {
             report.tip_before = Some(h.0);
         }
+        let write = crate::array_table::ClassCWrite::new();
 
         // HWM can include a trailing run of null slots (crash mid-grow). Trim
         // the whole suffix in one shot so the 6-height window sees a real tip.
-        let trimmed = self.confirmed.trim_trailing_nulls()?;
+        let trimmed = self.confirmed.trim_trailing_nulls(&write)?;
         if trimmed > 0 {
             self.flush_confirmed_only()?;
             self.rebuild_height_fence()?;
@@ -253,13 +254,13 @@ impl Store {
             if let Some(tip) = self.confirmed.tip_height() {
                 if tip.0 > seal.tip_height {
                     // Unsealed extension past last barrier seal — drop to sealed tip.
-                    self.shrink_tip_to(Some(seal.tip_height), &mut report)?;
+                    self.shrink_tip_to(&write, Some(seal.tip_height), &mut report)?;
                 } else if tip.0 == seal.tip_height {
                     if let Some(fk) = self.confirmed.get(tip)? {
                         if let Ok(rec) = self.headers.get(fk) {
                             if rec.hash != seal.tip_hash {
                                 let lg = tip.0.checked_sub(1);
-                                self.shrink_tip_to(lg, &mut report)?;
+                                self.shrink_tip_to(&write, lg, &mut report)?;
                             }
                         }
                     }
@@ -287,7 +288,7 @@ impl Store {
         let mut progress = TipRevalidateLog::start(lo, tip.0);
 
         for h in lo..=tip.0 {
-            match self.check_confirmed_height(Height(h), tx_count, &mut report) {
+            match self.check_confirmed_height(&write, Height(h), tx_count, &mut report) {
                 Ok(()) => last_good = Some(h),
                 Err(reason) => {
                     report.first_bad_height = Some(h);
@@ -299,7 +300,7 @@ impl Store {
         }
 
         if report.first_bad_height.is_some() {
-            self.shrink_tip_to(last_good, &mut report)?;
+            self.shrink_tip_to(&write, last_good, &mut report)?;
         } else {
             report.tip_after = Some(tip.0);
         }
@@ -319,6 +320,7 @@ impl Store {
     #[doc(hidden)]
     pub fn check_confirmed_height(
         &self,
+        write: &crate::array_table::ClassCWrite,
         height: Height,
         tx_count: u64,
         report: &mut TipRevalidateReport,
@@ -378,16 +380,24 @@ impl Store {
 
         match self.header_txs.get_range(fk) {
             Ok(None) => Ok(()),
-            Ok(Some((first, count))) => {
-                self.check_header_tx_range(fk, first, count, tx_count, &rec.merkle_root, report)
-            }
+            Ok(Some((first, count))) => self.check_header_tx_range(
+                write,
+                fk,
+                first,
+                count,
+                tx_count,
+                &rec.merkle_root,
+                report,
+            ),
             Err(_) => Err("header_txs read"),
         }
     }
 
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn check_header_tx_range(
         &self,
+        write: &crate::array_table::ClassCWrite,
         fk: Fk,
         first: Fk,
         count: u32,
@@ -396,37 +406,37 @@ impl Store {
         report: &mut TipRevalidateReport,
     ) -> Result<(), &'static str> {
         if count == 0 || first.is_null() {
-            let _ = self.header_txs.clear_body(fk);
+            let _ = self.header_txs.clear_body(write, fk);
             report.bodies_cleared = report.bodies_cleared.saturating_add(1);
             return Err("header_txs empty association");
         }
         let last = first.0.saturating_add(u64::from(count)).saturating_sub(1);
         if first.0 == 0 || last > tx_count {
-            let _ = self.header_txs.clear_body(fk);
+            let _ = self.header_txs.clear_body(write, fk);
             report.bodies_cleared = report.bodies_cleared.saturating_add(1);
             return Err("header_txs range OOB");
         }
         let leaves = match self.txs.body_txid_range(first.0, last) {
             Ok(v) if v.len() == count as usize => v,
             Ok(_) => {
-                let _ = self.header_txs.clear_body(fk);
+                let _ = self.header_txs.clear_body(write, fk);
                 report.bodies_cleared = report.bodies_cleared.saturating_add(1);
                 return Err("txid.body short for header_txs range");
             }
             Err(_) => {
-                let _ = self.header_txs.clear_body(fk);
+                let _ = self.header_txs.clear_body(write, fk);
                 report.bodies_cleared = report.bodies_cleared.saturating_add(1);
                 return Err("txid.body read");
             }
         };
         let root = merkle_root_from_txids(&leaves);
         if root != *merkle_root {
-            let _ = self.header_txs.clear_body(fk);
+            let _ = self.header_txs.clear_body(write, fk);
             report.bodies_cleared = report.bodies_cleared.saturating_add(1);
             return Err("merkle root mismatch");
         }
         match self.strong_tx.all_strong_range(first, count) {
-            Ok(true) => self.check_block_input_edges(fk, first.0, count, report),
+            Ok(true) => self.check_block_input_edges(write, fk, first.0, count, report),
             Ok(false) => Err("strong bits missing in tip window"),
             Err(_) => Err("strong_tx read"),
         }
@@ -441,6 +451,7 @@ impl Store {
     #[doc(hidden)]
     pub fn check_block_input_edges(
         &self,
+        write: &crate::array_table::ClassCWrite,
         header_fk: Fk,
         first: u64,
         count: u32,
@@ -448,7 +459,7 @@ impl Store {
     ) -> Result<(), &'static str> {
         let reason = self.block_input_edge_reason(first, count);
         if let Err(reason) = reason {
-            let _ = self.header_txs.clear_body(header_fk);
+            let _ = self.header_txs.clear_body(write, header_fk);
             report.bodies_cleared = report.bodies_cleared.saturating_add(1);
             return Err(reason);
         }
@@ -541,6 +552,7 @@ impl Store {
     #[doc(hidden)]
     pub fn shrink_tip_to(
         &self,
+        write: &crate::array_table::ClassCWrite,
         last_good: Option<u32>,
         report: &mut TipRevalidateReport,
     ) -> Result<(), StoreError> {
@@ -566,7 +578,7 @@ impl Store {
             if !keep {
                 break;
             }
-            self.confirmed.disconnect_tip(Height(cur))?;
+            self.confirmed.disconnect_tip(write, Height(cur))?;
             if cur == 0 {
                 break;
             }

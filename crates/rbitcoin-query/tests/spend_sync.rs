@@ -7,7 +7,10 @@ use rbitcoin_query::spend_sync::SpendSync;
 #[test]
 fn shutdown_publishes_the_snapshot() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-sync-stop");
-    q.store().confirmed.set(Height(4), Fk(1)).unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(4), Fk(1))
+        .unwrap();
     q.store().note_spend_snapshot(4);
     let q = Arc::new(q);
     let sync = SpendSync::spawn(Arc::clone(&q));

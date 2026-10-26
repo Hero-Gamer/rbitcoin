@@ -1571,12 +1571,13 @@ impl Store {
         }
         let n_ranges = ranges.len();
         let mut cleared = 0u64;
+        let write = crate::array_table::ClassCWrite::new();
         for (lo, hi) in ranges {
             let ones = self.strong_tx.count_strong_in_fk_range(lo, hi)?;
             if ones == 0 {
                 continue;
             }
-            self.clear_class_c_run(lo, hi)?;
+            self.clear_class_c_run(&write, lo, hi)?;
             cleared = cleared.saturating_add(ones);
         }
         let ms = t0.elapsed().as_millis();
@@ -1613,16 +1614,22 @@ impl Store {
     }
 
     #[doc(hidden)]
-    pub fn clear_class_c_run(&self, start: u64, end: u64) -> Result<u64, StoreError> {
+    pub fn clear_class_c_run(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, StoreError> {
         if end <= start {
             return Ok(0);
         }
         let count = end - start;
         if count <= u64::from(u32::MAX) {
-            self.strong_tx.set_unstrong_range(Fk(start), count as u32)?;
+            self.strong_tx
+                .set_unstrong_range(write, Fk(start), count as u32)?;
         } else {
             for id in start..end {
-                self.strong_tx.set_unstrong(Fk(id))?;
+                self.strong_tx.set_unstrong(write, Fk(id))?;
             }
         }
         Ok(count)

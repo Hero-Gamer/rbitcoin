@@ -2191,7 +2191,11 @@ fn chain_work_error_leaves_prefix_empty() {
     hub.query
         .store()
         .confirmed
-        .set(rbitcoin_primitives::Height(1), Fk(9_000))
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(1),
+            Fk(9_000),
+        )
         .unwrap();
     assert!(hub.chain_work().is_err());
     assert_eq!(
@@ -4228,11 +4232,15 @@ fn check_block_proposal_reads_medians_from_confirmed_headers() {
 
     let missing = "missing confirmed header";
     let confirmed = &hub.query.store().confirmed;
-    confirmed.set_raw_for_test(Height(11), 0).unwrap();
+    confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(11), 0)
+        .unwrap();
     let err = hub.check_block_proposal(&met).unwrap_err();
     assert!(err.contains(missing), "coin median: {err}");
     assert_eq!(hub.check_block_proposal(&empty), Ok(0));
-    confirmed.set_raw_for_test(Height(110), 0).unwrap();
+    confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(110), 0)
+        .unwrap();
     hub.query.store().rebuild_height_fence().unwrap();
     let err = hub.check_block_proposal(&empty).unwrap_err();
     assert!(err.contains(missing), "tip median: {err}");

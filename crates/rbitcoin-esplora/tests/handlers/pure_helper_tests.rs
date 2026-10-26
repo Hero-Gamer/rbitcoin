@@ -116,11 +116,20 @@ fn outspend_json_spent_includes_vin() {
     let view = q.pin_chain_view().unwrap().expect("tip");
     q.store()
         .header_txs
-        .put_range(view.header_fk, create_fk, 2)
+        .put_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            view.header_fk,
+            create_fk,
+            2,
+        )
         .unwrap();
     q.store()
         .strong_tx
-        .set_strong(spend_fk, view.header_fk)
+        .set_strong(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            spend_fk,
+            view.header_fk,
+        )
         .unwrap();
     q.store().rebuild_height_fence().unwrap();
     let v = outspend_json(&q, None, &[0xcb; 32], 0, Some(&view)).unwrap();

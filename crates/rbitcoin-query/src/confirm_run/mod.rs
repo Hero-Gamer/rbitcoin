@@ -213,6 +213,22 @@ pub struct ScriptOkBatch {
     pub trust_script_warns: Vec<(u32, rbitcoin_consensus::ConsensusError)>,
 }
 
+/// One item on the confirm-write channel.
+///
+/// [`ConfirmWriteMsg::ClearArchived`] is the archived-body clear. The write
+/// thread joins the in-flight tip flush, then clears. IBD orchestration does
+/// not store that image.
+///
+/// `Batch` stays unboxed: this channel already moved the batch by value.
+#[allow(clippy::large_enum_variant)]
+pub enum ConfirmWriteMsg {
+    Batch(ScriptOkBatch),
+    ClearArchived {
+        hash: [u8; 32],
+        reply: std::sync::mpsc::Sender<Result<bool, rbitcoin_store::StoreError>>,
+    },
+}
+
 /// Outcome of load: batch ready for scripts + pure work wall.
 pub struct ConfirmLoadOutcome {
     pub batch: LoadedBatch,

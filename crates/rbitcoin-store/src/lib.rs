@@ -121,6 +121,7 @@ pub mod uring_session;
 #[doc(hidden)]
 pub mod var_table;
 
+pub use crate::array_table::ClassCWrite;
 pub use crate::chain::HeaderTxsTable;
 pub use crate::compact::output_flags;
 pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};

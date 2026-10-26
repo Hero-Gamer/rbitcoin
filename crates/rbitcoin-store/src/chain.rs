@@ -54,21 +54,35 @@ impl ConfirmedTable {
     /// no header fk. Production `set` refuses 0.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
-    pub fn set_raw_for_test(&self, height: Height, value: u64) -> Result<(), StoreError> {
-        self.arr.set(u64::from(height.0), value)
+    pub fn set_raw_for_test(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        height: Height,
+        value: u64,
+    ) -> Result<(), StoreError> {
+        self.arr.set(write, u64::from(height.0), value)
     }
 
-    pub fn set(&self, height: Height, header_fk: Fk) -> Result<(), StoreError> {
+    pub fn set(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        height: Height,
+        header_fk: Fk,
+    ) -> Result<(), StoreError> {
         if header_fk.is_null() {
             return Err(StoreError::InvalidFk);
         }
-        self.arr.set(u64::from(height.0), header_fk.0)
+        self.arr.set(write, u64::from(height.0), header_fk.0)
     }
 
     /// Set many height→header_fk pairs (one grow for max height, then bulk writes).
     ///
     /// Used by multi-block Class C confirm so tip extension is not N separate grows.
-    pub fn set_many(&self, pairs: &[(Height, Fk)]) -> Result<(), StoreError> {
+    pub fn set_many(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        pairs: &[(Height, Fk)],
+    ) -> Result<(), StoreError> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -79,14 +93,17 @@ impl ConfirmedTable {
             }
             raw.push((u64::from(h.0), fk.0));
         }
-        self.arr.set_many(&raw)
+        self.arr.set_many(write, &raw)
     }
 
     /// Drop a trailing run of null header fks (HWM ahead of last real tip).
     ///
     /// Returns how many slots were removed. Mid-array holes are left for
     /// [`Store::revalidate_tip_window_n`] to shrink to last good.
-    pub fn trim_trailing_nulls(&self) -> Result<u64, StoreError> {
+    pub fn trim_trailing_nulls(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+    ) -> Result<u64, StoreError> {
         let n = self.arr.len();
         if n == 0 {
             return Ok(0);
@@ -101,16 +118,20 @@ impl ConfirmedTable {
         }
         let trimmed = n - keep;
         if trimmed > 0 {
-            self.arr.truncate(keep)?;
+            self.arr.truncate(write, keep)?;
         }
         Ok(trimmed)
     }
 
     /// Disconnect tip: height must be current tip.
-    pub fn disconnect_tip(&self, height: Height) -> Result<(), StoreError> {
+    pub fn disconnect_tip(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        height: Height,
+    ) -> Result<(), StoreError> {
         match self.tip_height() {
             Some(t) if t == height => {
-                self.arr.truncate(u64::from(height.0))?;
+                self.arr.truncate(write, u64::from(height.0))?;
                 Ok(())
             }
             Some(_) => Err(StoreError::Corrupt("disconnect not at tip")),
@@ -218,7 +239,11 @@ impl StrongTxTable {
     }
 
     #[doc(hidden)]
-    pub fn ensure_bits(&self, need_bits: u64) -> Result<(), StoreError> {
+    pub fn ensure_bits(
+        &self,
+        _write: &crate::array_table::ClassCWrite,
+        need_bits: u64,
+    ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         let n = self.n_bits.load(Ordering::Acquire);
         if need_bits <= n {
@@ -248,8 +273,13 @@ impl StrongTxTable {
     }
 
     #[doc(hidden)]
-    pub fn set_bit(&self, bit: u64, on: bool) -> Result<(), StoreError> {
-        self.ensure_bits(bit + 1)?;
+    pub fn set_bit(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        bit: u64,
+        on: bool,
+    ) -> Result<(), StoreError> {
+        self.ensure_bits(write, bit + 1)?;
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         self.refuse_while_flushing()?;
         let bi = (bit / 8) as usize;
@@ -277,17 +307,23 @@ impl StrongTxTable {
         g.len() as u64
     }
 
-    pub fn set_strong(&self, tx_fk: Fk, header_fk: Fk) -> Result<(), StoreError> {
+    pub fn set_strong(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        tx_fk: Fk,
+        header_fk: Fk,
+    ) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
         if header_fk.is_null() {
             return Err(StoreError::InvalidFk);
         }
-        self.set_bit(id - 1, true)
+        self.set_bit(write, id - 1, true)
     }
 
     /// Mark many consecutive tx fks strong (one ensure + bulk byte writes).
     pub fn set_strong_range(
         &self,
+        write: &crate::array_table::ClassCWrite,
         first_tx_fk: Fk,
         count: u32,
         header_fk: Fk,
@@ -302,16 +338,22 @@ impl StrongTxTable {
         }
         let start = id - 1;
         let end = start + u64::from(count);
-        self.set_bits_range(start, end, true)
+        self.set_bits_range(write, start, end, true)
     }
 
     /// Set bits in half-open `[start, end)` (bit indices).
     #[doc(hidden)]
-    pub fn set_bits_range(&self, start: u64, end: u64, on: bool) -> Result<(), StoreError> {
+    pub fn set_bits_range(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        start: u64,
+        end: u64,
+        on: bool,
+    ) -> Result<(), StoreError> {
         if end <= start {
             return Ok(());
         }
-        self.ensure_bits(end)?;
+        self.ensure_bits(write, end)?;
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         self.refuse_while_flushing()?;
         let mut bit = start;
@@ -328,17 +370,26 @@ impl StrongTxTable {
         Ok(())
     }
 
-    pub fn set_unstrong(&self, tx_fk: Fk) -> Result<(), StoreError> {
+    pub fn set_unstrong(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        tx_fk: Fk,
+    ) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
         let n = self.n_bits.load(std::sync::atomic::Ordering::Acquire);
         if id > n {
             return Ok(());
         }
-        self.set_bit(id - 1, false)
+        self.set_bit(write, id - 1, false)
     }
 
     /// Clear many consecutive strong bits (Class C repair / disconnect ranges).
-    pub fn set_unstrong_range(&self, first_tx_fk: Fk, count: u32) -> Result<(), StoreError> {
+    pub fn set_unstrong_range(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        first_tx_fk: Fk,
+        count: u32,
+    ) -> Result<(), StoreError> {
         let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
         if count == 0 {
             return Ok(());
@@ -350,7 +401,7 @@ impl StrongTxTable {
             return Ok(());
         }
         let end = end.min(n);
-        self.set_bits_range(start, end, false)
+        self.set_bits_range(write, start, end, false)
     }
 
     pub fn is_strong(&self, tx_fk: Fk) -> Result<bool, StoreError> {
@@ -526,7 +577,12 @@ impl HeaderTxsTable {
     }
 
     /// Store a contiguous range. `tx_fks` must be non-empty and contiguous.
-    pub fn put_list(&self, header_fk: Fk, tx_fks: &[Fk]) -> Result<(), StoreError> {
+    pub fn put_list(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        header_fk: Fk,
+        tx_fks: &[Fk],
+    ) -> Result<(), StoreError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("empty header tx list"));
         }
@@ -542,21 +598,31 @@ impl HeaderTxsTable {
         {
             return Err(StoreError::Corrupt("header_txs not contiguous"));
         }
-        self.put_range(header_fk, tx_fks[0], tx_fks.len() as u32)
+        self.put_range(write, header_fk, tx_fks[0], tx_fks.len() as u32)
     }
 
-    pub fn put_range(&self, header_fk: Fk, first_tx_fk: Fk, n: u32) -> Result<(), StoreError> {
+    pub fn put_range(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        header_fk: Fk,
+        first_tx_fk: Fk,
+        n: u32,
+    ) -> Result<(), StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
         if first_tx_fk.is_null() || n == 0 {
             return Err(StoreError::InvalidFk);
         }
-        self.first.set(id - 1, first_tx_fk.0)?;
-        self.count.set(id - 1, u64::from(n))?;
+        self.first.set(write, id - 1, first_tx_fk.0)?;
+        self.count.set(write, id - 1, u64::from(n))?;
         Ok(())
     }
 
     /// Batch-append many header→tx ranges.
-    pub fn put_lists_batch(&self, items: &[(Fk, &[Fk])]) -> Result<(), StoreError> {
+    pub fn put_lists_batch(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        items: &[(Fk, &[Fk])],
+    ) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -576,13 +642,17 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, tx_fks[0].0));
             count_pairs.push((id - 1, tx_fks.len() as u64));
         }
-        self.first.set_many(&first_pairs)?;
-        self.count.set_many(&count_pairs)?;
+        self.first.set_many(write, &first_pairs)?;
+        self.count.set_many(write, &count_pairs)?;
         Ok(())
     }
 
     /// Batch store ranges without expanding fk vectors.
-    pub fn put_ranges_batch(&self, items: &[(Fk, Fk, u32)]) -> Result<(), StoreError> {
+    pub fn put_ranges_batch(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        items: &[(Fk, Fk, u32)],
+    ) -> Result<(), StoreError> {
         if items.is_empty() {
             return Ok(());
         }
@@ -596,8 +666,8 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, first_tx_fk.0));
             count_pairs.push((id - 1, u64::from(n)));
         }
-        self.first.set_many(&first_pairs)?;
-        self.count.set_many(&count_pairs)?;
+        self.first.set_many(write, &first_pairs)?;
+        self.count.set_many(write, &count_pairs)?;
         Ok(())
     }
 
@@ -666,7 +736,11 @@ impl HeaderTxsTable {
     ///
     /// Used when reconstruct produces a block that fails header checks (e.g.
     /// merkle root mismatch) — the header hash is fine; the association is bad.
-    pub fn clear_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
+    pub fn clear_body(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        header_fk: Fk,
+    ) -> Result<bool, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
         if id == 0 {
             return Err(StoreError::InvalidFk);
@@ -680,8 +754,8 @@ impl HeaderTxsTable {
         if idx >= self.first.len() {
             return Ok(false);
         }
-        self.first.set(idx, 0)?;
-        self.count.set(idx, 0)?;
+        self.first.set(write, idx, 0)?;
+        self.count.set(write, idx, 0)?;
         Ok(true)
     }
 

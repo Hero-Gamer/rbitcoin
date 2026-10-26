@@ -25,10 +25,16 @@ fn query_open_clears_strong_above_tip() {
         h0.nonce,
     );
     let hfk = q.put_header(&h0).unwrap();
-    q.store().confirmed.set(Height(0), hfk).unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), hfk)
+        .unwrap();
     q.store().rebuild_height_fence().unwrap();
     let leftover = Fk(99);
-    q.store().strong_tx.set_strong(leftover, hfk).unwrap();
+    q.store()
+        .strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), leftover, hfk)
+        .unwrap();
     q.store().flush_class_c_tip().unwrap();
     assert_eq!(q.tip_height(), Some(Height(0)));
     assert!(q.store().strong_tx.is_strong(leftover).unwrap());
@@ -61,7 +67,10 @@ fn uring_recover_credit_gap() {
 fn uring_recover_credit_once_per_window_does_not_repair() {
     let (_d, q) = temp_query("uring-recover");
     let leftover = Fk(99);
-    q.store().strong_tx.set_strong(leftover, Fk(1)).unwrap();
+    q.store()
+        .strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), leftover, Fk(1))
+        .unwrap();
     q.store().flush_class_c_tip().unwrap();
     assert!(q.store().strong_tx.is_strong(leftover).unwrap());
     assert_eq!(q.uring_recover("test"), UringRecover::Recovered);
@@ -69,7 +78,10 @@ fn uring_recover_credit_once_per_window_does_not_repair() {
         q.store().strong_tx.is_strong(leftover).unwrap(),
         "in-process recover must not mutate Class C; leftover strong waits for open repair"
     );
-    q.store().strong_tx.set_strong(leftover, Fk(1)).unwrap();
+    q.store()
+        .strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), leftover, Fk(1))
+        .unwrap();
     q.store().flush_class_c_tip().unwrap();
     assert_eq!(q.uring_recover("again"), UringRecover::Exhausted);
 }
@@ -109,7 +121,10 @@ fn held_pread_fault_string_exhausts_lookup_recover_at_same_tip() {
 #[test]
 fn published_tip_is_in_the_height_index() {
     let (dir, q) = temp_query("pub-tip-index");
-    q.store().confirmed.set_raw_for_test(Height(0), 1).unwrap();
+    q.store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(0), 1)
+        .unwrap();
     let hash = [0xab; 32];
     q.publish_confirmed_tip(0, hash);
     let before = rbitcoin_query::chain_view::header_lookup_count();
@@ -125,7 +140,10 @@ fn published_tip_is_in_the_height_index() {
 #[test]
 fn extend_refuses_a_height_the_store_already_left() {
     let (dir, q) = temp_query("idx-left-height");
-    q.store().confirmed.set_raw_for_test(Height(0), 1).unwrap();
+    q.store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(0), 1)
+        .unwrap();
     q.publish_confirmed_tip(0, [0x11; 32]);
     let stale = [0x22; 32];
     assert!(
@@ -133,7 +151,10 @@ fn extend_refuses_a_height_the_store_already_left() {
         "a reader must not index a height the store has already left"
     );
     assert_eq!(q.height_of_hash(&stale).unwrap(), None);
-    q.store().confirmed.set_raw_for_test(Height(1), 2).unwrap();
+    q.store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(1), 2)
+        .unwrap();
     assert!(q.extend_height_index(&[(stale, 1)], 1, Some(0), false));
     assert_eq!(q.height_of_hash(&stale).unwrap(), Some(Height(1)));
     let _ = std::fs::remove_dir_all(&dir);
@@ -184,7 +205,10 @@ fn height_index_catchup_does_not_hold_the_lock_across_header_reads() {
 #[test]
 fn seed_published_tip_refuses_a_tip_with_no_header() {
     let (dir, q) = temp_query("seed-no-header");
-    q.store().confirmed.set_raw_for_test(Height(0), 0).unwrap();
+    q.store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(0), 0)
+        .unwrap();
     assert_eq!(q.tip_height(), Some(Height(0)));
     let err = q.seed_published_tip().unwrap_err();
     assert!(
@@ -606,7 +630,7 @@ fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
     q.invalidate_height_by_hash_index();
     q.store
         .confirmed
-        .disconnect_tip(Height(4))
+        .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(4))
         .expect("shrink confirmed without map ensure");
     q.store.height_fence_pop_tip(Height(4));
     assert_eq!(q.tip_height(), Some(Height(3)));
@@ -619,7 +643,10 @@ fn height_of_hash_stale_snapshot_after_confirmed_shrink_is_none() {
     assert_height(&q, &hashes[3], 3);
 
     while let Some(h) = q.tip_height() {
-        q.store.confirmed.disconnect_tip(h).unwrap();
+        q.store
+            .confirmed
+            .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), h)
+            .unwrap();
         q.store.height_fence_pop_tip(h);
     }
     q.ensure_height_by_hash_index(Height(5))
@@ -881,13 +908,53 @@ fn recover_sh_writebehind_fails_open_on_interior_missing_header_txs() {
     let (h2, t2) = coinbase_block(2, hfk1, Some(hash1));
     q.commit_class_a_only(&h2, &[t2]).unwrap();
     q.confirm_block(Height(2), &h2.hash).unwrap();
-    assert!(q.store().header_txs.clear_body(hfk1).unwrap());
+    assert!(q
+        .store()
+        .header_txs
+        .clear_body(&rbitcoin_store::ClassCWrite::for_test(), hfk1)
+        .unwrap());
     let err = q.recover_sh_writebehind().expect_err("interior hole");
     let msg = format!("{err}");
     assert!(
         msg.contains("invariant:") || msg.contains("missing"),
         "expected invariant/missing body, got {msg}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn clear_archived_body_waits_for_the_confirm_write_channel() {
+    let (dir, q) = temp_query("clear-on-write-channel");
+    let (h0, t0) = coinbase_block(0, Fk::NULL, None);
+    let hash = h0.hash;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let hfk = q.tip_header_fk().unwrap().unwrap();
+    assert!(q.store().header_txs.has_body(hfk).unwrap());
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    q.attach_confirm_write(tx);
+    let cleared = std::thread::scope(|scope| {
+        let worker = scope.spawn(|| q.clear_archived_body(&hash).unwrap());
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("clear is a write-channel item");
+        assert!(
+            q.store().header_txs.has_body(hfk).unwrap(),
+            "orchestration must not store Class C while the write thread has the channel"
+        );
+        let rbitcoin_query::ConfirmWriteMsg::ClearArchived { hash: got, reply } = msg else {
+            panic!("clear must not arrive as a script batch");
+        };
+        assert_eq!(got, hash);
+        let result = {
+            let _commit = q.lock_tip_commit().unwrap();
+            q.clear_archived_body_here(&got).unwrap()
+        };
+        reply.send(Ok(result)).unwrap();
+        worker.join().unwrap()
+    });
+    assert!(cleared);
+    assert!(!q.store().header_txs.has_body(hfk).unwrap());
+    q.detach_confirm_write();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -905,7 +972,11 @@ fn recover_sh_writebehind_skips_bodyless_structural_tip() {
     let _stolen = q.take_sh_job_for_apply().expect("height-1 job");
     q.finish_sh_job(Height(1));
     assert_eq!(q.tip_height(), Some(Height(1)));
-    assert!(q.store().header_txs.clear_body(hfk1).unwrap());
+    assert!(q
+        .store()
+        .header_txs
+        .clear_body(&rbitcoin_store::ClassCWrite::for_test(), hfk1)
+        .unwrap());
     q.recover_sh_writebehind()
         .expect("body-less structural tip must not fail open");
     assert_eq!(q.sh_indexed_through_height(), Some(0));

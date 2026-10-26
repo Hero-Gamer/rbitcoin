@@ -2163,7 +2163,11 @@ fn getrawtransaction_verbose_mid_disconnect_has_no_block_fields() {
     let cb_txid = blk["tx"][0]["txid"].as_str().unwrap().to_string();
     let height = Height(blk["height"].as_u64().unwrap() as u32);
     // Stop halfway through Query::disconnect_tip: confirmed cleared, fence not.
-    ctx.query.store().confirmed.disconnect_tip(height).unwrap();
+    ctx.query
+        .store()
+        .confirmed
+        .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), height)
+        .unwrap();
     let mid = dispatch(
         &ctx,
         "getrawtransaction",
@@ -2182,7 +2186,11 @@ fn getrawtransaction_verbose_mid_disconnect_has_no_block_fields() {
         .header_at_height(Height(height.0 - 1))
         .unwrap()
         .unwrap();
-    ctx.query.store().confirmed.set(height, other_fk).unwrap();
+    ctx.query
+        .store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), height, other_fk)
+        .unwrap();
     let replaced = dispatch(
         &ctx,
         "getrawtransaction",

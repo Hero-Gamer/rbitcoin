@@ -463,7 +463,7 @@ impl Query {
     /// Class C-only path. [`Self::confirm_blocks_run`] itself does not annotate
     /// (the wire write stage would double-walk).
     pub fn confirm_blocks_run(&self, items: &[ConfirmPrepared]) -> Result<Vec<Fk>, QueryError> {
-        self.confirm_blocks_run_with_create_pins(items, None)
+        self.confirm_blocks_run_with_create_pins(items, None, &[])
     }
 
     /// The run must be contiguous, start at tip+1 (genesis on an empty
@@ -520,6 +520,7 @@ impl Query {
         &self,
         items: &[ConfirmPrepared],
         create_pins: Option<&crate::FkMap<CreatePin>>,
+        header_ranges: &[(Fk, Fk, u32)],
     ) -> Result<Vec<Fk>, QueryError> {
         if items.is_empty() {
             return Ok(Vec::new());
@@ -528,6 +529,13 @@ impl Query {
         let durable_before = self.tip_height();
         if let Some(fk) = self.check_run_extends_tip(items)? {
             return Ok(vec![fk]);
+        }
+
+        let write = rbitcoin_store::ClassCWrite::new();
+        if !header_ranges.is_empty() {
+            self.store
+                .header_txs
+                .put_ranges_batch(&write, header_ranges)?;
         }
 
         let t_strong = std::time::Instant::now();
@@ -541,6 +549,7 @@ impl Query {
             if contiguous {
                 if let Some(&first) = item.tx_fks.first() {
                     self.store.strong_tx.set_strong_range(
+                        &write,
                         first,
                         item.tx_fks.len() as u32,
                         item.header_fk,
@@ -548,7 +557,9 @@ impl Query {
                 }
             } else {
                 for &tx_fk in &item.tx_fks {
-                    self.store.strong_tx.set_strong(tx_fk, item.header_fk)?;
+                    self.store
+                        .strong_tx
+                        .set_strong(&write, tx_fk, item.header_fk)?;
                 }
             }
             confirmed_pairs.push((item.height, item.header_fk));
@@ -566,7 +577,7 @@ impl Query {
             self.store
                 .height_fence_extend(item.height, item.header_fk)?;
         }
-        self.store.confirmed.set_many(&confirmed_pairs)?;
+        self.store.confirmed.set_many(&write, &confirmed_pairs)?;
         // Same commit as `confirmed[]`, before the flush. `tip_height` is
         // already the new tip; the orchestration loop reads this snapshot.
         if !items.is_empty() {
@@ -1163,7 +1174,8 @@ impl Query {
         }
         self.store.scripthash.unlink_creates_batch(&groups)?;
 
-        self.store.confirmed.disconnect_tip(height)?;
+        let write = rbitcoin_store::ClassCWrite::new();
+        self.store.confirmed.disconnect_tip(&write, height)?;
         self.store.height_fence_pop_tip(height);
         self.note_disconnect_height(height.0);
         let _ = self.on_load_pack();
@@ -1183,7 +1195,7 @@ impl Query {
         log_disconnect_tip(height.0, &hash, tx_fks.len());
 
         for &tx_fk in &tx_fks {
-            self.store.strong_tx.set_unstrong(tx_fk)?;
+            self.store.strong_tx.set_unstrong(&write, tx_fk)?;
         }
         self.store.flush_class_c_after_disconnect_tip()?;
 

@@ -144,6 +144,7 @@ pub fn finish_already_committed_write(
 pub struct ArchivePlanNs {
     pub pins: FkMap<crate::CreatePin>,
     pub class_a_wave: crate::block_pipeline::ClassAWave,
+    pub header_ranges: Vec<(rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)>,
     pub class_a_ns: u64,
     pub ensure_ns: u64,
     pub plan_take_ns: u64,
@@ -158,6 +159,7 @@ pub fn apply_archive_plan(
     let mut ns = ArchivePlanNs {
         pins: FkMap::default(),
         class_a_wave: crate::block_pipeline::ClassAWave::default(),
+        header_ranges: Vec::new(),
         class_a_ns: 0,
         ensure_ns: 0,
         plan_take_ns: 0,
@@ -179,13 +181,14 @@ pub fn apply_archive_plan(
     let packed_pins: Vec<crate::CreatePin> = std::mem::take(&mut plan.batch_pin);
     ns.plan_take_ns = t_take.elapsed().as_nanos() as u64;
     let t_ca = Instant::now();
-    let (committed, loc) = {
+    let (committed, loc, header_ranges) = {
         let _gate = hold_spindle(query);
         spindle_mark("class-a");
         query
             .archive_commit_plan_defer_head_parents(plan)
             .map_err(ConfirmError::from)?
     };
+    ns.header_ranges = header_ranges;
     ns.class_a_ns = t_ca.elapsed().as_nanos() as u64;
     if !committed {
         return Ok(ns);
@@ -201,14 +204,19 @@ pub fn apply_archive_plan(
         ns.create_map_ns = t_map.elapsed().as_nanos() as u64;
     }
     let t_ens = Instant::now();
-    fill_planned_create_layout_after_commit(
+    if let Err(e) = fill_planned_create_layout_after_commit(
         query,
         &mut batch.batch_parents,
         &planned_fks,
         &loc,
         &packed_pins,
         &batch.prepared,
-    )?;
+    ) {
+        // Class A is already appended. `header_txs` is what a retry uses to
+        // skip that append. Store it even though this phase failed.
+        publish_archived_header_ranges(query, &ns.header_ranges)?;
+        return Err(e);
+    }
     ns.ensure_ns = t_ens.elapsed().as_nanos() as u64;
     if let Some(last) = batch.prepared.last() {
         query.set_class_a_hi(Some(last.height.0));
@@ -299,13 +307,21 @@ fn write_phase_inner(
     let ArchivePlanNs {
         pins: write_create_pins,
         class_a_wave,
+        header_ranges,
         class_a_ns,
         mut ensure_ns,
         plan_take_ns,
         create_map_ns,
     } = apply_archive_plan(query, batch)?;
     let t_ens = Instant::now();
-    let abs_jobs = super::collect_spend_abs_after_fill(&batch.batch_parents, &batch.prepared)?;
+    let abs_jobs = match super::collect_spend_abs_after_fill(&batch.batch_parents, &batch.prepared)
+    {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            publish_archived_header_ranges(query, &header_ranges)?;
+            return Err(e);
+        }
+    };
     ensure_ns = ensure_ns.saturating_add(t_ens.elapsed().as_nanos() as u64);
     if class_a_ns > 0 {
         crate::note_confirm(&query.confirm_stats().class_a_ns, class_a_ns);
@@ -360,7 +376,12 @@ fn write_phase_inner(
             .write_tip_flush_wait_ns
             .load(Ordering::Relaxed);
         let t_cc = Instant::now();
-        let out = class_c_commit(query, &mut batch.prepared, &write_create_pins)?;
+        let out = class_c_commit(
+            query,
+            &mut batch.prepared,
+            &write_create_pins,
+            &header_ranges,
+        )?;
         super::phases::remember_connected_bip34(query, params, &batch.prepared);
         let class_c_wall_ns = t_cc.elapsed().as_nanos() as u64;
         let class_c_ns = query
@@ -428,7 +449,16 @@ fn write_phase_inner(
     if drain_res.is_err() {
         query.store().txs.head_note_pending(&restore);
     }
-    let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns) = overlap?;
+    let (out, n_blocks, structural_ns, struct_ph, class_c_ns, spend_ann_ns) = match overlap {
+        Ok(v) => v,
+        Err(e) => {
+            // Success stores these inside `class_c_commit` after the same join.
+            // A reject before that still has to leave `header_txs` behind, or
+            // the next batch mixes a connected block with this partial append.
+            publish_archived_header_ranges(query, &header_ranges)?;
+            return Err(e);
+        }
+    };
     drain_res.map_err(ConfirmError::from)?;
     if let Some(fk) = drain_max_fk {
         query.note_head_drain_fk(fk);
@@ -454,6 +484,28 @@ fn write_phase_inner(
             spend_ann_ns,
         });
     Ok(out)
+}
+
+/// Store header ranges after the in-flight tip flush joins.
+///
+/// The success path does this inside `class_c_commit`. This is the same put
+/// for a write that appended Class A and then rejected, so `has_body` matches
+/// that append. It does not flush: the next successful commit still flushes
+/// Class C once.
+fn publish_archived_header_ranges(
+    query: &Query,
+    ranges: &[(rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
+) -> Result<(), ConfirmError> {
+    if ranges.is_empty() {
+        return Ok(());
+    }
+    let _commit = query.lock_tip_commit()?;
+    let write = rbitcoin_store::ClassCWrite::new();
+    query
+        .store
+        .header_txs
+        .put_ranges_batch(&write, ranges)
+        .map_err(ConfirmError::from)
 }
 
 /// Replay spend annotate + `tx.head` drain after Class C already committed.

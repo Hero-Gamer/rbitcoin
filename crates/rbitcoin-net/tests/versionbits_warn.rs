@@ -61,7 +61,10 @@ fn put_chain(q: &Query, n: u32, signal: impl Fn(u32) -> bool, salt: u8) {
             weight: 0,
         };
         prev_fk = q.put_header(&rec).unwrap();
-        q.store().confirmed.set(Height(h), prev_fk).unwrap();
+        q.store()
+            .confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), prev_fk)
+            .unwrap();
         prev_hash = hash;
     }
     q.store().rebuild_height_fence().unwrap();

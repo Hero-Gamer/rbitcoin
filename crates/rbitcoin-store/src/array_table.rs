@@ -26,9 +26,41 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::TableKind;
+use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
+
+/// Capability for the one Class C writer.
+///
+/// `!Send` and `!Sync`: a shared [`crate::Store`] cannot carry this onto
+/// another thread. Confirm-write, tip-accept, and startup each mint one on
+/// the thread that stores. The flush thread reads live slots and does not
+/// take this token.
+pub struct ClassCWrite {
+    _thread: PhantomData<*const ()>,
+}
+
+impl Default for ClassCWrite {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClassCWrite {
+    /// Mint a writer capability on the calling thread.
+    pub fn new() -> Self {
+        Self {
+            _thread: PhantomData,
+        }
+    }
+
+    /// Same as [`Self::new`]. Tests are not the confirm-write thread.
+    #[doc(hidden)]
+    pub fn for_test() -> Self {
+        Self::new()
+    }
+}
 
 #[doc(hidden)]
 pub const ELEM: u64 = 8;
@@ -204,7 +236,7 @@ impl ArrayTable {
         Ok(u64::from_le_bytes(buf))
     }
 
-    pub fn set(&self, index: u64, value: u64) -> Result<(), StoreError> {
+    pub fn set(&self, _write: &ClassCWrite, index: u64, value: u64) -> Result<(), StoreError> {
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
         self.refuse_while_flushing()?;
         if let Some(ref mut v) = *guard {
@@ -233,7 +265,7 @@ impl ArrayTable {
         Ok(())
     }
 
-    pub fn set_many(&self, pairs: &[(u64, u64)]) -> Result<(), StoreError> {
+    pub fn set_many(&self, _write: &ClassCWrite, pairs: &[(u64, u64)]) -> Result<(), StoreError> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -277,7 +309,7 @@ impl ArrayTable {
         Ok(())
     }
 
-    pub fn truncate(&self, new_len: u64) -> Result<(), StoreError> {
+    pub fn truncate(&self, _write: &ClassCWrite, new_len: u64) -> Result<(), StoreError> {
         let len = self.len.load(Ordering::Acquire);
         if new_len > len {
             return Err(StoreError::Corrupt("array truncate grows"));

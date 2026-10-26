@@ -494,11 +494,19 @@ fn load_gcs_header_plans_from_store_tip() {
     );
     q.store()
         .confirmed
-        .set(rbitcoin_primitives::Height(0), Fk(1))
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(0),
+            Fk(1),
+        )
         .unwrap();
     q.store()
         .confirmed
-        .set(rbitcoin_primitives::Height(1), Fk(2))
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(1),
+            Fk(2),
+        )
         .unwrap();
     q.on_load_pack().unwrap();
     assert!(

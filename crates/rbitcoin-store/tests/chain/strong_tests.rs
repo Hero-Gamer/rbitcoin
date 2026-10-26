@@ -24,14 +24,16 @@ fn strong_flush_writes_live_bytes_and_refuses_a_store() {
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
     let bits = (FLUSH_SCRATCH as u32) * 8 + 64;
-    t.set_strong_range(Fk(1), bits, Fk(1)).unwrap();
+    t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), bits, Fk(1))
+        .unwrap();
     t.flush().unwrap();
-    t.set_unstrong(Fk(1)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1))
+        .unwrap();
     let mut during = Ok(());
     t.flush_dirty_between(|t, step| {
         if step == FlushStep::Write {
             t.data.write().unwrap_or_else(|e| e.into_inner())[0] = 0xff;
-            during = t.set_unstrong(Fk(2));
+            during = t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(2));
         }
     })
     .unwrap();
@@ -45,7 +47,8 @@ fn strong_flush_writes_live_bytes_and_refuses_a_store() {
         "live byte must be the flushed image"
     );
     assert!(t.is_strong(Fk(2)).unwrap(), "refused store stays off disk");
-    t.set_unstrong(Fk(2)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(2))
+        .unwrap();
     t.flush().unwrap();
     drop(t);
     let t = StrongTxTable::open(&dir).unwrap();
@@ -61,9 +64,11 @@ fn strong_failed_write_keeps_the_range_dirty() {
     use rbitcoin_store::file::FILE_HEADER_LEN;
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
-    t.set_strong(Fk(1), Fk(1)).unwrap();
+    t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+        .unwrap();
     t.flush().unwrap();
-    t.set_unstrong(Fk(1)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1))
+        .unwrap();
     let mut swapped = None;
     let failed = t.flush_dirty_between(|t, step| {
         if step == FlushStep::Write {
@@ -90,12 +95,14 @@ fn strong_same_length_rewrite_publishes_logical_len() {
     use rbitcoin_store::file::FILE_HEADER_LEN;
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
-    t.set_strong_range(Fk(1), 16, Fk(1)).unwrap();
+    t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 16, Fk(1))
+        .unwrap();
     t.flush().unwrap();
     let published = t.bits.logical_len();
     assert!(published > FILE_HEADER_LEN as u64);
     t.bits.set_logical_len(published + 64).unwrap();
-    t.set_unstrong(Fk(3)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(3))
+        .unwrap();
     t.flush_dirty().unwrap();
     assert_eq!(t.bits.logical_len(), published);
     drop(t);
@@ -109,12 +116,14 @@ fn strong_same_length_rewrite_publishes_logical_len() {
 fn strong_bitset_range_and_clear() {
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
-    t.set_strong_range(Fk(1), 10, Fk(99)).unwrap();
+    t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 10, Fk(99))
+        .unwrap();
     for i in 1..=10 {
         assert!(t.is_strong(Fk(i)).unwrap());
     }
     assert!(!t.is_strong(Fk(11)).unwrap());
-    t.set_unstrong(Fk(5)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(5))
+        .unwrap();
     assert!(!t.is_strong(Fk(5)).unwrap());
     assert!(t.is_strong(Fk(4)).unwrap());
     assert!(t.get(Fk(1)).unwrap().is_some());
@@ -134,8 +143,10 @@ fn count_strong_in_fk_range_skips_zero_bytes() {
     assert_eq!(t.count_strong_in_fk_range(0, 8).unwrap(), 0);
     assert_eq!(t.count_strong_in_fk_range(5, 5).unwrap(), 0);
     assert_eq!(t.count_strong_in_fk_range(100, 200).unwrap(), 0);
-    t.set_strong(Fk(1), Fk(1)).unwrap();
-    t.set_strong(Fk(16), Fk(1)).unwrap();
+    t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+        .unwrap();
+    t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(16), Fk(1))
+        .unwrap();
     assert_eq!(t.count_strong_in_fk_range(1, 17).unwrap(), 2);
     assert_eq!(t.count_strong_in_fk_range(2, 16).unwrap(), 0);
     t.flush().unwrap();
@@ -150,7 +161,8 @@ fn count_strong_in_fk_range_skips_zero_bytes() {
 fn strong_tx_count_reads_l2_not_the_file() {
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
-    t.set_strong_range(Fk(1), 20, Fk(1)).unwrap();
+    t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 20, Fk(1))
+        .unwrap();
     t.flush().unwrap();
     assert!(t.l2_resident_bytes() > 0);
     assert_eq!(t.count_strong_in_fk_range(1, 21).unwrap(), 20);
@@ -178,7 +190,8 @@ fn strong_tx_always_l2_above_class_c_cap() {
     let fk = Fk(8_388_608 + 8);
     {
         let t = StrongTxTable::create(&dir).unwrap();
-        t.set_strong(fk, Fk(1)).unwrap();
+        t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), fk, Fk(1))
+            .unwrap();
         t.flush().unwrap();
         assert!(
             t.l2_resident_bytes() > 1024 * 1024,
@@ -206,9 +219,11 @@ fn strong_store_on_another_thread_during_flush_is_refused() {
     use std::sync::Arc;
     let dir = tmp();
     let t = Arc::new(StrongTxTable::create(&dir).unwrap());
-    t.set_strong(Fk(1), Fk(1)).unwrap();
+    t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+        .unwrap();
     t.flush().unwrap();
-    t.set_unstrong(Fk(1)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1))
+        .unwrap();
     let (started, start_rx) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     let flush_t = {
@@ -224,14 +239,15 @@ fn strong_store_on_another_thread_during_flush_is_refused() {
         })
     };
     start_rx.recv().unwrap();
-    let during = t.set_strong(Fk(1), Fk(1));
+    let during = t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1));
     release.send(()).unwrap();
     flush_t.join().unwrap();
     assert!(during.is_err(), "store during flush refused={during:?}");
     drop(t);
     let t = StrongTxTable::open(&dir).unwrap();
     assert!(!t.is_strong(Fk(1)).unwrap());
-    t.set_strong(Fk(1), Fk(1)).unwrap();
+    t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+        .unwrap();
     t.flush().unwrap();
     drop(t);
     let t = StrongTxTable::open(&dir).unwrap();
@@ -244,9 +260,11 @@ fn strong_write_behind_no_flush_keeps_old() {
     let dir = tmp();
     {
         let t = StrongTxTable::create(&dir).unwrap();
-        t.set_strong_range(Fk(1), 8, Fk(1)).unwrap();
+        t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 8, Fk(1))
+            .unwrap();
         t.flush().unwrap();
-        t.set_strong(Fk(9), Fk(1)).unwrap();
+        t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(9), Fk(1))
+            .unwrap();
         // Drop without flush.
     }
     let t = StrongTxTable::open(&dir).unwrap();
@@ -264,9 +282,16 @@ fn strong_high_fk_flush_writes_suffix_not_full_image() {
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
     // 80_000 bits = 10_000 payload bytes.
-    t.set_strong_range(Fk(1), 80_000, Fk(1)).unwrap();
+    t.set_strong_range(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        Fk(1),
+        80_000,
+        Fk(1),
+    )
+    .unwrap();
     t.flush_dirty().unwrap();
-    t.set_unstrong(Fk(80_000)).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(80_000))
+        .unwrap();
     t.flush_dirty().unwrap();
     assert!(t.is_strong(Fk(1)).unwrap());
     assert!(!t.is_strong(Fk(80_000)).unwrap());
@@ -280,10 +305,22 @@ fn strong_suffix_dirty_flush_preserves_prefix() {
     {
         let s = StrongTxTable::create(&dir).unwrap();
         // Allocate a wide bit image then flush so disk_bytes covers it.
-        s.set_strong_range(Fk(1), 10_000, Fk(1)).unwrap();
+        s.set_strong_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Fk(1),
+            10_000,
+            Fk(1),
+        )
+        .unwrap();
         s.flush().unwrap();
         // Flip only high bits (still within disk image) — suffix dirty path.
-        s.set_strong_range(Fk(9000), 100, Fk(1)).unwrap();
+        s.set_strong_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Fk(9000),
+            100,
+            Fk(1),
+        )
+        .unwrap();
         s.flush().unwrap();
     }
     let s = StrongTxTable::open(&dir).unwrap();
@@ -299,9 +336,11 @@ fn strong_write_behind_flush_reopen() {
     let dir = tmp();
     {
         let t = StrongTxTable::create(&dir).unwrap();
-        t.set_strong_range(Fk(1), 16, Fk(1)).unwrap();
+        t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 16, Fk(1))
+            .unwrap();
         t.flush().unwrap();
-        t.set_unstrong_range(Fk(5), 4).unwrap();
+        t.set_unstrong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(5), 4)
+            .unwrap();
         t.flush().unwrap();
     }
     let t = StrongTxTable::open(&dir).unwrap();
@@ -317,37 +356,43 @@ fn strong_partial_bytes_unstrong_range_and_errors() {
     let dir = tmp();
     let t = StrongTxTable::create(&dir).unwrap();
     // Unaligned start so partial-first-byte path runs.
-    t.set_strong_range(Fk(3), 20, Fk(1)).unwrap();
+    t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(3), 20, Fk(1))
+        .unwrap();
     for i in 3..23 {
         assert!(t.is_strong(Fk(i)).unwrap(), "i={i}");
     }
     assert!(!t.is_strong(Fk(2)).unwrap());
-    t.set_strong_range(Fk(1), 0, Fk(1)).unwrap();
-    t.set_unstrong_range(Fk(1), 0).unwrap();
+    t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 0, Fk(1))
+        .unwrap();
+    t.set_unstrong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 0)
+        .unwrap();
     // Clear a mid-range with partial ends.
-    t.set_unstrong_range(Fk(5), 10).unwrap();
+    t.set_unstrong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(5), 10)
+        .unwrap();
     for i in 5..15 {
         assert!(!t.is_strong(Fk(i)).unwrap());
     }
     assert!(t.is_strong(Fk(4)).unwrap());
     assert!(t.is_strong(Fk(15)).unwrap());
     // past allocated → no-op
-    t.set_unstrong(Fk(9999)).unwrap();
-    t.set_unstrong_range(Fk(9000), 10).unwrap();
+    t.set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), Fk(9999))
+        .unwrap();
+    t.set_unstrong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(9000), 10)
+        .unwrap();
     assert!(matches!(
-        t.set_strong(Fk::NULL, Fk(1)),
+        t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk::NULL, Fk(1)),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        t.set_strong(Fk(1), Fk::NULL),
+        t.set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk::NULL),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        t.set_strong_range(Fk::NULL, 1, Fk(1)),
+        t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk::NULL, 1, Fk(1)),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        t.set_strong_range(Fk(1), 1, Fk::NULL),
+        t.set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 1, Fk::NULL),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(t.is_strong(Fk::NULL), Err(StoreError::InvalidFk)));

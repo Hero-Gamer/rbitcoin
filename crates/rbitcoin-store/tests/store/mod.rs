@@ -324,8 +324,12 @@ fn coinbase_fk_at_heights_matches_first_tx() {
         .unwrap();
     let fks = [cb_fks[0], non_fks[0]];
     assert_eq!(fks.len(), 2);
-    s.header_txs.put_range(hfk, fks[0], 2).unwrap();
-    s.confirmed.set(Height(0), hfk).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), hfk, fks[0], 2)
+        .unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), hfk)
+        .unwrap();
     s.rebuild_height_fence().unwrap();
 
     let map = s.coinbase_fk_at_heights(&[0, 1, 99]).unwrap();
@@ -540,14 +544,23 @@ fn store_create_open_archive_spend_and_meta_errors() {
 
     // Class C: confirm spenders + heights. Body list must include spend_fk
     // (membership is part of is_confirmed_strong).
-    s.confirmed.set(Height(0), hfk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), hfk)
+        .unwrap();
     // Contiguous body covering create..spend (sequential put order).
     let body_first = create_fk.0.min(spend_fk.0);
     let body_last = create_fk.0.max(spend_fk.0);
     s.header_txs
-        .put_range(hfk, Fk(body_first), (body_last - body_first + 1) as u32)
+        .put_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            hfk,
+            Fk(body_first),
+            (body_last - body_first + 1) as u32,
+        )
         .unwrap();
-    s.strong_tx.set_strong(spend_fk, hfk).unwrap();
+    s.strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), spend_fk, hfk)
+        .unwrap();
     s.rebuild_height_fence().unwrap();
     assert!(s.is_confirmed_strong(spend_fk).unwrap());
     assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
@@ -591,7 +604,9 @@ fn store_create_open_archive_spend_and_meta_errors() {
     s.flush_for_shutdown().unwrap();
 
     // repair: strong not on the fence
-    s.strong_tx.set_strong(spend2_fk, hfk).unwrap();
+    s.strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), spend2_fk, hfk)
+        .unwrap();
     let cleared = s.repair_class_c_above_tip().unwrap();
     assert!(cleared >= 1);
     assert!(!s.is_confirmed_strong(spend2_fk).unwrap());
@@ -1015,17 +1030,29 @@ fn class_c_barrier_pre_tip_only_does_not_advance_tip() {
     {
         let s = Store::create_tiny(&dir).unwrap();
         // Genesis tip: height 0 → header fk 1, one strong tx.
-        s.confirmed.set(Height(0), Fk(1)).unwrap();
-        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
-        s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+            .unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+            .unwrap();
         s.rebuild_height_fence().unwrap();
         s.flush_class_c_tip().unwrap();
         assert_eq!(s.confirmed.tip_height(), Some(Height(0)));
 
         // In-RAM tip extension (height 1) + strong for new txs — no full barrier.
-        s.strong_tx.set_strong_range(Fk(2), 3, Fk(2)).unwrap();
-        s.header_txs.put_range(Fk(2), Fk(2), 3).unwrap();
-        s.confirmed.set(Height(1), Fk(2)).unwrap();
+        s.strong_tx
+            .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), 3, Fk(2))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), Fk(2), 3)
+            .unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+            .unwrap();
         // Mid-barrier: strong/height durable, confirmed still unflushed.
         s.flush_class_c_pre_tip().unwrap();
         assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
@@ -1057,15 +1084,27 @@ fn class_c_barrier_full_flush_reopen_tip_with_strong() {
     let dir = tmp();
     {
         let s = Store::create_tiny(&dir).unwrap();
-        s.confirmed.set(Height(0), Fk(1)).unwrap();
-        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
-        s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+            .unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+            .unwrap();
         s.rebuild_height_fence().unwrap();
         s.flush_class_c_tip().unwrap();
 
-        s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
-        s.confirmed.set(Height(1), Fk(2)).unwrap();
-        s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
+        s.strong_tx
+            .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), 2, Fk(2))
+            .unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), Fk(2), 2)
+            .unwrap();
         s.rebuild_height_fence().unwrap();
         s.flush_class_c_tip().unwrap();
     }
@@ -1084,9 +1123,15 @@ fn class_c_barrier_full_flush_reopen_tip_with_strong() {
 fn get_fk_by_txid_tip_hits_pending_before_head_drain() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
-    s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
-    s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+        .unwrap();
+    s.strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+        .unwrap();
     let item = coinbase_item([0x51; 32], vec![OutputRecord::unspent(1, vec![0x51])]);
     let fks = s
         .put_tx_full_batch_indexed(&[item], /*index=*/ false)
@@ -1110,14 +1155,22 @@ fn get_fk_by_txid_tip_hits_pending_before_head_drain() {
 fn fence_tip_height_lags_unextended_confirmed() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
-    s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+        .unwrap();
     s.rebuild_height_fence().unwrap();
     assert_eq!(s.tip_height(), Some(Height(0)));
     assert_eq!(s.fence_tip_height(), Some(0));
 
-    s.confirmed.set(Height(1), Fk(2)).unwrap();
-    s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+        .unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), Fk(2), 2)
+        .unwrap();
     assert_eq!(
         s.tip_height(),
         Some(Height(1)),
@@ -1142,11 +1195,17 @@ fn fence_tip_height_lags_unextended_confirmed() {
 fn height_fence_extend_missing_header_txs_is_not_ok_hole() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
-    s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+        .unwrap();
     s.rebuild_height_fence().unwrap();
 
-    s.confirmed.set(Height(1), Fk(2)).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+        .unwrap();
     let err = s
         .height_fence_extend(Height(1), Fk(2))
         .expect_err("missing header_txs must not silently skip");
@@ -1333,18 +1392,32 @@ fn class_c_disconnect_tip_first_mid_barrier_is_repairable() {
     {
         let s = Store::create_tiny(&dir).unwrap();
         // Tip 0 + tip 1 fully durable.
-        s.confirmed.set(Height(0), Fk(1)).unwrap();
-        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
-        s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-        s.confirmed.set(Height(1), Fk(2)).unwrap();
-        s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
-        s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+            .unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+            .unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), Fk(2), 2)
+            .unwrap();
+        s.strong_tx
+            .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), 2, Fk(2))
+            .unwrap();
         s.rebuild_height_fence().unwrap();
         s.flush_class_c_tip().unwrap();
         assert_eq!(s.confirmed.tip_height(), Some(Height(1)));
 
         // Disconnect tip-first: shrink tip + flush confirmed only (kill before unstrong).
-        s.confirmed.disconnect_tip(Height(1)).unwrap();
+        s.confirmed
+            .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(1))
+            .unwrap();
         s.flush_confirmed_only().unwrap();
         // Do not unstrong — simulate kill mid-disconnect.
     }
@@ -1372,19 +1445,35 @@ fn class_c_disconnect_full_sequence_reopen_clean() {
     let dir = tmp();
     {
         let s = Store::create_tiny(&dir).unwrap();
-        s.confirmed.set(Height(0), Fk(1)).unwrap();
-        s.header_txs.put_range(Fk(1), Fk(1), 1).unwrap();
-        s.strong_tx.set_strong(Fk(1), Fk(1)).unwrap();
-        s.confirmed.set(Height(1), Fk(2)).unwrap();
-        s.header_txs.put_range(Fk(2), Fk(2), 2).unwrap();
-        s.strong_tx.set_strong_range(Fk(2), 2, Fk(2)).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 1)
+            .unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1))
+            .unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), Fk(2), 2)
+            .unwrap();
+        s.strong_tx
+            .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), 2, Fk(2))
+            .unwrap();
         s.rebuild_height_fence().unwrap();
         s.flush_class_c_tip().unwrap();
 
         // Production disconnect order (store half).
-        s.confirmed.disconnect_tip(Height(1)).unwrap();
+        s.confirmed
+            .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(1))
+            .unwrap();
         s.flush_confirmed_only().unwrap();
-        s.strong_tx.set_unstrong_range(Fk(2), 2).unwrap();
+        s.strong_tx
+            .set_unstrong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), 2)
+            .unwrap();
         s.height_fence_pop_tip(Height(1));
         s.flush_class_c_after_disconnect_tip().unwrap();
     }
@@ -1402,12 +1491,20 @@ fn orphan_class_c_at_tip_height_not_confirmed_strong_and_repairable() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();
     // Real tip body: txs 1..=2 under header 1.
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
-    s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
-    s.strong_tx.set_strong_range(Fk(1), 2, Fk(1)).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 2)
+        .unwrap();
+    s.strong_tx
+        .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 2, Fk(1))
+        .unwrap();
     s.rebuild_height_fence().unwrap();
     // Orphan second copy: txs 3..=4 strong, not in header_txs.
-    s.strong_tx.set_strong_range(Fk(3), 2, Fk(99)).unwrap();
+    s.strong_tx
+        .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(3), 2, Fk(99))
+        .unwrap();
     s.flush_class_c_tip().unwrap();
 
     assert!(s.is_confirmed_strong(Fk(1)).unwrap());
@@ -1447,12 +1544,22 @@ fn repair_class_c_above_tip_empty_tip_and_gapped_orphans() {
             "{text}"
         );
         // Tip body 1..=2; orphans 5 and 10 (non-adjacent → two clear runs).
-        s.confirmed.set(Height(0), Fk(1)).unwrap();
-        s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
-        s.strong_tx.set_strong_range(Fk(1), 2, Fk(1)).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+            .unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 2)
+            .unwrap();
+        s.strong_tx
+            .set_strong_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), 2, Fk(1))
+            .unwrap();
         s.rebuild_height_fence().unwrap();
-        s.strong_tx.set_strong(Fk(5), Fk(99)).unwrap();
-        s.strong_tx.set_strong(Fk(10), Fk(99)).unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(5), Fk(99))
+            .unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(10), Fk(99))
+            .unwrap();
         s.flush_class_c_tip().unwrap();
         let n = s.repair_class_c_above_tip().unwrap();
         assert_eq!(n, 2, "cleared gapped orphans");
@@ -1460,7 +1567,9 @@ fn repair_class_c_above_tip_empty_tip_and_gapped_orphans() {
         assert!(!s.strong_tx.is_strong(Fk(10)).unwrap());
         assert!(s.is_confirmed_strong(Fk(1)).unwrap());
         // Strong not on the fence (same repair as above-tip leftovers).
-        s.strong_tx.set_strong(Fk(20), Fk(1)).unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(20), Fk(1))
+            .unwrap();
         assert_eq!(s.repair_class_c_above_tip().unwrap(), 1);
         assert!(!s.strong_tx.is_strong(Fk(20)).unwrap());
     }
@@ -1594,8 +1703,12 @@ fn resolve_txid_prefers_connected_over_newer_unconnected() {
     assert_ne!(old, new);
     assert_eq!(s.get_fk_by_txid(&txid).unwrap(), Some(new));
     assert_eq!(s.get_fk_by_txid_tip(&txid).unwrap(), None);
-    s.header_txs.put_range(Fk(1), old, 1).unwrap();
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), old, 1)
+        .unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
     s.rebuild_height_fence().unwrap();
     assert_eq!(
         s.get_fk_by_txid_tip(&txid).unwrap(),
@@ -1637,9 +1750,15 @@ fn resolve_txid_prefers_connected_over_newer_unconnected() {
             true,
         )
         .unwrap()[0];
-    s.header_txs.put_range(Fk(2), spender, 1).unwrap();
-    s.confirmed.set(Height(1), Fk(2)).unwrap();
-    s.strong_tx.set_strong(spender, Fk(2)).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), spender, 1)
+        .unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+        .unwrap();
+    s.strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), spender, Fk(2))
+        .unwrap();
     s.rebuild_height_fence().unwrap();
     s.put_spend_create(old, 0, spender, 0).unwrap();
     assert!(
@@ -1737,8 +1856,12 @@ fn tip_then_any_connected_in_cold_beats_unconnected_hot() {
         None
     );
 
-    s.header_txs.put_range(Fk(1), old, 1).unwrap();
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), old, 1)
+        .unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
     s.rebuild_height_fence().unwrap();
 
     assert_eq!(s.get_fk_by_txid_tip(&txid).unwrap(), Some(old));
@@ -1798,12 +1921,22 @@ fn create_does_not_write_tx_height_and_fence_has_reorg_holes() {
         !dir.join("tx_height.body").exists(),
         "live create must not write tx_height.body"
     );
-    s.header_txs.put_range(Fk(1), Fk(1), 2).unwrap();
-    s.confirmed.set(Height(0), Fk(1)).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 2)
+        .unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
     // Discarded block used fks 3..=5 under header 2 (not confirmed).
-    s.header_txs.put_range(Fk(2), Fk(3), 3).unwrap();
-    s.header_txs.put_range(Fk(3), Fk(6), 2).unwrap();
-    s.confirmed.set(Height(1), Fk(3)).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(2), Fk(3), 3)
+        .unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(3), Fk(6), 2)
+        .unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(3))
+        .unwrap();
     s.rebuild_height_fence().unwrap();
     assert_eq!(s.tx_height_get(Fk(1)).unwrap(), Some(0));
     assert_eq!(s.tx_height_get(Fk(3)).unwrap(), None);

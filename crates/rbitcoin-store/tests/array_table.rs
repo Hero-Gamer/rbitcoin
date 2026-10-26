@@ -24,7 +24,8 @@ fn get_racing_truncate_does_not_panic() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
-    t.set(1023, 7).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1023, 7)
+        .unwrap();
     assert!(t.l2_resident_bytes() > 0, "test needs the in-RAM image");
     let stop = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..4)
@@ -40,8 +41,10 @@ fn get_racing_truncate_does_not_panic() {
         .collect();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        t.truncate(0).unwrap();
-        t.set(1023, 7).unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 0)
+            .unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 1023, 7)
+            .unwrap();
     }
     stop.store(true, Ordering::Relaxed);
     for r in readers {
@@ -61,18 +64,20 @@ fn flush_writes_live_slots_and_refuses_a_store_until_it_finishes() {
     let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
     let n = 600u64;
     let pairs: Vec<(u64, u64)> = (0..n).map(|i| (i, i + 1)).collect();
-    t.set_many(&pairs).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
+        .unwrap();
     t.flush().unwrap();
-    t.set(0, 5).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 5)
+        .unwrap();
     let mut during = Ok(());
     t.flush_dirty_between(|t, step| {
         if step == FlushStep::Write {
             if let Some(v) = t.data.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
                 v[0] = 77;
             }
-            during = t.set(1, 9);
-            let _ = t.set_many(&[(2, 8)]);
-            let _ = t.truncate(n - 1);
+            during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9);
+            let _ = t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(2, 8)]);
+            let _ = t.truncate(&rbitcoin_store::ClassCWrite::for_test(), n - 1);
         }
     })
     .unwrap();
@@ -88,7 +93,8 @@ fn flush_writes_live_slots_and_refuses_a_store_until_it_finishes() {
     assert!(n * ELEM > FLUSH_SCRATCH as u64);
     let chunk = t.flush_chunk_max.load(Ordering::Relaxed);
     assert!(chunk > 0 && chunk <= FLUSH_SCRATCH, "flush chunk {chunk}");
-    t.set(1, 9).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9)
+        .unwrap();
     let mut buf = [0u8; 8];
     t.file
         .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
@@ -113,12 +119,17 @@ fn same_length_rewrite_publishes_logical_len() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-    t.set_many(&[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    )
+    .unwrap();
     t.flush().unwrap();
     let published = FILE_HEADER_LEN as u64 + 4 * ELEM;
     assert_eq!(t.file.logical_len(), published);
     t.file.set_logical_len(published + 64).unwrap();
-    t.set(1, 99).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 99)
+        .unwrap();
     assert_eq!(t.len(), 4);
     assert_eq!(t.disk_len.load(Ordering::Acquire), 4);
     t.flush().unwrap();
@@ -138,9 +149,14 @@ fn failed_write_keeps_the_range_dirty() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
-    t.set_many(&[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    )
+    .unwrap();
     t.flush().unwrap();
-    t.set(1, 42).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 42)
+        .unwrap();
     let mut swapped = None;
     let failed = t.flush_dirty_between(|t, step| {
         if step == FlushStep::Write {
@@ -177,13 +193,18 @@ fn set_after_flush_is_flushed_next() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
-    t.set_many(&[(0, 10), (1, 11), (2, 12), (3, 13)]).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 10), (1, 11), (2, 12), (3, 13)],
+    )
+    .unwrap();
     t.flush().unwrap();
-    t.set(3, 23).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 3, 23)
+        .unwrap();
     let mut during = Ok(());
     t.flush_dirty_between(|t, step| {
         if step == FlushStep::Clean {
-            during = t.set(1, 21);
+            during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 21);
         }
     })
     .unwrap();
@@ -191,7 +212,8 @@ fn set_after_flush_is_flushed_next() {
     drop(t);
     let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
     assert_eq!((t.get(1).unwrap(), t.get(3).unwrap()), (11, 23));
-    t.set(1, 21).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 21)
+        .unwrap();
     t.flush().unwrap();
     drop(t);
     let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
@@ -206,14 +228,21 @@ fn array_set_get_grow_set_many_truncate_flush() {
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.len(), 0);
     assert_eq!(t.get(0).unwrap(), 0);
-    t.set(3, 30).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 3, 30)
+        .unwrap();
     assert_eq!(t.len(), 4);
     assert_eq!(t.get(0).unwrap(), 0);
     assert_eq!(t.get(3).unwrap(), 30);
-    t.set(1, 11).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 11)
+        .unwrap();
     assert_eq!(t.get(1).unwrap(), 11);
-    t.set_many(&[]).unwrap();
-    t.set_many(&[(10, 100), (5, 50)]).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[])
+        .unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(10, 100), (5, 50)],
+    )
+    .unwrap();
     assert_eq!(t.len(), 11);
     assert_eq!(t.get(5).unwrap(), 50);
     assert_eq!(t.get(10).unwrap(), 100);
@@ -223,9 +252,13 @@ fn array_set_get_grow_set_many_truncate_flush() {
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.len(), 11);
     assert_eq!(t.get(3).unwrap(), 30);
-    t.truncate(4).unwrap();
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 4)
+        .unwrap();
     assert_eq!(t.len(), 4);
-    assert!(matches!(t.truncate(99), Err(StoreError::Corrupt(_))));
+    assert!(matches!(
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 99),
+        Err(StoreError::Corrupt(_))
+    ));
     t.flush().unwrap();
     {
         let mut raw = std::fs::read(&path).unwrap();
@@ -246,10 +279,16 @@ fn write_behind_no_flush_reopen_keeps_old_image() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 10), (1, 20)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 10), (1, 20)],
+        )
+        .unwrap();
         t.flush().unwrap();
-        t.set(0, 999).unwrap();
-        t.set(2, 30).unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 999)
+            .unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 2, 30)
+            .unwrap();
         assert_eq!(t.get(0).unwrap(), 999);
         assert_eq!(t.len(), 3);
     }
@@ -267,9 +306,14 @@ fn write_behind_flush_reopen_sees_new_image() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 1), (1, 2)]).unwrap();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(0, 1), (1, 2)])
+            .unwrap();
         t.flush().unwrap();
-        t.set_many(&[(0, 7), (1, 8), (2, 9)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 7), (1, 8), (2, 9)],
+        )
+        .unwrap();
         t.flush().unwrap();
     }
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
@@ -286,14 +330,20 @@ fn write_behind_truncate_flush_reopen() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 1), (1, 2), (2, 3), (3, 4)],
+        )
+        .unwrap();
         t.flush().unwrap();
-        t.truncate(2).unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 2)
+            .unwrap();
         assert_eq!(t.len(), 2);
         drop(t);
         let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
         assert_eq!(t.len(), 4);
-        t.truncate(2).unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 2)
+            .unwrap();
         t.flush().unwrap();
     }
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
@@ -310,10 +360,15 @@ fn append_only_flush_extends_without_losing_prefix() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 100), (1, 101)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 100), (1, 101)],
+        )
+        .unwrap();
         t.flush().unwrap();
         // Pure tip extension (unstored index 2, disk length 2).
-        t.set(2, 102).unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 2, 102)
+            .unwrap();
         t.flush().unwrap();
     }
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
@@ -329,13 +384,18 @@ fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-    t.set(3, 42).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 3, 42)
+        .unwrap();
     assert_eq!(t.len(), 4);
     assert_eq!(t.get(0).unwrap(), 0);
     assert_eq!(t.get(1).unwrap(), 0);
     assert_eq!(t.get(2).unwrap(), 0);
     assert_eq!(t.get(3).unwrap(), 42);
-    t.set_many(&[(1, 11), (5, 55), (3, 33)]).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(1, 11), (5, 55), (3, 33)],
+    )
+    .unwrap();
     assert_eq!(t.len(), 6);
     assert_eq!(t.get(1).unwrap(), 11);
     assert_eq!(t.get(3).unwrap(), 33);
@@ -343,7 +403,8 @@ fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
     t.flush_async().unwrap();
     t.flush_dirty().unwrap();
     t.flush().unwrap();
-    t.truncate(0).unwrap();
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 0)
+        .unwrap();
     t.flush().unwrap();
     assert_eq!(t.len(), 0);
     drop(t);
@@ -370,9 +431,11 @@ fn store_on_another_thread_during_flush_is_refused() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
-    t.set_many(&[(0, 1), (1, 2)]).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(0, 1), (1, 2)])
+        .unwrap();
     t.flush().unwrap();
-    t.set(0, 5).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 5)
+        .unwrap();
     let (started, start_rx) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     let flush_t = {
@@ -388,14 +451,15 @@ fn store_on_another_thread_during_flush_is_refused() {
         })
     };
     start_rx.recv().unwrap();
-    let during = t.set(0, 9);
+    let during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 9);
     release.send(()).unwrap();
     flush_t.join().unwrap();
     assert!(during.is_err(), "store during flush refused={during:?}");
     drop(t);
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.get(0).unwrap(), 5);
-    t.set(0, 9).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 9)
+        .unwrap();
     t.flush().unwrap();
     drop(t);
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
