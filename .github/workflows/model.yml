@@ -5,6 +5,10 @@
 # nightly schedule raises the budget (TESTING.md) and seeds shuttle with the
 # run id. The index-release order is not a model: it needs a Query full of
 # std locks.
+#
+# rustc comes from rust-toolchain.toml (the nix-shell / crane baseline). The
+# runner image's rustup auto-installs that toolchain and its components on
+# first cargo.
 
 name: model
 
@@ -45,7 +49,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@035fceb3c12fb0c6a9461b52775e16473133e591 # 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: model-${{ matrix.engine }}
