@@ -25,7 +25,10 @@ fn get_racing_truncate_does_not_panic() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
-    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1023, 7)
+    let wide: Vec<_> = (0..1024u64)
+        .map(|i| (i, if i == 1023 { 7 } else { 0 }))
+        .collect();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &wide)
         .unwrap();
     assert!(t.l2_resident_bytes() > 0, "test needs the in-RAM image");
     let stop = Arc::new(AtomicBool::new(false));
@@ -44,7 +47,7 @@ fn get_racing_truncate_does_not_panic() {
     while std::time::Instant::now() < deadline {
         t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 0)
             .unwrap();
-        t.set(&rbitcoin_store::ClassCWrite::for_test(), 1023, 7)
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &wide)
             .unwrap();
     }
     stop.store(true, Ordering::Relaxed);
@@ -304,8 +307,11 @@ fn array_set_get_grow_set_many_truncate_flush() {
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.len(), 0);
     assert_eq!(t.get(0).unwrap(), 0);
-    t.set(&rbitcoin_store::ClassCWrite::for_test(), 3, 30)
-        .unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 0), (1, 0), (2, 0), (3, 30)],
+    )
+    .unwrap();
     assert_eq!(t.len(), 4);
     assert_eq!(t.get(0).unwrap(), 0);
     assert_eq!(t.get(3).unwrap(), 30);
@@ -316,7 +322,7 @@ fn array_set_get_grow_set_many_truncate_flush() {
         .unwrap();
     t.set_many(
         &rbitcoin_store::ClassCWrite::for_test(),
-        &[(10, 100), (5, 50)],
+        &[(4, 0), (5, 50), (6, 0), (7, 0), (8, 0), (9, 0), (10, 100)],
     )
     .unwrap();
     assert_eq!(t.len(), 11);
@@ -456,20 +462,13 @@ fn append_only_flush_extends_without_losing_prefix() {
 }
 
 #[test]
-fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
+fn contiguous_image_flush_async_and_env_cap() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-    t.set(&rbitcoin_store::ClassCWrite::for_test(), 3, 42)
-        .unwrap();
-    assert_eq!(t.len(), 4);
-    assert_eq!(t.get(0).unwrap(), 0);
-    assert_eq!(t.get(1).unwrap(), 0);
-    assert_eq!(t.get(2).unwrap(), 0);
-    assert_eq!(t.get(3).unwrap(), 42);
     t.set_many(
         &rbitcoin_store::ClassCWrite::for_test(),
-        &[(1, 11), (5, 55), (3, 33)],
+        &[(0, 0), (1, 11), (2, 0), (3, 33), (4, 0), (5, 55)],
     )
     .unwrap();
     assert_eq!(t.len(), 6);
@@ -540,5 +539,42 @@ fn store_on_another_thread_during_flush_is_refused() {
     drop(t);
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.get(0).unwrap(), 9);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Truncate keeps the logical length. A later store may overwrite a slot
+/// below that length or append the next index. It may not skip ahead: the
+/// bytes above the length are still in the buffer, and a skip would publish
+/// them again.
+#[test]
+fn sparse_set_after_truncate_is_corrupt() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.set_many(&write, &[(0, 10), (1, 11), (2, 12), (3, 13)])
+        .unwrap();
+    t.truncate(&write, 1).unwrap();
+    assert!(matches!(t.set(&write, 3, 99), Err(StoreError::Corrupt(_))));
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.get(0).unwrap(), 10);
+    t.set(&write, 1, 77).unwrap();
+    assert_eq!((t.len(), t.get(0).unwrap(), t.get(1).unwrap()), (2, 10, 77));
+    t.set_many(&write, &[(2, 20), (3, 21)]).unwrap();
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.get(3).unwrap(), 21);
+    t.set(&write, 0, 1).unwrap();
+    assert_eq!(t.get(0).unwrap(), 1);
+    assert!(matches!(
+        t.set_many(&write, &[(5, 50)]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert_eq!(t.len(), 4);
+    t.set_zero_gap(&write, 6, 60).unwrap();
+    assert_eq!(t.len(), 7);
+    assert_eq!(t.get(4).unwrap(), 0);
+    assert_eq!(t.get(5).unwrap(), 0);
+    assert_eq!(t.get(6).unwrap(), 60);
+    assert_eq!(t.get(0).unwrap(), 1);
     let _ = std::fs::remove_file(&path);
 }

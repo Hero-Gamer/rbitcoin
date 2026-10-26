@@ -404,32 +404,63 @@ impl ArrayTable {
         Some((slots[index as usize].load(order), len))
     }
 
-    pub fn set(&self, _write: &ClassCWrite, index: u64, value: u64) -> Result<(), StoreError> {
-        let _odd = self.begin_store()?;
-        if !self.in_ram {
-            let len = self.len.load(Ordering::Acquire);
-            if index >= len {
-                for i in len..index {
-                    self.file.write_at(Self::offset(i), &0u64.to_le_bytes())?;
-                }
-            }
-            self.file
-                .write_at(Self::offset(index), &value.to_le_bytes())?;
-            if index >= len {
-                self.len.store(index + 1, Ordering::Release);
-            }
-            return Ok(());
-        }
-        self.store_ram(index, index, &[(index, value)]);
-        Ok(())
+    /// Overwrite `index < len`, or append `index == len`. A higher index is
+    /// corrupt: the buffer can still hold bytes above `len` after a truncate.
+    pub fn set(&self, write: &ClassCWrite, index: u64, value: u64) -> Result<(), StoreError> {
+        self.write_slots(write, index, index, &[(index, value)], false)
     }
 
-    pub fn set_many(&self, _write: &ClassCWrite, pairs: &[(u64, u64)]) -> Result<(), StoreError> {
+    /// Like [`Self::set`], and indexes from `len` up to `index` that this call
+    /// does not name become zero. Header ranges use this. A failed header can
+    /// sit between two bodies; that slot is empty, not the bytes truncate left.
+    pub fn set_zero_gap(
+        &self,
+        write: &ClassCWrite,
+        index: u64,
+        value: u64,
+    ) -> Result<(), StoreError> {
+        self.write_slots(write, index, index, &[(index, value)], true)
+    }
+
+    pub fn set_many(&self, write: &ClassCWrite, pairs: &[(u64, u64)]) -> Result<(), StoreError> {
+        self.write_many(write, pairs, false)
+    }
+
+    /// Like [`Self::set_many`]. Slots from `len` through `max` that `pairs`
+    /// does not name become zero.
+    pub fn set_many_zero_gap(
+        &self,
+        write: &ClassCWrite,
+        pairs: &[(u64, u64)],
+    ) -> Result<(), StoreError> {
+        self.write_many(write, pairs, true)
+    }
+
+    fn write_many(
+        &self,
+        write: &ClassCWrite,
+        pairs: &[(u64, u64)],
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
         if pairs.is_empty() {
             return Ok(());
         }
         let max_idx = pairs.iter().map(|(i, _)| *i).max().unwrap();
         let min_idx = pairs.iter().map(|(i, _)| *i).min().unwrap();
+        self.write_slots(write, min_idx, max_idx, pairs, zero_gap)
+    }
+
+    fn write_slots(
+        &self,
+        _write: &ClassCWrite,
+        min_idx: u64,
+        max_idx: u64,
+        pairs: &[(u64, u64)],
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        if !zero_gap && !self.extension_is_dense(max_idx, pairs) {
+            return Err(StoreError::Corrupt("array set skips slots"));
+        }
         let _odd = self.begin_store()?;
         if !self.in_ram {
             let len = self.len.load(Ordering::Acquire);
@@ -454,21 +485,53 @@ impl ArrayTable {
             }
             return Ok(());
         }
-        self.store_ram(min_idx, max_idx, pairs);
+        self.store_ram(min_idx, max_idx, pairs, zero_gap);
         Ok(())
+    }
+
+    /// An append must name every index from `len` through `max`. Overwrites
+    /// below `len` may skip. A single next-slot append is dense by itself.
+    /// A skip would publish buffer bytes the length no longer names.
+    fn extension_is_dense(&self, max_idx: u64, pairs: &[(u64, u64)]) -> bool {
+        let len = self.len.load(Ordering::Acquire);
+        if max_idx <= len {
+            return true;
+        }
+        let width = max_idx - len + 1;
+        if width > pairs.len() as u64 {
+            return false;
+        }
+        let mut seen = vec![false; width as usize];
+        for &(index, _) in pairs {
+            if index >= len {
+                seen[(index - len) as usize] = true;
+            }
+        }
+        seen.iter().all(|slot| *slot)
     }
 
     /// Release-store each slot, then the length. A relaxed slot store can move
     /// one header column while that pair's counter still looks even.
-    fn store_ram(&self, min_idx: u64, max_idx: u64, pairs: &[(u64, u64)]) {
+    fn store_ram(&self, min_idx: u64, max_idx: u64, pairs: &[(u64, u64)], zero_gap: bool) {
         self.slots.grow(max_idx as usize + 1);
         let slots = self.slots.slots(Ordering::Relaxed);
+        let len_now = self.len.load(Ordering::Relaxed);
+        let mark = if zero_gap {
+            if max_idx >= len_now {
+                for i in len_now..=max_idx {
+                    slots[i as usize].store(0, Ordering::Release);
+                }
+            }
+            min_idx.min(len_now)
+        } else {
+            min_idx
+        };
         for &(index, value) in pairs {
             slots[index as usize].store(value, Ordering::Release);
         }
-        let len = self.len.load(Ordering::Relaxed).max(max_idx + 1);
+        let len = len_now.max(max_idx + 1);
         self.len.store(len, Ordering::Relaxed);
-        self.mark_unstored(min_idx);
+        self.mark_unstored(mark);
     }
 
     pub fn truncate(&self, _write: &ClassCWrite, new_len: u64) -> Result<(), StoreError> {

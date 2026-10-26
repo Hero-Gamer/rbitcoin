@@ -532,8 +532,8 @@ impl HeaderTxsTable {
             return Err(StoreError::InvalidFk);
         }
         let _pair = seq_odd(&self.seq);
-        self.first.set(write, id - 1, first_tx_fk.0)?;
-        self.count.set(write, id - 1, u64::from(n))?;
+        self.first.set_zero_gap(write, id - 1, first_tx_fk.0)?;
+        self.count.set_zero_gap(write, id - 1, u64::from(n))?;
         Ok(())
     }
 
@@ -555,8 +555,8 @@ impl HeaderTxsTable {
             count_pairs.push((id - 1, u64::from(n)));
         }
         let _pair = seq_odd(&self.seq);
-        self.first.set_many(write, &first_pairs)?;
-        self.count.set_many(write, &count_pairs)?;
+        self.first.set_many_zero_gap(write, &first_pairs)?;
+        self.count.set_many_zero_gap(write, &count_pairs)?;
         Ok(())
     }
 
@@ -580,8 +580,8 @@ impl HeaderTxsTable {
             count_pairs.push((id - 1, u64::from(n)));
         }
         let _pair = seq_odd(&self.seq);
-        self.first.set_many(write, &first_pairs)?;
-        self.count.set_many(write, &count_pairs)?;
+        self.first.set_many_zero_gap(write, &first_pairs)?;
+        self.count.set_many_zero_gap(write, &count_pairs)?;
         Ok(())
     }
 

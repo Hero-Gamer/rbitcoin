@@ -37,12 +37,11 @@ fn eight_notes_do_not_publish_and_checkpoint_keeps_the_snapshot() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let s = rbitcoin_store::Store::create_tiny(&dir).unwrap();
+    let pairs: Vec<_> = (0..=7u32)
+        .map(|h| (rbitcoin_primitives::Height(h), rbitcoin_primitives::Fk(1)))
+        .collect();
     s.confirmed
-        .set(
-            &rbitcoin_store::ClassCWrite::for_test(),
-            rbitcoin_primitives::Height(7),
-            rbitcoin_primitives::Fk(1),
-        )
+        .set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
         .unwrap();
     for _ in 0..8 {
         s.note_spend_snapshot(4);
@@ -153,12 +152,11 @@ fn checkpoint_stops_below_a_pending_annotate() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let s = rbitcoin_store::Store::create_tiny(&dir).unwrap();
+    let pairs: Vec<_> = (0..=7u32)
+        .map(|h| (rbitcoin_primitives::Height(h), rbitcoin_primitives::Fk(1)))
+        .collect();
     s.confirmed
-        .set(
-            &rbitcoin_store::ClassCWrite::for_test(),
-            rbitcoin_primitives::Height(7),
-            rbitcoin_primitives::Fk(1),
-        )
+        .set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
         .unwrap();
     s.note_spend_snapshot(7);
     s.note_spend_annotate_pending(5);

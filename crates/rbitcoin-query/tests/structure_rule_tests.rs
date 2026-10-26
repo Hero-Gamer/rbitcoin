@@ -495,13 +495,14 @@ fn plant_bip34_ancestor(q: &rbitcoin_query::Query, hash: [u8; 32]) {
             ..HeaderRecord::default()
         })
         .unwrap();
+    let tip = main.btc.bip34_height;
+    let pairs: Vec<_> = (0..tip)
+        .map(|h| (Height(h), rbitcoin_primitives::Fk(1)))
+        .chain(std::iter::once((Height(tip), hfk)))
+        .collect();
     q.store()
         .confirmed
-        .set(
-            &rbitcoin_store::ClassCWrite::for_test(),
-            Height(main.btc.bip34_height),
-            hfk,
-        )
+        .set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
         .unwrap();
     q.clear_bip34_ancestor();
 }

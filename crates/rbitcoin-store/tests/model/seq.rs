@@ -23,7 +23,9 @@ fn len_belongs_to_the_slot_and_a_header_pair_does_not_mix() {
         let headers_w = std::sync::Arc::clone(&headers);
         let writer = loom::thread::spawn(move || {
             let write = ClassCWrite::for_test();
-            slots_w.set(&write, 3, 99).unwrap();
+            slots_w
+                .set_many(&write, &[(0, 0), (1, 0), (2, 0), (3, 99)])
+                .unwrap();
             headers_w.put_range(&write, Fk(1), Fk(10), 4).unwrap();
             headers_w.put_range(&write, Fk(1), Fk(50), 9).unwrap();
         });
