@@ -154,6 +154,8 @@ pub const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
 /// Missed header asks before header-role retirement or disconnection.
 #[doc(hidden)]
 pub const HEADER_MISS_DISCONNECT: u8 = 2;
+/// Recent block traffic permits two extra header misses, not indefinite silence.
+const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = HEADER_MISS_DISCONNECT + 2;
 /// Header-only timeouts must not destroy a productive block session. Match
 /// the minimum block-stall window; pings and unrelated bytes do not renew it.
 #[doc(hidden)]
@@ -2561,7 +2563,7 @@ pub fn expire_header_ask(st: &mut IbdWorkState) -> Option<usize> {
         st.header_walk.challenge_external = false;
         if n >= HEADER_MISS_DISCONNECT {
             finish_header_timeout(st, peer);
-        } else if !retain_productive_header_timeout_peer(st, peer) {
+        } else if !header_peer_has_block_progress(st, peer) {
             st.header_walk.walk_quiet.insert(peer);
         }
         return None;
@@ -2591,19 +2593,29 @@ pub fn header_timeout_has_block_progress(slot: &super::peer_io::PeerSlot, now_ms
 }
 
 fn finish_header_timeout(st: &mut IbdWorkState, peer: usize) {
-    st.header_walk.header_misses.remove(&peer);
-    if !retain_productive_header_timeout_peer(st, peer) {
-        punish_header_peer(st, peer);
+    let misses = st
+        .header_walk
+        .header_misses
+        .get(&peer)
+        .copied()
+        .unwrap_or(0);
+    if misses < PRODUCTIVE_HEADER_MISS_DISCONNECT && retain_productive_header_timeout_peer(st, peer)
+    {
+        return;
     }
+    st.header_walk.header_misses.remove(&peer);
+    punish_header_peer(st, peer);
+}
+
+fn header_peer_has_block_progress(st: &IbdWorkState, peer: usize) -> bool {
+    let now_ms = super::peer_io::ibd_mono_ms();
+    st.slots
+        .iter()
+        .any(|slot| slot.id == peer && header_timeout_has_block_progress(slot, now_ms))
 }
 
 fn retain_productive_header_timeout_peer(st: &mut IbdWorkState, peer: usize) -> bool {
-    let now_ms = super::peer_io::ibd_mono_ms();
-    let productive = st
-        .slots
-        .iter()
-        .any(|slot| slot.id == peer && header_timeout_has_block_progress(slot, now_ms));
-    if !productive {
+    if !header_peer_has_block_progress(st, peer) {
         return false;
     }
     st.header_walk.header_timeout_peers.insert(peer);

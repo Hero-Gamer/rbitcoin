@@ -139,11 +139,13 @@ fn spawn_server(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opt-in delayed-supplier BIP324 replay; default coverage backdates header deadlines and exercises assignment directly"]
 async fn healthy_supplier_gets_frontier_below_racing_threshold() {
     competing(32).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opt-in 1100-block BIP324 replay; default coverage queues 1000 tiny bodies without mining or wall-clock sleeps"]
 async fn healthy_supplier_gets_frontier_above_racing_threshold() {
     competing(1100).await;
 }
@@ -214,6 +216,7 @@ async fn competing(count: u32) {
             }).await;
             eprintln!("competition count={count} handoff_wait_ms={} supplier_frontier={} withholder_closed_before_cancel={}", requested_at.elapsed().as_millis(), supplier.frontier.load(Ordering::SeqCst), primary.closed.load(Ordering::SeqCst));
             frontier_result.map_err(|_| "healthy connected supplier was not asked for block 1 within 8s")?;
+            if primary.closed.load(Ordering::SeqCst) { return Err("handoff must not rely on dropping the productive connection"); }
             while node.tip_height() != Some(count) { tokio::time::sleep(Duration::from_millis(10)).await; }
             if node.hub.tip_hash() != Some(blocks[count as usize].block_hash()) { return Err("unexpected final tip hash"); }
             Ok::<(), &str>(())

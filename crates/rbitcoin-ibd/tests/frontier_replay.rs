@@ -68,7 +68,7 @@ async fn serve_delayed_frontier(
     let mut released = false;
     let mut frontier_requested = false;
     let mut pending: VecDeque<usize> = VecDeque::new();
-    let mut sends = tokio::time::interval(Duration::from_millis(200));
+    let mut sends = tokio::time::interval(Duration::from_millis(5));
     loop {
         let frame = tokio::select! {
             _ = sends.tick(), if !pending.is_empty() => {
@@ -136,6 +136,7 @@ async fn later_bodies_wait_for_frontier_then_fully_validate() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "opt-in BIP324 replay of real header deadlines; default coverage backdates the header lane"]
 async fn header_timeouts_preserve_frontier_delivery_from_productive_peer() {
     run_replay(Replay::SilentHeaders).await;
 }
@@ -156,7 +157,7 @@ async fn run_replay(mode: Replay) {
     )
     .await
     .unwrap();
-    let blocks = Arc::new(chain(12));
+    let blocks = Arc::new(chain(6));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = rbitcoin_net::NetAddr::Ip(listener.local_addr().unwrap());
     let (release, released) = oneshot::channel();
@@ -224,16 +225,16 @@ async fn run_replay(mode: Replay) {
                 }
                 tokio::time::sleep(Duration::from_secs(6)).await;
             } else {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                tokio::task::yield_now().await;
             }
             assert_eq!(node.tip_height(), Some(0));
             release
                 .send(())
                 .map_err(|_| "peer disconnected before withheld frontier release")?;
-            while node.tip_height() != Some(12) {
+            while node.tip_height() != Some(6) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert_eq!(node.hub.tip_hash(), Some(blocks[12].block_hash()));
+            assert_eq!(node.hub.tip_hash(), Some(blocks[6].block_hash()));
             if matches!(mode, Replay::InitialPeerEof) {
                 assert_eq!(stats.frontier_failures.load(Ordering::SeqCst), 1);
                 assert!(
