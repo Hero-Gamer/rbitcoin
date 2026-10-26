@@ -16,9 +16,11 @@ use std::marker::PhantomData;
 use std::path::Path;
 use std::sync::Mutex;
 
-/// One Class C writer (`!Send` + `!Sync`). A shared [`crate::Store`] cannot carry
-/// it onto another thread. Confirm-write, tip-accept, and startup each mint one
-/// on the storing thread. The flush thread reads live slots and does not take it.
+/// Minted on the storing thread (`!Send` + `!Sync`). A shared store cannot
+/// carry this value onto another thread. It does not stop that thread from
+/// minting its own. The sequence counter's even-to-odd exchange is what keeps
+/// two stores out of one image. Confirm-write, tip-accept, and startup each
+/// mint one. The flush thread reads live slots and does not take it.
 #[derive(Default)]
 pub struct ClassCWrite(PhantomData<*const ()>);
 
@@ -413,7 +415,7 @@ pub(crate) fn seq_begin(seq: &AtomicU64, flushing: &AtomicBool) -> Result<SeqOdd
     if flushing.load(Ordering::SeqCst) {
         return Err(StoreError::Rejected("class C store during flush"));
     }
-    seq.fetch_add(1, Ordering::SeqCst);
+    claim_odd(seq);
     atomic::fence(Ordering::SeqCst);
     if flushing.load(Ordering::SeqCst) {
         seq.fetch_add(1, Ordering::SeqCst);
@@ -425,9 +427,27 @@ pub(crate) fn seq_begin(seq: &AtomicU64, flushing: &AtomicBool) -> Result<SeqOdd
 
 /// Header pairs have no flush flag. Same odd-then-fence order as [`seq_begin`].
 pub(crate) fn seq_odd(seq: &AtomicU64) -> SeqOdd {
-    seq.fetch_add(1, Ordering::Relaxed);
+    claim_odd(seq);
     atomic::fence(Ordering::Release);
     SeqOdd(seq as *const AtomicU64)
+}
+
+/// Even to odd. A loser waits. The release fence after this is what publishes
+/// the slot stores; this exchange does not.
+fn claim_odd(seq: &AtomicU64) {
+    loop {
+        let cur = seq.load(Ordering::SeqCst);
+        if cur & 1 == 1 {
+            crate::sync::spin();
+            continue;
+        }
+        if seq
+            .compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+    }
 }
 
 pub(crate) fn seq_arm(seq: &AtomicU64, flushing: &AtomicBool) {
@@ -816,9 +836,8 @@ impl ArrayTable {
         &self,
         mut between: impl FnMut(&Self, FlushStep),
     ) -> Result<(), StoreError> {
-        // `strong_tx` has one flusher. Slot tables keep the lock.
-        let _one =
-            (!self.byte_body).then(|| self.flush_lock.lock().unwrap_or_else(|e| e.into_inner()));
+        // One flusher, including the strong-bit image.
+        let _one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
         if !self.in_ram {
             return Ok(());
         }

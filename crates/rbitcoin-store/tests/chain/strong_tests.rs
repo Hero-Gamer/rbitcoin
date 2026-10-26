@@ -63,6 +63,50 @@ fn strong_bit_past_the_reservation_is_corrupt() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two flushes of the bit image and one store all return. Loom cannot run
+/// this: the flush lock is a real mutex, and a second waiter blocks the
+/// model thread. A store that returned is on disk once the mark is clean.
+#[test]
+fn two_strong_flushes_keep_a_store_that_returned() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = tmp();
+    let table = Arc::new(StrongTxTable::create(&dir).unwrap());
+    table
+        .set_bit(&rbitcoin_store::ClassCWrite::for_test(), 0, true)
+        .unwrap();
+    table.flush().unwrap();
+    let stored = Arc::new(AtomicBool::new(false));
+    let writing = Arc::clone(&table);
+    let stored_w = Arc::clone(&stored);
+    let writer = std::thread::spawn(move || {
+        if writing
+            .set_bit(&rbitcoin_store::ClassCWrite::for_test(), 8, true)
+            .is_ok()
+        {
+            stored_w.store(true, Ordering::Relaxed);
+        }
+    });
+    let first = Arc::clone(&table);
+    let second = Arc::clone(&table);
+    let flush_a = std::thread::spawn(move || first.table.flush_dirty().unwrap());
+    let flush_b = std::thread::spawn(move || second.table.flush_dirty().unwrap());
+    writer.join().unwrap();
+    flush_a.join().unwrap();
+    flush_b.join().unwrap();
+    if stored.load(Ordering::Relaxed)
+        && table.table.unstored_from.load(Ordering::Relaxed) == u64::MAX
+    {
+        let opened = StrongTxTable::open(&dir).unwrap();
+        assert!(
+            opened.get_bit(8).unwrap(),
+            "store that returned is not on disk"
+        );
+    }
+    drop(table);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A bit store after the flush has noticed dirt, and before new stores are
 /// excluded, is still in this flush.
 #[test]

@@ -217,9 +217,12 @@ impl StrongTxTable {
     fn store_byte(words: &[AtomicU64], index: usize, value: u8) {
         let w = &words[index / 8];
         let shift = (index % 8) * 8;
-        let _ = w.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            Some((cur & !(0xffu64 << shift)) | (u64::from(value) << shift))
-        });
+        let update = |cur: u64| Some((cur & !(0xffu64 << shift)) | (u64::from(value) << shift));
+        // loom 0.7 still names this `fetch_update`. std renamed it `try_update`.
+        #[cfg(loom)]
+        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, update);
+        #[cfg(not(loom))]
+        let _ = w.try_update(Ordering::Relaxed, Ordering::Relaxed, update);
     }
 
     fn copy_bytes_in(words: &[AtomicU64], src: &[u8]) {

@@ -262,8 +262,10 @@ write-behind (barrier `flush_class_c_tip`); large tables stay L0.
 In-RAM gets of `confirmed`, `header_txs`, and `strong_tx` take no reader-writer
 lock. `strong_tx` packs its bits into the same slot buffer and flush as those
 arrays. Its length is the body in bytes and is not rounded up to a word.
-The writer advances a sequence counter to odd, release-fences, stores
-the slots, and advances the counter to even. The odd advance does not publish
+The writer advances a sequence counter from even to odd with a
+compare-exchange, so a second writer waits. The `ClassCWrite` token does
+not do that exclusion. It then release-fences, stores the slots, and
+advances the counter to even. The odd advance does not publish
 those stores: a release on it would publish only the writes that came before
 it, and a `SeqCst` increment does not either. A get loads the counter, loads
 the slots, acquire-fences, and keeps the sample only when the counter is still
