@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 
 #[doc(hidden)]
+pub mod json_cpu;
+#[doc(hidden)]
 pub mod server;
 #[doc(hidden)]
 pub mod silent_scan;
@@ -21,6 +23,7 @@ pub mod tweaks;
 #[doc(hidden)]
 pub mod unspent;
 
+pub use json_cpu::{encode_json_body, json_is_cpu_heavy, JSON_CPU_MIN};
 pub use server::{
     batch_window, electrum_scripthash_hex, parse_electrum_request_line, perf_totals, run_electrum,
     sample_reset_perf, ElectrumConfig, ElectrumHandle, ServeLimits, TipNotify,

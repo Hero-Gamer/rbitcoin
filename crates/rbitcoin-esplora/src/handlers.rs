@@ -1,8 +1,8 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{
-    block_hash_hex, maybe_attach_view, mempool_wire, not_found, parse_hash32, pin_or_reject,
-    plain_ok, store_err, AppState, AsOf, GbtCache, JoinClient,
+    block_hash_hex, json_reply_here, maybe_attach_view, mempool_wire, not_found, parse_hash32,
+    pin_or_reject, plain_ok, store_err, AppState, AsOf, GbtCache, JoinClient,
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
@@ -12,7 +12,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bitcoin::address::Address;
 use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
 use bitcoin::hashes::Hash;
@@ -152,7 +151,7 @@ pub async fn block_json(State(st): State<AppState>, Path(hash_hex): Path<String>
     };
     let q = std::sync::Arc::clone(&st.query);
     match tokio::task::spawn_blocking(move || block_summary_json(&q, &hash)).await {
-        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Ok(v)) => json_reply_here(v),
         Ok(Err(e)) => store_err(e),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -186,12 +185,11 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
         return not_found();
     }
     match st.query.height_of_hash(&hash) {
-        Ok(None) => Json(json!({
+        Ok(None) => json_reply_here(json!({
             "in_best_chain": false,
             "height": null,
             "next_best": null,
-        }))
-        .into_response(),
+        })),
         Ok(Some(h)) => {
             let next_best = if let Some(tip) = st.query.tip_height() {
                 if h.0 < tip.0 {
@@ -205,12 +203,11 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
             } else {
                 Value::Null
             };
-            Json(json!({
+            json_reply_here(json!({
                 "in_best_chain": true,
                 "height": h.0,
                 "next_best": next_best,
             }))
-            .into_response()
         }
         Err(e) => store_err(e),
     }
@@ -255,7 +252,7 @@ pub async fn blocks_from_height(State(st): State<AppState>, Path(start): Path<u3
 #[doc(hidden)]
 pub fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
     let Some(tip) = st.query.tip_height() else {
-        return Json(json!([])).into_response();
+        return json_reply_here(json!([]));
     };
     let mut h = start.unwrap_or(tip.0);
     if h > tip.0 {
@@ -276,7 +273,7 @@ pub fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
         }
         h -= 1;
     }
-    Json(out).into_response()
+    json_reply_here(out)
 }
 
 pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
@@ -291,7 +288,7 @@ pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String
             return not_found();
         };
         match st.query.block_txids(h) {
-            Ok(ids) => Json(ids.iter().map(block_hash_hex).collect::<Vec<_>>()).into_response(),
+            Ok(ids) => json_reply_here(ids.iter().map(block_hash_hex).collect::<Vec<_>>()),
             Err(e) => store_err(e),
         }
     })
@@ -341,7 +338,7 @@ pub fn block_txs_impl(st: AppState, hash_hex: &str, start: u32) -> Response {
                     Err(e) => return store_err(e),
                 }
             }
-            Json(out).into_response()
+            json_reply_here(out)
         }
         Err(e) => store_err(e),
     }
@@ -370,12 +367,11 @@ pub fn tx_merkle_proof_sync(st: AppState, txid_hex: String) -> Response {
     match st.query.merkle_proof(Height(height), &txid) {
         Ok(proof) => {
             let merkle: Vec<String> = proof.merkle.iter().map(block_hash_hex).collect();
-            Json(json!({
+            json_reply_here(json!({
                 "block_height": proof.block_height,
                 "merkle": merkle,
                 "pos": proof.pos,
             }))
-            .into_response()
         }
         Err(e) => store_err(e),
     }
@@ -549,7 +545,7 @@ pub async fn block_height_tx(
             Err(e) => return store_err(e),
         };
         match build_tx_json(&st.query, fk, st.network, Some(&view)) {
-            Ok(v) => maybe_attach_view(Json(v).into_response(), Some(view)),
+            Ok(v) => maybe_attach_view(json_reply_here(v), Some(view)),
             Err(e) => store_err(e),
         }
     })
@@ -568,7 +564,7 @@ pub async fn block_height_tx_out(
             Err(r) => return r,
         };
         match output_at_height(&st, &view, height, index, vout) {
-            Ok(Some(v)) => maybe_attach_view(Json(v).into_response(), Some(view)),
+            Ok(Some(v)) => maybe_attach_view(json_reply_here(v), Some(view)),
             Ok(None) => not_found(),
             Err(e) => store_err(e),
         }
@@ -623,7 +619,7 @@ pub async fn post_block_height_outs(
                 Err(e) => return store_err(e),
             }
         }
-        maybe_attach_view(Json(Value::Array(out)).into_response(), Some(view))
+        maybe_attach_view(json_reply_here(Value::Array(out)), Some(view))
     })
     .await
 }
@@ -662,7 +658,7 @@ pub async fn tx_out(
             Err(e) => return store_err(e),
         }
         match output_at_view(&st.query, st.network, fk, &txid, vout, &view) {
-            Ok(v) => maybe_attach_view(Json(v).into_response(), Some(view)),
+            Ok(v) => maybe_attach_view(json_reply_here(v), Some(view)),
             Err(e) => store_err(e),
         }
     })
@@ -697,7 +693,7 @@ pub async fn tx_outspend(
             None
         };
         match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
-            Ok(v) => maybe_attach_view(Json(v).into_response(), view),
+            Ok(v) => maybe_attach_view(json_reply_here(v), view),
             Err(e) => store_err(e),
         }
     })
@@ -751,7 +747,7 @@ pub async fn tx_outspends(
                 Err(e) => return store_err(e),
             }
         }
-        maybe_attach_view(Json(arr).into_response(), view)
+        maybe_attach_view(json_reply_here(arr), view)
     })
     .await
 }
@@ -865,7 +861,7 @@ pub async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Respon
     })
     .await
     {
-        Ok(r) => r,
+        Ok(r) => crate::server::ensure_json(r).await,
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -947,7 +943,7 @@ pub async fn address_info(
                     asof,
                     client.as_deref(),
                 ) {
-                    Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
+                    Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
                     Err(r) => r,
                 }
             })
@@ -975,7 +971,7 @@ pub async fn scripthash_info(
             asof,
             client.as_deref(),
         ) {
-            Ok((v, view)) => maybe_attach_view(Json(v).into_response(), view),
+            Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
             Err(r) => r,
         }
     })
@@ -1036,7 +1032,7 @@ pub fn utxo_response(
     };
     maybe_attach_view(
         match utxo_list_json(&st.query, &list) {
-            Ok(v) => Json(v).into_response(),
+            Ok(v) => json_reply_here(v),
             Err(e) => store_err(e),
         },
         view,
@@ -1323,7 +1319,7 @@ pub fn summary_page_sh(
     };
     maybe_attach_view(
         match summaries_json(&st.query, &items) {
-            Ok(v) => Json(v).into_response(),
+            Ok(v) => json_reply_here(v),
             Err(e) => store_err(e),
         },
         view,
@@ -1398,7 +1394,7 @@ pub fn chain_page_sh(
     };
     maybe_attach_view(
         match history_items_to_tx_json(&st.query, &items, st.network) {
-            Ok(v) => Json(v).into_response(),
+            Ok(v) => json_reply_here(v),
             Err(e) => store_err(e),
         },
         view,
@@ -1461,7 +1457,7 @@ pub fn combined_txs(
         match history_items_to_tx_json(&st.query, &items, st.network) {
             Ok(chain) => {
                 out.extend(chain);
-                Json(out).into_response()
+                json_reply_here(out)
             }
             Err(e) => store_err(e),
         },
@@ -1731,7 +1727,7 @@ pub fn multi_txs(
     sort_confirmed_txs(&mut chain);
     truncate_page(&mut chain, limit);
     mempool_rows.extend(chain);
-    Json(mempool_rows).into_response()
+    json_reply_here(mempool_rows)
 }
 
 #[doc(hidden)]
@@ -1785,7 +1781,7 @@ pub fn multi_summary(
     let mut rows = dedup_txid(rows);
     sort_summaries_newest(&mut rows);
     truncate_page(&mut rows, limit);
-    Json(rows).into_response()
+    json_reply_here(rows)
 }
 
 #[doc(hidden)]
@@ -1858,7 +1854,7 @@ pub async fn mempool_info(State(st): State<AppState>) -> Response {
 
 #[doc(hidden)]
 pub fn mempool_info_sync(st: &AppState) -> Response {
-    Json(mempool_info_json(st.mempool.as_deref())).into_response()
+    json_reply_here(mempool_info_json(st.mempool.as_deref()))
 }
 
 /// `GET /mempool` body. Request path loads published fee-snapshot totals.
@@ -1918,9 +1914,9 @@ pub fn fee_estimates_sync(st: &AppState) -> Response {
         .map(|m| m.fee_estimates_btc_per_kb())
         .unwrap_or_default();
     match fee_estimates_from(&pairs) {
-        Some(v) => Json(v).into_response(),
+        Some(v) => json_reply_here(v),
         // LDK aborts startup on a failed fee update and must not be handed an invented rate.
-        None if st.network != Network::Bitcoin => Json(json!({})).into_response(),
+        None if st.network != Network::Bitcoin => json_reply_here(json!({})),
         None => (StatusCode::SERVICE_UNAVAILABLE, "fee estimates unavailable").into_response(),
     }
 }
@@ -1932,19 +1928,19 @@ pub async fn mempool_txids(State(st): State<AppState>) -> Response {
 #[doc(hidden)]
 pub fn mempool_txids_sync(st: &AppState) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
-        return Json(json!([])).into_response();
+        return json_reply_here(json!([]));
     };
     let ids: Vec<String> = mp
         .list_live_meta()
         .into_iter()
         .map(|(txid, _, _)| block_hash_hex(&txid.to_byte_array()))
         .collect();
-    Json(ids).into_response()
+    json_reply_here(ids)
 }
 
 pub async fn mempool_recent(State(st): State<AppState>) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
-        return Json(json!([])).into_response();
+        return json_reply_here(json!([]));
     };
     let rows: Vec<Value> = mp
         .recent_accepts()
@@ -1958,7 +1954,7 @@ pub async fn mempool_recent(State(st): State<AppState>) -> Response {
             })
         })
         .collect();
-    Json(rows).into_response()
+    json_reply_here(rows)
 }
 
 /// Mempool-only history (up to 50), dedicated Esplora path.
@@ -2069,7 +2065,7 @@ pub fn push_mempool_tx_json(
 
 #[doc(hidden)]
 pub fn mempool_txs_for_sh(st: &AppState, sh: &[u8; 32]) -> Response {
-    Json(mempool_txs_json(st, sh)).into_response()
+    json_reply_here(mempool_txs_json(st, sh))
 }
 
 #[derive(Deserialize, Default)]
@@ -2247,13 +2243,12 @@ pub async fn post_txs_test(
         let mut ids = HashSet::new();
         if decoded.iter().any(|tx| !ids.insert(tx.compute_txid())) {
             let tx = &decoded[0];
-            return Json(json!([{
+            return json_reply_here(json!([{
                 "txid": format!("{}", tx.compute_txid()),
                 "wtxid": format!("{}", tx.compute_wtxid()),
                 "allowed": false,
                 "package-error": "package-contains-duplicates",
-            }]))
-            .into_response();
+            }]));
         }
         let mut out = Vec::new();
         for tx in decoded {
@@ -2289,7 +2284,7 @@ pub async fn post_txs_test(
                 }
             }
         }
-        Json(out).into_response()
+        json_reply_here(out)
     })
     .await
 }
@@ -2362,7 +2357,7 @@ pub async fn post_tx_package(State(st): State<AppState>, body: Bytes) -> Respons
                 .iter()
                 .map(|r| block_hash_hex(&r.txid.to_byte_array()))
                 .collect();
-            Json(json!({ "txids": txids })).into_response()
+            json_reply_here(json!({ "txids": txids }))
         }
         Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }

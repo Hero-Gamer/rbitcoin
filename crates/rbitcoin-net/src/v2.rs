@@ -673,19 +673,26 @@ pub async fn write_v2_msg(writer: &mut V2Writer, payload: NetworkMessage) -> Res
     write_v2_contents(writer, contents).await
 }
 
-/// Like [`write_v2_msg`]; heavy payloads encode on the blocking pool before encrypt.
+/// Like [`write_v2_msg`]. A heavy payload encodes on `rbtc-scripts-*`.
+/// A short header batch and an inv list of 64 or fewer stay on the caller.
 pub async fn write_v2_msg_offload(
     writer: &mut V2Writer,
     payload: NetworkMessage,
 ) -> Result<(), NetError> {
-    let contents = if encode_is_cpu_heavy(&payload) {
-        tokio::task::spawn_blocking(move || encode_v2_contents(payload))
-            .await
-            .map_err(|_| NetError::Protocol("encode task join failed"))??
-    } else {
-        encode_v2_contents(payload)?
-    };
+    let contents = encode_v2_payload(payload).await?;
     write_v2_contents(writer, contents).await
+}
+
+/// Encode one v2 payload. Heavy messages hop to `rbtc-scripts-*`.
+#[doc(hidden)]
+pub async fn encode_v2_payload(payload: NetworkMessage) -> Result<Vec<u8>, NetError> {
+    if !encode_is_cpu_heavy(&payload) {
+        return encode_v2_contents(payload);
+    }
+    match rbitcoin_consensus::script_pool::run_cpu(move || encode_v2_contents(payload)).await {
+        Some(contents) => contents,
+        None => Err(NetError::Protocol("encode task join failed")),
+    }
 }
 
 /// Next genuine application contents (skips decoy packets).

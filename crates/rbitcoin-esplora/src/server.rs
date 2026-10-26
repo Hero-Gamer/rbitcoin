@@ -8,7 +8,6 @@ use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Json;
 use axum::Router;
 use bitcoin::consensus::Encodable;
 use bitcoin::Network;
@@ -18,7 +17,7 @@ use rbitcoin_net::RequestMeter;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::{ChainView, ChainViewKind, Query, ShJoinSlot};
 use rbitcoin_store::StoreError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -137,6 +136,55 @@ pub fn maybe_attach_view(resp: Response, view: Option<ChainView>) -> Response {
         Some(v) => attach_chain_view(resp, v),
         None => resp,
     }
+}
+
+/// A JSON body whose encoded size is at least 4 KiB. The listener encodes it
+/// on `rbtc-scripts-*` after the store join returns.
+#[derive(Clone)]
+struct HeavyJson(Value);
+
+/// Encode on this thread when the body is under 4 KiB. A heavier body waits
+/// for [`ensure_json`] so a blocking-pool thread is not held across the encode.
+///
+/// Callers pass the same values `Json` used to take: a [`Value`], a list, or
+/// a string.
+#[doc(hidden)]
+pub fn json_reply_here(v: impl Serialize) -> Response {
+    let v = match serde_json::to_value(v) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                Vec::<u8>::from(&b"{}"[..]),
+            )
+                .into_response();
+        }
+    };
+    if !rbitcoin_electrum::json_is_cpu_heavy(&v) {
+        let bytes = serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec());
+        return ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+    }
+    let mut resp = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::empty())
+        .expect("json response");
+    resp.extensions_mut().insert(HeavyJson(v));
+    resp
+}
+
+/// Finish a [`json_reply_here`] body. A light reply is unchanged.
+#[doc(hidden)]
+pub async fn ensure_json(resp: Response) -> Response {
+    let (mut parts, body) = resp.into_parts();
+    let Some(heavy) = parts.extensions.remove::<HeavyJson>() else {
+        return Response::from_parts(parts, body);
+    };
+    let bytes = rbitcoin_electrum::encode_json_body(&heavy.0).await;
+    Response::from_parts(parts, axum::body::Body::from(bytes))
+}
+
+async fn finish_heavy_json(req: Request, next: Next) -> Response {
+    ensure_json(next.run(req).await).await
 }
 
 #[allow(clippy::result_large_err)] // public error enum
@@ -936,20 +984,21 @@ pub async fn run_esplora(
     } else {
         rest
     };
-    // Outer → inner: timeout → concurrency → body → meter → chain-view stamp.
-    // The timeout goes on last, outside the limit, so the wait for a slot
-    // counts against it.
+    // Outer → inner: timeout → concurrency → body → meter → chain-view stamp
+    // → heavy JSON encode. The timeout goes on last, outside the limit, so
+    // the wait for a slot counts against it.
     let conn_limit = GlobalConcurrencyLimitLayer::new(max_conn);
     let listener_layers = |r: Router<AppState>| {
-        r.layer(middleware::from_fn_with_state(
-            state.clone(),
-            stamp_chain_view_mw,
-        ))
-        .layer(middleware::from_fn(meter_rest))
-        .layer(RequestBodyLimitLayer::new(max_body))
-        // `Router::layer` wraps each route on its own; one global limit, cloned,
-        // shares its semaphore, so `max_conn` bounds the listener.
-        .layer(conn_limit.clone())
+        r.layer(middleware::from_fn(finish_heavy_json))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                stamp_chain_view_mw,
+            ))
+            .layer(middleware::from_fn(meter_rest))
+            .layer(RequestBodyLimitLayer::new(max_body))
+            // `Router::layer` wraps each route on its own; one global limit, cloned,
+            // shares its semaphore, so `max_conn` bounds the listener.
+            .layer(conn_limit.clone())
     };
     let request_timeout = || TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, timeout);
     let rest = listener_layers(rest.fallback(fallback_404)).layer(request_timeout());
@@ -1078,7 +1127,7 @@ pub async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -
         };
         match st.query.get_tx_by_txid(&txid) {
             Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network, None) {
-                Ok(v) => Json(v).into_response(),
+                Ok(v) => json_reply_here(v),
                 Err(e) => store_err(e),
             },
             Ok(None) => match mempool_wire(&st, &txid) {
@@ -1089,7 +1138,7 @@ pub async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -
                     None,
                     st.mempool.as_deref(),
                 ) {
-                    Ok(v) => Json(v).into_response(),
+                    Ok(v) => json_reply_here(v),
                     Err(e) => store_err(e),
                 },
                 None => not_found(),
@@ -1145,7 +1194,7 @@ pub async fn tx_status(
                     None => Ok(json!({ "confirmed": false })),
                 };
                 match status {
-                    Ok(v) => maybe_attach_view(Json(v).into_response(), view),
+                    Ok(v) => maybe_attach_view(json_reply_here(v), view),
                     Err(e) => store_err(e),
                 }
             }
@@ -1156,7 +1205,7 @@ pub async fn tx_status(
                 use bitcoin::hashes::Hash;
                 let tid = bitcoin::Txid::from_byte_array(txid);
                 if st.mempool.as_ref().is_some_and(|m| m.contains(&tid)) {
-                    Json(json!({ "confirmed": false })).into_response()
+                    json_reply_here(json!({ "confirmed": false }))
                 } else {
                     not_found()
                 }

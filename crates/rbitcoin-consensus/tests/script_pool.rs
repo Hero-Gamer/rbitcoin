@@ -855,3 +855,74 @@ fn second_stage_keeps_the_first_publisher_wake() {
     a.join().expect("stage a");
     b.join().expect("stage b");
 }
+
+static CPU_ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+fn note_cpu_wave(_: &u32) -> Result<(), ConsensusError> {
+    CPU_ORDER.lock().unwrap_or_else(|p| p.into_inner()).push(1);
+    Ok(())
+}
+
+fn block_on_cpu<T>(job: CpuJob<T>) -> Option<T> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let mut job = Pin::new(Box::new(job));
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match job.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+/// `run_cpu` finishes on `rbtc-scripts-*`. The caller parks; it does not
+/// take a blocking-pool thread. A published steal chunk runs before the guest.
+#[test]
+fn run_cpu_uses_one_script_worker_after_the_wave() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    CPU_ORDER.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    let n = worker_spawn_count();
+    let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+    let wave = start_for_each_pooled(vec![1u32], note_cpu_wave, 1)
+        .unwrap()
+        .expect("published wave");
+    let name = block_on_cpu(run_cpu(|| {
+        CPU_ORDER.lock().unwrap_or_else(|p| p.into_inner()).push(2);
+        thread::current().name().unwrap_or("").to_string()
+    }))
+    .expect("script worker");
+    wave.finish().unwrap();
+    occupy.release();
+    assert!(name.starts_with("rbtc-scripts-"), "guest ran on {name}");
+    assert_eq!(
+        CPU_ORDER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_slice(),
+        &[1, 2],
+        "the steal chunk finishes before the guest"
+    );
+}
+
+/// A guest that enters store IO trips the script-worker guard.
+#[test]
+fn run_cpu_guest_cannot_touch_store_io() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let hit = block_on_cpu(run_cpu(|| {
+        std::panic::catch_unwind(|| {
+            rbitcoin_primitives::assert_not_script_worker("store read");
+        })
+        .is_err()
+    }))
+    .expect("script worker");
+    assert!(hit, "store read on a script worker must panic");
+}

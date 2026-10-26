@@ -580,6 +580,7 @@ impl TableFile {
 
     /// Positional pread (page cache / disk). Preferred for Class A `tx.body`.
     pub fn pread_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
+        rbitcoin_primitives::assert_not_script_worker("store read");
         if buf.is_empty() {
             return Ok(());
         }
@@ -605,6 +606,7 @@ impl TableFile {
     /// `offset+len`, or an error is returned and HWM is left unchanged for this
     /// write (prior published range remains valid).
     pub fn write_at_pwrite(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
+        rbitcoin_primitives::assert_not_script_worker("store write");
         if bytes.is_empty() {
             return Ok(());
         }

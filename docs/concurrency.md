@@ -45,7 +45,7 @@ Three thread kinds only. **Tokio workers must not wait on a `std` mutex/rwlock, 
 |------|-----|--------|
 | Reactor | `tokio-rt-worker` × nCPU | epoll, timers, framing. Node caps `spawn_blocking` at nCPU (min 4), not tokio’s 512. |
 | Role | `tip-accept`, `ibd-header`, `ibd-confirm-*`, `rbtc-tip-flush`, `rbtc-sh-wb`, `rbtc-idx-wb` | Sole writer for a resource. Not a job pool. |
-| Work pool | `rbtc-scripts-*` steal; tokio blocking pool | Independent jobs. Mempool accept / Electrum / Esplora / RPC run here. |
+| Work pool | `rbtc-scripts-*` steal; tokio blocking pool | Independent jobs. Mempool accept / Electrum / Esplora / RPC store joins run on the blocking pool. Heavy v2 encode, compact short ids, and JSON of at least 4 KiB run on `rbtc-scripts-*`. |
 
 | Role | Notes |
 |------|--------|
@@ -148,11 +148,12 @@ the body is missing, so the session check is gone.
 
 **Fixed.** A compact tip announcement used to call `block_for_peer` on the
 session inside `on_tip_event`, then build short ids there.
-`cmpct_announce_msg` now does both on the blocking pool, under the
-block-decode permit. A missing body still falls through to a headers
-announcement. High-bandwidth relay of a body already in hand persists that
-header, builds the prefill, and builds those short ids on that pool
-too, and only when a high-bandwidth peer would be offered the block.
+The body load stays on the blocking pool, under the block-decode permit.
+Short ids run on `rbtc-scripts-*` once that body is in hand. A missing
+body still falls through to a headers announcement. High-bandwidth relay
+of a body already in hand persists that header and builds the prefill on
+the blocking pool, then builds those short ids on `rbtc-scripts-*`, and
+only when a high-bandwidth peer would be offered the block.
 A failed high-bandwidth join is logged and skips that announcement.
 A failed compact tip-announce join still ends that session.
 An unsolicited compact block that does not
@@ -198,10 +199,22 @@ body was found. `is_connected` is the published height index and does not
 read the header file. The per-item getdata loop was the batch, and that
 moved.
 
-**Deferred.** Mempool accept, Electrum, Esplora, RPC, block decode,
-compact reconstruct, and header jobs share Tokio's blocking pool (nCPU,
-minimum 4). A private pool would be a second pool. RPC can delay a
-reconstruct until one replacement lane exists.
+**Fixed.** Block-sized pure CPU leaves the blocking pool for
+`rbtc-scripts-*` through `run_cpu`. That is v2 encode when
+`encode_is_cpu_heavy` (a short header batch and an inv list of 64 or fewer
+stay on the caller), compact short ids after the body is in hand, and
+Electrum or Esplora JSON of at least 4 KiB. Under 4 KiB, JSON stays on the
+thread that did the store join. `run_cpu` parks the awaiting task. A script
+worker that calls store IO panics. A published steal chunk still runs
+before the guest.
+`run_cpu_uses_one_script_worker_after_the_wave` and
+`script_worker_cannot_pread` are the pins.
+
+**Deferred.** Mempool accept, Electrum, Esplora, and RPC store joins, block
+and header decode, compact reconstruct, header persist, and full-block
+serve stay on Tokio's blocking pool (nCPU, minimum 4). The cap stays there
+while block decode still occupies that pool. A private pool would be a
+second pool. RPC can delay a reconstruct until one replacement lane exists.
 
 **Fixed.** Each failed async `try_send` on a full tip-accept queue
 increments `FULL_QUEUE_SPINS`, then the sender parks on `Notify`. A yield

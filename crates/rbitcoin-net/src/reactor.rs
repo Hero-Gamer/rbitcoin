@@ -42,3 +42,5 @@ pub fn assert_not_reactor(what: &'static str) {
         "{what} on tokio-rt-worker"
     );
 }
+
+pub use rbitcoin_primitives::assert_not_script_worker;
