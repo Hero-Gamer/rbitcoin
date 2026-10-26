@@ -634,23 +634,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         rbitcoin_net::install_i2p_dialer(sam.dialer());
     }
     let _i2p_sam = i2p_sam;
-    // One Class B appender thread. Join it at shutdown so apply does not race flush.
-    let sh_writebehind = if config.shindex {
-        Some(spawn_sh_writebehind(
-            Arc::clone(&node.hub.query),
-            Arc::clone(&shutdown.flag),
-            {
-                let sd = Arc::clone(&shutdown);
-                move || {
-                    sd.fail(NodeError::Init(
-                        "scripthash or index write-behind failed".into(),
-                    ))
-                }
-            },
-        ))
-    } else {
-        None
-    };
+    // Joined at shutdown. Started only after tip entry, once materialize is done.
+    let mut sh_writebehind = None;
     let peers_path = config.datadir.path().join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
@@ -846,11 +831,24 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let mut index_writebehind = None;
     if catch_up.is_complete() && !shutdown.requested() {
         status.enter(Phase::Indexing);
-        let gates = enter_tip_mode(
-            &node.hub.query,
-            Some(Arc::clone(&shutdown.flag)),
-            config.shindex,
-        );
+        let query = Arc::clone(&node.hub.query);
+        let cancel = Arc::clone(&shutdown.flag);
+        let shindex = config.shindex;
+        let gates = tokio::task::spawn_blocking(move || {
+            let _region = BlockingRegion::enter();
+            enter_tip_mode(&query, Some(cancel), shindex)
+        })
+        .await
+        .map_err(|e| NodeError::Config(format!("tip entry: {e}")))?;
+        sh_writebehind =
+            sh_writebehind_at_tip_entry(Arc::clone(&node.hub.query), Arc::clone(&shutdown.flag), {
+                let sd = Arc::clone(&shutdown);
+                move || {
+                    sd.fail(NodeError::Init(
+                        "scripthash or index write-behind failed".into(),
+                    ))
+                }
+            });
         tip_follow_ready = gates.tip_follow_ready;
         sh_tip_ready = gates.sh_tip_ready;
         if tip_follow_ready && !shutdown.requested() {
@@ -1990,7 +1988,7 @@ pub fn apply_startup_index_mode(
         query.enter_tip_index_mode();
         info!(
             "node: durable scripthash head — resume IndexMode::Tip \
-             (skip Class A recollect; catch-up uses write-behind)"
+             (skip Class A recollect; write-behind starts at tip entry)"
         );
     } else {
         query
@@ -2547,6 +2545,18 @@ pub fn sh_tip_ready_gates(query: &Query) -> TipModeGates {
     }
 }
 
+/// Class B scripthash appender. `None` until Tip mode with `--sh-index`.
+pub fn sh_writebehind_at_tip_entry(
+    query: Arc<Query>,
+    stop: Arc<AtomicBool>,
+    on_fatal: impl FnOnce() + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !query.enqueues_sh_writebehind() {
+        return None;
+    }
+    Some(spawn_sh_writebehind(query, stop, on_fatal))
+}
+
 /// Enter steady-state after true catch-up.
 ///
 /// **Preconditions (enforced by IBD, not repaired here):** Direct catch-up already
@@ -2556,11 +2566,11 @@ pub fn sh_tip_ready_gates(query: &Query) -> TipModeGates {
 /// max tip age with no heavier local header chain.
 ///
 /// **SH methods (exactly two):**
-/// - Durable head: stay/flip `IndexMode::Tip`, discard leftover runs;
-///   catch-up / follow use write-behind. `sh_tip_ready` only when inclusion
-///   already covers the tip.
-/// - No head: Class A collect + unsorted pack **while Direct** (write-behind
-///   no-ops), then Tip. Cancel leaves Direct; Electrum stays closed.
+/// - Durable head: stay/flip `IndexMode::Tip`, discard leftover runs.
+///   Write-behind starts when this returns in Tip. `sh_tip_ready` only when
+///   inclusion already covers the tip.
+/// - No head: Class A collect + unsorted pack **while Direct** (the appender
+///   is not started yet), then Tip. Cancel leaves Direct; Electrum stays closed.
 ///
 /// **When `!shindex`:** skip SH materialize. Listeners may bind
 /// (`sh_tip_ready`); address methods fail closed.
@@ -2569,6 +2579,7 @@ pub fn enter_tip_mode(
     cancel: Option<Arc<AtomicBool>>,
     shindex: bool,
 ) -> TipModeGates {
+    rbitcoin_net::reactor::assert_not_reactor("enter_tip_mode");
     query.set_sh_index_enabled(shindex);
 
     if !shindex {
