@@ -944,10 +944,18 @@ fn proxy_seed_bootstrap_queues_domain_addrfetch() {
 fn shutdown_flag_and_node_handle_smoke() {
     let sd = Shutdown::new();
     assert!(!sd.requested());
+    assert!(!sd.failed());
     sd.request();
     assert!(sd.requested());
+    assert!(!sd.failed(), "SIGTERM and RPC stop stay a clean exit");
+    assert!(shutdown_result(false).is_ok());
     sd.request();
     assert!(sd.requested());
+    let failed = Shutdown::new();
+    failed.fail();
+    assert!(failed.requested());
+    assert!(failed.failed());
+    assert!(shutdown_result(true).is_err());
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

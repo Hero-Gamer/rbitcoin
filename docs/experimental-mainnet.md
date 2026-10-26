@@ -78,7 +78,7 @@ results.
 
 ## Interrupt and resume
 
-1. Prefer **SIGTERM** / Ctrl+C (clean flush of tip tables + mempool).
+1. Prefer **SIGTERM** / Ctrl+C (clean flush of tip tables + mempool, exit 0). A scripthash or index write-behind IO error uses that same flush and then exits non-zero.
 2. Same `--datadir` on restart — catch-up continues; no special “resume” flag.
 3. Class A archive is largely durable mid-IBD; tip is Class C. Hard `kill -9`
    can lose the last unflushed pages.
