@@ -42,6 +42,9 @@ The Linux `pread` job runs the same store and query suites with
 `RBITCOIN_IO=pread` after `qc` and `test`, in parallel with `coverage`.
 The `test` job does not set `RBITCOIN_IO`, so it stays on io_uring.
 `pread` is Actions-only. It is not part of the local gate list.
+`rust-forward` is the same wait: `cargo check --workspace --all-targets`
+on the channel in `rust-forward.toml`, beside `pread`. Product builds stay
+on rustc 1.95. It is not part of the local gate list.
 
 When adding or folding a pin:
 

@@ -18,6 +18,7 @@ REQUIRED=(
   macos
   coverage
   pread
+  rust-forward
 )
 
 usage() {

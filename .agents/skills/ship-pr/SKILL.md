@@ -75,12 +75,14 @@ Coverage and native `windows` / `macos` stay GitHub Actions;
 
 ## Push and poll
 
-Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, and `pread`.
-`qc` is fmt, ast-grep, deny, the script self-tests, clippy, then
-nixos-module-eval on one runner. `pread` is GitHub Actions only:
+Required jobs: `qc`, `test`, `windows`, `macos`, `coverage`, `pread`, and
+`rust-forward`. `qc` is fmt, ast-grep, deny, the script self-tests, clippy,
+then nixos-module-eval on one runner. `pread` is GitHub Actions only:
 `RBITCOIN_IO=pread cargo test -p rbitcoin-store -p rbitcoin-query` after
-`qc` and `test`, in parallel with `coverage`. Do not run it in the local
-gate list. The `test` job leaves `RBITCOIN_IO` unset. Mutants run nightly
+`qc` and `test`, in parallel with `coverage`. `rust-forward` is the same
+wait: `cargo check --workspace --all-targets` on the channel in
+`rust-forward.toml`. Do not run either in the local gate list. The `test`
+job leaves `RBITCOIN_IO` unset and stays on rustc 1.95. Mutants run nightly
 with workspace tests (`mutants.yml`); they are not a required check.
 Structural scan is `./scripts/ast-grep.sh`. `windows` / `macos` are native
 store plus `--smoke`, not operator zips.

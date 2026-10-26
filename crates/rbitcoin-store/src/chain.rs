@@ -216,7 +216,7 @@ impl StrongTxTable {
     fn store_byte(words: &[AtomicU64], index: usize, value: u8) {
         let w = &words[index / 8];
         let shift = (index % 8) * 8;
-        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+        let _ = w.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
             Some((cur & !(0xffu64 << shift)) | (u64::from(value) << shift))
         });
     }
