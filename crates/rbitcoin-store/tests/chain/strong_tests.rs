@@ -15,6 +15,96 @@ fn tmp() -> std::path::PathBuf {
     p
 }
 
+/// Flush persists the live bit image. A bit store from the write hook is
+/// refused; a store after flush returns lands in the next flush.
+#[test]
+fn strong_flush_writes_live_bytes_and_refuses_a_store() {
+    use rbitcoin_store::array_table::{FlushStep, FLUSH_SCRATCH};
+    use std::sync::atomic::Ordering;
+    let dir = tmp();
+    let t = StrongTxTable::create(&dir).unwrap();
+    let bits = (FLUSH_SCRATCH as u32) * 8 + 64;
+    t.set_strong_range(Fk(1), bits, Fk(1)).unwrap();
+    t.flush().unwrap();
+    t.set_unstrong(Fk(1)).unwrap();
+    let mut during = Ok(());
+    t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Write {
+            t.data.write().unwrap_or_else(|e| e.into_inner())[0] = 0xff;
+            during = t.set_unstrong(Fk(2));
+        }
+    })
+    .unwrap();
+    assert!(during.is_err(), "store during flush refused={during:?}");
+    let chunk = t.flush_chunk_max.load(Ordering::Relaxed);
+    assert!(chunk > 0 && chunk <= FLUSH_SCRATCH, "flush chunk {chunk}");
+    drop(t);
+    let t = StrongTxTable::open(&dir).unwrap();
+    assert!(
+        t.is_strong(Fk(1)).unwrap(),
+        "live byte must be the flushed image"
+    );
+    assert!(t.is_strong(Fk(2)).unwrap(), "refused store stays off disk");
+    t.set_unstrong(Fk(2)).unwrap();
+    t.flush().unwrap();
+    drop(t);
+    let t = StrongTxTable::open(&dir).unwrap();
+    assert!(!t.is_strong(Fk(2)).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A failed bit-image `write_at` leaves that range dirty. The retry writes it.
+#[cfg(unix)]
+#[test]
+fn strong_failed_write_keeps_the_range_dirty() {
+    use rbitcoin_store::array_table::FlushStep;
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    let dir = tmp();
+    let t = StrongTxTable::create(&dir).unwrap();
+    t.set_strong(Fk(1), Fk(1)).unwrap();
+    t.flush().unwrap();
+    t.set_unstrong(Fk(1)).unwrap();
+    let mut swapped = None;
+    let failed = t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Write {
+            swapped = Some(crate::dev_full::DevFull::on(&t.bits.read_file));
+        }
+    });
+    drop(swapped);
+    assert!(
+        failed.is_err(),
+        "write_at must fail while the fd is /dev/full"
+    );
+    let mut byte = [0u8; 1];
+    t.bits.read_at(FILE_HEADER_LEN as u64, &mut byte).unwrap();
+    assert_eq!(byte[0] & 1, 1, "failed persist must not publish the clear");
+    t.flush().unwrap();
+    t.bits.read_at(FILE_HEADER_LEN as u64, &mut byte).unwrap();
+    assert_eq!(byte[0] & 1, 0, "retry writes the same slots");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A same-length bit rewrite still publishes the recorded body length.
+#[test]
+fn strong_same_length_rewrite_publishes_logical_len() {
+    use rbitcoin_store::file::FILE_HEADER_LEN;
+    let dir = tmp();
+    let t = StrongTxTable::create(&dir).unwrap();
+    t.set_strong_range(Fk(1), 16, Fk(1)).unwrap();
+    t.flush().unwrap();
+    let published = t.bits.logical_len();
+    assert!(published > FILE_HEADER_LEN as u64);
+    t.bits.set_logical_len(published + 64).unwrap();
+    t.set_unstrong(Fk(3)).unwrap();
+    t.flush_dirty().unwrap();
+    assert_eq!(t.bits.logical_len(), published);
+    drop(t);
+    let t = StrongTxTable::open(&dir).unwrap();
+    assert!(!t.is_strong(Fk(3)).unwrap());
+    assert!(t.is_strong(Fk(1)).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn strong_bitset_range_and_clear() {
     let dir = tmp();
@@ -111,34 +201,41 @@ fn strong_tx_always_l2_above_class_c_cap() {
 }
 
 #[test]
-fn concurrent_set_strong_during_flush_persists() {
-    use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+fn strong_store_on_another_thread_during_flush_is_refused() {
+    use rbitcoin_store::array_table::FlushStep;
     use std::sync::Arc;
     let dir = tmp();
     let t = Arc::new(StrongTxTable::create(&dir).unwrap());
-    t.set_strong_range(Fk(1), 80_000, Fk(1)).unwrap();
+    t.set_strong(Fk(1), Fk(1)).unwrap();
     t.flush().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
+    t.set_unstrong(Fk(1)).unwrap();
+    let (started, start_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
     let flush_t = {
         let t = Arc::clone(&t);
-        let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            while !stop.load(AtomOrd::Relaxed) {
-                t.flush_dirty().unwrap();
-            }
+            t.flush_dirty_between(|_, step| {
+                if step == FlushStep::Write {
+                    started.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+            })
+            .unwrap();
         })
     };
-    for _ in 0..2_000 {
-        t.set_unstrong(Fk(1)).unwrap();
-        t.set_strong(Fk(1), Fk(1)).unwrap();
-    }
-    stop.store(true, AtomOrd::Relaxed);
+    start_rx.recv().unwrap();
+    let during = t.set_strong(Fk(1), Fk(1));
+    release.send(()).unwrap();
     flush_t.join().unwrap();
-    let want = t.is_strong(Fk(1)).unwrap();
+    assert!(during.is_err(), "store during flush refused={during:?}");
+    drop(t);
+    let t = StrongTxTable::open(&dir).unwrap();
+    assert!(!t.is_strong(Fk(1)).unwrap());
+    t.set_strong(Fk(1), Fk(1)).unwrap();
     t.flush().unwrap();
     drop(t);
     let t = StrongTxTable::open(&dir).unwrap();
-    assert_eq!(t.is_strong(Fk(1)).unwrap(), want);
+    assert!(t.is_strong(Fk(1)).unwrap());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

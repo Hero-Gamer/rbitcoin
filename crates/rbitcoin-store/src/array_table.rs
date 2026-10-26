@@ -7,51 +7,40 @@
 //! Compact **array** tables (`confirmed`, `header_txs_*`; body ≤
 //! [`class_c_inram_max_bytes`]) load fully into process RAM on open.
 //! `strong_tx` is always L2 (see [`crate::chain::StrongTxTable`]).
-//! Mutates update the `Vec` only and mark dirty. Disk is updated on
-//! `Self::flush` / barrier:
+//! Mutates update the `Vec` only and record the lowest unstored index. Disk
+//! is updated on `Self::flush` / barrier by reading those live slots:
 //!
-//! - **Append-only** (dirty only at indices ≥ last flushed len): write the new
-//!   **suffix** only, then extend HWM — never overwrites published prefix bytes.
-//! - **Truncate**: shrink HWM only (complete-or-fail length publish).
-//! - **In-prefix mutate** (rare for tip Class C): full body rewrite (residual
-//!   mid-pwrite tear risk on same-size published range — mitigated by tip-last
-//!   barrier so `confirmed` is not advanced until strong/height are durable).
+//! - **Append** (unstored index ≥ last flushed len): pwrite the new suffix.
+//! - **Truncate**: shrink the published length only.
+//! - **In-prefix mutate**: pwrite from the first unstored index through the
+//!   length recorded when the flush started, then publish that length even
+//!   when it equals the previous disk length.
 //!
-//! Tables over the cap stay pure fd L0 (per-slot write-through).
+//! Each pwrite is at most [`FLUSH_SCRATCH`] bytes. The unstored mark clears
+//! only after that persist succeeds. A store that starts after the flush has
+//! recorded its range is refused until the flush returns.
+//!
+//! Tables over the cap stay pure fd L0 (per-slot write-through). The flush
+//! does not read that path.
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use rbitcoin_primitives::TableKind;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, RwLock};
-
-/// Packed dirty generation: `0` is clean. `set` bumps; flush CASes back to `0`.
-pub fn dirty_epoch_bump(epoch: &AtomicU64) {
-    let _ = epoch.try_update(Ordering::Release, Ordering::Relaxed, |e| {
-        Some(e.wrapping_add(1).max(1))
-    });
-}
-
-/// Mark clean after a persist that sampled generation `e0`. `lo` resets
-/// first: a `set` that lands here bumps the generation, the clean fails, and
-/// its index survives for the next flush.
-pub fn dirty_try_clean(epoch: &AtomicU64, lo: &AtomicU64, e0: u64, between: impl FnOnce()) {
-    let prev = lo.swap(u64::MAX, Ordering::AcqRel);
-    between();
-    if epoch
-        .compare_exchange(e0, 0, Ordering::Release, Ordering::Relaxed)
-        .is_err()
-    {
-        lo.fetch_min(prev, Ordering::AcqRel);
-    }
-}
 
 #[doc(hidden)]
 pub const ELEM: u64 = 8;
 
-/// Where a flush calls its test hook: after the snapshot, before the write;
-/// or inside the clean step.
+/// Bytes of the fixed pwrite buffer. A flush does not allocate a second image.
+#[doc(hidden)]
+pub const FLUSH_SCRATCH: usize = 4096;
+
+const CLEAN: u64 = u64::MAX;
+
+/// Where a flush calls its test hook: after the range is recorded, before the
+/// write; or after the persist, before the unstored mark clears.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub enum FlushStep {
@@ -75,33 +64,67 @@ pub fn class_c_inram_max_bytes() -> u64 {
     }
 }
 
+/// Pwrite `len` bytes at `base` in [`FLUSH_SCRATCH`] chunks. `fill` loads one
+/// chunk from the live image. Returns the largest chunk written.
+pub(crate) fn pwrite_scratched(
+    mut write: impl FnMut(u64, &[u8]) -> Result<(), StoreError>,
+    base: u64,
+    len: u64,
+    mut fill: impl FnMut(&mut [u8], u64) -> Result<(), StoreError>,
+) -> Result<usize, StoreError> {
+    let mut scratch = [0u8; FLUSH_SCRATCH];
+    let mut off = 0u64;
+    let mut max_chunk = 0usize;
+    while off < len {
+        let n = ((len - off) as usize).min(FLUSH_SCRATCH);
+        fill(&mut scratch[..n], off)?;
+        max_chunk = max_chunk.max(n);
+        write(base + off, &scratch[..n])?;
+        off += n as u64;
+    }
+    Ok(max_chunk)
+}
+
 pub struct ArrayTable {
     pub file: TableFile,
     pub len: AtomicU64,
     /// `Some` = L2 authoritative image; `None` = L0 fd-only path.
     pub data: RwLock<Option<Vec<u64>>>,
-    /// `0` = clean. Nonzero generation: a `set` raced persist if CAS fails.
-    pub dirty_epoch: AtomicU64,
-    /// Min index mutated since last flush (`u64::MAX` = none).
-    pub dirty_lo: AtomicU64,
+    /// Lowest index not yet persisted. [`CLEAN`] means none.
+    pub unstored_from: AtomicU64,
+    /// True from the moment a flush records its range until it returns.
+    pub flushing: AtomicBool,
     /// Element count last successfully flushed to disk (L2).
     pub disk_len: AtomicU64,
-    /// One flusher at a time: a second snapshot never lands under an older one.
+    /// One flusher at a time.
     pub flush_lock: Mutex<()>,
+    /// Largest chunk the last flush passed to `write_at`.
+    #[doc(hidden)]
+    pub flush_chunk_max: AtomicUsize,
+}
+
+/// Clears `flushing` on drop. On success, also publishes `disk_len` and
+/// clears the unstored mark, in that order, while stores are still refused.
+#[must_use]
+struct EndFlush<'a> {
+    table: &'a ArrayTable,
+    persisted: Option<u64>,
+}
+
+impl Drop for EndFlush<'_> {
+    fn drop(&mut self) {
+        if let Some(n) = self.persisted {
+            self.table.disk_len.store(n, Ordering::Release);
+            self.table.unstored_from.store(CLEAN, Ordering::Release);
+        }
+        self.table.flushing.store(false, Ordering::Release);
+    }
 }
 
 impl ArrayTable {
     pub fn create(path: impl AsRef<Path>, kind: TableKind) -> Result<Self, StoreError> {
         let file = TableFile::create(path.as_ref(), kind)?;
-        Ok(Self {
-            file,
-            len: AtomicU64::new(0),
-            data: RwLock::new(Some(Vec::new())),
-            dirty_epoch: AtomicU64::new(0),
-            dirty_lo: AtomicU64::new(u64::MAX),
-            disk_len: AtomicU64::new(0),
-            flush_lock: Mutex::new(()),
-        })
+        Ok(Self::new(file, Some(Vec::new()), 0))
     }
 
     pub fn open(path: impl AsRef<Path>, kind: TableKind) -> Result<Self, StoreError> {
@@ -124,15 +147,20 @@ impl ArrayTable {
         } else {
             None
         };
-        Ok(Self {
+        Ok(Self::new(file, data, n))
+    }
+
+    fn new(file: TableFile, data: Option<Vec<u64>>, n: u64) -> Self {
+        Self {
             file,
             len: AtomicU64::new(n),
             data: RwLock::new(data),
-            dirty_epoch: AtomicU64::new(0),
-            dirty_lo: AtomicU64::new(u64::MAX),
+            unstored_from: AtomicU64::new(CLEAN),
+            flushing: AtomicBool::new(false),
             disk_len: AtomicU64::new(n),
             flush_lock: Mutex::new(()),
-        })
+            flush_chunk_max: AtomicUsize::new(0),
+        }
     }
 
     pub fn len(&self) -> u64 {
@@ -148,21 +176,16 @@ impl ArrayTable {
         FILE_HEADER_LEN as u64 + index * ELEM
     }
 
-    #[doc(hidden)]
-    pub fn mark_dirty_index(&self, index: u64) {
-        dirty_epoch_bump(&self.dirty_epoch);
-        let mut cur = self.dirty_lo.load(Ordering::Relaxed);
-        while index < cur {
-            match self.dirty_lo.compare_exchange_weak(
-                cur,
-                index,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => cur = c,
-            }
+    fn refuse_while_flushing(&self) -> Result<(), StoreError> {
+        if self.flushing.load(Ordering::Acquire) {
+            Err(StoreError::Rejected("class C store during flush"))
+        } else {
+            Ok(())
         }
+    }
+
+    fn mark_unstored(&self, index: u64) {
+        let _ = self.unstored_from.fetch_min(index, Ordering::AcqRel);
     }
 
     pub fn get(&self, index: u64) -> Result<u64, StoreError> {
@@ -183,6 +206,7 @@ impl ArrayTable {
 
     pub fn set(&self, index: u64, value: u64) -> Result<(), StoreError> {
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        self.refuse_while_flushing()?;
         if let Some(ref mut v) = *guard {
             let need = index as usize + 1;
             if v.len() < need {
@@ -190,7 +214,7 @@ impl ArrayTable {
             }
             v[index as usize] = value;
             self.len.store(v.len() as u64, Ordering::Release);
-            self.mark_dirty_index(index);
+            self.mark_unstored(index);
             return Ok(());
         }
         drop(guard);
@@ -216,6 +240,7 @@ impl ArrayTable {
         let max_idx = pairs.iter().map(|(i, _)| *i).max().unwrap();
         let min_idx = pairs.iter().map(|(i, _)| *i).min().unwrap();
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        self.refuse_while_flushing()?;
         if let Some(ref mut v) = *guard {
             let need = max_idx as usize + 1;
             if v.len() < need {
@@ -225,7 +250,7 @@ impl ArrayTable {
                 v[index as usize] = value;
             }
             self.len.store(v.len() as u64, Ordering::Release);
-            self.mark_dirty_index(min_idx);
+            self.mark_unstored(min_idx);
             return Ok(());
         }
         drop(guard);
@@ -258,12 +283,12 @@ impl ArrayTable {
             return Err(StoreError::Corrupt("array truncate grows"));
         }
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        self.refuse_while_flushing()?;
         if let Some(ref mut v) = *guard {
             v.truncate(new_len as usize);
             self.len.store(new_len, Ordering::Release);
-            // Shrink is a length-only publish; mark dirty from 0 so flush takes
-            // the truncate path (set_logical_len), not an append.
-            self.mark_dirty_index(0);
+            // Length-only publish. Mark the start so flush takes the shrink path.
+            self.mark_unstored(0);
             return Ok(());
         }
         drop(guard);
@@ -273,21 +298,12 @@ impl ArrayTable {
         Ok(())
     }
 
-    /// Persist dirty L2 image. Prefers append-only suffix writes so published
-    /// prefix bytes are never overwritten mid-barrier.
     /// In-RAM L2 image bytes (0 when FdOnly).
     pub fn l2_resident_bytes(&self) -> u64 {
         let g = self.data.read().unwrap_or_else(|e| e.into_inner());
         g.as_ref()
             .map(|v| (v.len() as u64).saturating_mul(ELEM))
             .unwrap_or(0)
-    }
-
-    #[doc(hidden)]
-    pub fn note_flush_clean(&self, e0: u64, between: &mut impl FnMut(&Self, FlushStep)) {
-        dirty_try_clean(&self.dirty_epoch, &self.dirty_lo, e0, || {
-            between(self, FlushStep::Clean)
-        });
     }
 
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
@@ -300,68 +316,51 @@ impl ArrayTable {
         mut between: impl FnMut(&Self, FlushStep),
     ) -> Result<(), StoreError> {
         let _one = self.flush_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let Some(ref v) = *guard else {
-            return Ok(());
-        };
-        let e0 = self.dirty_epoch.load(Ordering::Acquire);
-        if e0 == 0 {
-            return Ok(());
-        }
-        let n = v.len() as u64;
-        let disk = self.disk_len.load(Ordering::Acquire);
-        let dirty_lo = self.dirty_lo.load(Ordering::Acquire);
-
-        if n < disk {
-            drop(guard);
-            between(self, FlushStep::Write);
-            let logical = FILE_HEADER_LEN as u64 + n * ELEM;
-            self.file.set_logical_len(logical)?;
-            self.disk_len.store(n, Ordering::Release);
-            self.note_flush_clean(e0, &mut between);
-            return Ok(());
-        }
-
-        if n == disk && dirty_lo >= disk {
-            drop(guard);
-            between(self, FlushStep::Write);
-            self.note_flush_clean(e0, &mut between);
-            return Ok(());
-        }
-
-        if dirty_lo >= disk && n > disk {
-            let start = disk as usize;
-            let mut bytes = vec![0u8; ((n - disk) as usize) * 8];
-            for (i, &val) in v[start..].iter().enumerate() {
-                bytes[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
+        let (from, n, disk) = {
+            let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+            let Some(ref v) = *guard else {
+                return Ok(());
+            };
+            let from = self.unstored_from.load(Ordering::Acquire);
+            if from == CLEAN {
+                return Ok(());
             }
-            drop(guard);
-            between(self, FlushStep::Write);
-            self.file.write_at(Self::offset(disk), &bytes)?;
-            let logical = FILE_HEADER_LEN as u64 + n * ELEM;
-            debug_assert_eq!(self.file.logical_len(), logical);
-            let _ = logical;
-            self.disk_len.store(n, Ordering::Release);
-            self.note_flush_clean(e0, &mut between);
-            return Ok(());
-        }
-
-        let from = dirty_lo.min(n);
-        let mut bytes = vec![0u8; ((n - from) as usize) * 8];
-        for (i, &val) in v[from as usize..].iter().enumerate() {
-            bytes[i * 8..(i + 1) * 8].copy_from_slice(&val.to_le_bytes());
-        }
-        drop(guard);
+            self.flushing.store(true, Ordering::Release);
+            (from, v.len() as u64, self.disk_len.load(Ordering::Acquire))
+        };
+        let mut end = EndFlush {
+            table: self,
+            persisted: None,
+        };
         between(self, FlushStep::Write);
-        if !bytes.is_empty() {
-            self.file.write_at(Self::offset(from), &bytes)?;
+        // Disconnect shrinks `confirmed` once per block. Rewriting the kept
+        // prefix would copy the whole image on that path.
+        if n >= disk {
+            let start = from.min(disk);
+            if start < n {
+                let max = pwrite_scratched(
+                    |at, chunk| self.file.write_at(at, chunk),
+                    Self::offset(start),
+                    (n - start) * ELEM,
+                    |dst, off| {
+                        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+                        let v = guard
+                            .as_ref()
+                            .ok_or(StoreError::Corrupt("class C flush lost its image"))?;
+                        let base = start as usize + (off as usize) / 8;
+                        for (i, slot) in dst.chunks_exact_mut(8).enumerate() {
+                            slot.copy_from_slice(&v[base + i].to_le_bytes());
+                        }
+                        Ok(())
+                    },
+                )?;
+                self.flush_chunk_max.store(max, Ordering::Relaxed);
+            }
         }
-        if n != disk {
-            let logical = FILE_HEADER_LEN as u64 + n * ELEM;
-            self.file.set_logical_len(logical)?;
-        }
-        self.disk_len.store(n, Ordering::Release);
-        self.note_flush_clean(e0, &mut between);
+        let logical = FILE_HEADER_LEN as u64 + n * ELEM;
+        self.file.set_logical_len(logical)?;
+        between(self, FlushStep::Clean);
+        end.persisted = Some(n);
         Ok(())
     }
 

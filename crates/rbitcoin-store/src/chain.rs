@@ -140,12 +140,32 @@ pub struct StrongTxTable {
     pub n_bits: std::sync::atomic::AtomicU64,
     /// L2 byte image. `strong_tx` stays in this `Vec`; open and create never go FdOnly.
     pub data: std::sync::RwLock<Vec<u8>>,
-    /// `0` = clean. Nonzero generation: a bit `set` raced persist if CAS fails.
-    pub dirty_epoch: std::sync::atomic::AtomicU64,
-    /// Min bit index mutated since last flush (`u64::MAX` = none).
-    pub dirty_lo_bit: std::sync::atomic::AtomicU64,
+    /// Lowest bit not yet persisted (`u64::MAX` = clean).
+    pub unstored_bit: std::sync::atomic::AtomicU64,
+    /// True from the moment a flush records its range until it returns.
+    pub flushing: std::sync::atomic::AtomicBool,
     /// Body byte length last flushed to disk (L2).
     pub disk_bytes: std::sync::atomic::AtomicU64,
+    /// Largest chunk the last flush passed to `write_at`.
+    #[doc(hidden)]
+    pub flush_chunk_max: std::sync::atomic::AtomicUsize,
+}
+
+#[must_use]
+struct EndStrongFlush<'a> {
+    table: &'a StrongTxTable,
+    persisted: Option<u64>,
+}
+
+impl Drop for EndStrongFlush<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if let Some(n) = self.persisted {
+            self.table.disk_bytes.store(n, Ordering::Release);
+            self.table.unstored_bit.store(u64::MAX, Ordering::Release);
+        }
+        self.table.flushing.store(false, Ordering::Release);
+    }
 }
 
 impl StrongTxTable {
@@ -154,9 +174,10 @@ impl StrongTxTable {
             bits: crate::file::TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?,
             n_bits: std::sync::atomic::AtomicU64::new(0),
             data: std::sync::RwLock::new(Vec::new()),
-            dirty_epoch: std::sync::atomic::AtomicU64::new(0),
-            dirty_lo_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
+            unstored_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
+            flushing: std::sync::atomic::AtomicBool::new(false),
             disk_bytes: std::sync::atomic::AtomicU64::new(0),
+            flush_chunk_max: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -174,28 +195,26 @@ impl StrongTxTable {
             bits,
             n_bits: std::sync::atomic::AtomicU64::new(n_bits),
             data: std::sync::RwLock::new(v),
-            dirty_epoch: std::sync::atomic::AtomicU64::new(0),
-            dirty_lo_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
+            unstored_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
+            flushing: std::sync::atomic::AtomicBool::new(false),
             disk_bytes: std::sync::atomic::AtomicU64::new(body),
+            flush_chunk_max: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    fn refuse_while_flushing(&self) -> Result<(), StoreError> {
+        use std::sync::atomic::Ordering;
+        if self.flushing.load(Ordering::Acquire) {
+            Err(StoreError::Rejected("class C store during flush"))
+        } else {
+            Ok(())
+        }
     }
 
     #[doc(hidden)]
     pub fn mark_dirty_bit(&self, bit: u64) {
         use std::sync::atomic::Ordering;
-        crate::array_table::dirty_epoch_bump(&self.dirty_epoch);
-        let mut cur = self.dirty_lo_bit.load(Ordering::Relaxed);
-        while bit < cur {
-            match self.dirty_lo_bit.compare_exchange_weak(
-                cur,
-                bit,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(c) => cur = c,
-            }
-        }
+        let _ = self.unstored_bit.fetch_min(bit, Ordering::AcqRel);
     }
 
     #[doc(hidden)]
@@ -207,6 +226,7 @@ impl StrongTxTable {
         }
         let need_bytes = need_bits.div_ceil(8);
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        self.refuse_while_flushing()?;
         if need_bytes as usize > guard.len() {
             guard.resize(need_bytes as usize, 0);
         }
@@ -231,6 +251,7 @@ impl StrongTxTable {
     pub fn set_bit(&self, bit: u64, on: bool) -> Result<(), StoreError> {
         self.ensure_bits(bit + 1)?;
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        self.refuse_while_flushing()?;
         let bi = (bit / 8) as usize;
         if on {
             guard[bi] |= 1 << (bit % 8);
@@ -292,6 +313,7 @@ impl StrongTxTable {
         }
         self.ensure_bits(end)?;
         let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
+        self.refuse_while_flushing()?;
         let mut bit = start;
         while bit < end {
             let bi = (bit / 8) as usize;
@@ -407,50 +429,55 @@ impl StrongTxTable {
         Ok(ones == u64::from(count))
     }
 
-    /// Persist dirty L2 bit image. Prefers append-only byte suffix writes.
+    /// Persist dirty L2 bit image by reading live bytes. The unstored mark
+    /// clears only after the length publish succeeds.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
+        self.flush_dirty_between(|_, _| {})
+    }
+
+    #[doc(hidden)]
+    pub fn flush_dirty_between(
+        &self,
+        mut between: impl FnMut(&Self, crate::array_table::FlushStep),
+    ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let v = &*guard;
-        let e0 = self.dirty_epoch.load(Ordering::Acquire);
-        if e0 == 0 {
-            return Ok(());
-        }
-        let body_len = v.len() as u64;
-        let disk = self.disk_bytes.load(Ordering::Acquire);
-        let dirty_lo = self.dirty_lo_bit.load(Ordering::Acquire);
-
-        let dirty_byte = if dirty_lo == u64::MAX {
-            body_len
-        } else {
-            dirty_lo / 8
-        };
-
-        if body_len > disk && dirty_byte >= disk {
-            let suffix = v[disk as usize..].to_vec();
-            drop(guard);
-            if !suffix.is_empty() {
-                self.bits
-                    .write_at(crate::file::FILE_HEADER_LEN as u64 + disk, &suffix)?;
+        let (body_len, disk, dirty_byte) = {
+            let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+            let bit = self.unstored_bit.load(Ordering::Acquire);
+            if bit == u64::MAX {
+                return Ok(());
             }
-            self.disk_bytes.store(body_len, Ordering::Release);
-            crate::array_table::dirty_try_clean(&self.dirty_epoch, &self.dirty_lo_bit, e0, || {});
-            return Ok(());
+            self.flushing.store(true, Ordering::Release);
+            let body_len = guard.len() as u64;
+            let disk = self.disk_bytes.load(Ordering::Acquire);
+            (body_len, disk, bit / 8)
+        };
+        let mut end = EndStrongFlush {
+            table: self,
+            persisted: None,
+        };
+        between(self, crate::array_table::FlushStep::Write);
+        if body_len >= disk {
+            let start = dirty_byte.min(disk);
+            if start < body_len {
+                let max = crate::array_table::pwrite_scratched(
+                    |at, chunk| self.bits.write_at(at, chunk),
+                    crate::file::FILE_HEADER_LEN as u64 + start,
+                    body_len - start,
+                    |dst, off| {
+                        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
+                        let at = start as usize + off as usize;
+                        dst.copy_from_slice(&guard[at..at + dst.len()]);
+                        Ok(())
+                    },
+                )?;
+                self.flush_chunk_max.store(max, Ordering::Relaxed);
+            }
         }
-
-        let from = dirty_byte.min(body_len);
-        let suffix = v[from as usize..].to_vec();
-        drop(guard);
-        if !suffix.is_empty() {
-            self.bits
-                .write_at(crate::file::FILE_HEADER_LEN as u64 + from, &suffix)?;
-        }
-        if body_len != disk {
-            let logical = crate::file::FILE_HEADER_LEN as u64 + body_len;
-            self.bits.set_logical_len(logical)?;
-        }
-        self.disk_bytes.store(body_len, Ordering::Release);
-        crate::array_table::dirty_try_clean(&self.dirty_epoch, &self.dirty_lo_bit, e0, || {});
+        let logical = crate::file::FILE_HEADER_LEN as u64 + body_len;
+        self.bits.set_logical_len(logical)?;
+        between(self, crate::array_table::FlushStep::Clean);
+        end.persisted = Some(body_len);
         Ok(())
     }
 

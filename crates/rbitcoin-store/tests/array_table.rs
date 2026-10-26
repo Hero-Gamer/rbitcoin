@@ -2,7 +2,7 @@ use rbitcoin_primitives::TableKind;
 use rbitcoin_store::array_table::*;
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::file::FILE_HEADER_LEN;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 fn tmp_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -50,69 +50,153 @@ fn get_racing_truncate_does_not_panic() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A `set` that lands while flush marks the table clean is written by
-/// the next flush. The IBD tip flush runs beside the next batch's archive.
+/// Flush persists the live slots of the dirty range recorded at start.
+/// A store from the write hook is refused; the bytes on disk are the slots
+/// after that hook, so the flush did not keep a detached image. A store
+/// after flush returns is absent here and present in the next flush.
 #[test]
-fn set_during_flush_clean_is_flushed_next() {
+fn flush_writes_live_slots_and_refuses_a_store_until_it_finishes() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
+    let n = 600u64;
+    let pairs: Vec<(u64, u64)> = (0..n).map(|i| (i, i + 1)).collect();
+    t.set_many(&pairs).unwrap();
+    t.flush().unwrap();
+    t.set(0, 5).unwrap();
+    let mut during = Ok(());
+    t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Write {
+            if let Some(v) = t.data.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                v[0] = 77;
+            }
+            during = t.set(1, 9);
+            let _ = t.set_many(&[(2, 8)]);
+            let _ = t.truncate(n - 1);
+        }
+    })
+    .unwrap();
+    let slot0 = {
+        let mut buf = [0u8; 8];
+        t.file.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+        u64::from_le_bytes(buf)
+    };
+    assert!(
+        during.is_err() && slot0 == 77,
+        "store during flush refused={during:?} live slot0={slot0}"
+    );
+    assert!(n * ELEM > FLUSH_SCRATCH as u64);
+    let chunk = t.flush_chunk_max.load(Ordering::Relaxed);
+    assert!(chunk > 0 && chunk <= FLUSH_SCRATCH, "flush chunk {chunk}");
+    t.set(1, 9).unwrap();
+    let mut buf = [0u8; 8];
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        2,
+        "store after flush stays off disk"
+    );
+    t.flush().unwrap();
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(buf), 9);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A rewrite whose length equals the last flushed length still publishes
+/// that length. A torn longer HWM must not survive the flush.
+#[test]
+fn same_length_rewrite_publishes_logical_len() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+    t.set_many(&[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
+    t.flush().unwrap();
+    let published = FILE_HEADER_LEN as u64 + 4 * ELEM;
+    assert_eq!(t.file.logical_len(), published);
+    t.file.set_logical_len(published + 64).unwrap();
+    t.set(1, 99).unwrap();
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.disk_len.load(Ordering::Acquire), 4);
+    t.flush().unwrap();
+    assert_eq!(t.file.logical_len(), published);
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.get(1).unwrap(), 99);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A failed `write_at` leaves the recorded range dirty. The retry writes
+/// those slots and does not truncate the table.
+#[cfg(unix)]
+#[test]
+fn failed_write_keeps_the_range_dirty() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
+    t.set_many(&[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
+    t.flush().unwrap();
+    t.set(1, 42).unwrap();
+    let mut swapped = None;
+    let failed = t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Write {
+            swapped = Some(crate::dev_full::DevFull::on(&t.file.read_file));
+        }
+    });
+    drop(swapped);
+    assert!(
+        failed.is_err(),
+        "write_at must fail while the fd is /dev/full"
+    );
+    assert_eq!(t.len(), 4, "a failed persist must not truncate");
+    let mut buf = [0u8; 8];
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        2,
+        "failed persist must not publish the slot"
+    );
+    t.flush().unwrap();
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(buf), 42);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A store during the clean step is refused. The store after flush returns
+/// is what the next flush persists.
+#[test]
+fn set_after_flush_is_flushed_next() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
     t.set_many(&[(0, 10), (1, 11), (2, 12), (3, 13)]).unwrap();
     t.flush().unwrap();
     t.set(3, 23).unwrap();
+    let mut during = Ok(());
     t.flush_dirty_between(|t, step| {
         if step == FlushStep::Clean {
-            t.set(1, 21).unwrap();
+            during = t.set(1, 21);
         }
     })
     .unwrap();
+    assert!(during.is_err(), "store during clean must be refused");
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
+    assert_eq!((t.get(1).unwrap(), t.get(3).unwrap()), (11, 23));
+    t.set(1, 21).unwrap();
     t.flush().unwrap();
     drop(t);
     let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
     assert_eq!((t.get(1).unwrap(), t.get(3).unwrap()), (21, 23));
     let _ = std::fs::remove_file(&path);
-}
-
-/// Two flushes of one table never leave the older image on disk. A body
-/// repair flushes `header_txs` beside the IBD tip flush.
-#[test]
-fn concurrent_flushes_keep_the_newer_image() {
-    use std::sync::Arc;
-    let path = tmp_path();
-    let _ = std::fs::remove_file(&path);
-    let t = Arc::new(ArrayTable::create(&path, TableKind::ArrayLink).unwrap());
-    t.set_many(&[(0, 10), (1, 11)]).unwrap();
-    t.flush().unwrap();
-    t.set(0, 20).unwrap();
-    let (done, finished) = std::sync::mpsc::channel();
-    let mut other = Some(Arc::clone(&t));
-    let mut second = None;
-    t.flush_dirty_between(|_, step| {
-        let Some(t2) = other.take().filter(|_| step == FlushStep::Write) else {
-            return;
-        };
-        let done = done.clone();
-        second = Some(std::thread::spawn(move || {
-            t2.set(1, 21).unwrap();
-            t2.flush().unwrap();
-            done.send(()).unwrap();
-        }));
-        let _ = finished.recv_timeout(std::time::Duration::from_millis(200));
-    })
-    .unwrap();
-    second.unwrap().join().unwrap();
-    drop(t);
-    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
-    assert_eq!((t.get(0).unwrap(), t.get(1).unwrap()), (20, 21));
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn dirty_epoch_bump_from_max_stays_dirty() {
-    let e = AtomicU64::new(u64::MAX);
-    dirty_epoch_bump(&e);
-    assert_ne!(e.load(Ordering::Acquire), 0);
-    assert_eq!(e.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -228,7 +312,7 @@ fn append_only_flush_extends_without_losing_prefix() {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
         t.set_many(&[(0, 100), (1, 101)]).unwrap();
         t.flush().unwrap();
-        // Pure tip extension (dirty_lo = 2 >= disk_len = 2).
+        // Pure tip extension (unstored index 2, disk length 2).
         t.set(2, 102).unwrap();
         t.flush().unwrap();
     }
@@ -278,40 +362,43 @@ fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A store from another thread while flush is in its write step is refused.
+/// The store after that flush joins is what the next flush persists.
 #[test]
-fn concurrent_set_during_flush_persists_new() {
-    use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+fn store_on_another_thread_during_flush_is_refused() {
     use std::sync::Arc;
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
-    let n = 32_768u64;
-    let pairs: Vec<(u64, u64)> = (0..n).map(|i| (i, i)).collect();
-    t.set_many(&pairs).unwrap();
+    t.set_many(&[(0, 1), (1, 2)]).unwrap();
     t.flush().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
+    t.set(0, 5).unwrap();
+    let (started, start_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
     let flush_t = {
         let t = Arc::clone(&t);
-        let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            while !stop.load(AtomOrd::Relaxed) {
-                t.flush_dirty().unwrap();
-            }
+            t.flush_dirty_between(|_, step| {
+                if step == FlushStep::Write {
+                    started.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+            })
+            .unwrap();
         })
     };
-    for i in 1..2_000u64 {
-        t.set(0, i).unwrap();
-    }
-    stop.store(true, AtomOrd::Relaxed);
+    start_rx.recv().unwrap();
+    let during = t.set(0, 9);
+    release.send(()).unwrap();
     flush_t.join().unwrap();
-    let want = t.get(0).unwrap();
+    assert!(during.is_err(), "store during flush refused={during:?}");
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.get(0).unwrap(), 5);
+    t.set(0, 9).unwrap();
     t.flush().unwrap();
     drop(t);
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
-    assert_eq!(
-        t.get(0).unwrap(),
-        want,
-        "set that races flush must still persist"
-    );
+    assert_eq!(t.get(0).unwrap(), 9);
     let _ = std::fs::remove_file(&path);
 }

@@ -10,6 +10,7 @@ mod chain;
 mod compact;
 mod create_loc;
 mod delta_loc;
+mod dev_full;
 mod error;
 mod file;
 mod fuse8_filter;
