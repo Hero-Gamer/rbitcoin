@@ -211,8 +211,9 @@ engineering.
    packed `g` (`mphf_g=0`) versus mmap sealed `.fuse8` (`fuse8=0` heap)
    and SH BDZ3 occupancy (`mphf_occ=` supers only; occ bits are `file=`)
    is that kind of choice. Reclaim of mapped fuse/occ is drop of file pages,
-   not swap. `strong_tx` and mempool stay process `Vec` (Class C tip-last write-behind
-   / live graph); do not mmap those because fuse mapping looked good.
+   not swap. `strong_tx` stays a process-resident bit image and mempool stays a
+   process `Vec` (Class C tip-last write-behind / live graph); do not mmap those
+   because fuse mapping looked good.
 
    Write as if the structure is huge, because in IBD it is. **Address** it
    (hash, slot, page, bit offset, subscript). Do not walk everything resident

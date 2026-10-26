@@ -1,7 +1,9 @@
 //! Class C tip/confirmation tables and Class A header→tx ranges.
 
-use crate::array_table::ArrayTable;
+use crate::array_table::{copy_bit_bytes, seq_odd, seq_read, ArrayTable, ClassCWrite, FlushStep};
 use crate::error::StoreError;
+use crate::file::{TableFile, FILE_HEADER_LEN};
+use crate::sync::atomic::{AtomicU64, Ordering};
 use rbitcoin_primitives::{Fk, Height, TableKind};
 use std::path::Path;
 
@@ -29,11 +31,7 @@ impl ConfirmedTable {
 
     pub fn tip_height(&self) -> Option<Height> {
         let n = self.arr.len();
-        if n == 0 {
-            None
-        } else {
-            Some(Height((n - 1) as u32))
-        }
+        (n != 0).then(|| Height((n - 1) as u32))
     }
 
     pub fn get(&self, height: Height) -> Result<Option<Fk>, StoreError> {
@@ -43,11 +41,7 @@ impl ConfirmedTable {
 
     /// Batch height → header_fk (0-based height indices). Missing/unset → `None`.
     pub fn get_many(&self, heights: &[Height]) -> Result<Vec<Option<Fk>>, StoreError> {
-        let mut out = Vec::with_capacity(heights.len());
-        for &h in heights {
-            out.push(self.get(h)?);
-        }
-        Ok(out)
+        heights.iter().map(|&h| self.get(h)).collect()
     }
 
     /// Write a raw slot, including 0. For tests that need a tip length with
@@ -56,7 +50,7 @@ impl ConfirmedTable {
     #[doc(hidden)]
     pub fn set_raw_for_test(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         height: Height,
         value: u64,
     ) -> Result<(), StoreError> {
@@ -65,7 +59,7 @@ impl ConfirmedTable {
 
     pub fn set(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         height: Height,
         header_fk: Fk,
     ) -> Result<(), StoreError> {
@@ -78,11 +72,7 @@ impl ConfirmedTable {
     /// Set many height→header_fk pairs (one grow for max height, then bulk writes).
     ///
     /// Used by multi-block Class C confirm so tip extension is not N separate grows.
-    pub fn set_many(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        pairs: &[(Height, Fk)],
-    ) -> Result<(), StoreError> {
+    pub fn set_many(&self, write: &ClassCWrite, pairs: &[(Height, Fk)]) -> Result<(), StoreError> {
         if pairs.is_empty() {
             return Ok(());
         }
@@ -100,10 +90,7 @@ impl ConfirmedTable {
     ///
     /// Returns how many slots were removed. Mid-array holes are left for
     /// [`Store::revalidate_tip_window_n`] to shrink to last good.
-    pub fn trim_trailing_nulls(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-    ) -> Result<u64, StoreError> {
+    pub fn trim_trailing_nulls(&self, write: &ClassCWrite) -> Result<u64, StoreError> {
         let n = self.arr.len();
         if n == 0 {
             return Ok(0);
@@ -124,11 +111,7 @@ impl ConfirmedTable {
     }
 
     /// Disconnect tip: height must be current tip.
-    pub fn disconnect_tip(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        height: Height,
-    ) -> Result<(), StoreError> {
+    pub fn disconnect_tip(&self, write: &ClassCWrite, height: Height) -> Result<(), StoreError> {
         match self.tip_height() {
             Some(t) if t == height => {
                 self.arr.truncate(write, u64::from(height.0))?;
@@ -149,167 +132,156 @@ impl ConfirmedTable {
 }
 
 /// Per-tx strong bit (schema v3): bit `(tx_fk - 1)` set ⇒ strong on best chain.
-///
-/// ~64× smaller than u64-per-tx; call sites only need `is_strong`. Header fk is
-/// not stored (derived from confirmed range when needed).
-///
-/// Always L2 write-behind (unlike [`crate::array_table::class_c_inram_max_bytes`],
-/// which still caps `confirmed` / `header_txs_*`). 1 bit/tx stays in RAM.
+/// ~64× smaller than a `u64` per tx; the header fk comes from the confirmed range.
+/// Always in RAM, ignoring [`crate::array_table::class_c_inram_max_bytes`].
+/// The words are [`ArrayTable`]'s slot buffer. Its length is body bytes, not
+/// rounded up to a word. Flush is that table's flush.
 pub struct StrongTxTable {
-    pub bits: crate::file::TableFile,
+    pub table: ArrayTable,
     /// Number of bits allocated (covers tx fks 1..=n_bits).
-    pub n_bits: std::sync::atomic::AtomicU64,
-    /// L2 byte image. `strong_tx` stays in this `Vec`; open and create never go FdOnly.
-    pub data: std::sync::RwLock<Vec<u8>>,
-    /// Lowest bit not yet persisted (`u64::MAX` = clean).
-    pub unstored_bit: std::sync::atomic::AtomicU64,
-    /// True from the moment a flush records its range until it returns.
-    pub flushing: std::sync::atomic::AtomicBool,
-    /// Body byte length last flushed to disk (L2).
-    pub disk_bytes: std::sync::atomic::AtomicU64,
-    /// Largest chunk the last flush passed to `write_at`.
-    #[doc(hidden)]
-    pub flush_chunk_max: std::sync::atomic::AtomicUsize,
-}
-
-#[must_use]
-struct EndStrongFlush<'a> {
-    table: &'a StrongTxTable,
-    persisted: Option<u64>,
-}
-
-impl Drop for EndStrongFlush<'_> {
-    fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
-        if let Some(n) = self.persisted {
-            self.table.disk_bytes.store(n, Ordering::Release);
-            self.table.unstored_bit.store(u64::MAX, Ordering::Release);
-        }
-        self.table.flushing.store(false, Ordering::Release);
-    }
+    pub n_bits: AtomicU64,
 }
 
 impl StrongTxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
+        let file = TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?;
         Ok(Self {
-            bits: crate::file::TableFile::create(dir.join("strong_tx.body"), TableKind::StrongTx)?,
-            n_bits: std::sync::atomic::AtomicU64::new(0),
-            data: std::sync::RwLock::new(Vec::new()),
-            unstored_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
-            flushing: std::sync::atomic::AtomicBool::new(false),
-            disk_bytes: std::sync::atomic::AtomicU64::new(0),
-            flush_chunk_max: std::sync::atomic::AtomicUsize::new(0),
+            table: ArrayTable::bit_image(file, 0),
+            n_bits: AtomicU64::new(0),
         })
     }
 
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
-        let bits = crate::file::TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
-        let body = bits
-            .logical_len()
-            .saturating_sub(crate::file::FILE_HEADER_LEN as u64);
-        let n_bits = body.saturating_mul(8);
-        let mut v = vec![0u8; body as usize];
+        let bits = TableFile::open(dir.join("strong_tx.body"), TableKind::StrongTx)?;
+        let body = bits.logical_len().saturating_sub(FILE_HEADER_LEN as u64);
+        let mut bytes = vec![0u8; body as usize];
         if body > 0 {
-            bits.read_at(crate::file::FILE_HEADER_LEN as u64, &mut v)?;
+            bits.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
+        }
+        let table = ArrayTable::bit_image(bits, body);
+        if body > 0 {
+            table.slots.grow((body as usize).div_ceil(8));
+            Self::copy_bytes_in(table.slots.slots(Ordering::Relaxed), &bytes);
         }
         Ok(Self {
-            bits,
-            n_bits: std::sync::atomic::AtomicU64::new(n_bits),
-            data: std::sync::RwLock::new(v),
-            unstored_bit: std::sync::atomic::AtomicU64::new(u64::MAX),
-            flushing: std::sync::atomic::AtomicBool::new(false),
-            disk_bytes: std::sync::atomic::AtomicU64::new(body),
-            flush_chunk_max: std::sync::atomic::AtomicUsize::new(0),
+            table,
+            n_bits: AtomicU64::new(body.saturating_mul(8)),
         })
     }
 
-    fn refuse_while_flushing(&self) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        if self.flushing.load(Ordering::Acquire) {
-            Err(StoreError::Rejected("class C store during flush"))
-        } else {
-            Ok(())
+    fn ensure_held(&self, need_bits: u64) {
+        if need_bits <= self.n_bits.load(Ordering::Relaxed) {
+            return;
+        }
+        let need_bytes = need_bits.div_ceil(8) as usize;
+        self.table.slots.grow(need_bytes.div_ceil(8));
+        self.table.len.store(need_bytes as u64, Ordering::Relaxed);
+        self.n_bits.store(need_bits, Ordering::Relaxed);
+    }
+
+    fn for_each_mask(start: u64, end: u64, mut f: impl FnMut(usize, u64)) {
+        let mut bit = start;
+        while bit < end {
+            let wi = (bit / 64) as usize;
+            let word_lo = (wi as u64) * 64;
+            let lo = bit - word_lo;
+            let hi = end.min(word_lo + 64) - word_lo;
+            // `u64::MAX << lo` is `MAX ^ ((1 << lo) - 1)`. A short word stops at `hi`.
+            let hi_bits = if hi == 64 { u64::MAX } else { (1u64 << hi) - 1 };
+            let mask = hi_bits ^ ((1u64 << lo) - 1);
+            f(wi, mask);
+            bit = word_lo + hi;
+        }
+    }
+
+    fn apply_bits(&self, start: u64, end: u64, on: bool) {
+        let words = self.table.slots.slots(Ordering::Relaxed);
+        Self::for_each_mask(start, end, |wi, mask| {
+            if on {
+                words[wi].fetch_or(mask, Ordering::Relaxed);
+            } else {
+                words[wi].fetch_and(!mask, Ordering::Relaxed);
+            }
+        });
+    }
+
+    fn count_word_ones(words: &[AtomicU64], start: u64, end: u64) -> u64 {
+        let mut ones = 0u64;
+        Self::for_each_mask(start, end, |wi, mask| {
+            ones += (words[wi].load(Ordering::Relaxed) & mask).count_ones() as u64;
+        });
+        ones
+    }
+
+    fn store_byte(words: &[AtomicU64], index: usize, value: u8) {
+        let w = &words[index / 8];
+        let shift = (index % 8) * 8;
+        let _ = w.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some((cur & !(0xffu64 << shift)) | (u64::from(value) << shift))
+        });
+    }
+
+    fn copy_bytes_in(words: &[AtomicU64], src: &[u8]) {
+        for (i, chunk) in src.chunks(8).enumerate() {
+            let mut buf = [0u8; 8];
+            buf[..chunk.len()].copy_from_slice(chunk);
+            words[i].store(u64::from_le_bytes(buf), Ordering::Relaxed);
         }
     }
 
     #[doc(hidden)]
     pub fn mark_dirty_bit(&self, bit: u64) {
-        use std::sync::atomic::Ordering;
-        let _ = self.unstored_bit.fetch_min(bit, Ordering::AcqRel);
+        let _ = self.table.unstored_from.fetch_min(bit, Ordering::AcqRel);
     }
 
     #[doc(hidden)]
-    pub fn ensure_bits(
-        &self,
-        _write: &crate::array_table::ClassCWrite,
-        need_bits: u64,
-    ) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        let n = self.n_bits.load(Ordering::Acquire);
-        if need_bits <= n {
+    pub fn ensure_bits(&self, _write: &ClassCWrite, need_bits: u64) -> Result<(), StoreError> {
+        if need_bits <= self.n_bits.load(Ordering::Acquire) {
             return Ok(());
         }
-        let need_bytes = need_bits.div_ceil(8);
-        let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
-        self.refuse_while_flushing()?;
-        if need_bytes as usize > guard.len() {
-            guard.resize(need_bytes as usize, 0);
-        }
-        self.n_bits.store(need_bits, Ordering::Release);
-        // Growth alone is not a bit mutate; callers set_bit mark dirty.
+        let _odd = self.table.begin_store()?;
+        self.ensure_held(need_bits);
         Ok(())
     }
 
     #[doc(hidden)]
     pub fn get_bit(&self, bit: u64) -> Result<bool, StoreError> {
-        use std::sync::atomic::Ordering;
-        let n = self.n_bits.load(Ordering::Acquire);
-        if bit >= n {
-            return Ok(false);
-        }
-        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let bi = (bit / 8) as usize;
-        Ok((guard[bi] >> (bit % 8)) & 1 != 0)
+        Ok(seq_read(&self.table.seq, || {
+            let n = self.n_bits.load(Ordering::Relaxed);
+            if bit >= n {
+                return Some(false);
+            }
+            let words = self.table.slots.try_slots((bit / 64) as usize + 1)?;
+            let word = words[(bit / 64) as usize].load(Ordering::Relaxed);
+            Some((word >> (bit % 64)) & 1 == 1)
+        }))
     }
 
     #[doc(hidden)]
-    pub fn set_bit(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        bit: u64,
-        on: bool,
-    ) -> Result<(), StoreError> {
-        self.ensure_bits(write, bit + 1)?;
-        let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
-        self.refuse_while_flushing()?;
-        let bi = (bit / 8) as usize;
-        if on {
-            guard[bi] |= 1 << (bit % 8);
-        } else {
-            guard[bi] &= !(1 << (bit % 8));
-        }
-        self.mark_dirty_bit(bit);
-        Ok(())
+    pub fn set_bit(&self, write: &ClassCWrite, bit: u64, on: bool) -> Result<(), StoreError> {
+        self.set_bits_range(write, bit, bit + 1, on)
     }
 
     /// Compatibility: Some(dummy nonzero) if strong, else None.
     pub fn get(&self, tx_fk: Fk) -> Result<Option<Fk>, StoreError> {
-        if self.is_strong(tx_fk)? {
-            Ok(Some(Fk(1)))
-        } else {
-            Ok(None)
-        }
+        Ok(self.is_strong(tx_fk)?.then_some(Fk(1)))
     }
 
     /// In-RAM L2 bit-image bytes.
     pub fn l2_resident_bytes(&self) -> u64 {
-        let g = self.data.read().unwrap_or_else(|e| e.into_inner());
-        g.len() as u64
+        self.table.l2_resident_bytes()
+    }
+
+    /// Set one live body byte without the sequence counter. Flush tests use
+    /// this to show the persist reads the image the writer would read.
+    #[doc(hidden)]
+    pub fn poke_live_byte(&self, index: usize, value: u8) {
+        Self::store_byte(self.table.slots.slots(Ordering::Acquire), index, value);
     }
 
     pub fn set_strong(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         tx_fk: Fk,
         header_fk: Fk,
     ) -> Result<(), StoreError> {
@@ -323,19 +295,18 @@ impl StrongTxTable {
     /// Mark many consecutive tx fks strong (one ensure + bulk byte writes).
     pub fn set_strong_range(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         first_tx_fk: Fk,
         count: u32,
         header_fk: Fk,
     ) -> Result<(), StoreError> {
-        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        if header_fk.is_null() || count == 0 {
-            return if count == 0 {
-                Ok(())
-            } else {
-                Err(StoreError::InvalidFk)
-            };
+        if count == 0 {
+            return Ok(());
         }
+        if header_fk.is_null() {
+            return Err(StoreError::InvalidFk);
+        }
+        let id = first_tx_fk.get().ok_or(StoreError::InvalidFk)?;
         let start = id - 1;
         let end = start + u64::from(count);
         self.set_bits_range(write, start, end, true)
@@ -345,7 +316,7 @@ impl StrongTxTable {
     #[doc(hidden)]
     pub fn set_bits_range(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        _write: &ClassCWrite,
         start: u64,
         end: u64,
         on: bool,
@@ -353,30 +324,16 @@ impl StrongTxTable {
         if end <= start {
             return Ok(());
         }
-        self.ensure_bits(write, end)?;
-        let mut guard = self.data.write().unwrap_or_else(|e| e.into_inner());
-        self.refuse_while_flushing()?;
-        let mut bit = start;
-        while bit < end {
-            let bi = (bit / 8) as usize;
-            if on {
-                guard[bi] |= 1 << (bit % 8);
-            } else {
-                guard[bi] &= !(1 << (bit % 8));
-            }
-            bit += 1;
-        }
+        let _odd = self.table.begin_store()?;
+        self.ensure_held(end);
+        self.apply_bits(start, end, on);
         self.mark_dirty_bit(start);
         Ok(())
     }
 
-    pub fn set_unstrong(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        tx_fk: Fk,
-    ) -> Result<(), StoreError> {
+    pub fn set_unstrong(&self, write: &ClassCWrite, tx_fk: Fk) -> Result<(), StoreError> {
         let id = tx_fk.get().ok_or(StoreError::InvalidFk)?;
-        let n = self.n_bits.load(std::sync::atomic::Ordering::Acquire);
+        let n = self.n_bits.load(Ordering::Acquire);
         if id > n {
             return Ok(());
         }
@@ -386,7 +343,7 @@ impl StrongTxTable {
     /// Clear many consecutive strong bits (Class C repair / disconnect ranges).
     pub fn set_unstrong_range(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         first_tx_fk: Fk,
         count: u32,
     ) -> Result<(), StoreError> {
@@ -396,7 +353,7 @@ impl StrongTxTable {
         }
         let start = id - 1;
         let end = start + u64::from(count);
-        let n = self.n_bits.load(std::sync::atomic::Ordering::Acquire);
+        let n = self.n_bits.load(Ordering::Acquire);
         if start >= n {
             return Ok(());
         }
@@ -411,7 +368,7 @@ impl StrongTxTable {
 
     /// Allocated bit count (covers create fks `1..=n`).
     pub fn allocated_bits(&self) -> u64 {
-        self.n_bits.load(std::sync::atomic::Ordering::Acquire)
+        self.n_bits.load(Ordering::Acquire)
     }
 
     /// Count set bits for create fks in half-open `[start_fk, end_fk)`.
@@ -433,23 +390,15 @@ impl StrongTxTable {
         if end_bit <= start_bit {
             return Ok(0);
         }
-        let mut ones = 0u64;
-        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let mut bit = start_bit;
-        while bit < end_bit {
-            let bi = (bit / 8) as usize;
-            let b = guard[bi];
-            if b == 0 {
-                bit = (bit + 8) & !7;
-                continue;
+        Ok(seq_read(&self.table.seq, || {
+            let n = self.n_bits.load(Ordering::Relaxed);
+            let end = end_bit.min(n);
+            if end <= start_bit {
+                return Some(0);
             }
-            let off = (bit % 8) as u32;
-            if (b >> off) & 1 != 0 {
-                ones += 1;
-            }
-            bit += 1;
-        }
-        Ok(ones)
+            let words = self.table.slots.try_slots(((end - 1) / 64) as usize + 1)?;
+            Some(Self::count_word_ones(words, start_bit, end))
+        }))
     }
 
     /// Read `dst.len()` bit-image bytes starting at payload byte `byte_off`.
@@ -457,16 +406,20 @@ impl StrongTxTable {
         if dst.is_empty() {
             return Ok(());
         }
-        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-        let start = byte_off as usize;
-        let end = start.saturating_add(dst.len()).min(guard.len());
-        if start >= guard.len() {
-            dst.fill(0);
-            return Ok(());
-        }
-        let n = end - start;
-        dst[..n].copy_from_slice(&guard[start..end]);
-        dst[n..].fill(0);
+        seq_read(&self.table.seq, || {
+            let n = self.table.len.load(Ordering::Relaxed) as usize;
+            let start = byte_off as usize;
+            if start >= n {
+                dst.fill(0);
+                return Some(());
+            }
+            let take = dst.len().min(n - start);
+            let last = start + take - 1;
+            let words = self.table.slots.try_slots(last / 8 + 1)?;
+            copy_bit_bytes(words, start, &mut dst[..take]);
+            dst[take..].fill(0);
+            Some(())
+        });
         Ok(())
     }
 
@@ -483,76 +436,41 @@ impl StrongTxTable {
     /// Persist dirty L2 bit image by reading live bytes. The unstored mark
     /// clears only after the length publish succeeds.
     pub fn flush_dirty(&self) -> Result<(), StoreError> {
-        self.flush_dirty_between(|_, _| {})
+        self.table.flush_dirty()
     }
 
+    /// Same flush as [`ArrayTable::flush_dirty_between`]. The hook sees this
+    /// table so a test can store during admit or the write.
     #[doc(hidden)]
-    pub fn flush_dirty_between(
+    pub fn flush_observing(
         &self,
-        mut between: impl FnMut(&Self, crate::array_table::FlushStep),
+        mut between: impl FnMut(&Self, FlushStep),
     ) -> Result<(), StoreError> {
-        use std::sync::atomic::Ordering;
-        let (body_len, disk, dirty_byte) = {
-            let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-            let bit = self.unstored_bit.load(Ordering::Acquire);
-            if bit == u64::MAX {
-                return Ok(());
-            }
-            self.flushing.store(true, Ordering::Release);
-            let body_len = guard.len() as u64;
-            let disk = self.disk_bytes.load(Ordering::Acquire);
-            (body_len, disk, bit / 8)
-        };
-        let mut end = EndStrongFlush {
-            table: self,
-            persisted: None,
-        };
-        between(self, crate::array_table::FlushStep::Write);
-        if body_len >= disk {
-            let start = dirty_byte.min(disk);
-            if start < body_len {
-                let max = crate::array_table::pwrite_scratched(
-                    |at, chunk| self.bits.write_at(at, chunk),
-                    crate::file::FILE_HEADER_LEN as u64 + start,
-                    body_len - start,
-                    |dst, off| {
-                        let guard = self.data.read().unwrap_or_else(|e| e.into_inner());
-                        let at = start as usize + off as usize;
-                        dst.copy_from_slice(&guard[at..at + dst.len()]);
-                        Ok(())
-                    },
-                )?;
-                self.flush_chunk_max.store(max, Ordering::Relaxed);
-            }
-        }
-        let logical = crate::file::FILE_HEADER_LEN as u64 + body_len;
-        self.bits.set_logical_len(logical)?;
-        between(self, crate::array_table::FlushStep::Clean);
-        end.persisted = Some(body_len);
-        Ok(())
+        let this = self as *const Self;
+        // SAFETY: `this` is `self`, and the hook runs before this method
+        // returns. Both uses are shared.
+        self.table
+            .flush_dirty_between(|_, step| between(unsafe { &*this }, step))
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {
-        self.flush_dirty()?;
-        self.bits.flush()
+        self.table.flush()
     }
 
     pub fn flush_async(&self) -> Result<(), StoreError> {
-        self.flush_dirty()?;
-        self.bits.flush_async()
+        self.table.flush_async()
     }
 }
 
-/// Per-header **contiguous** tx_fk range (Class A archive body association).
-///
-/// Schema v2 stores `(first_tx_fk, count)` only — not a u64 fk vector.
-/// Writer must assign contiguous FKs per block (archive plan does).
-///
-/// - `first.body[header_fk-1]` = first_tx_fk (0 = no body)
-/// - `count.body[header_fk-1]` = n txs (0 = no body)
+/// Per-header contiguous tx_fk range (Class A). Schema v2 stores `(first, count)`
+/// only, and the writer assigns contiguous fks per block.
+/// `first.body[header_fk-1]` is the first tx fk (0 = no body).
+/// `count.body[header_fk-1]` is the tx count (0 = no body).
 pub struct HeaderTxsTable {
     pub first: ArrayTable,
     pub count: ArrayTable,
+    /// One counter for a header's `(first, count)` pair.
+    seq: AtomicU64,
 }
 
 impl HeaderTxsTable {
@@ -560,6 +478,7 @@ impl HeaderTxsTable {
         Ok(Self {
             first: ArrayTable::create(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
             count: ArrayTable::create(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
+            seq: AtomicU64::new(0),
         })
     }
 
@@ -567,6 +486,7 @@ impl HeaderTxsTable {
         Ok(Self {
             first: ArrayTable::open(dir.join("header_txs_first.body"), TableKind::ArrayLink)?,
             count: ArrayTable::open(dir.join("header_txs_count.body"), TableKind::ArrayLink)?,
+            seq: AtomicU64::new(0),
         })
     }
 
@@ -579,31 +499,30 @@ impl HeaderTxsTable {
     /// Store a contiguous range. `tx_fks` must be non-empty and contiguous.
     pub fn put_list(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         header_fk: Fk,
         tx_fks: &[Fk],
     ) -> Result<(), StoreError> {
+        let (first, n) = Self::list_span(tx_fks)?;
+        self.put_range(write, header_fk, first, n)
+    }
+
+    fn list_span(tx_fks: &[Fk]) -> Result<(Fk, u32), StoreError> {
         if tx_fks.is_empty() {
             return Err(StoreError::Corrupt("empty header tx list"));
         }
-        debug_assert!(
-            tx_fks
-                .windows(2)
-                .all(|w| w[1].0 == w[0].0.saturating_add(1)),
-            "header_txs must be contiguous"
-        );
         if !tx_fks
             .windows(2)
             .all(|w| w[1].0 == w[0].0.saturating_add(1))
         {
             return Err(StoreError::Corrupt("header_txs not contiguous"));
         }
-        self.put_range(write, header_fk, tx_fks[0], tx_fks.len() as u32)
+        Ok((tx_fks[0], tx_fks.len() as u32))
     }
 
     pub fn put_range(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         header_fk: Fk,
         first_tx_fk: Fk,
         n: u32,
@@ -612,6 +531,7 @@ impl HeaderTxsTable {
         if first_tx_fk.is_null() || n == 0 {
             return Err(StoreError::InvalidFk);
         }
+        let _pair = seq_odd(&self.seq);
         self.first.set(write, id - 1, first_tx_fk.0)?;
         self.count.set(write, id - 1, u64::from(n))?;
         Ok(())
@@ -620,7 +540,7 @@ impl HeaderTxsTable {
     /// Batch-append many header→tx ranges.
     pub fn put_lists_batch(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         items: &[(Fk, &[Fk])],
     ) -> Result<(), StoreError> {
         if items.is_empty() {
@@ -629,19 +549,12 @@ impl HeaderTxsTable {
         let mut first_pairs = Vec::with_capacity(items.len());
         let mut count_pairs = Vec::with_capacity(items.len());
         for (header_fk, tx_fks) in items {
-            if tx_fks.is_empty() {
-                return Err(StoreError::Corrupt("empty header tx list"));
-            }
-            if !tx_fks
-                .windows(2)
-                .all(|w| w[1].0 == w[0].0.saturating_add(1))
-            {
-                return Err(StoreError::Corrupt("header_txs not contiguous"));
-            }
+            let (first, n) = Self::list_span(tx_fks)?;
             let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-            first_pairs.push((id - 1, tx_fks[0].0));
-            count_pairs.push((id - 1, tx_fks.len() as u64));
+            first_pairs.push((id - 1, first.0));
+            count_pairs.push((id - 1, u64::from(n)));
         }
+        let _pair = seq_odd(&self.seq);
         self.first.set_many(write, &first_pairs)?;
         self.count.set_many(write, &count_pairs)?;
         Ok(())
@@ -650,7 +563,7 @@ impl HeaderTxsTable {
     /// Batch store ranges without expanding fk vectors.
     pub fn put_ranges_batch(
         &self,
-        write: &crate::array_table::ClassCWrite,
+        write: &ClassCWrite,
         items: &[(Fk, Fk, u32)],
     ) -> Result<(), StoreError> {
         if items.is_empty() {
@@ -666,6 +579,7 @@ impl HeaderTxsTable {
             first_pairs.push((id - 1, first_tx_fk.0));
             count_pairs.push((id - 1, u64::from(n)));
         }
+        let _pair = seq_odd(&self.seq);
         self.first.set_many(write, &first_pairs)?;
         self.count.set_many(write, &count_pairs)?;
         Ok(())
@@ -673,18 +587,29 @@ impl HeaderTxsTable {
 
     pub fn get_range(&self, header_fk: Fk) -> Result<Option<(Fk, u32)>, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
-        if id > self.first.len() {
-            return Ok(None);
-        }
-        let first_raw = self.first.get(id - 1)?;
-        let Some(first) = Fk::new(first_raw) else {
-            return Ok(None);
-        };
-        let n = self.count.get(id - 1)?;
-        if n == 0 || n > u64::from(u32::MAX) {
-            return Ok(None);
-        }
-        Ok(Some((first, n as u32)))
+        let mut failed = None;
+        let pair = seq_read(&self.seq, || {
+            failed = None;
+            if id > self.first.len() {
+                return Some(None);
+            }
+            // Column loads acquire the stores. `seq_read` rechecks behind its
+            // acquire fence. `Ok(None)` retries; `Err` returns once that generation holds.
+            let mut raw = [0u64; 2];
+            for (i, col) in [&self.first, &self.count].into_iter().enumerate() {
+                match col.peek_slot(id - 1) {
+                    Ok(Some(v)) => raw[i] = v,
+                    Ok(None) => return None,
+                    Err(e) => {
+                        failed = Some(e);
+                        return Some(None);
+                    }
+                }
+            }
+            let count = u32::try_from(raw[1]).ok().filter(|&n| n > 0);
+            Some(Fk::new(raw[0]).zip(count))
+        });
+        failed.map_or(Ok(pair), Err)
     }
 
     /// Expand range to a vec of fks (convenience for existing call sites).
@@ -692,11 +617,7 @@ impl HeaderTxsTable {
         let Some((first, n)) = self.get_range(header_fk)? else {
             return Ok(None);
         };
-        let mut out = Vec::with_capacity(n as usize);
-        for i in 0..n {
-            out.push(Fk(first.0 + u64::from(i)));
-        }
-        Ok(Some(out))
+        Ok(Some((0..n).map(|i| Fk(first.0 + u64::from(i))).collect()))
     }
 
     pub fn has_body(&self, header_fk: Fk) -> Result<bool, StoreError> {
@@ -707,14 +628,10 @@ impl HeaderTxsTable {
     pub fn index_in_span(first: Fk, n: u32, tx_fk: Fk) -> Option<u32> {
         let tid = tx_fk.get()?;
         let lo = first.get()?;
-        if n == 0 {
-            return None;
-        }
         let end = lo.saturating_add(u64::from(n));
-        if tid < lo || tid >= end {
-            return None;
-        }
-        u32::try_from(tid - lo).ok()
+        (n != 0 && (lo..end).contains(&tid))
+            .then(|| u32::try_from(tid - lo).ok())
+            .flatten()
     }
 
     /// True if `tx_fk` is in this header's contiguous Class A body range.
@@ -732,21 +649,14 @@ impl HeaderTxsTable {
         Ok(Self::index_in_span(first, n, tx_fk))
     }
 
-    /// Drop Class A body association for `header_fk` (does not free tx rows).
-    ///
-    /// Used when reconstruct produces a block that fails header checks (e.g.
-    /// merkle root mismatch) — the header hash is fine; the association is bad.
-    pub fn clear_body(
-        &self,
-        write: &crate::array_table::ClassCWrite,
-        header_fk: Fk,
-    ) -> Result<bool, StoreError> {
+    /// Drop the Class A body association for `header_fk` (tx rows stay).
+    /// Reconstruct uses this when a block fails a header check such as merkle.
+    pub fn clear_body(&self, write: &ClassCWrite, header_fk: Fk) -> Result<bool, StoreError> {
         let id = header_fk.get().ok_or(StoreError::InvalidFk)?;
         if id == 0 {
             return Err(StoreError::InvalidFk);
         }
-        let had = self.has_body(header_fk)?;
-        if !had {
+        if !self.has_body(header_fk)? {
             return Ok(false);
         }
         // Ensure array slots exist then zero (0 = no body).
@@ -754,26 +664,18 @@ impl HeaderTxsTable {
         if idx >= self.first.len() {
             return Ok(false);
         }
+        let _pair = seq_odd(&self.seq);
         self.first.set(write, idx, 0)?;
         self.count.set(write, idx, 0)?;
         Ok(true)
     }
 
-    /// Number of headers that currently have a Class A body (`count > 0`).
-    ///
-    /// Full-array scan — use only for rare status/startup (`archived_block_count`).
-    /// **Not** on the plan hot path: Class A never leads tip, so plan must not
-    /// call this for “archive far ahead” heuristics.
+    /// Headers with a Class A body (`count > 0`). Full scan for status and startup
+    /// (`archived_block_count`) only. Not a plan hot path: Class A never leads tip.
     pub fn count_bodies(&self) -> Result<u64, StoreError> {
-        let n = self.count.len();
-        let mut total = 0u64;
-        for i in 0..n {
-            let c = self.count.get(i)?;
-            if c > 0 {
-                total += 1;
-            }
-        }
-        Ok(total)
+        (0..self.count.len()).try_fold(0u64, |total, i| {
+            Ok(total + u64::from(self.count.get(i)? > 0))
+        })
     }
 
     pub fn flush(&self) -> Result<(), StoreError> {

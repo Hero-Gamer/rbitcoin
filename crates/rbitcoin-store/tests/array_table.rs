@@ -15,8 +15,9 @@ fn tmp_path() -> std::path::PathBuf {
     ))
 }
 
-/// `get` checks `len` before taking the read lock, so a `truncate` can
-/// land in between. The reader must see the shorter table, not panic.
+/// `get` samples `len` and the slot under one sequence counter. A `truncate`
+/// between those loads retries. The reader sees the previous value or the
+/// shortened table, not a mix and not a panic.
 #[test]
 fn get_racing_truncate_does_not_panic() {
     use std::sync::atomic::AtomicBool;
@@ -53,6 +54,83 @@ fn get_racing_truncate_does_not_panic() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A multi-slot store publishes one generation. Each `get` is the previous
+/// value or the new one for that index.
+#[test]
+fn get_during_set_many_is_old_or_new() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
+    let n = 32u64;
+    let old: Vec<_> = (0..n).map(|i| (i, 10 + i)).collect();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &old)
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (t, stop) = (Arc::clone(&t), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for i in 0..n {
+                        let v = t.get(i).unwrap();
+                        assert!(v == 10 + i || v == 100 + i, "mixed slot {i} value {v}");
+                    }
+                }
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        let new: Vec<_> = (0..n).map(|i| (i, 100 + i)).collect();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &new)
+            .unwrap();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &old)
+            .unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        assert!(r.join().is_ok(), "get panicked during set_many");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A store that lands after the flush has noticed it is dirty, and before
+/// new stores are excluded, is still in this flush. Sampling the dirty index
+/// before that exclusion would clear the mark and leave the slot off disk.
+#[test]
+fn store_before_exclude_is_in_this_flush() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(0, 1), (1, 2)])
+        .unwrap();
+    t.flush().unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9)
+        .unwrap();
+    t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Admit {
+            t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 7)
+                .unwrap();
+        }
+    })
+    .unwrap();
+    let mut buf = [0u8; 8];
+    t.file.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        7,
+        "earlier slot must be in this flush"
+    );
+    assert_eq!(
+        t.unstored_from.load(Ordering::Acquire),
+        u64::MAX,
+        "the mark must stay set until that slot is persisted"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Flush persists the live slots of the dirty range recorded at start.
 /// A store from the write hook is refused; the bytes on disk are the slots
 /// after that hook, so the flush did not keep a detached image. A store
@@ -72,9 +150,7 @@ fn flush_writes_live_slots_and_refuses_a_store_until_it_finishes() {
     let mut during = Ok(());
     t.flush_dirty_between(|t, step| {
         if step == FlushStep::Write {
-            if let Some(v) = t.data.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                v[0] = 77;
-            }
+            t.poke_live_slot(0, 77);
             during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9);
             let _ = t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(2, 8)]);
             let _ = t.truncate(&rbitcoin_store::ClassCWrite::for_test(), n - 1);

@@ -137,7 +137,10 @@ and no environment knob for these choices.
 capped by how many workers are parked. A worker is on that idle list only
 while it is not holding a job. The epoch check still runs after the debug
 park delay, so a wave published after the steal check is not missed.
-`steal_publish_wakes_idle_workers` is the pin.
+`steal_publish_wakes_idle_workers` is the pin. A claim increments
+`in_wave`, then release-increments `next`. `is_complete` acquire-loads
+`next` before it reads `in_wave`, so it does not drop the wave under a
+claim that still applies.
 
 **Fixed.** `serve_getdata_tail` used to call `ChainHub::knows_header` on
 the session worker for every block `getdata`. An unknown hash took
@@ -256,6 +259,29 @@ Single Class A writer is intentional. Multi‑GiB **FdOnly grow** is fallocate-o
 (no remap). Hash heads do not rewrite occupied tables while serving; a leftover
 undersized `header.head` may be **rewritten via `header.head.grow` then rename** once on open. Class C tip tables use L2
 write-behind (barrier `flush_class_c_tip`); large tables stay L0.
+In-RAM gets of `confirmed`, `header_txs`, and `strong_tx` take no reader-writer
+lock. `strong_tx` packs its bits into the same slot buffer and flush as those
+arrays. Its length is the body in bytes and is not rounded up to a word.
+The writer advances a sequence counter to odd, release-fences, stores
+the slots, and advances the counter to even. The odd advance does not publish
+those stores: a release on it would publish only the writes that came before
+it, and a `SeqCst` increment does not either. A get loads the counter, loads
+the slots, acquire-fences, and keeps the sample only when the counter is still
+that even value. An acquire load of the counter does not by itself keep the
+slot loads from moving after it. Gets are not `SeqCst`.
+`header_txs` `get_range` uses one counter for the first and the count. A
+column load acquires that store, then the same acquire fence checks the
+counter again. A flush excludes new stores, then reads the dirty range and
+the live slots. The odd bit and the flushing flag are `SeqCst` in both
+directions. A `SeqCst` fence sits between the odd store and the flag load,
+and between the flag store and the flusher's counter load. A relaxed odd bit
+and a release store of the flag do not exclude each other, and a `SeqCst`
+access is not that fence. The flag clears with `SeqCst` after the disk length
+and the clean mark, which stay release stores. The flush does not bump the
+counter, so a get during the flush does not retry because of the flush. Readers stay up
+during IBD. Growth keeps the previous buffer until the table is dropped. A
+get retries when the length it sampled does not fit the buffer it loaded. A
+bulk bit scan rechecks the counter once at the end.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline

@@ -646,6 +646,10 @@ impl Query {
         };
         #[cfg(debug_assertions)]
         let _probe = admit.as_ref().map(|a| self.sh_join_probe.enter(a.heavy));
+        // Release builds have no probe. Moving the guard into `_admit` keeps
+        // it until this function returns. Debug drops `_probe` first.
+        #[cfg(not(debug_assertions))]
+        let _admit = admit;
         let t_pages = std::time::Instant::now();
         let entries = self.store.scripthash.create_fks(scripthash)?;
         let pages_us = t_pages.elapsed().as_micros();
@@ -714,7 +718,8 @@ impl Query {
                 spends_us
             );
         }
-        drop(admit);
+        // Debug drops `_probe` before `admit`. Releasing the heavy lock first
+        // lets the next heavy join enter the probe while this one is still counted.
         Ok(out)
     }
 

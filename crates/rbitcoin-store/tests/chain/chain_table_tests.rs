@@ -15,6 +15,47 @@ fn tmp() -> std::path::PathBuf {
     p
 }
 
+/// `get_range` samples first and count together. A paired update or a clear
+/// returns the previous pair, the new pair, or no body. Never a new first
+/// with the old count, and never a zeroed first with the old count.
+#[test]
+fn get_range_during_put_and_clear_is_one_pair() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = tmp();
+    let ht = Arc::new(HeaderTxsTable::create(&dir).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    ht.put_range(&write, Fk(1), Fk(10), 4).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (ht, stop) = (Arc::clone(&ht), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match ht.get_range(Fk(1)).unwrap() {
+                        Some((Fk(10), 4)) => {}
+                        Some((Fk(50), 9)) => {}
+                        None => {}
+                        other => panic!("torn header range {other:?}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        ht.put_range(&write, Fk(1), Fk(50), 9).unwrap();
+        ht.clear_body(&write, Fk(1)).unwrap();
+        ht.put_range(&write, Fk(1), Fk(10), 4).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        assert!(r.join().is_ok(), "get_range panicked");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many chain surface arms
 #[test]
 fn confirmed_tx_height_header_txs_surface() {

@@ -11,7 +11,8 @@ cache keeps the view coherent). Unix
 `mmap` `PROT_READ`/`MAP_SHARED`, Windows `MapViewOfFile` `PAGE_READONLY`. Packed
 MPHF `g` stays FdOnly 4 KiB: a mapped miss is one synchronous fault on the lookup
 thread, while `KIND_MPHF_G` keeps 128 pages in flight on the completion
-session. `strong_tx` and mempool stay process `Vec`.
+session. `strong_tx` stays a process-resident bit image. Mempool stays
+process `Vec`.
 
 **Map vs FdOnly:** map when the bytes are immutable after write, touched as
 a few random bytes per key, and must stay resident for the hot path (sealed
@@ -131,7 +132,7 @@ If a change seems to require collapsing a machine, **stop and ask**.
 |------|----------------------|------|
 | **L0** | Kernel page cache via pread/pwrite; process holds staging only | Payload then HWM publish; `sync_data` on flush barriers |
 | **L1** | 4 KiB head pages / 3–4 KiB SH chunks (working-set caches) | Write-back dirty page/chunk with one pwrite |
-| **L2** | Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) full `Vec` in process | **Write-behind:** RAM mutate during commit; complete-or-fail body image on `flush_class_c_tip` ([when](./crash-recovery.md#flush)) |
+| **L2** | Compact Class C (`confirmed`, `header_txs_*`, `strong_tx`) full image in process | **Write-behind:** RAM mutate during commit; live slots on `flush_class_c_tip` ([when](./crash-recovery.md#flush)) |
 
 **Never L2:** `txout` / `seqsigwit` / `spent`, full `tx.head` / `*.idx`.
 `RBITCOIN_CLASS_C_INRAM_MAX_MB` (default 256) caps **`confirmed`** and
