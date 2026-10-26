@@ -24,6 +24,8 @@ pub mod script_pool;
 pub mod signet;
 pub mod silent_payments;
 #[doc(hidden)]
+pub mod sync;
+#[doc(hidden)]
 pub mod trust;
 #[doc(hidden)]
 pub mod tx_precompute;

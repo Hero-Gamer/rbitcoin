@@ -24,3 +24,13 @@ Changed
   pass the flag and still be marked clean. The flush does not bump the
   counter. Growth keeps the previous buffer. A get retries when the
   length it sampled does not fit that buffer.
+- **A script-pool claim release-publishes `next` after `in_wave`.**
+  `is_complete` acquire-loads `next`, so it does not drop the wave under
+  a claim that still applies.
+- **Loom and shuttle model the claim order, the idle turn, the UTXO view
+  stamp, the Class C sequence counter, and Class C flush exclusion.**
+  They are not required PR checks. The index-release order is not a model:
+  it needs a `Query` full of `std` locks. The job shape follows phlip9's
+  #1214: cfg-gated model tests, a separate target directory, and the same
+  pull-request and nightly jobs. This change is an alternative to that
+  ArrayTable model. Those scenarios stay on #1214.

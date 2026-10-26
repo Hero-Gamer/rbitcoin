@@ -13,6 +13,7 @@
 //!
 //! No rayon / crossbeam.
 
+use crate::sync::atomic::Ordering as ModelOrdering;
 use arc_swap::ArcSwap;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -56,8 +57,8 @@ pub struct Wave {
     /// Jobs taken per successful steal. Script verify uses [`STEAL_CHUNK`].
     /// An index window claims one height.
     pub chunk: usize,
-    pub next: AtomicUsize,
-    pub in_wave: AtomicUsize,
+    pub next: crate::sync::atomic::AtomicUsize,
+    pub in_wave: crate::sync::atomic::AtomicUsize,
     pub failed: AtomicBool,
     pub first_err: Mutex<Option<ConsensusError>>,
     /// When set, warn-and-apply script faults are kept and the rest of the
@@ -85,10 +86,10 @@ impl Wave {
         if wave.failed.load(Ordering::Acquire) {
             return None;
         }
-        // `in_wave` before `next`: a last-chunk claimer is visible to
-        // `is_complete` before `next >= n`, so the publisher cannot free ctx
-        // under a worker about to `apply`.
-        wave.in_wave.fetch_add(1, Ordering::AcqRel);
+        // `in_wave` before `next`. `next` is the release, and `is_complete`
+        // acquire-loads it, so that load sees this increment. A relaxed
+        // `next` can become visible first and look like the claim finished.
+        wave.in_wave.fetch_add(1, ModelOrdering::AcqRel);
         let hold = InWave {
             wave: Arc::clone(wave),
         };
@@ -96,7 +97,7 @@ impl Wave {
             return None;
         }
         let chunk = wave.chunk.max(1);
-        let i = wave.next.fetch_add(chunk, Ordering::Relaxed);
+        let i = wave.next.fetch_add(chunk, ModelOrdering::Release);
         if i >= wave.n {
             return None;
         }
@@ -110,8 +111,8 @@ impl Wave {
     #[doc(hidden)]
     pub fn is_complete(&self) -> bool {
         let claimed_out =
-            self.next.load(Ordering::Relaxed) >= self.n || self.failed.load(Ordering::Acquire);
-        claimed_out && self.in_wave.load(Ordering::Acquire) == 0
+            self.next.load(ModelOrdering::Acquire) >= self.n || self.failed.load(Ordering::Acquire);
+        claimed_out && self.in_wave.load(ModelOrdering::Acquire) == 0
     }
 
     #[doc(hidden)]
@@ -143,14 +144,14 @@ impl Wave {
 
     #[doc(hidden)]
     pub fn has_unclaimed(&self) -> bool {
-        !self.failed.load(Ordering::Acquire) && self.next.load(Ordering::Relaxed) < self.n
+        !self.failed.load(Ordering::Acquire) && self.next.load(ModelOrdering::Relaxed) < self.n
     }
 
     fn unclaimed_chunks(&self) -> usize {
         if !self.has_unclaimed() {
             return 0;
         }
-        let next = self.next.load(Ordering::Relaxed);
+        let next = self.next.load(ModelOrdering::Relaxed);
         let chunk = self.chunk.max(1);
         self.n.saturating_sub(next).div_ceil(chunk)
     }
@@ -234,7 +235,7 @@ pub struct InWave {
 
 impl Drop for InWave {
     fn drop(&mut self) {
-        self.wave.in_wave.fetch_sub(1, Ordering::AcqRel);
+        self.wave.in_wave.fetch_sub(1, ModelOrdering::AcqRel);
         self.wave.notify_if_complete();
     }
 }
@@ -433,8 +434,8 @@ pub fn start_wave<T: Sync>(
     let wave = Arc::new(Wave {
         n: items.len(),
         chunk,
-        next: AtomicUsize::new(0),
-        in_wave: AtomicUsize::new(0),
+        next: crate::sync::atomic::AtomicUsize::new(0),
+        in_wave: crate::sync::atomic::AtomicUsize::new(0),
         failed: AtomicBool::new(false),
         first_err: Mutex::new(None),
         keep_faults: AtomicBool::new(keep_faults),
@@ -464,8 +465,8 @@ pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
 #[doc(hidden)]
 pub struct ScriptWorkers {
-    pub jobs: Mutex<VecDeque<Job>>,
-    pub epoch: AtomicUsize,
+    pub jobs: crate::sync::Mutex<VecDeque<Job>>,
+    pub epoch: crate::sync::atomic::AtomicUsize,
 }
 
 #[doc(hidden)]
@@ -485,10 +486,7 @@ pub static STEAL_UNPARKS: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub fn take_detached_job(pool: &ScriptWorkers) -> Option<Job> {
-    pool.jobs
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pop_front()
+    crate::sync::lock(&pool.jobs).pop_front()
 }
 
 #[doc(hidden)]
@@ -511,7 +509,7 @@ pub fn steal_or_job(pool: &ScriptWorkers) -> bool {
 #[doc(hidden)]
 pub fn wake_steal_workers() {
     let pool = workers();
-    pool.epoch.fetch_add(1, Ordering::Release);
+    pool.epoch.fetch_add(1, ModelOrdering::Release);
     unpark_idle(queued_wake_count(pool));
 }
 
@@ -519,11 +517,7 @@ fn work_pending(pool: &ScriptWorkers) -> bool {
     if fg_has_unclaimed() {
         return true;
     }
-    !pool
-        .jobs
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .is_empty()
+    !crate::sync::lock(&pool.jobs).is_empty()
 }
 
 fn queued_wake_count(pool: &ScriptWorkers) -> usize {
@@ -531,34 +525,40 @@ fn queued_wake_count(pool: &ScriptWorkers) -> usize {
     for wave in waves_snap().load().iter() {
         n = n.saturating_add(wave.unclaimed_chunks());
     }
-    let jobs = pool.jobs.lock().unwrap_or_else(|p| p.into_inner()).len();
+    let jobs = crate::sync::lock(&pool.jobs).len();
     n.saturating_add(jobs)
 }
 
-static IDLE_THREADS: Mutex<Vec<thread::Thread>> = Mutex::new(Vec::new());
+static IDLE_THREADS: std::sync::LazyLock<crate::sync::Mutex<Vec<crate::sync::thread::Thread>>> =
+    std::sync::LazyLock::new(|| crate::sync::Mutex::new(Vec::new()));
 
-fn register_idle_worker() {
-    let current = thread::current();
-    let mut idle = IDLE_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+#[doc(hidden)]
+pub fn register_idle(idle: &crate::sync::Mutex<Vec<crate::sync::thread::Thread>>) {
+    let current = crate::sync::thread::current();
+    let mut idle = crate::sync::lock(idle);
     if idle.iter().all(|parked| parked.id() != current.id()) {
         idle.push(current);
     }
 }
 
-fn unregister_idle_worker() {
-    let id = thread::current().id();
-    IDLE_THREADS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retain(|parked| parked.id() != id);
+#[doc(hidden)]
+pub fn unregister_idle(idle: &crate::sync::Mutex<Vec<crate::sync::thread::Thread>>) {
+    let id = crate::sync::thread::current().id();
+    crate::sync::lock(idle).retain(|parked| parked.id() != id);
 }
 
 fn unpark_idle(n: usize) {
+    unpark_idle_from(&IDLE_THREADS, n);
+}
+
+/// Wake up to `n` threads on this idle list. The OS pool uses [`IDLE_THREADS`].
+#[doc(hidden)]
+pub fn unpark_idle_from(idle: &crate::sync::Mutex<Vec<crate::sync::thread::Thread>>, n: usize) {
     if n == 0 {
         return;
     }
     let taken = {
-        let mut idle = IDLE_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut idle = crate::sync::lock(idle);
         let n = n.min(idle.len());
         idle.drain(..n).collect::<Vec<_>>()
     };
@@ -569,12 +569,46 @@ fn unpark_idle(n: usize) {
     }
 }
 
+/// Register, recheck, then park. Returns false when work or a newer epoch
+/// arrived before park, and true after a park that was woken.
+///
+/// The second check is the lost-wakeup close: a publisher that bumps the
+/// epoch after the first check must either be seen here or find this thread
+/// already on `idle` so its unpark is a park permit.
+#[doc(hidden)]
+pub fn park_if_still_idle(
+    pool: &ScriptWorkers,
+    epoch: usize,
+    idle: &crate::sync::Mutex<Vec<crate::sync::thread::Thread>>,
+) -> bool {
+    register_idle(idle);
+    let missed = work_pending(pool) || pool.epoch.load(ModelOrdering::Acquire) != epoch;
+    if missed {
+        unregister_idle(idle);
+        return false;
+    }
+    #[cfg(debug_assertions)]
+    maybe_delay_park();
+    let missed = work_pending(pool) || pool.epoch.load(ModelOrdering::Acquire) != epoch;
+    if missed {
+        unregister_idle(idle);
+        return false;
+    }
+    #[cfg(debug_assertions)]
+    IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
+    crate::sync::thread::park();
+    #[cfg(debug_assertions)]
+    IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    unregister_idle(idle);
+    true
+}
+
 #[doc(hidden)]
 pub fn workers() -> &'static ScriptWorkers {
     static SPAWN: OnceLock<()> = OnceLock::new();
     let pool = WORKERS.get_or_init(|| ScriptWorkers {
-        jobs: Mutex::new(VecDeque::new()),
-        epoch: AtomicUsize::new(0),
+        jobs: crate::sync::Mutex::new(VecDeque::new()),
+        epoch: crate::sync::atomic::AtomicUsize::new(0),
     });
     SPAWN.get_or_init(|| {
         let n = thread::available_parallelism()
@@ -592,37 +626,17 @@ pub fn workers() -> &'static ScriptWorkers {
                         if steal_or_job(pool) {
                             continue;
                         }
-                        let epoch = pool.epoch.load(Ordering::Acquire);
+                        let epoch = pool.epoch.load(ModelOrdering::Acquire);
                         if steal_or_job(pool) {
                             continue;
                         }
-                        if pool.epoch.load(Ordering::Acquire) != epoch {
+                        if pool.epoch.load(ModelOrdering::Acquire) != epoch {
                             continue;
                         }
-                        register_idle_worker();
                         // Do not run a job while registered. A busy worker on
                         // the idle list would take a wake meant for one that
                         // is actually parked.
-                        let missed =
-                            work_pending(pool) || pool.epoch.load(Ordering::Acquire) != epoch;
-                        if missed {
-                            unregister_idle_worker();
-                            continue;
-                        }
-                        #[cfg(debug_assertions)]
-                        maybe_delay_park();
-                        let missed =
-                            work_pending(pool) || pool.epoch.load(Ordering::Acquire) != epoch;
-                        if missed {
-                            unregister_idle_worker();
-                            continue;
-                        }
-                        #[cfg(debug_assertions)]
-                        IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
-                        thread::park();
-                        #[cfg(debug_assertions)]
-                        IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
-                        unregister_idle_worker();
+                        let _ = park_if_still_idle(pool, epoch, &IDLE_THREADS);
                     }
                 })
             else {
@@ -717,7 +731,7 @@ where
 {
     let pool = workers();
     {
-        let mut q = pool.jobs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut q = crate::sync::lock(&pool.jobs);
         q.push_back(Box::new(work));
     }
     wake_steal_workers();
