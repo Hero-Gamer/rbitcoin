@@ -27,6 +27,7 @@ use bitcoin::CompactTarget;
 use bitcoin::Work;
 use rbitcoin_net::chain::ChainHub;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 /// Difficulty state after a header, so a fork or rewind can retarget without
@@ -99,6 +100,10 @@ pub struct HeaderWalk {
     /// Peers retired from the walk after a reply made no useful progress.
     /// A block inv or a redial clears the bit. Not written to `header.adopt`.
     pub walk_quiet: HashSet<usize>,
+    /// Productive block peers with late headers. Prefer other header peers,
+    /// but retain their advertised horizon and use them as a fallback.
+    /// A header reply or disconnect clears this process-local preference.
+    pub header_timeout_peers: HashSet<usize>,
     /// Peer that serves the one headers ask. Not written to `header.adopt`.
     pub reserved: Option<usize>,
     /// One ask owed after a block inv.
@@ -141,13 +146,18 @@ pub struct Lane {
 
 /// How long one header reply may take before another peer is asked.
 /// Each lane has its own request. A miss skips that peer on that lane when
-/// someone else can be asked. A second miss on the same lane disconnects them.
+/// someone else can be asked. A second miss deprioritizes an actively downloading
+/// header peer; without recent solicited block progress it disconnects.
 /// Shorter than a stall cooldown: one headers reply, not a silent peer.
 #[doc(hidden)]
 pub const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
-/// Missed header asks before the peer is disconnected, same as a block stall.
+/// Missed header asks before header-role retirement or disconnection.
 #[doc(hidden)]
 pub const HEADER_MISS_DISCONNECT: u8 = 2;
+/// Header-only timeouts must not destroy a productive block session. Match
+/// the minimum block-stall window; pings and unrelated bytes do not renew it.
+#[doc(hidden)]
+pub const HEADER_BLOCK_PROGRESS_GRACE_MS: u64 = 30_000;
 #[doc(hidden)]
 pub const DEAD_END_CAP: usize = 1024;
 /// Past the cap the oldest refused tip gives way, so the newest is kept: the
@@ -643,6 +653,8 @@ pub fn note_external_block_inv(st: &mut IbdWorkState) -> bool {
 /// A redialed slot can reuse this id. Do not inherit the previous walk retirement.
 pub fn forget_walk_peer(st: &mut IbdWorkState, peer: usize) {
     st.header_walk.walk_quiet.remove(&peer);
+    st.header_walk.header_timeout_peers.remove(&peer);
+    st.header_walk.header_misses.remove(&peer);
     if st.header_walk.reserved == Some(peer) {
         st.header_walk.reserved = None;
     }
@@ -2507,6 +2519,7 @@ pub fn take_header_ask(st: &mut IbdWorkState, peer: usize) -> HeaderAsk {
     if previous {
         lane.prev_peer = None;
     }
+    st.header_walk.header_timeout_peers.remove(&peer);
     st.header_walk
         .header_misses
         .retain(|&asked, _| asked != peer);
@@ -2518,7 +2531,8 @@ pub fn take_header_ask(st: &mut IbdWorkState, peer: usize) -> HeaderAsk {
 }
 
 /// Count an expired ask on this lane. The peer is skipped on this pick. A
-/// second expiry disconnects them and is not skipped: they are no longer alive.
+/// second expiry deprioritizes their header role if solicited blocks are progressing;
+/// otherwise it disconnects them. Existing block-stall checks remain active.
 #[doc(hidden)]
 pub fn expire_header_ask(st: &mut IbdWorkState) -> Option<usize> {
     let peer = {
@@ -2538,8 +2552,7 @@ pub fn expire_header_ask(st: &mut IbdWorkState) -> Option<usize> {
         st.header_walk.probe_open = None;
         st.header_walk.probe_top = None;
         if n >= HEADER_MISS_DISCONNECT {
-            st.header_walk.header_misses.remove(&peer);
-            punish_header_peer(st, peer);
+            finish_header_timeout(st, peer);
         }
         return None;
     }
@@ -2547,9 +2560,8 @@ pub fn expire_header_ask(st: &mut IbdWorkState) -> Option<usize> {
         st.header_walk.challenge_open = None;
         st.header_walk.challenge_external = false;
         if n >= HEADER_MISS_DISCONNECT {
-            st.header_walk.header_misses.remove(&peer);
-            punish_header_peer(st, peer);
-        } else {
+            finish_header_timeout(st, peer);
+        } else if !retain_productive_header_timeout_peer(st, peer) {
             st.header_walk.walk_quiet.insert(peer);
         }
         return None;
@@ -2558,11 +2570,50 @@ pub fn expire_header_ask(st: &mut IbdWorkState) -> Option<usize> {
         st.header_walk.reserved = None;
     }
     if n >= HEADER_MISS_DISCONNECT {
-        st.header_walk.header_misses.remove(&peer);
-        punish_header_peer(st, peer);
+        finish_header_timeout(st, peer);
         return None;
     }
     Some(peer)
+}
+
+/// Only a completed solicited body renews this grace. Outstanding getdata must
+/// already be on the wire; queued commands or generic stream traffic do not.
+#[doc(hidden)]
+pub fn header_timeout_has_block_progress(slot: &super::peer_io::PeerSlot, now_ms: u64) -> bool {
+    slot.alive
+        && !slot.task.is_finished()
+        && !slot.in_flight.is_empty()
+        && slot.getdata_wire.unwritten() < slot.in_flight.len()
+        && slot.getdata_wire.window_ms.load(Ordering::Relaxed) >= 0
+        && slot.solicited_bytes.load(Ordering::Relaxed) > 0
+        && now_ms.saturating_sub(slot.solicited_ms.load(Ordering::Relaxed))
+            < HEADER_BLOCK_PROGRESS_GRACE_MS
+}
+
+fn finish_header_timeout(st: &mut IbdWorkState, peer: usize) {
+    st.header_walk.header_misses.remove(&peer);
+    if !retain_productive_header_timeout_peer(st, peer) {
+        punish_header_peer(st, peer);
+    }
+}
+
+fn retain_productive_header_timeout_peer(st: &mut IbdWorkState, peer: usize) -> bool {
+    let now_ms = super::peer_io::ibd_mono_ms();
+    let productive = st
+        .slots
+        .iter()
+        .any(|slot| slot.id == peer && header_timeout_has_block_progress(slot, now_ms));
+    if !productive {
+        return false;
+    }
+    st.header_walk.header_timeout_peers.insert(peer);
+    if st.header_walk.reserved == Some(peer) {
+        st.header_walk.reserved = None;
+    }
+    rbitcoin_log::info!(
+        "ibd: peer[{peer}] header replies timed out; keeping productive block connection"
+    );
+    true
 }
 
 #[doc(hidden)]
@@ -2585,7 +2636,8 @@ pub fn punish_header_peer(st: &mut IbdWorkState, peer: usize) {
 /// Ask for the next header when it is not already stored. The locator is the
 /// stored path tip. A request still inside its window stays in flight. One
 /// miss moves the reservation when another peer can take it. A second miss
-/// disconnects. A block-inv challenge is one ask to that peer and does not
+/// deprioritizes a productive block peer for headers, or disconnects an idle one.
+/// A block-inv challenge is one ask to that peer and does not
 /// replace the reservation until the reply beats the candidate.
 pub fn send_getheaders(
     st: &mut IbdWorkState,
@@ -2728,7 +2780,7 @@ pub fn peer_can_head(st: &IbdWorkState, id: usize, above: u32) -> bool {
 #[doc(hidden)]
 pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<usize> {
     fn rank(st: &IbdWorkState, skip: Option<usize>, quiet_ok: bool) -> Option<usize> {
-        let mut best: Option<(u8, u64, usize)> = None;
+        let mut best: Option<(bool, u8, u64, usize)> = None;
         for slot in &st.slots {
             if !slot.alive || skip == Some(slot.id) {
                 continue;
@@ -2737,14 +2789,24 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
                 continue;
             }
             let key = match header_ttfb(slot) {
-                Some(ttfb) => (0u8, ttfb, slot.id),
-                None => (1u8, 0, slot.id),
+                Some(ttfb) => (
+                    st.header_walk.header_timeout_peers.contains(&slot.id),
+                    0u8,
+                    ttfb,
+                    slot.id,
+                ),
+                None => (
+                    st.header_walk.header_timeout_peers.contains(&slot.id),
+                    1u8,
+                    0,
+                    slot.id,
+                ),
             };
             if best.is_none_or(|cur| key < cur) {
                 best = Some(key);
             }
         }
-        if let Some((_, _, id)) = best {
+        if let Some((_, _, _, id)) = best {
             return Some(id);
         }
         skip.filter(|&id| {
@@ -2761,20 +2823,30 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
 /// just expired, unless they are the only one left.
 #[doc(hidden)]
 pub fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> Option<usize> {
-    let mut best: Option<(u8, u64, usize)> = None;
+    let mut best: Option<(bool, u8, u64, usize)> = None;
     for slot in &st.slots {
         if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
             continue;
         }
         let key = match header_ttfb(slot) {
-            Some(ttfb) => (0u8, ttfb, slot.id),
-            None => (1u8, 0, slot.id),
+            Some(ttfb) => (
+                st.header_walk.header_timeout_peers.contains(&slot.id),
+                0u8,
+                ttfb,
+                slot.id,
+            ),
+            None => (
+                st.header_walk.header_timeout_peers.contains(&slot.id),
+                1u8,
+                0,
+                slot.id,
+            ),
         };
         if best.is_none_or(|cur| key < cur) {
             best = Some(key);
         }
     }
-    if let Some((_, _, id)) = best {
+    if let Some((_, _, _, id)) = best {
         return Some(id);
     }
     skip.filter(|&id| peer_can_head(st, id, above))
@@ -3572,6 +3644,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         #[cfg(debug_assertions)]
         announced_done: false,
         walk_quiet: HashSet::new(),
+        header_timeout_peers: HashSet::new(),
         reserved: None,
         challenge: None,
         challenge_external: false,

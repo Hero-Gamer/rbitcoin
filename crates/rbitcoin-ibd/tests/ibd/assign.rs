@@ -2006,6 +2006,46 @@ fn hostile_peer_session() {
 /// A hole in front of queued bodies is requested even when the densify
 /// cursor has moved past it. A holder whose peer is gone does not cover it.
 #[test]
+fn retained_header_timeout_frontier_is_recovered_in_critical_assign() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let (slots, mut wire) = wired_slots(2);
+    let mut st = IbdWorkState::new(slots, hub.tip_hash(), hub.tip_height());
+    plant_work_path(&mut st, 1, 8);
+    mark_heights_ready(&mut st, &hub, 2, 8);
+    st.slots[0].in_flight.insert(h(1));
+    st.inflight.insert(h(1), state::InflightReq::new(0));
+    st.header_walk.header_timeout_peers.insert(0);
+    let mut cfg = IbdConfig::for_test();
+    cfg.window = 16;
+    cfg.per_peer = 8;
+
+    assign_work_ordered(
+        &mut st,
+        &hub,
+        &cfg,
+        &LoopStats::default(),
+        AssignDepth::Critical,
+        None,
+    );
+
+    assert_eq!(
+        getdata_asks(&mut wire, h(1)),
+        vec![0, 1],
+        "critical assignment must ask the alternative peer without densify"
+    );
+    assert!(st.inflight[&h(1)].retired.contains(&0));
+    assert!(st.inflight[&h(1)].peers.contains(&1));
+    assert!(
+        st.slots[0].in_flight.contains(&h(1)),
+        "the retained peer keeps its outstanding request"
+    );
+    drop(st);
+    drop(hub);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn tip_hole_in_front_of_queued_bodies_is_requested() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
