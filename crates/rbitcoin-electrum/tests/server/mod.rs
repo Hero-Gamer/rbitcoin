@@ -2178,7 +2178,7 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
     .unwrap_err();
     assert!(
         err.contains("asof not on chain"),
-        "asof without dialect: {err}"
+        "unknown asof hash: {err}"
     );
 
     dispatch(
