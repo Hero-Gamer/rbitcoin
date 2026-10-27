@@ -634,8 +634,22 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         rbitcoin_net::install_i2p_dialer(sam.dialer());
     }
     let _i2p_sam = i2p_sam;
-    // Joined at shutdown. Started only after tip entry, once materialize is done.
+    // Joined at shutdown. A durable Tip head starts now, before catch-up.
+    // Direct stays down until materialize enters Tip.
     let mut sh_writebehind = None;
+    ensure_sh_writebehind(
+        &mut sh_writebehind,
+        Arc::clone(&node.hub.query),
+        Arc::clone(&shutdown.flag),
+        {
+            let sd = Arc::clone(&shutdown);
+            move || {
+                sd.fail(NodeError::Init(
+                    "scripthash or index write-behind failed".into(),
+                ))
+            }
+        },
+    );
     let peers_path = config.datadir.path().join("peers");
     let mut addrman = match AddrMan::load(&peers_path) {
         Ok(am) => {
@@ -840,15 +854,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         })
         .await
         .map_err(|e| NodeError::Config(format!("tip entry: {e}")))?;
-        sh_writebehind =
-            sh_writebehind_at_tip_entry(Arc::clone(&node.hub.query), Arc::clone(&shutdown.flag), {
+        ensure_sh_writebehind(
+            &mut sh_writebehind,
+            Arc::clone(&node.hub.query),
+            Arc::clone(&shutdown.flag),
+            {
                 let sd = Arc::clone(&shutdown);
                 move || {
                     sd.fail(NodeError::Init(
                         "scripthash or index write-behind failed".into(),
                     ))
                 }
-            });
+            },
+        );
         tip_follow_ready = gates.tip_follow_ready;
         sh_tip_ready = gates.sh_tip_ready;
         if tip_follow_ready && !shutdown.requested() {
@@ -1988,7 +2006,7 @@ pub fn apply_startup_index_mode(
         query.enter_tip_index_mode();
         info!(
             "node: durable scripthash head — resume IndexMode::Tip \
-             (skip Class A recollect; write-behind starts at tip entry)"
+             (skip Class A recollect; write-behind already started)"
         );
     } else {
         query
@@ -2545,6 +2563,19 @@ pub fn sh_tip_ready_gates(query: &Query) -> TipModeGates {
     }
 }
 
+/// Start the Class B appender once. A second call does not spawn another thread.
+pub fn ensure_sh_writebehind(
+    slot: &mut Option<std::thread::JoinHandle<()>>,
+    query: Arc<Query>,
+    stop: Arc<AtomicBool>,
+    on_fatal: impl FnOnce() + Send + 'static,
+) {
+    if slot.is_some() {
+        return;
+    }
+    *slot = sh_writebehind_at_tip_entry(query, stop, on_fatal);
+}
+
 /// Class B scripthash appender. `None` until Tip mode with `--sh-index`.
 pub fn sh_writebehind_at_tip_entry(
     query: Arc<Query>,
@@ -2567,7 +2598,7 @@ pub fn sh_writebehind_at_tip_entry(
 ///
 /// **SH methods (exactly two):**
 /// - Durable head: stay/flip `IndexMode::Tip`, discard leftover runs.
-///   Write-behind starts when this returns in Tip. `sh_tip_ready` only when
+///   The appender is already running from startup. `sh_tip_ready` only when
 ///   inclusion already covers the tip.
 /// - No head: Class A collect + unsorted pack **while Direct** (the appender
 ///   is not started yet), then Tip. Cancel leaves Direct; Electrum stays closed.
