@@ -4005,8 +4005,10 @@ impl ChainHub {
             if tip <= keep_height {
                 break;
             }
+            // A block that cannot be read back is not disconnected, so its
+            // txs are not lost from the pool.
             if mp.is_some() {
-                if let Ok(Some(b)) = self.block_at_height(tip) {
+                if let Some(b) = self.block_at_height(tip)? {
                     blocks.push(b.txdata.into_iter().skip(1).collect());
                 }
             }

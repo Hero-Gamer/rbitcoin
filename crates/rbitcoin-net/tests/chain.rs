@@ -2007,6 +2007,27 @@ fn branch_reorg_tip_events_follow_the_reaccept() {
     let _ = std::fs::remove_dir_all(pad.dir);
 }
 
+/// A disconnect whose block cannot be read back fails. It does not drop the
+/// block and lose its transactions from the pool.
+#[test]
+fn disconnect_fails_when_the_block_read_faults() {
+    let pad = reorg_pad();
+    let tip = pad.hub.tip_height();
+    pad.hub.cache.clear();
+    let inputs = find_store_file(pad.dir.path(), "input.body").expect("input.body");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&inputs)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    pad.hub
+        .rewind_to_height(pad.fork)
+        .expect_err("the tip block cannot be read back");
+    assert_eq!(pad.hub.tip_height(), tip, "the unreadable block stays");
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
 /// The new branch double-spends the parent. Core drops the parent and its
 /// child. The child does not wait in the orphanage for a parent that cannot
 /// come back.
