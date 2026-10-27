@@ -2404,11 +2404,25 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext, at: u32,
         cb - max_fee - 1,
         ScriptBuf::from_bytes(vec![0x51]),
     );
-    let e = dispatch(ctx, "sendrawtransaction", vec![json!(over_hex)]).unwrap_err();
-    assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
-    assert_eq!(
-        e["message"], "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
-        "{e}"
+    // Pre-0.19 `allowhighfees`, which btcd rpcclient sends for a `/rbitcoin:`
+    // subversion: `false` keeps the default cap, `true` lifts it.
+    for params in [vec![json!(over_hex)], vec![json!(over_hex), json!(false)]] {
+        let e = dispatch(ctx, "sendrawtransaction", params).unwrap_err();
+        assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
+        assert_eq!(
+            e["message"], "Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)",
+            "{e}"
+        );
+    }
+    let ok = dispatch(
+        ctx,
+        "sendrawtransaction",
+        vec![json!(over_hex), json!(true)],
+    )
+    .unwrap();
+    assert!(
+        ok.as_str().is_some(),
+        "allowhighfees true must lift the cap: {ok}"
     );
 }
 
@@ -2427,7 +2441,7 @@ fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
             "maxfeerate must be an integer sat/vB",
         ),
         (
-            json!(true),
+            json!({}),
             ERR_TYPE_ERROR,
             "maxfeerate is not a number or string",
         ),
