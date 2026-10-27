@@ -70,6 +70,12 @@ includes `checkmempool`), `deploymentinfo.json`, and
 `blockfilter/basic/<hash>.*` when `--block-filter-index` is on and that height is sealed. A later height is “still in the process of being indexed”, not an empty filter.
 No wallet routes. Broadcast and fees stay `POST /`.
 
+TCP and Unix sockets share a 256-connection cap. Each HTTP header and request
+body must finish within 30 seconds; waiting for the next keep-alive request
+uses the same header deadline. Expiry closes the connection and releases its
+slot. These read deadlines do not limit execution of a complete RPC request,
+including long-poll calls. The deadlines are fixed, with no operator knob.
+
 The Core-functional proxy still
 speaks TestNode cookie + HTTP Basic on the public port and forwards Bearer
 to the node. Mixed AuthServiceProxy `{args: […], maxfeerate: …}` is expanded

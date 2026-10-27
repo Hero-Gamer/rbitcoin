@@ -1060,6 +1060,8 @@ dependencies = [
  "base64",
  "bitcoin",
  "getrandom 0.4.3",
+ "hyper",
+ "hyper-util",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",

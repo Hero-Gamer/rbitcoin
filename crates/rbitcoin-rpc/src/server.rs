@@ -6,12 +6,15 @@ use crate::auth::{
 };
 use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 
 /// Axum's default request-body cap, named so auth and 413 share one limit.
 pub const RPC_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
@@ -20,6 +23,7 @@ pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
 /// Accept cap, copied from the Electrum public listener. Not a knob.
 #[doc(hidden)]
 pub const RPC_MAX_CONNECTIONS: usize = 256;
+const RPC_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 use rbitcoin_log::info;
 #[cfg(unix)]
 use rbitcoin_log::warn;
@@ -28,14 +32,11 @@ use rbitcoin_primitives::Network;
 use rbitcoin_query::Query;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 
 #[cfg(unix)]
 #[doc(hidden)]
@@ -48,82 +49,39 @@ pub fn bind_unix_mode(
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(listener)
 }
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
-/// One accepted connection. The permit is the accept slot and dies with the socket.
-#[doc(hidden)]
-pub struct HeldConn<S> {
-    pub io: S,
-    pub _permit: OwnedSemaphorePermit,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for HeldConn<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for HeldConn<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
-    }
-}
-
-/// Drops a new socket when [`RPC_MAX_CONNECTIONS`] are already open.
-#[doc(hidden)]
-pub struct AcceptCap<L> {
-    pub listener: L,
-    pub sem: Arc<Semaphore>,
-}
-
-impl<L> axum::serve::Listener for AcceptCap<L>
+async fn serve_rpc<L>(mut listener: L, app: Router, sem: Arc<Semaphore>, shutdown: Arc<AtomicBool>)
 where
     L: axum::serve::Listener,
-    L::Io: AsyncRead + AsyncWrite + Unpin,
     L::Addr: std::fmt::Debug,
 {
-    type Io = HeldConn<L::Io>;
-    type Addr = L::Addr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (io, addr) = axum::serve::Listener::accept(&mut self.listener).await;
-            match self.sem.clone().try_acquire_owned() {
-                Ok(permit) => {
-                    return (
-                        HeldConn {
-                            io,
-                            _permit: permit,
-                        },
-                        addr,
-                    )
-                }
-                Err(_) => {
-                    info!("rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})");
-                    drop(io);
+    let mut connections = JoinSet::new();
+    let mut shutdown_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            _ = shutdown_tick.tick() => {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
                 }
             }
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            (io, addr) = listener.accept() => {
+                let Ok(permit) = sem.clone().try_acquire_owned() else {
+                    info!("rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})");
+                    continue;
+                };
+                let service = TowerToHyperService::new(app.clone());
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let _ = http1::Builder::new()
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(RPC_READ_TIMEOUT)
+                        .serve_connection(TokioIo::new(io), service)
+                        .await;
+                });
+            }
         }
-    }
-
-    fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.listener.local_addr()
     }
 }
 
@@ -288,22 +246,9 @@ pub async fn run_rpc(
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
         let accept_sem = Arc::clone(&accept_sem);
-        tasks.push(tokio::spawn(async move {
-            axum::serve(
-                AcceptCap {
-                    listener,
-                    sem: accept_sem,
-                },
-                app,
-            )
-            .with_graceful_shutdown(async move {
-                while !shutdown_w.load(Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .ok();
-        }));
+        tasks.push(tokio::spawn(serve_rpc(
+            listener, app, accept_sem, shutdown_w,
+        )));
         info!(
             "rpc: HTTP JSON-RPC on {bound} (bearer token {})",
             token_path.display()
@@ -354,22 +299,9 @@ pub async fn run_rpc(
         let app = rpc_app(state);
         let shutdown_w = Arc::clone(&shutdown);
         let accept_sem = Arc::clone(&accept_sem);
-        tasks.push(tokio::spawn(async move {
-            axum::serve(
-                AcceptCap {
-                    listener,
-                    sem: accept_sem,
-                },
-                app,
-            )
-            .with_graceful_shutdown(async move {
-                while !shutdown_w.load(Ordering::SeqCst) {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            })
-            .await
-            .ok();
-        }));
+        tasks.push(tokio::spawn(serve_rpc(
+            listener, app, accept_sem, shutdown_w,
+        )));
         info!("rpc: unix JSON-RPC on {}", sock.display());
         Some(sock.clone())
     } else {
@@ -422,9 +354,10 @@ pub async fn rest_entry(State(state): State<AppState>, req: axum::extract::Reque
     // and REST does not use the RPC work queue.
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
-    let body = axum::body::to_bytes(req.into_body(), RPC_MAX_HTTP_BODY)
-        .await
-        .unwrap_or_default();
+    let body = match read_http_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let _permit = match state.rest_queue.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -623,7 +556,20 @@ pub async fn recv_tip(tips: &mut Option<tokio::sync::broadcast::Receiver<rbitcoi
     }
 }
 
-pub async fn rpc_post(State(state): State<AppState>, body: Bytes) -> Response {
+async fn read_http_body(req: Request) -> Result<Bytes, Response> {
+    match tokio::time::timeout(RPC_READ_TIMEOUT, Bytes::from_request(req, &())).await {
+        Ok(body) => body.map_err(IntoResponse::into_response),
+        Err(_) => {
+            Err((StatusCode::REQUEST_TIMEOUT, [(header::CONNECTION, "close")]).into_response())
+        }
+    }
+}
+
+pub async fn rpc_post(State(state): State<AppState>, req: Request) -> Response {
+    let body = match read_http_body(req).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     let parsed: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(_) => {
