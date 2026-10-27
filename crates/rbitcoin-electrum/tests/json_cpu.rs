@@ -64,7 +64,7 @@ fn poll_until(v: &Value, limit: Duration) -> Vec<u8> {
     let start = Instant::now();
     loop {
         match fut.as_mut().poll(&mut cx) {
-            Poll::Ready(bytes) => return bytes,
+            Poll::Ready(bytes) => return bytes.expect("json encode"),
             Poll::Pending => {
                 assert!(
                     start.elapsed() < limit,
@@ -115,7 +115,7 @@ fn encode_json_body_hops_only_at_4kib() {
     let start = Instant::now();
     let got = loop {
         match pending.as_mut().poll(&mut cx) {
-            std::task::Poll::Ready(bytes) => break bytes,
+            std::task::Poll::Ready(bytes) => break bytes.expect("json encode"),
             std::task::Poll::Pending => {
                 assert!(start.elapsed() < Duration::from_secs(2));
                 std::thread::park_timeout(Duration::from_millis(10));

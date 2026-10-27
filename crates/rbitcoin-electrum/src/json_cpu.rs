@@ -66,15 +66,18 @@ fn walk(v: &Value, left: &mut usize) -> bool {
 }
 
 /// Encode `v`. A heavy body hops to `rbtc-scripts-*`. A light body encodes here.
+///
+/// `Err` means the script worker dropped the reply. That is not an empty
+/// object: callers must not publish HTTP 200 `{}` for it.
 #[doc(hidden)]
-pub async fn encode_json_body(v: &Value) -> Vec<u8> {
+pub async fn encode_json_body(v: &Value) -> Result<Vec<u8>, ()> {
     if !json_is_cpu_heavy(v) {
-        return serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec());
+        return Ok(serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec()));
     }
     let v = v.clone();
     rbitcoin_consensus::script_pool::run_cpu(move || {
         serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec())
     })
     .await
-    .unwrap_or_else(|| b"{}".to_vec())
+    .ok_or(())
 }

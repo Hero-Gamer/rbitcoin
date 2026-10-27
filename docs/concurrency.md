@@ -204,11 +204,13 @@ moved.
 `encode_is_cpu_heavy` (a short header batch and an inv list of 64 or fewer
 stay on the caller), compact short ids after the body is in hand, and
 Electrum or Esplora JSON of at least 4 KiB. Under 4 KiB, JSON stays on the
-thread that did the store join. `run_cpu` parks the awaiting task. A script
-worker that calls store IO panics. A published steal chunk still runs
-before the guest.
-`run_cpu_uses_one_script_worker_after_the_wave` and
-`script_worker_cannot_pread` are the pins.
+thread that did the store join. `run_cpu` parks the awaiting task. A guest
+panic drops that reply and leaves the worker in the pool. A script worker
+that calls store IO panics. A published steal chunk still runs before the
+guest.
+`run_cpu_uses_one_script_worker_after_the_wave`,
+`run_cpu_panic_keeps_the_worker`, and `script_worker_cannot_pread` are the
+pins.
 
 **Deferred.** Mempool accept, Electrum, Esplora, and RPC store joins, block
 and header decode, compact reconstruct, header persist, and full-block

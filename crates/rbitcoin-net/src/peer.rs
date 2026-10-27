@@ -5215,10 +5215,15 @@ async fn cmpct_from_parts_cpu(
     nonce: u64,
     ver: u32,
     pref: Vec<usize>,
-) -> Option<NetworkMessage> {
-    rbitcoin_consensus::script_pool::run_cpu(move || cmpct_from_parts(&block, nonce, ver, &pref))
-        .await
-        .flatten()
+) -> Result<Option<NetworkMessage>, NetError> {
+    match rbitcoin_consensus::script_pool::run_cpu(move || {
+        cmpct_from_parts(&block, nonce, ver, &pref)
+    })
+    .await
+    {
+        Some(msg) => Ok(msg),
+        None => Err(NetError::Protocol("cmpct relay join failed")),
+    }
 }
 
 /// BIP152 compact tip announcement (coinbase prefilled). `None` if the body
@@ -5267,7 +5272,7 @@ async fn cmpct_tip_announce(
     let Some((block, pref, nonce)) = loaded else {
         return Ok(None);
     };
-    Ok(cmpct_from_parts_cpu(block, nonce, ver, pref).await)
+    cmpct_from_parts_cpu(block, nonce, ver, pref).await
 }
 
 /// Header persist and prefill for a block already in hand, then short ids.
@@ -5295,7 +5300,7 @@ async fn cmpct_announce_off_session(
     let Some((block, ver, pref, nonce)) = map_cmpct_relay_join(joined)? else {
         return Ok(None);
     };
-    Ok(cmpct_from_parts_cpu(block, nonce, ver, pref).await)
+    cmpct_from_parts_cpu(block, nonce, ver, pref).await
 }
 
 fn hb_relay_prepare(

@@ -859,7 +859,11 @@ impl<W: AsyncWrite + Unpin> BatchOut<'_, W> {
     async fn slot(&mut self, index: usize, answer: &Value) -> Result<(), std::io::Error> {
         batch_mark(BatchStep::Write(index));
         let mut slot = vec![if self.opened { b',' } else { b'[' }];
-        slot.extend(crate::json_cpu::encode_json_body(answer).await);
+        slot.extend(
+            crate::json_cpu::encode_json_body(answer)
+                .await
+                .map_err(|_| std::io::Error::other("json encode join failed"))?,
+        );
         self.opened = true;
         write_bytes_within(self.writer, &slot, self.idle).await
     }
@@ -1762,7 +1766,9 @@ pub async fn write_line<W: AsyncWrite + Unpin>(
     msg: &Value,
     deadline: Duration,
 ) -> Result<(), std::io::Error> {
-    let mut s = crate::json_cpu::encode_json_body(msg).await;
+    let mut s = crate::json_cpu::encode_json_body(msg)
+        .await
+        .map_err(|_| std::io::Error::other("json encode join failed"))?;
     s.push(b'\n');
     write_bytes_within(writer, &s, deadline).await
 }

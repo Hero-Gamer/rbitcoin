@@ -179,7 +179,12 @@ pub async fn ensure_json(resp: Response) -> Response {
     let Some(heavy) = parts.extensions.remove::<HeavyJson>() else {
         return Response::from_parts(parts, body);
     };
-    let bytes = rbitcoin_electrum::encode_json_body(&heavy.0).await;
+    let bytes = match rbitcoin_electrum::encode_json_body(&heavy.0).await {
+        Ok(bytes) => bytes,
+        Err(()) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "json encode join failed").into_response();
+        }
+    };
     Response::from_parts(parts, axum::body::Body::from(bytes))
 }
 

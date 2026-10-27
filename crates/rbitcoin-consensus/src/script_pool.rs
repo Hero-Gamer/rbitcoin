@@ -775,8 +775,8 @@ impl<T> Future for CpuJob<T> {
 /// Run `work` on `rbtc-scripts-*` and await it.
 ///
 /// The caller parks. It does not hold a blocking-pool thread. A published
-/// steal chunk is claimed before this job. `None` means the worker dropped
-/// the reply.
+/// steal chunk is claimed before this job. `None` means the guest panicked
+/// and the worker dropped the reply. The worker stays in the pool.
 pub fn run_cpu<T, F>(work: F) -> CpuJob<T>
 where
     T: Send + 'static,
@@ -793,7 +793,9 @@ where
     };
     spawn_detached(move || {
         let mut finish = finish;
-        finish.value = Some(work());
+        if let Ok(value) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            finish.value = Some(value);
+        }
     });
     CpuJob { state }
 }

@@ -884,6 +884,16 @@ fn block_on_cpu<T>(job: CpuJob<T>) -> Option<T> {
     }
 }
 
+/// `None` when `limit` passes with the job still pending. The waiter thread
+/// is left behind on timeout so a dead script worker cannot hang the suite.
+fn block_on_cpu_timeout<T: Send + 'static>(job: CpuJob<T>, limit: Duration) -> Option<Option<T>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(block_on_cpu(job));
+    });
+    rx.recv_timeout(limit).ok()
+}
+
 /// `run_cpu` finishes on `rbtc-scripts-*`. The caller parks; it does not
 /// take a blocking-pool thread. A published steal chunk runs before the guest.
 #[test]
@@ -910,6 +920,28 @@ fn run_cpu_uses_one_script_worker_after_the_wave() {
             .as_slice(),
         &[1, 2],
         "the steal chunk finishes before the guest"
+    );
+}
+
+/// A panicking guest drops the reply and leaves that worker in the pool.
+/// The other workers are held, so the next job can run only on the one
+/// that just panicked.
+#[test]
+fn run_cpu_panic_keeps_the_worker() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let n = worker_spawn_count();
+    let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+    let lost = block_on_cpu_timeout(
+        run_cpu(|| -> u8 { panic!("run_cpu guest") }),
+        Duration::from_secs(2),
+    );
+    assert_eq!(lost, Some(None), "a panicking guest must drop the reply");
+    let next = block_on_cpu_timeout(run_cpu(|| 7u8), Duration::from_secs(2));
+    occupy.release();
+    assert_eq!(
+        next,
+        Some(Some(7)),
+        "the script worker must take the next job"
     );
 }
 
