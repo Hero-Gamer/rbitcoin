@@ -243,6 +243,13 @@ when that integer is at least `150000`, which it is. Raising the integer
 toward a current Core release would advertise wallet RPC that this node
 does not have. See [`rpc.md`](./rpc.md#getnetworkinfoversion).
 
+LND reaches this node through btcd `rpcclient`, which string-compares
+`subversion` after trimming `/Satoshi:`. `/rbitcoin:…/` sorts below
+`0.19.0`, so the client speaks the pre-0.19 dialect:
+`sendrawtransaction` gets the boolean `allowhighfees`, which this node
+accepts. The client also refuses to call `testmempoolaccept`, so LND
+skips that pre-check and publishes directly.
+
 `estimatesmartfee` accepts `estimate_mode` `economical` and `conservative`
 and returns the same 10-minute feerate either way. `initialblockdownload`
 means relay is inhibited (`--min-chain-work` / `--max-tip-age`), not

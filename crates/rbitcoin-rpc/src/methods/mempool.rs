@@ -646,7 +646,13 @@ pub const MAX_BURN_MSG: &str =
 pub fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["hexstring", "maxfeerate", "maxburnamount"])?;
     let hex = params.req_str(0, "hexstring")?;
-    let max_feerate = opt_maxfeerate_sat_vb(params, 1)?;
+    // Pre-0.19 `allowhighfees`. btcd rpcclient (LND, btcwallet) sends it
+    // because `/rbitcoin:` sorts below its `0.19.0` subversion check.
+    let max_feerate = match params.get(1, "maxfeerate") {
+        Some(Value::Bool(true)) => 0,
+        Some(Value::Bool(false)) => DEFAULT_MAX_RAW_TX_FEE_SAT_VB,
+        _ => opt_maxfeerate_sat_vb(params, 1)?,
+    };
     let max_burn = opt_maxburn_sat(params, 2)?;
     let tx = decode_tx_hex(hex)?;
     let mp = ctx
