@@ -503,17 +503,23 @@ where
                     sh_seen = now;
                     continue;
                 }
+                let q = Arc::clone(&query);
+                let mp = mempool.clone();
+                let subs: Vec<[u8; 32]> = conn.sh_subs.iter().copied().collect();
+                let notes = tokio::task::spawn_blocking(move || {
+                    let _g = BlockingRegion::enter();
+                    settled_restatus_notes(&q, mp.as_deref(), &subs, scan.as_deref())
+                })
+                .await
+                .unwrap_or_default();
+                // A reorg walks the watermark back before its txs are back in
+                // the pool. Its tip events restatus once they are.
+                let Some(notes) = notes else {
+                    continue;
+                };
                 sh_seen = now;
-                emit_sh_notes(
-                    &mut writer,
-                    &query,
-                    mempool.clone(),
-                    &conn.sh_subs,
-                    &mut last_sent_status,
-                    scan,
-                    idle,
-                )
-                .await?;
+                push_sh_notes(&mut writer, &conn.sh_subs, &mut last_sent_status, notes, idle)
+                    .await?;
             }
             ann = async {
                 if let Some(rx) = mempool_rx.as_mut() {
@@ -1823,6 +1829,23 @@ pub fn restatus_notes(
     out
 }
 
+/// [`restatus_notes`] read while no connect or reorg holds the pool, else
+/// `None`.
+#[doc(hidden)]
+pub fn settled_restatus_notes(
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    subs: &[[u8; 32]],
+    heights: Option<&[u32]>,
+) -> Option<Vec<([u8; 32], String)>> {
+    let gen = mempool.map(MempoolHub::pool_settle_gen);
+    if gen.is_some_and(|g| g % 2 == 1) {
+        return None;
+    }
+    let notes = restatus_notes(query, mempool, subs, heights);
+    (mempool.map(MempoolHub::pool_settle_gen) == gen).then_some(notes)
+}
+
 #[doc(hidden)]
 pub const TICK_SCAN_MAX_GAP: u32 = 32;
 
@@ -1919,6 +1942,18 @@ pub async fn emit_sh_notes<W: AsyncWrite + Unpin>(
     })
     .await
     .unwrap_or_default();
+    push_sh_notes(writer, sh_subs, last_sent, notes, idle).await
+}
+
+/// Push each status in `notes` that differs from the last one sent.
+#[doc(hidden)]
+pub async fn push_sh_notes<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    sh_subs: &HashSet<[u8; 32]>,
+    last_sent: &mut HashMap<[u8; 32], String>,
+    notes: Vec<([u8; 32], String)>,
+    idle: Duration,
+) -> Result<(), std::io::Error> {
     for (sh, status) in notes {
         let Some(status) = take_new_status(last_sent, sh_subs, sh, status) else {
             continue;

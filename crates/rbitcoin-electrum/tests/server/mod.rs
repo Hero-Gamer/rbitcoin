@@ -1415,6 +1415,89 @@ fn get_history_height_window_and_status_full() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A reorg holds the template mark until its disconnected txs are back in
+/// the pool. The tick sees the scripthash watermark walk back during that
+/// hold, and must not push a status read from the pool in between.
+#[tokio::test]
+async fn tick_waits_for_the_pool_after_a_reorg() {
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let (dir, q) = tmp_store();
+    let mut hash = [0u8; 32];
+    hash[0] = 0x44;
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: hash,
+        hash,
+        size: 0,
+        weight: 0,
+    };
+    let mut txid = [0u8; 32];
+    txid[31] = 0xce;
+    let ta = TxApply {
+        tx: TxRecord {
+            txid,
+            version: 1,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: [0u8; 32],
+            parent: rbitcoin_store::InputParent::Coinbase,
+            sequence: u32::MAX,
+            script_sig: vec![0],
+            witness: vec![],
+        }],
+        outputs: vec![OutputRecord::unspent(1, vec![0x51])],
+    };
+    q.connect_block(Height(0), &header, &[ta]).unwrap();
+    let sh = electrum_scripthash_hex(&[0x51]);
+    let params = ChainParams::regtest();
+    let q = Arc::new(q);
+    let mp = Arc::new(MempoolHub::open(dir.join("mempool"), Arc::clone(&q)).unwrap());
+    let (tip_tx, _) = broadcast::channel(2);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx, Some(Arc::clone(&mp)))
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let mut line = serde_json::to_string(&json!({
+        "jsonrpc":"2.0","id":1,"method":"blockchain.scripthash.subscribe","params":[sh]
+    }))
+    .unwrap();
+    line.push('\n');
+    stream.write_all(line.as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(&mut stream);
+    let mut resp = String::new();
+    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut resp))
+        .await
+        .unwrap()
+        .unwrap();
+    let first: Value = serde_json::from_str(&resp).unwrap();
+    assert!(!first["result"].as_str().unwrap().is_empty());
+
+    let hold = mp.template_hold();
+    q.disconnect_tip().unwrap();
+    resp.clear();
+    let early = tokio::time::timeout(Duration::from_millis(400), reader.read_line(&mut resp)).await;
+    assert!(early.is_err(), "pushed while the pool was held: {resp}");
+    drop(hold);
+    tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut resp))
+        .await
+        .expect("the tick restatuses once the pool is back")
+        .unwrap();
+    let push: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(push["params"][0], json!(sh), "{push}");
+    assert_eq!(push["params"][1], Value::Null, "{push}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn chain_view_reorg_notifies_dropped_scripthash() {
     use rbitcoin_query::TxApply;
