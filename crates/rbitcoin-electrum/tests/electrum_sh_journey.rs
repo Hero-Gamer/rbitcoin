@@ -104,7 +104,6 @@ pub fn view_hash(q: &Query) -> ([u8; 32], Height) {
         q,
         "blockchain.scripthash.get_balance",
         &json!([sh]),
-        false,
         |q, rpc_params, view, is_asof| {
             let mut pin_conn = ElectrumConn::new();
             dispatch_pinned(

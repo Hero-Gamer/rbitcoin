@@ -220,12 +220,13 @@ the tip chain: **404** / `asof not on chain` (no retry onto another
 block at the same height). We still do **not** serve a disconnected fork
 hash.
 
-Electrum clients that want as-of send `server.version(name, "1.4.2-asof")`
-(or a `[min, max]` range containing that string). Standard Electrum
-`"1.4"` / `["1.4", "1.4.2"]` stays on dotted-int 1.4.x; an `asof:` tag
-without the dialect is an error. `server.features.protocol_max` stays
-`"1.6"`. As-of discovery is `asof` / `asof_protocol` (`1.4.2-asof`), not
-`protocol_max`.
+Electrum clients that want as-of add a trailing `asof:<blockhash>`
+argument to a method that takes it, on any negotiated protocol. A 1.6
+connection keeps its 1.6 shapes. `server.version(name, "1.4.2-asof")` (or a
+`[min, max]` range containing that string) is still accepted for clients
+that negotiate it, and pins that connection to 1.4.x shapes.
+`server.features.protocol_max` stays `"1.6"`. As-of discovery is `asof` /
+`asof_protocol` (`1.4.2-asof`), not `protocol_max`.
 
 ## Esplora REST surface
 

@@ -126,40 +126,32 @@ fn config_helpers_and_param_parsers() {
     let tagged = format!("asof:{asof_hex}");
     let (rest, h) = take_trailing_asof(
         "blockchain.scripthash.get_balance",
-        &json!([sh_hex, tagged]),
-        true,
-    )
+        &json!([sh_hex, tagged]))
     .unwrap();
     assert!(h.is_some());
     assert_eq!(rest, json!([sh_hex]));
     let (rest_win, h_win) = take_trailing_asof(
         "blockchain.scripthash.get_history",
-        &json!([sh_hex, 1, 10, tagged]),
-        true,
-    )
+        &json!([sh_hex, 1, 10, tagged]))
     .unwrap();
     assert!(h_win.is_some());
     assert_eq!(rest_win, json!([sh_hex, 1, 10]));
     let (rest_tx, h_tx) =
-        take_trailing_asof("blockchain.transaction.get", &json!([sh_hex, tagged]), true).unwrap();
+        take_trailing_asof("blockchain.transaction.get", &json!([sh_hex, tagged])).unwrap();
     assert!(h_tx.is_some());
     assert_eq!(rest_tx, json!([sh_hex]));
     let (rest_merkle, h_merkle) = take_trailing_asof(
         "blockchain.transaction.get_merkle",
-        &json!([sh_hex, 0, tagged]),
-        true,
-    )
+        &json!([sh_hex, 0, tagged]))
     .unwrap();
     assert!(h_merkle.is_some());
     assert_eq!(rest_merkle, json!([sh_hex, 0]));
     let (_, none) =
-        take_trailing_asof("blockchain.scripthash.get_balance", &json!([sh_hex]), true).unwrap();
+        take_trailing_asof("blockchain.scripthash.get_balance", &json!([sh_hex])).unwrap();
     assert!(none.is_none());
     let (_, not_hex) = take_trailing_asof(
         "blockchain.scripthash.get_balance",
-        &json!([sh_hex, asof_hex]),
-        true,
-    )
+        &json!([sh_hex, asof_hex]))
     .unwrap();
     assert!(
         not_hex.is_none(),
@@ -167,31 +159,17 @@ fn config_helpers_and_param_parsers() {
     );
     let (_, leftover_obj) = take_trailing_asof(
         "blockchain.scripthash.get_balance",
-        &json!([sh_hex, { "other": true }]),
-        true,
-    )
+        &json!([sh_hex, { "other": true }]))
     .unwrap();
     assert!(leftover_obj.is_none());
-    let denied = take_trailing_asof(
-        "blockchain.scripthash.get_balance",
-        &json!([sh_hex, tagged]),
-        false,
-    )
-    .unwrap_err();
-    assert!(
-        denied.contains("1.4.2-asof"),
-        "asof tag without dialect: {denied}"
-    );
     assert!(take_trailing_asof(
         "blockchain.scripthash.get_balance",
-        &json!([sh_hex, "asof:zz"]),
-        true,
-    )
+        &json!([sh_hex, "asof:zz"]))
     .unwrap_err()
     .contains("asof:<32-byte hex>"));
     let asof_tag = format!("asof:{}", "ab".repeat(32));
     let (_, ignored) =
-        take_trailing_asof("blockchain.block.header", &json!([0, asof_tag]), true).unwrap();
+        take_trailing_asof("blockchain.block.header", &json!([0, asof_tag])).unwrap();
     assert!(
         ignored.is_none(),
         "asof tag on a method that does not accept asof is leftover params, not a view"
@@ -2192,7 +2170,7 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
         &mut sh_subs,
     )
     .unwrap_err();
-    assert!(err.contains("1.4.2-asof"), "asof without dialect: {err}");
+    assert!(err.contains("asof not on chain"), "asof without dialect: {err}");
 
     dispatch(
         "blockchain.scripthash.subscribe",
