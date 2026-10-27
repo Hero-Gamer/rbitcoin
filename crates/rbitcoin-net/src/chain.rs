@@ -3999,18 +3999,20 @@ impl ChainHub {
         keep_height: u32,
     ) -> Result<Vec<Transaction>, NetError> {
         let mp = self.mempool().cloned();
-        let mut blocks: Vec<Vec<Transaction>> = Vec::new();
-        while let Some(h) = self.query.tip_height() {
-            let tip = h.0;
-            if tip <= keep_height {
-                break;
-            }
-            // A block that cannot be read back is not disconnected, so its
-            // txs are not lost from the pool.
-            if mp.is_some() {
-                if let Some(b) = self.block_at_height(tip)? {
-                    blocks.push(b.txdata.into_iter().skip(1).collect());
+        // Every body is read before the first disconnect, so a read fault
+        // leaves the chain where it was and no tx is lost from the pool.
+        let mut gone: Vec<Transaction> = Vec::new();
+        if mp.is_some() {
+            let tip = self.query.tip_height().map_or(0, |h| h.0);
+            for height in keep_height.saturating_add(1)..=tip {
+                if let Some(b) = self.block_at_height(height)? {
+                    gone.extend(b.txdata.into_iter().skip(1));
                 }
+            }
+        }
+        while let Some(h) = self.query.tip_height() {
+            if h.0 <= keep_height {
+                break;
             }
             if let Some(th) = self.tip_hash() {
                 self.confirmed.write().unwrap().remove(&th);
@@ -4023,7 +4025,7 @@ impl ChainHub {
         if let Some(mp) = mp {
             mp.clear_recent_confirmed();
         }
-        Ok(blocks.into_iter().rev().flatten().collect())
+        Ok(gone)
     }
 
     /// Drop the RAM SH head and chain work above `keep_height`.

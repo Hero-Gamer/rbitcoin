@@ -2007,13 +2007,14 @@ fn branch_reorg_tip_events_follow_the_reaccept() {
     let _ = std::fs::remove_dir_all(pad.dir);
 }
 
-/// A disconnect whose block cannot be read back fails. It does not drop the
-/// block and lose its transactions from the pool.
+/// A disconnect whose blocks cannot all be read back fails before it moves
+/// the tip. The 16 cached tip bodies read fine, and the next one down
+/// faults, so a disconnect that read as it went would stop halfway.
 #[test]
 fn disconnect_fails_when_the_block_read_faults() {
     let pad = reorg_pad();
     let tip = pad.hub.tip_height();
-    pad.hub.cache.clear();
+    let tip_hash = pad.hub.tip_hash();
     let inputs = find_store_file(pad.dir.path(), "input.body").expect("input.body");
     std::fs::OpenOptions::new()
         .write(true)
@@ -2022,9 +2023,10 @@ fn disconnect_fails_when_the_block_read_faults() {
         .set_len(0)
         .unwrap();
     pad.hub
-        .rewind_to_height(pad.fork)
-        .expect_err("the tip block cannot be read back");
-    assert_eq!(pad.hub.tip_height(), tip, "the unreadable block stays");
+        .rewind_to_height(pad.fork - 20)
+        .expect_err("a block below the cache cannot be read back");
+    assert_eq!(pad.hub.tip_height(), tip, "nothing was disconnected");
+    assert_eq!(pad.hub.tip_hash(), tip_hash);
     let _ = std::fs::remove_dir_all(pad.dir);
 }
 
