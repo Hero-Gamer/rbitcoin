@@ -164,8 +164,8 @@ pub fn first_bucket_above(rate_sat_per_kvb: u64) -> usize {
 /// `stock_above(R) + projected_in(R, H) ≤ effective_capacity(N)`.
 ///
 /// `stock_above` is a callback (live mining-chunk weight strictly above R).
-/// `candidate_rates` is searched ascending (bucket edges + optional extras).
-/// Returns `None` if even the highest candidate cannot fit (caller applies floors).
+/// When no candidate fits, the demand is priced above the ladder and the
+/// answer is its top rate. `None` only for an empty ladder.
 pub fn min_rate_for_capacity<F>(
     stock_above: F,
     inflow_wu_per_s_by_bucket: &[u64],
@@ -179,19 +179,17 @@ where
     let h = inflow_horizon_secs(n_blocks);
     let lam = lambda_mult(inclusion_confidence(n_blocks));
     let suffix = inflow_suffix_wu(inflow_wu_per_s_by_bucket, h);
-    let mut best: Option<u64> = None;
-    for &r in candidate_rates {
+    let fits = |r: u64| {
         let idx = first_bucket_above(r).min(suffix.len().saturating_sub(1));
         let stressed = (suffix[idx] as f64 * lam).round() as u64;
-        let load = stock_above(r).saturating_add(stressed);
-        if load <= cap {
-            best = Some(match best {
-                Some(b) => b.min(r),
-                None => r,
-            });
-        }
-    }
-    best
+        stock_above(r).saturating_add(stressed) <= cap
+    };
+    candidate_rates
+        .iter()
+        .copied()
+        .filter(|&r| fits(r))
+        .min()
+        .or_else(|| candidate_rates.iter().copied().max())
 }
 
 /// Default candidate ladder: bucket edges.
@@ -208,7 +206,7 @@ pub fn fine_candidate_rates() -> Vec<u64> {
 pub const INFLOW_HORIZON_CAP_SECS: u64 = 600;
 /// Blend length in blocks (~1 hour). `w(1)=1`, `w(6)≈0.43`, `w(144)≈0`.
 pub const BLEND_N0: f64 = 6.0;
-/// Under-full pool may still answer min-relay when `blend_weight ≥` this (N=1–5).
+/// A pool thinner than N blocks still quotes flow when `blend_weight ≥` this (N=1–5).
 pub const NEAR_BLEND_FLOOR: f64 = 0.5;
 
 /// Horizon used for inflow projection (capped; not N×10 minutes for N=144).
@@ -224,32 +222,14 @@ pub fn blend_weight(n_blocks: u32) -> f64 {
 
 /// Combine projected inflow with the N-block frontier.
 ///
-/// If the pool is thinner than N blocks, live stock does not set a far rate
-/// (`w < NEAR_BLEND_FLOOR`). Near depths with any live stock still answer
-/// min-relay (everything fits now).
-pub fn flow_for_depth(
-    projected: Option<u64>,
-    frontier: Option<u64>,
-    has_live_stock: bool,
-    n_blocks: u32,
-    min_relay: u64,
-) -> Option<u64> {
-    let mut flow = match (projected, frontier) {
+/// If the pool is thinner than N blocks, a far depth (`w < NEAR_BLEND_FLOOR`)
+/// has no flow rate and a near depth keeps the projected rate.
+pub fn flow_for_depth(projected: Option<u64>, frontier: Option<u64>, n_blocks: u32) -> Option<u64> {
+    match (projected, frontier) {
         (Some(p), Some(f)) => Some(p.max(f)),
-        (Some(p), None) => Some(p),
         (None, Some(f)) => Some(f),
-        (None, None) => None,
-    };
-    if frontier.is_none() {
-        if blend_weight(n_blocks) >= NEAR_BLEND_FLOOR {
-            if flow.is_none() && has_live_stock {
-                flow = Some(min_relay);
-            }
-        } else {
-            flow = None;
-        }
+        (projected, None) => projected.filter(|_| blend_weight(n_blocks) >= NEAR_BLEND_FLOOR),
     }
-    flow
 }
 
 /// `pct` in 0..=100. Empty → None.

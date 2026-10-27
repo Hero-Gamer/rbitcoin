@@ -4285,6 +4285,33 @@ fn far_horizon_follows_block_history_not_pool_tail() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Arrivals priced above the flow ladder fill the next blocks at every
+/// ladder rate. The near targets quote the ladder top, not min relay for
+/// a pool thinner than one block.
+#[test]
+fn arrivals_above_the_ladder_quote_its_top() {
+    let (_store, q, cbs) = pad_cbs(3);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.accept_tx(&spend_true(
+        cbs[0],
+        1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    ))
+    .expect("live stock");
+    let vsize = rbitcoin_mempool::BLOCK_WEIGHT_WU / 4;
+    for _ in 0..3 {
+        hub.note_fee_flow_admit(rbitcoin_mempool::BLOCK_WEIGHT_WU, 2_000 * vsize);
+    }
+    let top = *rbitcoin_mempool::fine_candidate_rates().last().unwrap();
+    for target in [1, 2] {
+        let sat = (hub.estimate_fee_btc_per_kb(target) * 100_000_000.0).round() as u64;
+        assert_eq!(sat, top, "target {target}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Fee-snapshot refresh publishes live count/vsize/total_fee (GET /mempool).
 #[test]
 fn fee_snapshot_live_totals_match_list_live_meta() {

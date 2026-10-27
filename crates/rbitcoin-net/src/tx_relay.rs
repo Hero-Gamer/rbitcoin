@@ -3076,7 +3076,7 @@ impl MempoolHub {
             let projected = inflow
                 .as_ref()
                 .and_then(|inf| min_rate_for_capacity(|r| stock.above(r), inf, depth, &candidates));
-            let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
+            let flow = flow_for_depth(projected, frontier, depth);
             let hist = history.get(&depth).copied().flatten();
             let rate = published_depth_rate(depth, alpha, flow, frontier, hist, confirm_floor);
             ordered.push((depth, rate.map(|r| r.max(min_r))));

@@ -52,11 +52,13 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
    `stock_above(R) + λ(c)·projected_inflow(R, min(N×600s, 600s)) ≤ fill(c) × N × 4e6`.
    `c(N)` is 0.999 at N=1 and 0.99 for N≥2. `fill(0.999)=0.80`,
    `fill(0.99)=0.95`; `λ(0.999)=2`, `λ(0.99)=1`. Inflow horizon is capped at
-   ~4 admit half-lives so a 150 s EMA is not stretched to a week.
-5. **Frontier** is the marginal chunk at `N×4e6` WU. If the pool is thinner
-   than N blocks, stock does **not** set a far rate (no last-chunk-as-far).
-   With warm flow, near depths (`w≥0.5`, N=1–5) with any live stock still
-   answer min-relay (the next few blocks have room).
+   ~4 admit half-lives so a 150 s EMA is not stretched to a week. When no
+   ladder rate fits, the projected rate is the ladder top (1000 sat/vB):
+   demand priced above the ladder does not read as missing flow.
+5. **Frontier** is the marginal chunk at `N×4e6` WU. The flow rate is the
+   higher of the projected rate and the frontier. If the pool is thinner
+   than N blocks, stock does **not** set a far rate (no last-chunk-as-far),
+   and near depths (`w≥0.5`, N=1–5) keep the projected rate alone.
 6. **Blend (warm flow):** N=1 is `R_flow`, or `R_hist` when flow is undefined.
    N≥2 is `w·R_flow + (1-w)·R_hist` with `w=exp(-(N-1)/6)`; a missing side
    drops out. Then enforce `R(1)≥R(2)≥…`.

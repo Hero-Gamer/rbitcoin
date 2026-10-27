@@ -426,26 +426,14 @@ fn inflow_horizon_is_capped() {
 }
 
 #[test]
-fn underfull_live_stock_defines_near_not_far() {
+fn underfull_pool_defines_near_not_far() {
     assert!(blend_weight(5) >= NEAR_BLEND_FLOOR);
     assert!(blend_weight(6) < NEAR_BLEND_FLOOR);
-    let min_r = 100u64;
-    assert_eq!(flow_for_depth(None, None, true, 1, min_r), Some(min_r));
-    assert_eq!(flow_for_depth(None, None, true, 5, min_r), Some(min_r));
-    assert_eq!(flow_for_depth(None, None, true, 6, min_r), None);
-    assert_eq!(flow_for_depth(None, None, true, 144, min_r), None);
-    assert_eq!(flow_for_depth(None, None, false, 1, min_r), None);
-    assert_eq!(
-        flow_for_depth(Some(5_000), None, true, 1, min_r),
-        Some(5_000)
-    );
-    assert_eq!(flow_for_depth(Some(5_000), None, true, 144, min_r), None);
-    assert_eq!(
-        flow_for_depth(Some(4_000), Some(3_000), true, 1, min_r),
-        Some(4_000)
-    );
-    assert_eq!(
-        flow_for_depth(None, Some(3_000), true, 144, min_r),
-        Some(3_000)
-    );
+    assert_eq!(flow_for_depth(Some(5_000), None, 1), Some(5_000));
+    assert_eq!(flow_for_depth(Some(5_000), None, 5), Some(5_000));
+    assert_eq!(flow_for_depth(Some(5_000), None, 6), None);
+    assert_eq!(flow_for_depth(Some(5_000), None, 144), None);
+    assert_eq!(flow_for_depth(None, None, 1), None);
+    assert_eq!(flow_for_depth(Some(4_000), Some(3_000), 1), Some(4_000));
+    assert_eq!(flow_for_depth(None, Some(3_000), 144), Some(3_000));
 }
