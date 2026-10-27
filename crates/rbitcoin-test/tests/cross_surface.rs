@@ -2821,10 +2821,7 @@ async fn node_listen_and_exit() {
     let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let taken = held.local_addr().unwrap();
     type Ask = fn(&mut NodeConfig, SocketAddr);
-    let asks: [(&str, Ask); 4] = [
-        ("rpc start: rpc bind", |cfg, addr| {
-            cfg.rpc.listen = Some(addr)
-        }),
+    let asks: [(&str, Ask); 3] = [
         ("electrum start", |cfg, addr| {
             cfg.listen.electrum = Some(addr)
         }),
@@ -2843,6 +2840,25 @@ async fn node_listen_and_exit() {
         let err = start_and_exit(cfg).await.expect_err(want).to_string();
         assert!(err.contains(want), "{err}");
     }
+
+    // RPC binds after Electrum. Its failure still tears the run down, so the
+    // Electrum port is closed once run_p2p returns.
+    let electrum_published = dir.join("run").join("electrum.addr");
+    let _ = std::fs::remove_file(&electrum_published);
+    let mut cfg = listen_and_exit_cfg(&dir);
+    cfg.shindex = true;
+    cfg.listen.electrum = Some("127.0.0.1:0".parse().unwrap());
+    cfg.rpc.listen = Some(taken);
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("held rpc port")
+        .to_string();
+    assert!(err.contains("rpc start: rpc bind"), "{err}");
+    let electrum_addr = published_listener(&dir, "electrum").await;
+    assert!(
+        TcpStream::connect(electrum_addr).await.is_err(),
+        "electrum still accepts after the failed start"
+    );
     drop(held);
 
     // An RPC socket whose directory cannot exist stops the start too.

@@ -7,7 +7,7 @@ use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandl
 use rbitcoin_ibd::{
     read_platform_rss, tip_perf_json, IbdConfig, Peerless, TipPerfLog, PEERLESS_REDIAL_CAP,
 };
-use rbitcoin_log::{debug, enabled, error, info, warn, Level};
+use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
     default_port, netgroup, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
     BlockingRegion, ChainHub, Dialer, MempoolHub, NetAddr, P2PNode, PeerConnType, TipEvent,
@@ -70,8 +70,8 @@ impl NodeHandle {
 pub struct Shutdown {
     /// Polled by IBD / long loops for cooperative cancel.
     pub flag: Arc<AtomicBool>,
-    /// Set only by [`Self::fail`]. SIGTERM, Ctrl+C, and RPC `stop` leave it clear.
-    failed: AtomicBool,
+    /// Set only by [`Self::fail`]. SIGTERM, Ctrl+C, and RPC `stop` leave it empty.
+    failure: std::sync::Mutex<Option<NodeError>>,
     pub notify: Notify,
 }
 
@@ -79,19 +79,40 @@ impl Shutdown {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             flag: Arc::new(AtomicBool::new(false)),
-            failed: AtomicBool::new(false),
+            failure: std::sync::Mutex::new(None),
             notify: Notify::new(),
         })
     }
 
-    /// Stop the process after a write-behind IO error. The exit is non-zero.
-    pub fn fail(&self) {
-        self.failed.store(true, Ordering::SeqCst);
+    /// Stop the process with `err` as its exit error. The first one is kept.
+    pub fn fail(&self, err: NodeError) {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert(err);
         self.request();
     }
 
-    pub fn failed(&self) -> bool {
-        self.failed.load(Ordering::SeqCst)
+    /// The started value, or [`Self::fail`] and an empty one.
+    pub fn or_fail<T: Default>(&self, started: Result<T, NodeError>) -> T {
+        started.unwrap_or_else(|e| {
+            self.fail(e);
+            T::default()
+        })
+    }
+
+    /// `Ok` for SIGTERM, Ctrl+C, and RPC `stop`. The [`Self::fail`] error
+    /// otherwise, so `process_main` exits non-zero and `Restart=on-failure` runs.
+    pub fn result(&self) -> Result<(), NodeError> {
+        match self
+            .failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     pub fn request(&self) {
@@ -620,7 +641,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             Arc::clone(&shutdown.flag),
             {
                 let sd = Arc::clone(&shutdown);
-                move || sd.fail()
+                move || {
+                    sd.fail(NodeError::Init(
+                        "scripthash or index write-behind failed".into(),
+                    ))
+                }
             },
         ))
     } else {
@@ -759,7 +784,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // A peerless catch-up can wait indefinitely. Bring RPC up first so
     // `stop`, `addnode`, and status calls still work while it waits.
     if matches!(peerless, Peerless::Redial { .. }) && !shutdown.requested() {
-        rpc_handle = start_rpc_listener(&config, &node, &mempool, &shared_peers).await?;
+        rpc_handle =
+            shutdown.or_fail(start_rpc_listener(&config, &node, &mempool, &shared_peers).await);
         if let Some(h) = &rpc_handle {
             let stop = Arc::clone(&h.stop);
             let sd = Arc::clone(&shutdown);
@@ -841,7 +867,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     Arc::clone(&shutdown.flag),
                     {
                         let sd = Arc::clone(&shutdown);
-                        move || sd.fail()
+                        move || {
+                            sd.fail(NodeError::Init(
+                                "scripthash or index write-behind failed".into(),
+                            ))
+                        }
                     },
                     // Version carries the bit once per peer: advertise only
                     // when served filters reach the tip, not during materialize.
@@ -996,17 +1026,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         sync_tx_relay(&node, &config, &mempool).await?;
     }
 
-    let (mut electrum_handles, mut electrum_bridge, electrum_onion) = start_electrum_if_ready(
-        sh_tip_ready,
-        config.listen.electrum,
-        config.sptweaks_dust,
-        config.electrum_max_subs,
-        &shutdown,
-        &node.hub,
-        &params,
-        &mempool,
-    )
-    .await?;
+    let (mut electrum_handles, mut electrum_bridge, electrum_onion) = shutdown.or_fail(
+        start_electrum_if_ready(
+            sh_tip_ready,
+            config.listen.electrum,
+            config.sptweaks_dust,
+            config.electrum_max_subs,
+            &shutdown,
+            &node.hub,
+            &params,
+            &mempool,
+        )
+        .await,
+    );
     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
         let hs = ctl
             .add_named_onion(config.datadir.path(), "electrum", h.local_addr)
@@ -1023,19 +1055,21 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if let Some(h) = electrum_handles.first() {
         publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
     }
-    let mut esplora_handles = start_esplora_if_ready(
-        sh_tip_ready,
-        config.listen.esplora.clone(),
-        config.network,
-        config
-            .esplora_block_template
-            .then_some(config.mempool.blocksonly),
-        config.esplora_max_inflight,
-        &shutdown,
-        Arc::clone(&node.hub),
-        &mempool,
-    )
-    .await?;
+    let mut esplora_handles = shutdown.or_fail(
+        start_esplora_if_ready(
+            sh_tip_ready,
+            config.listen.esplora.clone(),
+            config.network,
+            config
+                .esplora_block_template
+                .then_some(config.mempool.blocksonly),
+            config.esplora_max_inflight,
+            &shutdown,
+            Arc::clone(&node.hub),
+            &mempool,
+        )
+        .await,
+    );
     if config.esplora_onion {
         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
             let hs = ctl
@@ -1054,9 +1088,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
     }
     if rpc_handle.is_none() && !shutdown.requested() {
-        rpc_handle = start_rpc_listener(&config, &node, &mempool, &shared_peers).await?;
+        rpc_handle =
+            shutdown.or_fail(start_rpc_listener(&config, &node, &mempool, &shared_peers).await);
     }
-    let sv2_tp = start_sv2_tp(&config, &node.hub).await?;
+    let sv2_tp = shutdown.or_fail(start_sv2_tp(&config, &node.hub).await);
     let sv2_stats = sv2_tp.as_ref().map(Sv2TpHandle::stats);
     if let Some(s) = &sv2_stats {
         status.attach_sv2(Arc::clone(s));
@@ -1141,17 +1176,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             if (electrum_due || esplora_due) && node.hub.query.sh_is_tip_ready() {
                 let mut bound_now = false;
                 if electrum_due {
-                    let (handles, bridge, onion) = start_electrum_if_ready(
-                        true,
-                        config.listen.electrum,
-                        config.sptweaks_dust,
-                        config.electrum_max_subs,
-                        &shutdown,
-                        &node.hub,
-                        &params,
-                        &mempool,
-                    )
-                    .await?;
+                    let (handles, bridge, onion) = shutdown.or_fail(
+                        start_electrum_if_ready(
+                            true,
+                            config.listen.electrum,
+                            config.sptweaks_dust,
+                            config.electrum_max_subs,
+                            &shutdown,
+                            &node.hub,
+                            &params,
+                            &mempool,
+                        )
+                        .await,
+                    );
                     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
                         let hs = ctl
                             .add_named_onion(config.datadir.path(), "electrum", h.local_addr)
@@ -1191,19 +1228,21 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     electrum_handles = handles;
                 }
                 if esplora_due {
-                    let handles = start_esplora_if_ready(
-                        true,
-                        config.listen.esplora.clone(),
-                        config.network,
-                        config
-                            .esplora_block_template
-                            .then_some(config.mempool.blocksonly),
-                        config.esplora_max_inflight,
-                        &shutdown,
-                        Arc::clone(&node.hub),
-                        &mempool,
-                    )
-                    .await?;
+                    let handles = shutdown.or_fail(
+                        start_esplora_if_ready(
+                            true,
+                            config.listen.esplora.clone(),
+                            config.network,
+                            config
+                                .esplora_block_template
+                                .then_some(config.mempool.blocksonly),
+                            config.esplora_max_inflight,
+                            &shutdown,
+                            Arc::clone(&node.hub),
+                            &mempool,
+                        )
+                        .await,
+                    );
                     if config.esplora_onion {
                         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
                             let hs = ctl
@@ -1542,29 +1581,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         info!("node: mempool flushed gen={gen} live={live}");
     }
     node.shutdown().await;
-    match shutdown_result(shutdown.failed()) {
-        Ok(()) => {
-            info!("node: clean exit");
-            Ok(())
-        }
-        Err(e) => {
-            error!("node: {e}");
-            Err(e)
-        }
-    }
-}
-
-/// `Ok` for SIGTERM, Ctrl+C, and RPC `stop`. `Err` when write-behind called
-/// [`Shutdown::fail`], so `process_main` exits non-zero and `Restart=on-failure` runs.
-#[doc(hidden)]
-pub fn shutdown_result(failed: bool) -> Result<(), NodeError> {
-    if failed {
-        Err(NodeError::Init(
-            "scripthash or index write-behind failed".into(),
-        ))
-    } else {
-        Ok(())
-    }
+    shutdown.result()?;
+    info!("node: clean exit");
+    Ok(())
 }
 
 #[doc(hidden)]

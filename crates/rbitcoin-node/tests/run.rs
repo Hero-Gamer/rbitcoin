@@ -944,18 +944,19 @@ fn proxy_seed_bootstrap_queues_domain_addrfetch() {
 fn shutdown_flag_and_node_handle_smoke() {
     let sd = Shutdown::new();
     assert!(!sd.requested());
-    assert!(!sd.failed());
     sd.request();
     assert!(sd.requested());
-    assert!(!sd.failed(), "SIGTERM and RPC stop stay a clean exit");
-    assert!(shutdown_result(false).is_ok());
+    assert!(
+        sd.result().is_ok(),
+        "SIGTERM and RPC stop stay a clean exit"
+    );
     sd.request();
     assert!(sd.requested());
     let failed = Shutdown::new();
-    failed.fail();
+    failed.fail(rbitcoin_node::NodeError::Init("first".into()));
+    failed.fail(rbitcoin_node::NodeError::Init("second".into()));
     assert!(failed.requested());
-    assert!(failed.failed());
-    assert!(shutdown_result(true).is_err());
+    assert_eq!(failed.result().unwrap_err().to_string(), "Error: first");
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
