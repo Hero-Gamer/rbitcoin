@@ -3658,7 +3658,7 @@ impl MempoolHub {
         })
     }
 
-    /// Re-admit txs after reorg disconnect (best-effort).
+    /// Re-admit txs after reorg disconnect (best-effort), parents first.
     pub fn reorg_reaccept(&self, txs: &[Transaction]) -> usize {
         let utxo = self.utxo_provider();
         let mut admitted: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
@@ -3686,21 +3686,16 @@ impl MempoolHub {
         utxo.note_spender(tx);
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
+        // Parents come first, so a missing input is a parent that did not
+        // come back or a coin the new chain spent. Core drops the tx.
         let spec = AdmitSpec {
-            report_orphans: true,
+            report_orphans: false,
             fee_delta: 0,
             time_prepare_lock: false,
             min_relay: None,
             waive: false,
         };
-        let prep = match self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us) {
-            Ok(p) => p,
-            Err(AcceptError::Orphaned { missing, .. }) => {
-                let mut g = self.lock_write();
-                return Err(g.park_orphan(tx, missing));
-            }
-            Err(e) => return Err(e),
-        };
+        let prep = self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us)?;
         let sample = self.sample_chain_coins(tx, utxo);
         let committed = {
             let mut g = self.lock_write();

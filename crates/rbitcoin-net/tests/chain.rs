@@ -1873,6 +1873,158 @@ fn disconnect_to_with_mempool_still_harvests() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Fork point `fork` (mature coinbases at 1 and 2), then the old branch:
+/// `parent` at `fork + 1` and `child` at `fork + 2`. The child's lock time is
+/// `fork + 1`, the height a Core wallet stamps after one block: final in its
+/// block and on any later tip, not on the fork point.
+struct ReorgPad {
+    dir: rbitcoin_query::testutil::TempDir,
+    hub: ChainHub,
+    mp: Arc<rbitcoin_net::tx_relay::MempoolHub>,
+    fork: u32,
+    fork_hash: BlockHash,
+    fork_time: u32,
+    parent: Transaction,
+    child: Transaction,
+}
+
+fn spend_out0(prev: bitcoin::Txid, sat: u64, lock_time: LockTime) -> Transaction {
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(sat),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
+fn reorg_pad() -> ReorgPad {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let gen = hub.tip_hash().unwrap();
+    hub.accept_block(mine(gen, hub.clock.now_secs() as u32, 1))
+        .unwrap();
+    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let fork = hub.tip_height().unwrap();
+    let fork_hash = hub.tip_hash().unwrap();
+    let fork_time = hub.tip_header().unwrap().time;
+    let parent = mature_spend_tx(&hub, 1);
+    let child = spend_out0(
+        parent.compute_txid(),
+        49_9998_0000,
+        LockTime::from_height(fork + 1).unwrap(),
+    );
+    let a1 = mine_with_extra(fork_hash, fork_time + 1, fork + 1, vec![parent.clone()]);
+    let a2 = mine_with_extra(
+        a1.block_hash(),
+        fork_time + 2,
+        fork + 2,
+        vec![child.clone()],
+    );
+    hub.accept_block(a1).unwrap();
+    hub.accept_block(a2).unwrap();
+    ReorgPad {
+        dir,
+        hub,
+        mp,
+        fork,
+        fork_hash,
+        fork_time,
+        parent,
+        child,
+    }
+}
+
+/// Mine `txs.len()` blocks on the fork point, block `i` holding `txs[i]`.
+fn pad_branch(pad: &ReorgPad, txs: Vec<Vec<Transaction>>) -> Vec<Block> {
+    let mut branch = Vec::new();
+    let mut prev = pad.fork_hash;
+    for (i, extra) in txs.into_iter().enumerate() {
+        let i = i as u32 + 1;
+        let b = mine_with_extra(prev, pad.fork_time + 10 + i, pad.fork + i, extra);
+        prev = b.block_hash();
+        branch.push(b);
+    }
+    branch
+}
+
+/// Core re-adds disconnected txs after the new branch connects
+/// (`MaybeUpdateMempoolForReorg`), so the child is final there (issue #1236).
+/// Parents go first, so the child comes back from its block, not the orphanage.
+#[test]
+fn branch_reorg_reaccepts_on_the_new_tip() {
+    let pad = reorg_pad();
+    let branch = pad_branch(&pad, vec![vec![], vec![], vec![]]);
+    assert_eq!(
+        pad.hub.accept_branch(&branch).unwrap(),
+        AcceptOutcome::Accepted {
+            height: pad.fork + 3
+        }
+    );
+    assert!(
+        pad.mp.contains(&pad.parent.compute_txid()),
+        "parent is back"
+    );
+    assert!(
+        pad.mp.contains(&pad.child.compute_txid()),
+        "the child is final on the new tip"
+    );
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// The new branch double-spends the parent. Core drops the parent and its
+/// child. The child does not wait in the orphanage for a parent that cannot
+/// come back.
+#[test]
+fn branch_reorg_drops_the_child_of_a_double_spent_parent() {
+    let pad = reorg_pad();
+    let mut rival = mature_spend_tx(&pad.hub, 1);
+    rival.output[0].value = Amount::from_sat(49_9998_0000);
+    let branch = pad_branch(&pad, vec![vec![rival], vec![], vec![]]);
+    pad.hub.accept_branch(&branch).unwrap();
+    assert!(!pad.mp.contains(&pad.parent.compute_txid()));
+    assert!(!pad.mp.contains(&pad.child.compute_txid()));
+    assert_eq!(pad.mp.orphan_count(), 0);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A failed connect restores the old branch under the same template hold.
+/// A tx only in the dropped prefix goes back in the pool.
+#[test]
+fn branch_reorg_restore_puts_the_prefix_back() {
+    let pad = reorg_pad();
+    let old_tip = pad.hub.tip_hash().unwrap();
+    let side = mature_spend_tx(&pad.hub, 2);
+    let bad = spend_out0(
+        bitcoin::Txid::from_byte_array([0xee; 32]),
+        1,
+        LockTime::ZERO,
+    );
+    let branch = pad_branch(&pad, vec![vec![side.clone()], vec![bad], vec![]]);
+    pad.hub
+        .accept_branch(&branch)
+        .expect_err("the second block spends a missing coin");
+    assert_eq!(pad.hub.tip_hash(), Some(old_tip));
+    assert!(pad.mp.contains(&side.compute_txid()), "prefix tx is back");
+    assert!(!pad.mp.contains(&pad.parent.compute_txid()));
+    assert!(!pad.mp.contains(&pad.child.compute_txid()));
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
 #[test]
 fn ensure_header_rejects_claimed_hard_bits_without_pow() {
     let (dir, hub) = tmp_hub();
