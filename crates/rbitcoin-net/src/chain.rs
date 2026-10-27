@@ -3370,6 +3370,8 @@ impl ChainHub {
                 "reorg connect failed ({e}); disconnect for restore failed: {disc}"
             )));
         }
+        // The prefix is gone, so its queued tip events are not announced.
+        reorg.tips.clear();
         for (j, ob) in old_path.iter().enumerate() {
             // These blocks were our chain. Disconnect already dropped them
             // from `confirmed`, so the mode bit is the restore waive.

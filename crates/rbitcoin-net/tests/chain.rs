@@ -2024,11 +2024,13 @@ fn branch_reorg_drops_the_child_of_a_double_spent_parent() {
 }
 
 /// A failed connect restores the old branch under the same template hold.
-/// A tx only in the dropped prefix goes back in the pool.
+/// A tx only in the dropped prefix goes back in the pool, and no tip event
+/// announces the dropped prefix.
 #[test]
 fn branch_reorg_restore_puts_the_prefix_back() {
     let pad = reorg_pad();
     let old_tip = pad.hub.tip_hash().unwrap();
+    let mut tips = pad.hub.subscribe_tips();
     let side = mature_spend_tx(&pad.hub, 2);
     let bad = spend_out0(
         bitcoin::Txid::from_byte_array([0xee; 32]),
@@ -2040,6 +2042,10 @@ fn branch_reorg_restore_puts_the_prefix_back() {
         .accept_branch(&branch)
         .expect_err("the second block spends a missing coin");
     assert_eq!(pad.hub.tip_hash(), Some(old_tip));
+    let dropped = branch[0].block_hash();
+    while let Ok(tip) = tips.try_recv() {
+        assert_ne!(tip.hash, dropped, "the dropped prefix is not announced");
+    }
     assert!(pad.mp.contains(&side.compute_txid()), "prefix tx is back");
     assert!(!pad.mp.contains(&pad.parent.compute_txid()));
     assert!(!pad.mp.contains(&pad.child.compute_txid()));
