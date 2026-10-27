@@ -1036,7 +1036,6 @@ pub fn parse_conf_target(v: &Value) -> Result<u32, Value> {
 }
 
 /// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
-/// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
 pub fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["conf_target", "estimate_mode"])?;
     // Core requires conf_target (`rpc_estimatefee.py`).

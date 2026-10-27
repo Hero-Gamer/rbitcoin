@@ -173,7 +173,7 @@ pub fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
 }
 
 /// Depths the refresh evaluates. Every other confirm target is
-/// [`fee_at_target_sat_kvb`] on this table (after 0–2 → default map).
+/// [`fee_at_target_sat_kvb`] on this table (after target 0 → default map).
 #[doc(hidden)]
 pub const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
 /// Txstat body bytes scanned and retained for historical fee estimates.
@@ -742,7 +742,7 @@ pub struct MempoolHub {
     pub recent_confirmed: Mutex<RecentConfirmed>,
     /// Core `m_lazy_recent_rejects` (wtxid). Forcerelay second-send skips ATMP.
     pub recent_rejects: Mutex<HashSet<Wtxid>>,
-    /// Recently confirmed package feerates (sat/kvB) for N=1 sanity clip.
+    /// Own feerates (sat/kvB) of the 64 newest confirmed entries, for the N=1 floor.
     pub confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
     pub block_p10_history: Mutex<FeeHistory>,
@@ -4670,7 +4670,7 @@ impl MempoolHub {
 
     /// Standard / target-depth fee in BTC/kB (Engine v2 when flow meter warm).
     ///
-    /// **Default product answer is 10-minute inclusion** (`target_blocks` 0–2 →
+    /// **Default product answer is 10-minute inclusion** (`target_blocks` 0 →
     /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks).
     ///
     /// **Non-blocking vs accept:** returns from a **published snapshot** (Arc).
@@ -4713,8 +4713,9 @@ impl MempoolHub {
         rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB as f64 / 100_000_000.0
     }
 
-    /// Ring of recently confirmed package feerates (sat/kvB), newest last.
-    /// Filled from `remove_for_block` when live entries leave the pool.
+    /// p90 of the 64 newest confirmed entries' own feerates (sat/kvB), at
+    /// least min relay. Filled in block order from `remove_for_block` when
+    /// live entries leave the pool.
     #[doc(hidden)]
     pub fn confirm_memory_floor_sat_per_kvb(&self) -> Option<u64> {
         let mem = self.confirm_feerate_memory.lock().unwrap();

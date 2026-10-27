@@ -139,7 +139,7 @@ fn warmup_blend_is_history_at_zero_and_flow_at_full() {
     assert_eq!(warmup_blend(0.5, Some(1_000), Some(3_000)), Some(2_000));
     assert_eq!(warmup_blend(0.0, Some(4_000), None), Some(4_000));
     assert_eq!(warmup_blend(0.5, Some(4_000), None), Some(4_000));
-    assert_eq!(warmup_blend(1.0, Some(4_000), None), None);
+    assert_eq!(warmup_blend(1.0, Some(4_000), None), Some(4_000));
     assert_eq!(warmup_blend(0.0, None, Some(8_000)), None);
     assert_eq!(warmup_blend(0.25, None, Some(8_000)), None);
     assert_eq!(warmup_blend(1.0, None, Some(8_000)), Some(8_000));

@@ -12,7 +12,7 @@ pub const SECONDS_PER_BLOCK: u64 = 600;
 
 /// Inclusion confidence at N=1 (10-minute default). Higher → higher sat/vB.
 pub const CONFIDENCE_NEAR: f64 = 0.999;
-/// Inclusion confidence for historical/blended targets from N=2 onward.
+/// Flow capacity confidence from N=2 onward (history uses its own quantile).
 pub const CONFIDENCE_FAR: f64 = 0.99;
 /// Fraction of `N×4e6` WU to fill at `CONFIDENCE_NEAR` (leave shock room).
 pub const FILL_AT_NEAR: f64 = 0.80;
@@ -297,9 +297,8 @@ pub fn warmup_blend(alpha: f64, cold: Option<u64>, warm: Option<u64>) -> Option<
     };
     match (cold, warm) {
         (Some(c), Some(w)) => Some(((1.0 - alpha) * c as f64 + alpha * w as f64).round() as u64),
-        (Some(c), None) => (alpha < 1.0).then_some(c),
         (None, Some(w)) => (alpha >= 1.0).then_some(w),
-        (None, None) => None,
+        (cold, None) => cold,
     }
 }
 
