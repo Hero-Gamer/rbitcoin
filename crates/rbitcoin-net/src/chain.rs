@@ -74,6 +74,16 @@ pub struct TipEvent {
     pub reorg_branch_len: u32,
 }
 
+/// A branch reorg in progress (Core `ActivateBestChainStep`). It holds the
+/// template mark, collects the disconnected txs, and keeps the tip events
+/// until those txs are back in the pool.
+#[doc(hidden)]
+pub struct BranchReorg<'a> {
+    hold: Option<crate::tx_relay::TemplateHold<'a>>,
+    gone: Vec<Transaction>,
+    tips: Vec<TipEvent>,
+}
+
 #[doc(hidden)]
 pub struct HeaderSyncNode {
     pub fk: Fk,
@@ -3017,25 +3027,17 @@ impl ChainHub {
         }
         self.accept_branch_check_headers(blocks, fork_height)?;
         let old_path = self.accept_branch_collect_old(fork_height)?;
-        // Core holds the pool across `ActivateBestChainStep` and puts the
-        // disconnected txs back on the new tip. This hold keeps templates off
-        // the pool from the disconnect until they are back.
         let mp_hold = self.mempool().cloned();
-        let mut hold = mp_hold.as_ref().map(|mp| mp.template_hold());
+        let mut reorg = BranchReorg {
+            hold: mp_hold.as_ref().map(|mp| mp.template_hold()),
+            gone: Vec::new(),
+            tips: Vec::new(),
+        };
         let was_ibd = self.in_ibd();
-        let mut gone = self.accept_branch_disconnect(fork_height, hold.as_mut())?;
+        self.accept_branch_disconnect(fork_height, &mut reorg)?;
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
-        let res = self.accept_branch_connect(
-            blocks,
-            fork_height,
-            old_work,
-            &old_path,
-            &mut hold,
-            &mut gone,
-        );
-        self.reaccept_disconnected(&gone);
-        drop(hold);
-        self.maintain_pool_after_ibd(was_ibd);
+        let res = self.accept_branch_connect(blocks, fork_height, old_work, &old_path, &mut reorg);
+        self.finish_branch_reorg(reorg, was_ibd);
         let (connected, failed) = res?;
         self.announce_reorg_len.store(0, Ordering::Relaxed);
         let height = base + (connected.len() as u32) - 1;
@@ -3234,14 +3236,14 @@ impl ChainHub {
         })
     }
 
-    /// Disconnect to the fork point under the reorg's `hold` and return the
-    /// disconnected txs. The reorg puts them back after its connect.
+    /// Disconnect to the fork point into `reorg`. The reorg puts the
+    /// disconnected txs back after its connect.
     #[doc(hidden)]
     pub fn accept_branch_disconnect(
         &self,
         fork_height: Option<u32>,
-        hold: Option<&mut crate::tx_relay::TemplateHold<'_>>,
-    ) -> Result<Vec<Transaction>, NetError> {
+        reorg: &mut BranchReorg<'_>,
+    ) -> Result<(), NetError> {
         let _commit = self
             .query
             .lock_tip_commit()
@@ -3257,17 +3259,35 @@ impl ChainHub {
             }
             self.cache.clear();
             self.confirmed.write().unwrap().clear();
-            return Ok(Vec::new());
+            return Ok(());
         };
         let gone = self.disconnect_harvest_in_commit(fh)?;
         // The new branch connects at these heights before `gone` is back.
         self.drop_above(fh);
-        if let Some(hold) = hold {
+        reorg.gone.extend(gone);
+        if let Some(hold) = reorg.hold.as_mut() {
             if let Ok(Some((_, rec))) = self.query.header_at_height(Height(fh)) {
                 hold.commit(rec.hash);
             }
         }
-        Ok(gone)
+        Ok(())
+    }
+
+    /// Put the disconnected txs back on the tip the reorg left, then send
+    /// its tip events, as Core signals after `MaybeUpdateMempoolForReorg`.
+    #[doc(hidden)]
+    pub fn finish_branch_reorg(&self, reorg: BranchReorg<'_>, was_ibd: bool) {
+        let BranchReorg { hold, gone, tips } = reorg;
+        self.reaccept_disconnected(&gone);
+        drop(hold);
+        self.maintain_pool_after_ibd(was_ibd);
+        if tips.is_empty() {
+            return;
+        }
+        for tip in tips {
+            let _ = self.tip_tx.send(tip);
+        }
+        self.notify.notify_waiters();
     }
 
     /// Connect `blocks` on the fork point and return the connected prefix,
@@ -3286,8 +3306,7 @@ impl ChainHub {
         fork_height: Option<u32>,
         old_work: Work,
         old_path: &[Block],
-        hold: &mut Option<crate::tx_relay::TemplateHold<'_>>,
-        gone: &mut Vec<Transaction>,
+        reorg: &mut BranchReorg<'_>,
     ) -> Result<(&'b [Block], Option<NetError>), NetError> {
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
         for (i, b) in blocks.iter().enumerate() {
@@ -3297,13 +3316,13 @@ impl ChainHub {
                 base + i as u32,
                 Arc::new(b.clone()),
                 self.waive_for_connect(&b.block_hash()),
-                hold.as_mut(),
+                Some(&mut *reorg),
             ) else {
                 continue;
             };
             self.announce_reorg_len.store(0, Ordering::Relaxed);
             if e.is_local_fault() {
-                self.accept_branch_restore(fork_height, old_path, &e, hold, gone)?;
+                self.accept_branch_restore(fork_height, old_path, &e, reorg)?;
                 return Err(e);
             }
             // `ConnectFailed` displays its own "consensus: " prefix.
@@ -3326,7 +3345,7 @@ impl ChainHub {
                 self.remember_failed_accept(b.block_hash(), &failed);
                 return Ok((prefix, Some(failed)));
             }
-            self.accept_branch_restore(fork_height, old_path, &e, hold, gone)?;
+            self.accept_branch_restore(fork_height, old_path, &e, reorg)?;
             return Err(failed);
         }
         Ok((blocks, None))
@@ -3341,19 +3360,15 @@ impl ChainHub {
         fork_height: Option<u32>,
         old_path: &[Block],
         e: &NetError,
-        hold: &mut Option<crate::tx_relay::TemplateHold<'_>>,
-        gone: &mut Vec<Transaction>,
+        reorg: &mut BranchReorg<'_>,
     ) -> Result<(), NetError> {
         let Some(fh) = fork_height else {
             return Ok(());
         };
-        match self.accept_branch_disconnect(fork_height, hold.as_mut()) {
-            Ok(prefix) => gone.extend(prefix),
-            Err(disc) => {
-                return Err(NetError::Store(format!(
-                    "reorg connect failed ({e}); disconnect for restore failed: {disc}"
-                )));
-            }
+        if let Err(disc) = self.accept_branch_disconnect(fork_height, reorg) {
+            return Err(NetError::Store(format!(
+                "reorg connect failed ({e}); disconnect for restore failed: {disc}"
+            )));
         }
         for (j, ob) in old_path.iter().enumerate() {
             // These blocks were our chain. Disconnect already dropped them
@@ -3363,7 +3378,7 @@ impl ChainHub {
                 fh + 1 + j as u32,
                 Arc::new(ob.clone()),
                 self.query.trust_peer(),
-                hold.as_mut(),
+                Some(&mut *reorg),
             ) {
                 return Err(NetError::Store(format!(
                     "reorg connect failed ({e}); tip restore failed: {re}"
@@ -3806,15 +3821,16 @@ impl ChainHub {
         pres.iter().map(|p| Txid::from_byte_array(p.txid)).collect()
     }
 
-    /// `branch` is the hold of a reorg that owns the template mark until its
-    /// disconnected txs are back. Without one, this connect takes its own.
+    /// Inside a branch `reorg`, the reorg owns the template mark and sends
+    /// the tip event once its disconnected txs are back. Without one, this
+    /// connect takes its own hold and sends the event itself.
     #[doc(hidden)]
     pub fn connect_at(
         &self,
         height: u32,
         block: Arc<Block>,
         waive: bool,
-        mut branch: Option<&mut crate::tx_relay::TemplateHold<'_>>,
+        mut reorg: Option<&mut BranchReorg<'_>>,
     ) -> Result<(), NetError> {
         debug_assert!(
             crate::tip_accept::on_tip_accept_thread(),
@@ -3823,7 +3839,7 @@ impl ChainHub {
         // Held until this connect returns, so a template cannot observe the
         // new query tip before the pool strip is recorded.
         let mp_hold = self.mempool().cloned();
-        let mut own_hold = match branch {
+        let mut own_hold = match reorg {
             Some(_) => None,
             None => mp_hold.as_ref().map(|mp| mp.template_hold()),
         };
@@ -3901,7 +3917,7 @@ impl ChainHub {
             rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
             if mp.pool_maintained() {
                 mp.note_block_fee_history(Height(height));
-                if let Some(hold) = branch.as_deref_mut() {
+                if let Some(hold) = reorg.as_deref_mut().and_then(|r| r.hold.as_mut()) {
                     hold.commit(hash.to_byte_array());
                 } else if let Some(hold) = own_hold.as_mut() {
                     hold.commit(hash.to_byte_array());
@@ -3922,19 +3938,20 @@ impl ChainHub {
         // wakes on this event already sees the new mark. Maintenance starts
         // here, after that hold, so a template built on the event is not
         // refused for a catch-up pool. This call does not change peer relay.
-        // A reorg runs maintenance itself once its hold is down.
         drop(own_hold);
-        if branch.is_none() {
-            self.maintain_pool_after_ibd(was_ibd);
-        }
         let event = TipEvent {
             height,
             hash,
             header,
             reorg_branch_len: self.announce_reorg_len.load(Ordering::Relaxed),
         };
-        let _ = self.tip_tx.send(event);
-        self.notify.notify_waiters();
+        if let Some(reorg) = reorg {
+            reorg.tips.push(event);
+        } else {
+            self.maintain_pool_after_ibd(was_ibd);
+            let _ = self.tip_tx.send(event);
+            self.notify.notify_waiters();
+        }
         self.query.release_index_writebehind(Height(height));
         self.trim_held_bodies(height);
         Ok(())

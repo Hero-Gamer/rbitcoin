@@ -1986,6 +1986,27 @@ fn branch_reorg_reaccepts_on_the_new_tip() {
     let _ = std::fs::remove_dir_all(pad.dir);
 }
 
+/// Core signals `BlockConnected` after `MaybeUpdateMempoolForReorg`. The
+/// branch's first tip event already finds the child back, so an Electrum
+/// restatus on that event does not go stale.
+#[test]
+fn branch_reorg_tip_events_follow_the_reaccept() {
+    let pad = reorg_pad();
+    let mut tips = pad.hub.subscribe_tips();
+    let mp = Arc::clone(&pad.mp);
+    let child = pad.child.compute_txid();
+    let seen = std::thread::spawn(move || {
+        let ev = tips.blocking_recv().expect("tip event");
+        (ev.height, mp.contains(&child))
+    });
+    let branch = pad_branch(&pad, vec![vec![], vec![], vec![]]);
+    pad.hub.accept_branch(&branch).unwrap();
+    let (height, back) = seen.join().unwrap();
+    assert_eq!(height, pad.fork + 1);
+    assert!(back, "the child is back before the first tip event");
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
 /// The new branch double-spends the parent. Core drops the parent and its
 /// child. The child does not wait in the orphanage for a parent that cannot
 /// come back.
