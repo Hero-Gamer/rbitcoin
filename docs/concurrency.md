@@ -207,7 +207,8 @@ Electrum or Esplora JSON of at least 4 KiB, including block templates.
 Under 4 KiB, JSON stays on the
 thread that did the store join. `run_cpu` parks the awaiting task. A guest
 panic drops that reply and leaves the worker in the pool. A script worker
-that calls store IO panics. A published steal chunk still runs before the
+that calls store IO panics, including `pread_exact`, `pwrite_all`, and an
+io_uring submit. A published steal chunk still runs before the
 guest.
 `run_cpu_uses_one_script_worker_after_the_wave`,
 `run_cpu_panic_keeps_the_worker`, and `script_worker_cannot_pread` are the

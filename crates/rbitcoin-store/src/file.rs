@@ -201,6 +201,7 @@ pub fn handle_pwrite_all(
     if bytes.is_empty() {
         return Ok(());
     }
+    rbitcoin_primitives::assert_not_script_worker("store write");
     let handle = IoHandle::from_file(file);
     let mut done = 0usize;
     while done < bytes.len() {
@@ -230,6 +231,7 @@ pub fn handle_pread_all(
     if buf.is_empty() {
         return Ok(());
     }
+    rbitcoin_primitives::assert_not_script_worker("store read");
     crate::coord_io::note_store_read();
     let handle = IoHandle::from_file(file);
     let mut done = 0usize;
@@ -580,7 +582,6 @@ impl TableFile {
 
     /// Positional pread (page cache / disk). Preferred for Class A `tx.body`.
     pub fn pread_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StoreError> {
-        rbitcoin_primitives::assert_not_script_worker("store read");
         if buf.is_empty() {
             return Ok(());
         }
@@ -606,7 +607,6 @@ impl TableFile {
     /// `offset+len`, or an error is returned and HWM is left unchanged for this
     /// write (prior published range remains valid).
     pub fn write_at_pwrite(&self, offset: u64, bytes: &[u8]) -> Result<(), StoreError> {
-        rbitcoin_primitives::assert_not_script_worker("store write");
         if bytes.is_empty() {
             return Ok(());
         }

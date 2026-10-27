@@ -620,9 +620,25 @@ fn script_worker_cannot_pread() {
     rbitcoin_primitives::set_script_worker(true);
     let mut buf = [0u8; 4];
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        f.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+        f.pread_exact(FILE_HEADER_LEN as u64, &mut buf).unwrap();
     }));
-    assert!(panicked.is_err(), "store read on rbtc-scripts must panic");
+    assert!(panicked.is_err(), "pread_exact on rbtc-scripts must panic");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.pwrite_all(FILE_HEADER_LEN as u64, &[9, 9, 9, 9]).unwrap();
+    }));
+    assert!(panicked.is_err(), "pwrite_all on rbtc-scripts must panic");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut session = rbitcoin_store::uring_session::UringSession::try_open_kind(
+            rbitcoin_store::uring_session::SessionKind::Pool,
+            32,
+        )
+        .expect("pool session");
+        session.submit().unwrap();
+    }));
+    assert!(
+        panicked.is_err(),
+        "io_uring submit on rbtc-scripts must panic"
+    );
     drop(_clear);
     let _ = std::fs::remove_file(&path);
 }
