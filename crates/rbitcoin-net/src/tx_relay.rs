@@ -242,10 +242,11 @@ impl FeeSnapshot {
         }
     }
 
+    /// `target`'s rate, at least `floor_sat_kvb`, in BTC/kvB; `-1.0` without one.
     #[doc(hidden)]
-    pub fn rate_btc_per_kb(&self, target: u32) -> f64 {
+    pub fn rate_btc_per_kb(&self, target: u32, floor_sat_kvb: u64) -> f64 {
         match fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &self.depth_rates_sat_kvb, target) {
-            Some(sat) => sat as f64 / 100_000_000.0,
+            Some(sat) => sat.max(floor_sat_kvb) as f64 / 100_000_000.0,
             None => -1.0,
         }
     }
@@ -4675,11 +4676,14 @@ impl MempoolHub {
     /// **Non-blocking vs accept:** returns from a **published snapshot** (Arc).
     /// Graph linearize runs only on dirty/stale singleflight **refresh** (≤~1 s
     /// stale; one `mining_chunks` per refresh for all depths). Request path does
-    /// not hold the hub lock across multi-pass walks.
+    /// not hold the hub lock across multi-pass walks. The answer is at least
+    /// the live `mempoolminfee`, read under a short read lock.
     pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
         self.maybe_refresh_fee_snapshot();
         let depth = Self::fee_depth(target_blocks);
-        self.fee_snapshot.load().rate_btc_per_kb(depth)
+        self.fee_snapshot
+            .load()
+            .rate_btc_per_kb(depth, self.mempool_min_fee_sat_kvb())
     }
 
     /// Esplora `/fee-estimates` targets in one Arc load (+ optional refresh):
@@ -4688,10 +4692,11 @@ impl MempoolHub {
     pub fn fee_estimates_btc_per_kb(&self) -> Vec<(u32, f64)> {
         self.maybe_refresh_fee_snapshot();
         let snap = self.fee_snapshot.load_full();
+        let floor = self.mempool_min_fee_sat_kvb();
         (1..=25)
             .chain([144, 504, 1008])
             .filter_map(|d| {
-                let rate = snap.rate_btc_per_kb(d);
+                let rate = snap.rate_btc_per_kb(d, floor);
                 (rate >= 0.0).then_some((d, rate))
             })
             .collect()

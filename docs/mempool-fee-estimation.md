@@ -35,7 +35,7 @@ Fee APIs **do not** walk the live mempool graph on every Electrum/Esplora reques
 | Refresh | Singleflight: at most one recompute; **one** `mining_chunks_best_first` under a short hub read lock, then pure math off-lock for all depths. |
 | Request | Loads a published `Arc` snapshot (≤ **~1 s** stale when dirty/max-age). Histogram and frontier use the **same** published chunk list. |
 
-This avoids fee-estimates holding the hub lock for multi-second full-pool linearizes (which previously blocked accepts and vice versa). Estimates may lag a short bound after fee spikes. Min-relay is a policy floor only. Confirm-memory clips **N=1** only.
+This avoids fee-estimates holding the hub lock for multi-second full-pool linearizes (which previously blocked accepts and vice versa). Estimates may lag a short bound after fee spikes. A request floors each rate at the live admission floor (`mempoolminfee`: the configured min relay, or a full pool's rolling minimum), read under a short hub read lock when it answers, so a raised floor applies at once, even while a refresh runs. Confirm-memory clips **N=1** only.
 
 ## Engine v2 (shipped)
 
@@ -173,8 +173,10 @@ failures, ready targets, and elapsed time.
 
 ### Histogram / relayfee
 
-Live chunk histogram remains a **stock** snapshot (transparency). Libre min
-relay (0.1 sat/vB) floors any defined number.
+Live chunk histogram remains a **stock** snapshot (transparency). Every
+defined number is at least `max(mempoolminfee, 0.1 sat/vB)` on every
+surface (RPC, Electrum, Esplora): Libre min relay floors the computed table,
+and `mempoolminfee` is applied when a request reads it.
 
 ## Template readiness (non-goal: full mining)
 
