@@ -60,7 +60,7 @@ fn poll_until(v: &Value, limit: Duration) -> Vec<u8> {
     }
     let waker = Waker::from(Arc::new(Unpark(thread::current())));
     let mut cx = Context::from_waker(&waker);
-    let mut fut = Box::pin(encode_json_body(v));
+    let mut fut = Box::pin(encode_json_body(Arc::new(v.clone())));
     let start = Instant::now();
     loop {
         match fut.as_mut().poll(&mut cx) {
@@ -106,7 +106,7 @@ fn encode_json_body_hops_only_at_4kib() {
         Waker::from(Arc::new(Unpark(std::thread::current())))
     };
     let mut cx = std::task::Context::from_waker(&waker);
-    let mut pending = Box::pin(encode_json_body(&heavy));
+    let mut pending = Box::pin(encode_json_body(Arc::new(heavy.clone())));
     assert!(
         matches!(pending.as_mut().poll(&mut cx), std::task::Poll::Pending),
         "4 KiB json encode ran while rbtc-scripts workers were held"

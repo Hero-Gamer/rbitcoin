@@ -203,7 +203,8 @@ moved.
 `rbtc-scripts-*` through `run_cpu`. That is v2 encode when
 `encode_is_cpu_heavy` (a short header batch and an inv list of 64 or fewer
 stay on the caller), compact short ids after the body is in hand, and
-Electrum or Esplora JSON of at least 4 KiB. Under 4 KiB, JSON stays on the
+Electrum or Esplora JSON of at least 4 KiB, including block templates.
+Under 4 KiB, JSON stays on the
 thread that did the store join. `run_cpu` parks the awaiting task. A guest
 panic drops that reply and leaves the worker in the pool. A script worker
 that calls store IO panics. A published steal chunk still runs before the

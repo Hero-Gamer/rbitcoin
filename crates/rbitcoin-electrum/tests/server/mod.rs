@@ -2372,7 +2372,7 @@ async fn stalled_electrum_write_is_closed() {
         std::time::Duration::from_secs(2),
         rbitcoin_electrum::server::write_line(
             &mut writer,
-            &json!({"jsonrpc":"2.0","id": 1, "result": null}),
+            json!({"jsonrpc":"2.0","id": 1, "result": null}),
             std::time::Duration::from_millis(40),
         ),
     )

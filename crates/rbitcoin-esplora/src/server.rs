@@ -141,7 +141,7 @@ pub fn maybe_attach_view(resp: Response, view: Option<ChainView>) -> Response {
 /// A JSON body whose encoded size is at least 4 KiB. The listener encodes it
 /// on `rbtc-scripts-*` after the store join returns.
 #[derive(Clone)]
-struct HeavyJson(Value);
+struct HeavyJson(Arc<Value>);
 
 /// Encode on this thread when the body is under 4 KiB. A heavier body waits
 /// for [`ensure_json`] so a blocking-pool thread is not held across the encode.
@@ -160,8 +160,15 @@ pub fn json_reply_here(v: impl Serialize) -> Response {
                 .into_response();
         }
     };
+    json_reply_shared(Arc::new(v))
+}
+
+/// Light bodies encode here. A heavy body moves the `Arc` into the response
+/// so [`ensure_json`] can hand it to `rbtc-scripts-*` without cloning.
+#[doc(hidden)]
+pub fn json_reply_shared(v: Arc<Value>) -> Response {
     if !rbitcoin_electrum::json_is_cpu_heavy(&v) {
-        let bytes = serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec());
+        let bytes = serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec());
         return ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
     }
     let mut resp = Response::builder()
@@ -179,7 +186,7 @@ pub async fn ensure_json(resp: Response) -> Response {
     let Some(heavy) = parts.extensions.remove::<HeavyJson>() else {
         return Response::from_parts(parts, body);
     };
-    let bytes = match rbitcoin_electrum::encode_json_body(&heavy.0).await {
+    let bytes = match rbitcoin_electrum::encode_json_body(heavy.0).await {
         Ok(bytes) => bytes,
         Err(()) => {
             return (StatusCode::INTERNAL_SERVER_ERROR, "json encode join failed").into_response();
@@ -357,7 +364,7 @@ pub struct GbtCache {
     pub at: Instant,
     pub tip: [u8; 32],
     pub updates: u64,
-    pub body: Value,
+    pub body: Arc<Value>,
 }
 
 /// TCP `host:port` or a filesystem unix socket.

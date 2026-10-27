@@ -2,6 +2,7 @@
 //! encoding runs on `rbtc-scripts-*`. The store join stays where it was.
 
 use serde_json::Value;
+use std::sync::Arc;
 
 /// Encoded bodies at or above this leave the caller for `rbtc-scripts-*`.
 pub const JSON_CPU_MIN: usize = 4096;
@@ -67,16 +68,16 @@ fn walk(v: &Value, left: &mut usize) -> bool {
 
 /// Encode `v`. A heavy body hops to `rbtc-scripts-*`. A light body encodes here.
 ///
-/// `Err` means the script worker dropped the reply. That is not an empty
-/// object: callers must not publish HTTP 200 `{}` for it.
+/// The `Arc` moves into the script job. Callers that already own the value
+/// do not clone it on the waiting task. `Err` means the worker dropped the
+/// reply.
 #[doc(hidden)]
-pub async fn encode_json_body(v: &Value) -> Result<Vec<u8>, ()> {
-    if !json_is_cpu_heavy(v) {
-        return Ok(serde_json::to_vec(v).unwrap_or_else(|_| b"{}".to_vec()));
+pub async fn encode_json_body(v: Arc<Value>) -> Result<Vec<u8>, ()> {
+    if !json_is_cpu_heavy(&v) {
+        return Ok(serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec()));
     }
-    let v = v.clone();
     rbitcoin_consensus::script_pool::run_cpu(move || {
-        serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec())
+        serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec())
     })
     .await
     .ok_or(())

@@ -1,8 +1,8 @@
 //! Esplora route handlers beyond tip/header/basic tx.
 
 use crate::server::{
-    block_hash_hex, json_reply_here, maybe_attach_view, mempool_wire, not_found, parse_hash32,
-    pin_or_reject, plain_ok, store_err, AppState, AsOf, GbtCache, JoinClient,
+    block_hash_hex, json_reply_here, json_reply_shared, maybe_attach_view, mempool_wire, not_found,
+    parse_hash32, pin_or_reject, plain_ok, store_err, AppState, AsOf, GbtCache, JoinClient,
 };
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, history_items_to_tx_json, tx_status_json_in,
@@ -10,7 +10,7 @@ use crate::tx_json::{
 };
 use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bitcoin::address::Address;
 use bitcoin::consensus::{deserialize, encode::serialize, Encodable};
@@ -829,11 +829,12 @@ pub fn block_template_sync(st: &AppState) -> Response {
     }
     match (fun.0)() {
         Ok(body) => {
+            let body = Arc::new(body);
             *cache = Some(GbtCache {
                 at: Instant::now(),
                 tip,
                 updates,
-                body: body.clone(),
+                body: Arc::clone(&body),
             });
             gbt_json(&body)
         }
@@ -842,16 +843,11 @@ pub fn block_template_sync(st: &AppState) -> Response {
 }
 
 #[doc(hidden)]
-pub fn gbt_json(body: &Value) -> Response {
-    (
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json"),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        body.to_string(),
-    )
-        .into_response()
+pub fn gbt_json(body: &Arc<Value>) -> Response {
+    let mut resp = json_reply_shared(Arc::clone(body));
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp
 }
 
 pub async fn spawn_join(f: impl FnOnce() -> Response + Send + 'static) -> Response {
