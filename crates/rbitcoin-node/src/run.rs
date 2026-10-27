@@ -7,7 +7,7 @@ use rbitcoin_esplora::{run_esplora, BlockTemplateFn, EsploraConfig, EsploraHandl
 use rbitcoin_ibd::{
     read_platform_rss, tip_perf_json, IbdConfig, Peerless, TipPerfLog, PEERLESS_REDIAL_CAP,
 };
-use rbitcoin_log::{debug, enabled, info, warn, Level};
+use rbitcoin_log::{debug, enabled, error, info, warn, Level};
 use rbitcoin_net::{
     default_port, netgroup, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
     BlockingRegion, ChainHub, Dialer, MempoolHub, NetAddr, P2PNode, PeerConnType, TipEvent,
@@ -70,6 +70,8 @@ impl NodeHandle {
 pub struct Shutdown {
     /// Polled by IBD / long loops for cooperative cancel.
     pub flag: Arc<AtomicBool>,
+    /// Set only by [`Self::fail`]. SIGTERM, Ctrl+C, and RPC `stop` leave it clear.
+    failed: AtomicBool,
     pub notify: Notify,
 }
 
@@ -77,8 +79,19 @@ impl Shutdown {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             flag: Arc::new(AtomicBool::new(false)),
+            failed: AtomicBool::new(false),
             notify: Notify::new(),
         })
+    }
+
+    /// Stop the process after a write-behind IO error. The exit is non-zero.
+    pub fn fail(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+        self.request();
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.load(Ordering::SeqCst)
     }
 
     pub fn request(&self) {
@@ -614,7 +627,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             Arc::clone(&shutdown.flag),
             {
                 let sd = Arc::clone(&shutdown);
-                move || sd.request()
+                move || sd.fail()
             },
         ))
     } else {
@@ -835,7 +848,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     Arc::clone(&shutdown.flag),
                     {
                         let sd = Arc::clone(&shutdown);
-                        move || sd.request()
+                        move || sd.fail()
                     },
                     // Version carries the bit once per peer: advertise only
                     // when served filters reach the tip, not during materialize.
@@ -1573,8 +1586,29 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         info!("node: mempool flushed gen={gen} live={live}");
     }
     node.shutdown().await;
-    info!("node: clean exit");
-    Ok(())
+    match shutdown_result(shutdown.failed()) {
+        Ok(()) => {
+            info!("node: clean exit");
+            Ok(())
+        }
+        Err(e) => {
+            error!("node: {e}");
+            Err(e)
+        }
+    }
+}
+
+/// `Ok` for SIGTERM, Ctrl+C, and RPC `stop`. `Err` when write-behind called
+/// [`Shutdown::fail`], so `process_main` exits non-zero and `Restart=on-failure` runs.
+#[doc(hidden)]
+pub fn shutdown_result(failed: bool) -> Result<(), NodeError> {
+    if failed {
+        Err(NodeError::Init(
+            "scripthash or index write-behind failed".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[doc(hidden)]
