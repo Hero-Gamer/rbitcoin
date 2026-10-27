@@ -947,6 +947,7 @@ fn waitfor_does_not_hold_the_blocking_pool() {
 
 #[tokio::test]
 async fn long_poll_does_not_hold_the_work_queue() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-queue").expect("dir");
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
     let hub = rbitcoin_net::ChainHub::new(
@@ -987,8 +988,14 @@ async fn long_poll_does_not_hold_the_work_queue() {
             "params": [5_000]
         })
         .to_string();
-        let _ = post_raw(addr, &auth, body.as_bytes()).await;
+        post_raw(addr, &auth, body.as_bytes()).await
     });
+    let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stalled.write_all(format!(
+        "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{",
+        auth_header(&handle.auth)
+    ).as_bytes()).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let (st, body) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -1006,8 +1013,39 @@ async fn long_poll_does_not_hold_the_work_queue() {
         !waiter.is_finished(),
         "waitfornewblock returned before the queue probe"
     );
-    waiter.abort();
-    handle.shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_millis(500), handle.shutdown())
+        .await
+        .expect("closing the listener must not await the long-poll deadline");
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    let mut buf = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), idle.read(&mut buf))
+            .await
+            .expect("idle connection closes during shutdown")
+            .unwrap(),
+        0
+    );
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    tokio::time::resume();
+    let (st, body) = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("in-flight reply finishes after listener shutdown")
+        .expect("client receives a complete HTTP response");
+    assert_eq!(st, 200, "{body:?}");
+    assert_eq!(body.expect("long-poll tip")["result"]["height"], 0);
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(25)).await;
+    tokio::time::resume();
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stalled.read_to_string(&mut response),
+    )
+    .await
+    .expect("stalled body still expires during shutdown")
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

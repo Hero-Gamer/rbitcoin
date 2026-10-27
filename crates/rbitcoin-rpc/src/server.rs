@@ -49,14 +49,14 @@ pub fn bind_unix_mode(
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(listener)
 }
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::JoinHandle;
 
 async fn serve_rpc<L>(mut listener: L, app: Router, sem: Arc<Semaphore>, shutdown: Arc<AtomicBool>)
 where
     L: axum::serve::Listener,
     L::Addr: std::fmt::Debug,
 {
-    let mut connections = JoinSet::new();
+    let (shutdown_tx, _) = tokio::sync::watch::channel(());
     let mut shutdown_tick = tokio::time::interval(std::time::Duration::from_millis(50));
     loop {
         tokio::select! {
@@ -65,20 +65,26 @@ where
                     break;
                 }
             }
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
             (io, addr) = listener.accept() => {
                 let Ok(permit) = sem.clone().try_acquire_owned() else {
                     info!("rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})");
                     continue;
                 };
                 let service = TowerToHyperService::new(app.clone());
-                connections.spawn(async move {
+                let mut shutdown_rx = shutdown_tx.subscribe();
+                tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = http1::Builder::new()
-                        .timer(TokioTimer::new())
-                        .header_read_timeout(RPC_READ_TIMEOUT)
-                        .serve_connection(TokioIo::new(io), service)
-                        .await;
+                    let mut http = http1::Builder::new();
+                    http.timer(TokioTimer::new()).header_read_timeout(RPC_READ_TIMEOUT);
+                    let connection = http.serve_connection(TokioIo::new(io), service);
+                    tokio::pin!(connection);
+                    tokio::select! {
+                        _ = &mut connection => {}
+                        _ = shutdown_rx.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            let _ = connection.await;
+                        }
+                    }
                 });
             }
         }
