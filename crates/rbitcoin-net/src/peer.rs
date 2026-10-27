@@ -4599,6 +4599,9 @@ pub async fn on_cmpct_got_block(
         Ok(_) => {
             hub.forget_asked_block(&hash);
         }
+        Err(e @ NetError::Store(_)) if !net_error_is_store_not_found(&e) => {
+            note_store_fault_keep_session(hub, hash, &e);
+        }
         _ => {
             if !hub.knows_header(&hsi.header.prev_blockhash) {
                 let _ = queue_getheaders(out_tx, hub, session, true, None);

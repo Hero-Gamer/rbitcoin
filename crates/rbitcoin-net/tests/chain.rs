@@ -3733,6 +3733,41 @@ fn store_fault_on_block_releases_the_body_ask() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A reconstructed compact block takes the same tip-connect read fault.
+/// The hub ask must come back so a later getdata can claim the hash.
+#[test]
+fn store_fault_on_cmpct_releases_the_body_ask() {
+    use bitcoin::bip152::HeaderAndShortIds;
+
+    let (dir, hub, b1, t2) = hub_with_truncated_body();
+    let b3 = spend_block(t2.block_hash(), t2.header.time + 600, 3, coinbase_out(&b1));
+    let hash = b3.block_hash();
+    assert!(hub.claim_block_ask(&hash));
+    let hsi = HeaderAndShortIds::from_block(&b3, 1, 2, &[0]).expect("compact header");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cmpct runtime");
+    rt.block_on(async {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut follow = rbitcoin_net::peer::PeerFollowState::new();
+        follow.requested_blocks.insert(hash);
+        rbitcoin_net::peer::on_cmpct_got_block(&hub, &tx, &mut follow, None, &hsi, hash, b3, None)
+            .await
+            .expect("compact store fault keeps the session");
+    });
+    assert!(
+        !hub.is_block_invalid(&hash),
+        "store fault is not a block verdict"
+    );
+    assert_eq!(hub.tip_hash(), Some(t2.block_hash()));
+    assert!(
+        hub.claim_block_ask(&hash),
+        "compact store fault must release the body ask"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // one hub: tip rejects, 64-byte body, in-block duplicates
 #[test]
 fn hostile_peer_session() {
