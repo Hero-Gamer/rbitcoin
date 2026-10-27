@@ -371,7 +371,7 @@ pub struct IbdPerfSample {
     pub lookup_decode_ms: u64,
     /// Lookup-wave `from_tx_wire` on payload slices (`precompute=`).
     pub lookup_precompute_ms: u64,
-    /// Lookup-wave TipOnly `get_fk_by_txid_batch` (`wave=… head=`). Not load stamp.
+    /// Lookup-wave TipOnly `get_fk_by_txid_batch_cancellable` (`wave=… head=`). Not load stamp.
     pub lookup_wave_head_ms: u64,
     /// TipOnly CPU (slot/fuse probe + fence snapshot) inside `head=`.
     pub lookup_wave_head_probe_ms: u64,
@@ -380,7 +380,7 @@ pub struct IbdPerfSample {
     /// TipOnly `txid.body` / identity preads this window.
     pub lookup_wave_head_preads: u64,
     /// Lookup-wave `create.loc` fill inside TipOnly `head=` (`wave=… loc=`).
-    /// One batch after identity; not on the probe ring.
+    /// One batch after the sealed walk; not on the probe ring.
     pub lookup_wave_spent_ms: u64,
     pub plan_parents: u64,
     pub plan_already: u64,

@@ -972,11 +972,12 @@ fn wave_under_confirm_cancel_returns_cancelled() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
-/// The cancellable batch resolves in pieces under one fence snapshot and asks
-/// before each piece: uncancelled it returns the rows the one-shot batch
-/// does, and a cancel after the first piece stops before the second.
+/// The cancellable batch is one resolve of the whole need. Uncancelled it
+/// returns the rows the one-shot batch does. The cancel is asked before the
+/// resolve and before each identity shot, so a flag set on the first ask
+/// returns cancelled and never resolves.
 #[test]
-fn txid_batch_asks_cancel_before_each_piece() {
+fn txid_batch_asks_cancel_before_the_identity_shot() {
     let (path, q) = tmp_query();
     let params = ChainParams::regtest();
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
@@ -996,24 +997,24 @@ fn txid_batch_asks_cancel_before_each_piece() {
         whole.iter().all(|(_, row)| row.is_some()),
         "connected coinbases resolve"
     );
-    let pieces = q
+    let once = q
         .store()
-        .get_fk_by_txid_batch_cancellable(&txids, 1, &|| false)
+        .get_fk_by_txid_batch_cancellable(&txids, &|| false)
         .unwrap();
-    assert_eq!(pieces, whole);
+    assert_eq!(once, whole, "one resolve returns the one-shot rows");
 
     let asked = std::cell::Cell::new(0u32);
     let err = q
         .store()
-        .get_fk_by_txid_batch_cancellable(&txids, 1, &|| {
+        .get_fk_by_txid_batch_cancellable(&txids, &|| {
             asked.set(asked.get() + 1);
-            asked.get() > 1
+            true
         })
         .unwrap_err();
     assert!(
         matches!(err, rbitcoin_store::StoreError::Cancelled(_)),
         "{err:?}"
     );
-    assert_eq!(asked.get(), 2, "one ask per piece, stopping at the second");
+    assert_eq!(asked.get(), 1, "the resolve asks before any identity shot");
     let _ = std::fs::remove_dir_all(&path);
 }

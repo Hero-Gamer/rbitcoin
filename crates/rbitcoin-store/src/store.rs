@@ -1147,54 +1147,45 @@ impl Store {
         txids: &[[u8; 32]],
         mode: TxidResolveMode,
     ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
-        self.resolve_txid_pieces(txids, mode, txids.len(), &|| false)
+        self.resolve_txid_batch(txids, mode, &|| false)
     }
 
-    /// [`Self::get_fk_by_txid_batch`] in pieces of `chunk` txids, asking
-    /// `cancelled` before each one. A confirm lookup wave is up to 64k cold
-    /// reads, most of an hour on a busy HDD; a stop now waits for one piece.
+    /// [`Self::get_fk_by_txid_batch`] that asks `cancelled` before each sealed
+    /// segment and each identity shot. One open probe, one sealed walk, one
+    /// `create.loc` batch. A confirm lookup wave is up to 64k cold reads; a
+    /// stop now waits for one segment rather than the wave.
     pub fn get_fk_by_txid_batch_cancellable(
         &self,
         txids: &[[u8; 32]],
-        chunk: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
-        self.resolve_txid_pieces(txids, TxidResolveMode::TipOnly, chunk, cancelled)
+        self.resolve_txid_batch(txids, TxidResolveMode::TipOnly, cancelled)
     }
 
-    fn resolve_txid_pieces(
+    fn resolve_txid_batch(
         &self,
         txids: &[[u8; 32]],
         mode: TxidResolveMode,
-        chunk: usize,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
         // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
         // `height_fence_extend`. Confirm extends before `set_many`, so tip
         // cannot publish while this clone is in flight. Clone is Arc (COW on
-        // the next extend if this snapshot is still live). Every piece reads
-        // under this one snapshot, so pieces agree on what is connected.
+        // the next extend if this snapshot is still live).
         let t_fence = std::time::Instant::now();
         let fence = self.fence().clone();
         crate::head_resolve_stats::add_probe(t_fence.elapsed().as_nanos() as u64);
         let tip_only = matches!(mode, TxidResolveMode::TipOnly);
-        if txids.is_empty() {
-            return crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
-                &self.txs, &fence, txids, tip_only,
-            );
+        if cancelled() {
+            return Err(StoreError::Cancelled("txid batch"));
         }
-        let mut rows = Vec::with_capacity(txids.len());
-        for piece in txids.chunks(chunk.max(1)) {
-            if cancelled() {
-                return Err(StoreError::Cancelled("txid batch"));
-            }
-            rows.extend(
-                crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
-                    &self.txs, &fence, piece, tip_only,
-                )?,
-            );
-        }
-        Ok(rows)
+        crate::head_resolve_denserels::resolve_fk_and_range_batch_cancellable(
+            &self.txs,
+            txids,
+            Some(&fence),
+            tip_only,
+            cancelled,
+        )
     }
 
     /// Failure-time hop dump for the leftover miss txid (load leftover only).
