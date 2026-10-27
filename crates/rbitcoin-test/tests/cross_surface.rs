@@ -2816,74 +2816,48 @@ async fn node_listen_and_exit() {
     pin_health_scrape(health_addr, true, 1.0).await;
     stop_run_p2p(rpc_addr, node).await;
 
-    // Another process holds the Electrum and RPC ports. The binds warn, the
-    // node still follows, and `/readyz` names both. `/metrics` is absent
-    // without `--metrics`.
-    let held_electrum = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let held_rpc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let health_addr = ephemeral_addr();
-    let mut cfg = listen_and_exit_cfg(&dir);
-    cfg.shindex = true;
-    cfg.listen.electrum = Some(held_electrum.local_addr().unwrap());
-    cfg.rpc.listen = Some(held_rpc.local_addr().unwrap());
-    cfg.listen.health = Some(health_addr);
-    // Deadline starts at tip-follow entry, after `/readyz` has left bring-up.
-    // Two seconds outlives that probe. The process then exits on the timer
-    // because the held RPC port cannot take `stop`.
-    cfg.max_run_secs = Some(2);
-    let node = spawn_run_p2p(cfg);
-    wait_listeners(&[health_addr]).await;
-    assert_eq!(
-        readyz_after_startup(health_addr).await,
-        (503, "not ready: rpc, electrum not listening".into())
-    );
-    let (st, body) = http_get(health_addr, "/metrics").await;
-    assert_eq!(st, 404, "/metrics without --metrics: {body}");
-    let stopped = tokio::time::timeout(Duration::from_secs(30), node).await;
-    assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
-    drop((held_electrum, held_rpc));
+    // Another process holds a listener the operator asked for. The start
+    // stops, as it does for the health port.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = held.local_addr().unwrap();
+    type Ask = fn(&mut NodeConfig, SocketAddr);
+    let asks: [(&str, Ask); 4] = [
+        ("rpc start: rpc bind", |cfg, addr| {
+            cfg.rpc.listen = Some(addr)
+        }),
+        ("electrum start", |cfg, addr| {
+            cfg.listen.electrum = Some(addr)
+        }),
+        ("esplora start", |cfg, addr| {
+            cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(addr));
+        }),
+        ("sv2 start", |cfg, addr| {
+            cfg.sv2_tp_listen = Some(addr);
+            cfg.sv2_tp_authority_sec = Some(Sv2AuthoritySecret(SV2_AUTHORITY_SEC));
+        }),
+    ];
+    for (want, ask) in asks {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.shindex = true;
+        ask(&mut cfg, taken);
+        let err = start_and_exit(cfg).await.expect_err(want).to_string();
+        assert!(err.contains(want), "{err}");
+    }
+    drop(held);
 
-    // RPC is up, so the tip loop wakes on its stop tick. A failed Electrum
-    // or Esplora bind stays failed when the other process releases the port.
-    let held_electrum = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let held_esplora = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let electrum_addr = held_electrum.local_addr().unwrap();
-    let esplora_addr = held_esplora.local_addr().unwrap();
-    let (rpc_addr, health_addr) = (ephemeral_addr(), ephemeral_addr());
-    let mut cfg = listen_and_exit_cfg(&dir);
-    cfg.shindex = true;
-    cfg.listen.electrum = Some(electrum_addr);
-    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
-    cfg.rpc.listen = Some(rpc_addr);
-    cfg.listen.health = Some(health_addr);
-    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    // An RPC socket whose directory cannot exist stops the start too.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dir.join("rpc.token"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.shindex = true;
+        cfg.rpc.socket = true;
+        cfg.rpc.socket_path = Some(dir.join("rpc.token").join("rpc.sock"));
+        let err = start_and_exit(cfg)
+            .await
+            .expect_err("rpc socket under a file")
+            .to_string();
+        assert!(err.contains("rpc start: rpc socket parent"), "{err}");
     }
-    cfg.max_run_secs = Some(30);
-    let node = spawn_run_p2p(cfg);
-    wait_listeners(&[rpc_addr, health_addr]).await;
-    assert_eq!(
-        readyz_after_startup(health_addr).await,
-        (503, "not ready: electrum, esplora not listening".into())
-    );
-    drop((held_electrum, held_esplora));
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        std::net::TcpListener::bind(electrum_addr).is_ok(),
-        "electrum bind failure is not retried on the tip loop"
-    );
-    assert!(
-        std::net::TcpListener::bind(esplora_addr).is_ok(),
-        "esplora bind failure is not retried on the tip loop"
-    );
-    stop_run_p2p(rpc_addr, node).await;
 
     // Without `--connect` and with seeds on: regtest resolves none, the one
     // saved peer still refuses, and the node exits short of tip mode.

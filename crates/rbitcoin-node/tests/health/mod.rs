@@ -10,7 +10,6 @@ use tokio::net::TcpListener;
 fn following() -> ReadySnapshot {
     ReadySnapshot {
         phase: Phase::Following,
-        unbound: Vec::new(),
         in_ibd: false,
         blocks: 100,
         headers: 100,
@@ -23,8 +22,8 @@ fn following() -> ReadySnapshot {
 /// Phase, header-lag, scripthash-lag, and tip-age boundaries. One live
 /// node would need a header fork, a stalled index, and a tip older than
 /// `--max-tip-age` at once. `node_listen_and_exit` owns the HTTP answers
-/// a probe sees: live during initial block download, ready after a fresh
-/// block, and 503 when a listener did not bind.
+/// a probe sees: live during initial block download and ready after a fresh
+/// block.
 #[test]
 fn readiness_reports_the_first_failing_gate() {
     let mut cases = Vec::new();
@@ -42,16 +41,6 @@ fn readiness_reports_the_first_failing_gate() {
             want,
         ));
     }
-    let unbound = |names: &[&'static str]| ReadySnapshot {
-        unbound: names.to_vec(),
-        in_ibd: true,
-        ..following()
-    };
-    cases.push((unbound(&["rpc"]), Err("rpc not listening".into())));
-    cases.push((
-        unbound(&["electrum", "esplora"]),
-        Err("electrum, esplora not listening".into()),
-    ));
     cases.push((
         ReadySnapshot {
             in_ibd: true,
@@ -241,6 +230,14 @@ async fn running_stage_is_visible_on_every_route() {
         last = format!("{p}\n---\n{r}\n---\n{m}");
     }
     panic!("stage not visible:\n{last}");
+}
+
+/// `/metrics` is absent without `--metrics`.
+#[tokio::test]
+async fn metrics_route_needs_the_flag() {
+    let addr = serve(router(NodeStatus::new(Network::Regtest, false), false)).await;
+    let m = get_soon(addr, "/metrics").await;
+    assert!(m.starts_with("HTTP/1.1 404 Not Found|"), "{m}");
 }
 
 async fn serve(app: Router) -> SocketAddr {

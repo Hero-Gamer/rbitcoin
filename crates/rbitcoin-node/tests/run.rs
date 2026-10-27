@@ -1346,7 +1346,8 @@ async fn start_esplora_applies_max_inflight() {
         Arc::clone(&hub),
         &mp,
     )
-    .await;
+    .await
+    .unwrap();
     let addr = handles[0].local_addr;
 
     let get = |addr| async move {

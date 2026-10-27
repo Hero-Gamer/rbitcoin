@@ -172,9 +172,9 @@ pub async fn start_rpc_listener(
     node: &P2PNode,
     mempool: &Arc<MempoolHub>,
     shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
-) -> Option<RpcHandle> {
+) -> Result<Option<RpcHandle>, NodeError> {
     if !(config.rpc.socket || config.rpc.listen.is_some()) {
-        return None;
+        return Ok(None);
     }
     let rcfg = RpcConfig {
         listen: config.rpc.listen,
@@ -210,7 +210,7 @@ pub async fn start_rpc_listener(
     } else {
         None
     };
-    match run_rpc(
+    let h = run_rpc(
         rcfg,
         Arc::clone(&node.hub.query),
         Some(Arc::clone(mempool)),
@@ -220,27 +220,20 @@ pub async fn start_rpc_listener(
         Some(Arc::clone(shared_peers)),
     )
     .await
-    {
-        Ok(h) => {
-            h.initial_block_download
-                .store(node.hub.in_ibd(), Ordering::SeqCst);
-            h.connections.store(0, Ordering::Relaxed);
-            info!(
-                "rpc: listening tcp={:?} sock={:?} token={}",
-                h.local_addr,
-                h.socket_path,
-                h.token_path.display()
-            );
-            if let Some(addr) = h.local_addr {
-                publish_listener_addr(config.datadir.path(), "rpc", addr);
-            }
-            Some(h)
-        }
-        Err(e) => {
-            warn!("rpc start warning: {e}");
-            None
-        }
+    .map_err(|e| NodeError::Config(format!("rpc start: {e}")))?;
+    h.initial_block_download
+        .store(node.hub.in_ibd(), Ordering::SeqCst);
+    h.connections.store(0, Ordering::Relaxed);
+    info!(
+        "rpc: listening tcp={:?} sock={:?} token={}",
+        h.local_addr,
+        h.socket_path,
+        h.token_path.display()
+    );
+    if let Some(addr) = h.local_addr {
+        publish_listener_addr(config.datadir.path(), "rpc", addr);
     }
+    Ok(Some(h))
 }
 
 /// Restore fee history from the mempool dir and read the rest of up to 1 GiB
@@ -766,7 +759,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // A peerless catch-up can wait indefinitely. Bring RPC up first so
     // `stop`, `addnode`, and status calls still work while it waits.
     if matches!(peerless, Peerless::Redial { .. }) && !shutdown.requested() {
-        rpc_handle = start_rpc_listener(&config, &node, &mempool, &shared_peers).await;
+        rpc_handle = start_rpc_listener(&config, &node, &mempool, &shared_peers).await?;
         if let Some(h) = &rpc_handle {
             let stop = Arc::clone(&h.stop);
             let sd = Arc::clone(&shutdown);
@@ -1013,7 +1006,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         &params,
         &mempool,
     )
-    .await;
+    .await?;
     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
         let hs = ctl
             .add_named_onion(config.datadir.path(), "electrum", h.local_addr)
@@ -1027,8 +1020,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         node.peers
             .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
     }
-    let mut electrum_gave_up =
-        sh_tip_ready && config.listen.electrum.is_some() && electrum_handles.is_empty();
     if let Some(h) = electrum_handles.first() {
         publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
     }
@@ -1044,7 +1035,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         Arc::clone(&node.hub),
         &mempool,
     )
-    .await;
+    .await?;
     if config.esplora_onion {
         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
             let hs = ctl
@@ -1059,15 +1050,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
         }
     }
-    let mut esplora_gave_up =
-        sh_tip_ready && config.listen.esplora.is_some() && esplora_handles.is_empty();
     if let Some(h) = esplora_handles.first() {
         publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
     }
     if rpc_handle.is_none() && !shutdown.requested() {
-        rpc_handle = start_rpc_listener(&config, &node, &mempool, &shared_peers).await;
+        rpc_handle = start_rpc_listener(&config, &node, &mempool, &shared_peers).await?;
     }
-    let sv2_tp = start_sv2_tp(&config, &node.hub).await;
+    let sv2_tp = start_sv2_tp(&config, &node.hub).await?;
     let sv2_stats = sv2_tp.as_ref().map(Sv2TpHandle::stats);
     if let Some(s) = &sv2_stats {
         status.attach_sv2(Arc::clone(s));
@@ -1109,30 +1098,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
 
     if tip_follow_ready && config.max_run_secs != Some(0) && !shutdown.requested() {
-        let unbound = [
-            (
-                "rpc",
-                config.rpc.socket || config.rpc.listen.is_some(),
-                rpc_handle.is_some(),
-            ),
-            (
-                "electrum",
-                config.listen.electrum.is_some(),
-                !electrum_handles.is_empty(),
-            ),
-            (
-                "esplora",
-                config.listen.esplora.is_some(),
-                !esplora_handles.is_empty(),
-            ),
-        ];
-        status.follow(
-            unbound
-                .into_iter()
-                .filter(|&(_, configured, bound)| configured && !bound)
-                .map(|(name, ..)| name)
-                .collect(),
-        );
+        status.enter(Phase::Following);
         let deadline = config
             .max_run_secs
             .map(|s| Instant::now() + Duration::from_secs(s));
@@ -1168,16 +1134,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
 
             // A durable head can lag `include_hwm` at tip entry. Electrum stays
             // down until write-behind covers the tip, then this same process binds.
-            // A bind that already failed stays down: retrying on the RPC stop
-            // tick takes a port another process released and spams the warning.
-            let electrum_due = config.shindex
-                && config.listen.electrum.is_some()
-                && electrum_handles.is_empty()
-                && !electrum_gave_up;
-            let esplora_due = config.shindex
-                && config.listen.esplora.is_some()
-                && esplora_handles.is_empty()
-                && !esplora_gave_up;
+            let electrum_due =
+                config.shindex && config.listen.electrum.is_some() && electrum_handles.is_empty();
+            let esplora_due =
+                config.shindex && config.listen.esplora.is_some() && esplora_handles.is_empty();
             if (electrum_due || esplora_due) && node.hub.query.sh_is_tip_ready() {
                 let mut bound_now = false;
                 if electrum_due {
@@ -1191,7 +1151,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         &params,
                         &mempool,
                     )
-                    .await;
+                    .await?;
                     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
                         let hs = ctl
                             .add_named_onion(config.datadir.path(), "electrum", h.local_addr)
@@ -1223,9 +1183,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             }
                         }
                     }
-                    if handles.is_empty() {
-                        electrum_gave_up = true;
-                    } else if let Some(h) = handles.first() {
+                    if let Some(h) = handles.first() {
                         bound_now = true;
                         publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
                     }
@@ -1245,7 +1203,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         Arc::clone(&node.hub),
                         &mempool,
                     )
-                    .await;
+                    .await?;
                     if config.esplora_onion {
                         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
                             let hs = ctl
@@ -1277,9 +1235,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             }
                         }
                     }
-                    if handles.is_empty() {
-                        esplora_gave_up = true;
-                    } else if let Some(h) = handles.first() {
+                    if let Some(h) = handles.first() {
                         bound_now = true;
                         publish_listener_addr(config.datadir.path(), "esplora", h.local_addr);
                     }
@@ -2341,17 +2297,20 @@ pub async fn start_electrum_if_ready(
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
     mempool: &std::sync::Arc<MempoolHub>,
-) -> (
-    Vec<ElectrumHandle>,
-    Option<tokio::task::JoinHandle<()>>,
-    Arc<OnceLock<(String, u16)>>,
-) {
+) -> Result<
+    (
+        Vec<ElectrumHandle>,
+        Option<tokio::task::JoinHandle<()>>,
+        Arc<OnceLock<(String, u16)>>,
+    ),
+    NodeError,
+> {
     let onion_tcp = Arc::new(OnceLock::new());
     let Some(addr) = addr else {
-        return (Vec::new(), None, onion_tcp);
+        return Ok((Vec::new(), None, onion_tcp));
     };
     if !sh_tip_ready || shutdown.requested() {
-        return (Vec::new(), None, onion_tcp);
+        return Ok((Vec::new(), None, onion_tcp));
     }
     let q = hub.query.clone();
     let (electrum_tip_tx, _) = broadcast::channel::<TipNotify>(64);
@@ -2384,11 +2343,11 @@ pub async fn start_electrum_if_ready(
                 "electrum TCP on {} (Query + mempool; max_conn={} max_line={} idle={}s; TLS via reverse proxy if public)",
                 h.local_addr, max_conn, max_line, idle_secs
             );
-            (vec![h], Some(bridge), onion_tcp)
+            Ok((vec![h], Some(bridge), onion_tcp))
         }
         Err(e) => {
-            warn!("electrum TCP start warning: {e}");
-            (Vec::new(), Some(bridge), onion_tcp)
+            bridge.abort();
+            Err(NodeError::Config(format!("electrum start: {e}")))
         }
     }
 }
@@ -2405,12 +2364,12 @@ pub async fn start_esplora_if_ready(
     shutdown: &Shutdown,
     hub: Arc<ChainHub>,
     mempool: &std::sync::Arc<MempoolHub>,
-) -> Vec<EsploraHandle> {
+) -> Result<Vec<EsploraHandle>, NodeError> {
     let Some(listen) = listen else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if !sh_tip_ready || shutdown.requested() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let q = hub.query.clone();
     let btc_net = rbitcoin_rpc::methods::mine::rpc_btc_network(network);
@@ -2452,28 +2411,32 @@ pub async fn start_esplora_if_ready(
     let max_conn = ecfg.limits.max_connections;
     let max_body = ecfg.limits.max_request_bytes;
     let idle_secs = ecfg.limits.idle_timeout.as_secs();
-    match run_esplora(ecfg, q, Some(Arc::clone(mempool))).await {
-        Ok(h) => {
-            info!(
-                "esplora HTTP on {} (max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
-                h.socket_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| h.local_addr.to_string()),
-                max_conn, max_body, idle_secs
-            );
-            vec![h]
-        }
-        Err(e) => {
-            warn!("esplora HTTP start warning: {e}");
-            Vec::new()
-        }
-    }
+    let h = run_esplora(ecfg, q, Some(Arc::clone(mempool)))
+        .await
+        .map_err(|e| NodeError::Config(format!("esplora start: {e}")))?;
+    info!(
+        "esplora HTTP on {} (max_conn={} max_body={} idle={}s; TLS via reverse proxy if public)",
+        h.socket_path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| h.local_addr.to_string()),
+        max_conn,
+        max_body,
+        idle_secs
+    );
+    Ok(vec![h])
 }
 
-pub async fn start_sv2_tp(config: &NodeConfig, hub: &Arc<ChainHub>) -> Option<Sv2TpHandle> {
-    let listen = config.sv2_tp_listen?;
-    let authority_secret = config.sv2_tp_authority_sec?.0;
+pub async fn start_sv2_tp(
+    config: &NodeConfig,
+    hub: &Arc<ChainHub>,
+) -> Result<Option<Sv2TpHandle>, NodeError> {
+    let (Some(listen), Some(authority_secret)) =
+        (config.sv2_tp_listen, config.sv2_tp_authority_sec)
+    else {
+        return Ok(None);
+    };
+    let authority_secret = authority_secret.0;
     let cfg = Sv2TpConfig {
         listen,
         chain: Arc::clone(hub),
@@ -2486,20 +2449,15 @@ pub async fn start_sv2_tp(config: &NodeConfig, hub: &Arc<ChainHub>) -> Option<Sv
         template_interval: config.sv2_tp_template_interval,
         constraints_cooldown: config.sv2_tp_constraints_cooldown,
     };
-    match run_sv2_tp(cfg).await {
-        Ok(h) => {
-            info!(
-                "sv2 TP on {} (authority pubkey {})",
-                h.local_addr,
-                h.authority_key()
-            );
-            Some(h)
-        }
-        Err(e) => {
-            warn!("sv2 TP start warning: {e}");
-            None
-        }
-    }
+    let h = run_sv2_tp(cfg)
+        .await
+        .map_err(|e| NodeError::Config(format!("sv2 start: {e}")))?;
+    info!(
+        "sv2 TP on {} (authority pubkey {})",
+        h.local_addr,
+        h.authority_key()
+    );
+    Ok(Some(h))
 }
 
 /// Result of post-IBD tip entry: follow/mempool gates vs Electrum SH gate.
