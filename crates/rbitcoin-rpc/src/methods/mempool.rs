@@ -1009,36 +1009,30 @@ pub fn tx_confirmed_on_active_chain(ctx: &RpcContext, tx: &Transaction) -> Resul
     }
 }
 
-/// Core `ParseConfirmTarget`: integer in `1..=1008`.
-/// Core `ParseConfirmTarget`: integer in `1..=1008`.
+/// Core `ParseConfirmTarget`: an `int` (else `JSON integer out of range`) in `1..=1008`.
 pub fn parse_conf_target(v: &Value) -> Result<u32, Value> {
-    let conf_target = match v {
-        Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
-            .ok_or_else(|| {
-                rpc_error(
-                    ERR_TYPE_ERROR,
-                    "JSON value of type number is not of expected type number",
-                )
-            })? as u32,
-        other => {
-            return Err(rpc_error(
-                ERR_TYPE_ERROR,
-                format!(
-                    "JSON value of type {} is not of expected type number",
-                    json_type_name(other)
-                ),
-            ));
-        }
-    };
-    if !(1..=1008).contains(&conf_target) {
+    let Value::Number(n) = v else {
         return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "Invalid conf_target, must be between 1 and 1008",
+            ERR_TYPE_ERROR,
+            format!(
+                "JSON value of type {} is not of expected type number",
+                json_type_name(v)
+            ),
         ));
-    }
-    Ok(conf_target)
+    };
+    let conf_target = n
+        .as_i64()
+        .and_then(|t| i32::try_from(t).ok())
+        .ok_or_else(|| rpc_error(ERR_MISC, "JSON integer out of range"))?;
+    u32::try_from(conf_target)
+        .ok()
+        .filter(|t| (1..=1008).contains(t))
+        .ok_or_else(|| {
+            rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Invalid conf_target, must be between 1 and 1008",
+            )
+        })
 }
 
 /// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.

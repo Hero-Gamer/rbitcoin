@@ -687,13 +687,19 @@ fn chain_ops_estimate_fee_param_gates(ctx: &RpcContext) {
     assert_eq!(e["code"], ERR_MISC);
     assert!(e["message"].as_str().unwrap().contains("estimatesmartfee"), "{e}");
     for method in ["estimatesmartfee", "estimaterawfee"] {
-        for bad in [json!(0), json!(1009)] {
+        for bad in [json!(0), json!(1009), json!(-1)] {
             let e = dispatch(ctx, method, vec![bad]).unwrap_err();
             assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{method}");
             assert!(
                 e["message"].as_str().unwrap().contains("Invalid conf_target, must be between 1 and 1008"),
                 "{method} {e}"
             );
+        }
+        // Core v31.1 reads conf_target as an int32: 2^32 + 1 does not wrap to 1.
+        for wide in [json!(4_294_967_297_u64), json!(2_147_483_648_u64), json!(2.5)] {
+            let e = dispatch(ctx, method, vec![wide.clone()]).unwrap_err();
+            assert_eq!(e["code"], ERR_MISC, "{method} {wide}: {e}");
+            assert_eq!(e["message"], "JSON integer out of range", "{method} {wide}");
         }
     }
     dispatch(ctx, "estimatesmartfee", vec![json!(1)]).unwrap();
