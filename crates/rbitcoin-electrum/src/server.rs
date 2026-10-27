@@ -407,6 +407,8 @@ where
     let idle = config.idle_timeout();
     let max_line = config.max_line_bytes();
     let mut sh_seen = query.sh_indexed_through_height();
+    // A status read overlapped a held pool, so the tick reads every sub again.
+    let mut sh_rescan = false;
     let mut sh_tick = tokio::time::interval(Duration::from_millis(50));
     sh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -459,7 +461,7 @@ where
                             } else {
                                 Some(vec![t.height])
                             };
-                            emit_sh_notes(
+                            sh_rescan |= !emit_sh_notes(
                                 &mut writer,
                                 &query,
                                 mempool.clone(),
@@ -473,7 +475,7 @@ where
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if !conn.sh_subs.is_empty() {
-                            emit_sh_notes(
+                            sh_rescan |= !emit_sh_notes(
                                 &mut writer,
                                 &query,
                                 mempool.clone(),
@@ -496,30 +498,31 @@ where
                 }
             } => {
                 let now = query.sh_indexed_through_height();
-                let Some(scan) = tick_scan(sh_seen, now) else {
-                    continue;
+                let scan = match tick_scan(sh_seen, now) {
+                    _ if sh_rescan => None,
+                    Some(scan) => scan,
+                    None => continue,
                 };
                 if conn.sh_subs.is_empty() {
                     sh_seen = now;
                     continue;
                 }
-                let q = Arc::clone(&query);
-                let mp = mempool.clone();
-                let subs: Vec<[u8; 32]> = conn.sh_subs.iter().copied().collect();
-                let notes = tokio::task::spawn_blocking(move || {
-                    let _g = BlockingRegion::enter();
-                    settled_restatus_notes(&q, mp.as_deref(), &subs, scan.as_deref())
-                })
-                .await
-                .unwrap_or_default();
                 // A reorg walks the watermark back before its txs are back in
-                // the pool. Its tip events restatus once they are.
-                let Some(notes) = notes else {
-                    continue;
-                };
-                sh_seen = now;
-                push_sh_notes(&mut writer, &conn.sh_subs, &mut last_sent_status, notes, idle)
-                    .await?;
+                // the pool, and may walk it forward again before that. A read
+                // inside the hold is dropped and every sub is read again.
+                sh_rescan = !emit_sh_notes(
+                    &mut writer,
+                    &query,
+                    mempool.clone(),
+                    &conn.sh_subs,
+                    &mut last_sent_status,
+                    scan,
+                    idle,
+                )
+                .await?;
+                if !sh_rescan {
+                    sh_seen = now;
+                }
             }
             ann = async {
                 if let Some(rx) = mempool_rx.as_mut() {
@@ -555,37 +558,27 @@ where
                         let hub = Arc::clone(mp);
                         let statuses = tokio::task::spawn_blocking(move || {
                             let _g = BlockingRegion::enter();
-                            let mut out = Vec::with_capacity(touched.len());
-                            for sh in touched {
-                                if let Ok(status) = scripthash_status_full(&q, &hub, &sh) {
-                                    out.push((sh, status));
-                                }
-                            }
-                            out
+                            settled_restatus_notes(&q, Some(&hub), &touched, None)
                         })
                         .await
                         .unwrap_or_else(|e| {
                             rbitcoin_log::warn!(
                                 "electrum: mempool scripthash status join failed: {e}"
                             );
-                            Vec::new()
+                            Some(Vec::new())
                         });
-                        for (sh, status) in statuses {
-                            let Some(status) = take_new_status(
-                                &mut last_sent_status,
-                                &conn.sh_subs,
-                                sh,
-                                status,
-                            ) else {
-                                continue;
-                            };
-                            let msg = json!({
-                                "jsonrpc": "2.0",
-                                "method": "blockchain.scripthash.subscribe",
-                                "params": [hash_hex_rev(&sh), status_json(status)]
-                            });
-                            write_line(&mut writer, msg, idle).await?;
-                        }
+                        let Some(statuses) = statuses else {
+                            sh_rescan = true;
+                            continue;
+                        };
+                        push_sh_notes(
+                            &mut writer,
+                            &conn.sh_subs,
+                            &mut last_sent_status,
+                            statuses,
+                            idle,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -1925,6 +1918,8 @@ pub fn take_new_status(
     Some(status)
 }
 
+/// Push the statuses that changed. `false` when a connect or reorg held the
+/// pool during the read: nothing was pushed, and the caller reads again.
 pub async fn emit_sh_notes<W: AsyncWrite + Unpin>(
     writer: &mut W,
     query: &Arc<Query>,
@@ -1933,16 +1928,20 @@ pub async fn emit_sh_notes<W: AsyncWrite + Unpin>(
     last_sent: &mut HashMap<[u8; 32], String>,
     heights: Option<Vec<u32>>,
     idle: Duration,
-) -> Result<(), std::io::Error> {
+) -> Result<bool, std::io::Error> {
     let q = Arc::clone(query);
     let subs: Vec<[u8; 32]> = sh_subs.iter().copied().collect();
     let notes = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
-        restatus_notes(&q, mempool.as_deref(), &subs, heights.as_deref())
+        settled_restatus_notes(&q, mempool.as_deref(), &subs, heights.as_deref())
     })
     .await
-    .unwrap_or_default();
-    push_sh_notes(writer, sh_subs, last_sent, notes, idle).await
+    .unwrap_or(Some(Vec::new()));
+    let Some(notes) = notes else {
+        return Ok(false);
+    };
+    push_sh_notes(writer, sh_subs, last_sent, notes, idle).await?;
+    Ok(true)
 }
 
 /// Push each status in `notes` that differs from the last one sent.
