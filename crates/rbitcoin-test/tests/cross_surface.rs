@@ -2842,13 +2842,16 @@ async fn node_listen_and_exit() {
     }
 
     // RPC binds after Electrum. Its failure still tears the run down, so the
-    // Electrum port is closed once run_p2p returns.
+    // Electrum port is closed once run_p2p returns, and the run never counts
+    // as started for `--startup-notify`.
     let electrum_published = dir.join("run").join("electrum.addr");
     let _ = std::fs::remove_file(&electrum_published);
+    let notified = dir.join("startup-notified");
     let mut cfg = listen_and_exit_cfg(&dir);
     cfg.shindex = true;
     cfg.listen.electrum = Some("127.0.0.1:0".parse().unwrap());
     cfg.rpc.listen = Some(taken);
+    cfg.startup_notify = Some(format!("touch '{}'", notified.display()));
     let err = start_and_exit(cfg)
         .await
         .expect_err("held rpc port")
@@ -2859,13 +2862,17 @@ async fn node_listen_and_exit() {
         TcpStream::connect(electrum_addr).await.is_err(),
         "electrum still accepts after the failed start"
     );
+    assert!(!notified.exists(), "startup-notify ran for a failed start");
     drop(held);
 
-    // An RPC socket whose directory cannot exist stops the start too.
+    // An RPC socket whose directory cannot exist stops the start too, and
+    // the TCP half of RPC does not outlive it.
     #[cfg(unix)]
     {
+        let rpc_addr = ephemeral_addr();
         let mut cfg = listen_and_exit_cfg(&dir);
         cfg.shindex = true;
+        cfg.rpc.listen = Some(rpc_addr);
         cfg.rpc.socket = true;
         cfg.rpc.socket_path = Some(dir.join("rpc.token").join("rpc.sock"));
         let err = start_and_exit(cfg)
@@ -2873,6 +2880,10 @@ async fn node_listen_and_exit() {
             .expect_err("rpc socket under a file")
             .to_string();
         assert!(err.contains("rpc start: rpc socket parent"), "{err}");
+        assert!(
+            std::net::TcpListener::bind(rpc_addr).is_ok(),
+            "rpc TCP still bound after the failed start"
+        );
     }
 
     // Without `--connect` and with seeds on: regtest resolves none, the one

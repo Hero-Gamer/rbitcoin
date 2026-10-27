@@ -1097,7 +1097,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         status.attach_sv2(Arc::clone(s));
     }
     let mut i2p_wallet = Vec::new();
-    if config.listen.i2p_accept_incoming {
+    if config.listen.i2p_accept_incoming && !shutdown.requested() {
         if let Some(addr) = config.listen.i2p_sam {
             if let Some(h) = electrum_handles.first() {
                 i2p_wallet.push(
@@ -1124,7 +1124,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
 
-    if let Some(cmd) = config.startup_notify.as_deref() {
+    if let Some(cmd) = config
+        .startup_notify
+        .as_deref()
+        .filter(|_| !shutdown.requested())
+    {
         match std::process::Command::new("sh").arg("-c").arg(cmd).status() {
             Ok(st) if st.success() => {}
             Ok(st) => warn!("startup-notify exited {st}: {cmd}"),
