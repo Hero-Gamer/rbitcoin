@@ -1040,17 +1040,20 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         .await,
     );
     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), electrum_handles.first()) {
-        let hs = ctl
-            .add_named_onion(config.datadir.path(), "electrum", h.local_addr)
-            .await?;
-        info!(
-            "electrum onion {}.onion:{}",
-            hs.service_id,
-            h.local_addr.port()
-        );
-        let _ = electrum_onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
-        node.peers
-            .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
+        if let Some(hs) = shutdown.or_fail(
+            ctl.add_named_onion(config.datadir.path(), "electrum", h.local_addr)
+                .await
+                .map(Some),
+        ) {
+            info!(
+                "electrum onion {}.onion:{}",
+                hs.service_id,
+                h.local_addr.port()
+            );
+            let _ = electrum_onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
+            node.peers
+                .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
+        }
     }
     if let Some(h) = electrum_handles.first() {
         publish_listener_addr(config.datadir.path(), "electrum", h.local_addr);
@@ -1072,16 +1075,19 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     );
     if config.esplora_onion {
         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), esplora_handles.first()) {
-            let hs = ctl
-                .add_named_onion(config.datadir.path(), "esplora", h.local_addr)
-                .await?;
-            info!(
-                "esplora onion http://{}.onion:{} (/ws same port)",
-                hs.service_id,
-                h.local_addr.port()
-            );
-            node.peers
-                .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
+            if let Some(hs) = shutdown.or_fail(
+                ctl.add_named_onion(config.datadir.path(), "esplora", h.local_addr)
+                    .await
+                    .map(Some),
+            ) {
+                info!(
+                    "esplora onion http://{}.onion:{} (/ws same port)",
+                    hs.service_id,
+                    h.local_addr.port()
+                );
+                node.peers
+                    .set_wallet_onion(format!("{}.onion", hs.service_id), h.local_addr.port());
+            }
         }
     }
     if let Some(h) = esplora_handles.first() {
@@ -1100,25 +1106,31 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if config.listen.i2p_accept_incoming && !shutdown.requested() {
         if let Some(addr) = config.listen.i2p_sam {
             if let Some(h) = electrum_handles.first() {
-                i2p_wallet.push(
-                    start_i2p_named_forward(
-                        addr,
-                        config.datadir.path(),
-                        "electrum",
-                        h.local_addr.port(),
-                    )
-                    .await?,
+                i2p_wallet.extend(
+                    shutdown.or_fail(
+                        start_i2p_named_forward(
+                            addr,
+                            config.datadir.path(),
+                            "electrum",
+                            h.local_addr.port(),
+                        )
+                        .await
+                        .map(Some),
+                    ),
                 );
             }
             if let Some(h) = esplora_handles.first() {
-                i2p_wallet.push(
-                    start_i2p_named_forward(
-                        addr,
-                        config.datadir.path(),
-                        "esplora",
-                        h.local_addr.port(),
-                    )
-                    .await?,
+                i2p_wallet.extend(
+                    shutdown.or_fail(
+                        start_i2p_named_forward(
+                            addr,
+                            config.datadir.path(),
+                            "esplora",
+                            h.local_addr.port(),
+                        )
+                        .await
+                        .map(Some),
+                    ),
                 );
             }
         }
@@ -1194,32 +1206,38 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                         .await,
                     );
                     if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
-                        let hs = ctl
-                            .add_named_onion(config.datadir.path(), "electrum", h.local_addr)
-                            .await?;
-                        info!(
-                            "electrum onion {}.onion:{}",
-                            hs.service_id,
-                            h.local_addr.port()
-                        );
-                        let _ =
-                            onion.set((format!("{}.onion", hs.service_id), h.local_addr.port()));
-                        node.peers.set_wallet_onion(
-                            format!("{}.onion", hs.service_id),
-                            h.local_addr.port(),
-                        );
+                        if let Some(hs) = shutdown.or_fail(
+                            ctl.add_named_onion(config.datadir.path(), "electrum", h.local_addr)
+                                .await
+                                .map(Some),
+                        ) {
+                            info!(
+                                "electrum onion {}.onion:{}",
+                                hs.service_id,
+                                h.local_addr.port()
+                            );
+                            let _ = onion
+                                .set((format!("{}.onion", hs.service_id), h.local_addr.port()));
+                            node.peers.set_wallet_onion(
+                                format!("{}.onion", hs.service_id),
+                                h.local_addr.port(),
+                            );
+                        }
                     }
                     if config.listen.i2p_accept_incoming {
                         if let Some(addr) = config.listen.i2p_sam {
                             if let Some(h) = handles.first() {
-                                i2p_wallet.push(
-                                    start_i2p_named_forward(
-                                        addr,
-                                        config.datadir.path(),
-                                        "electrum",
-                                        h.local_addr.port(),
-                                    )
-                                    .await?,
+                                i2p_wallet.extend(
+                                    shutdown.or_fail(
+                                        start_i2p_named_forward(
+                                            addr,
+                                            config.datadir.path(),
+                                            "electrum",
+                                            h.local_addr.port(),
+                                        )
+                                        .await
+                                        .map(Some),
+                                    ),
                                 );
                             }
                         }
@@ -1249,31 +1267,37 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     );
                     if config.esplora_onion {
                         if let (Some(ctl), Some(h)) = (tor_ctl.as_mut(), handles.first()) {
-                            let hs = ctl
-                                .add_named_onion(config.datadir.path(), "esplora", h.local_addr)
-                                .await?;
-                            info!(
-                                "esplora onion http://{}.onion:{} (/ws same port)",
-                                hs.service_id,
-                                h.local_addr.port()
-                            );
-                            node.peers.set_wallet_onion(
-                                format!("{}.onion", hs.service_id),
-                                h.local_addr.port(),
-                            );
+                            if let Some(hs) = shutdown.or_fail(
+                                ctl.add_named_onion(config.datadir.path(), "esplora", h.local_addr)
+                                    .await
+                                    .map(Some),
+                            ) {
+                                info!(
+                                    "esplora onion http://{}.onion:{} (/ws same port)",
+                                    hs.service_id,
+                                    h.local_addr.port()
+                                );
+                                node.peers.set_wallet_onion(
+                                    format!("{}.onion", hs.service_id),
+                                    h.local_addr.port(),
+                                );
+                            }
                         }
                     }
                     if config.listen.i2p_accept_incoming {
                         if let Some(addr) = config.listen.i2p_sam {
                             if let Some(h) = handles.first() {
-                                i2p_wallet.push(
-                                    start_i2p_named_forward(
-                                        addr,
-                                        config.datadir.path(),
-                                        "esplora",
-                                        h.local_addr.port(),
-                                    )
-                                    .await?,
+                                i2p_wallet.extend(
+                                    shutdown.or_fail(
+                                        start_i2p_named_forward(
+                                            addr,
+                                            config.datadir.path(),
+                                            "esplora",
+                                            h.local_addr.port(),
+                                        )
+                                        .await
+                                        .map(Some),
+                                    ),
                                 );
                             }
                         }

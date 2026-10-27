@@ -3333,6 +3333,39 @@ async fn tor_control_onion_lifecycle() {
         let needle = format!("DESTINATION={dest} ");
         assert!(creates.iter().any(|c| c.contains(&needle)), "{creates:?}");
     }
+
+    // A saved Electrum onion key Tor refuses, then an Electrum I2P
+    // destination that cannot be read, ends the start after Electrum bound.
+    // The run still tears down, so that port is closed once run_p2p returns.
+    let onion_key = dir.join("onion").join("electrum.priv");
+    let saved_key = std::fs::read(&onion_key).unwrap();
+    std::fs::write(&onion_key, "ED25519-V3:revoked").unwrap();
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("refused electrum onion key")
+        .to_string();
+    assert!(err.contains("Invalid onion key"), "{err}");
+    assert!(
+        TcpStream::connect(electrum).await.is_err(),
+        "electrum still accepts after the onion error"
+    );
+    std::fs::write(&onion_key, saved_key).unwrap();
+    let i2p_dest = dir.join("i2p").join("electrum.priv");
+    std::fs::remove_file(&i2p_dest).unwrap();
+    std::fs::create_dir(&i2p_dest).unwrap();
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("unreadable electrum i2p destination")
+        .to_string();
+    assert!(err.contains("i2p electrum session"), "{err}");
+    assert!(
+        TcpStream::connect(electrum).await.is_err(),
+        "electrum still accepts after the i2p error"
+    );
 }
 
 async fn history_closed(electrum_addr: SocketAddr, scripthash: &str) {
