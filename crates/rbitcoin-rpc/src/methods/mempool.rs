@@ -182,6 +182,8 @@ pub fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -
         .unwrap_or_default();
     json!({
         "vsize": vsize,
+        "vsize_adjusted": vsize,
+        "vsize_bip141": rbitcoin_consensus::policy::vbytes_ceil(weight),
         "weight": weight,
         "wtxid": wtxid,
         "fee": sat_btc_json(fee as i64),
@@ -301,11 +303,11 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
             if !verbose {
                 return Ok(json!(serialize_hex(&tx)));
             }
-            return Ok(tx_to_json(
-                &tx,
-                Some(json!({ "in_mempool": true })),
-                rpc_btc_network(ctx.network),
-            ));
+            let mut extra = json!({ "in_mempool": true });
+            if let Some(weight) = mp.get_live_adjusted_weight(&tid) {
+                extra["vsize_adjusted"] = json!(rbitcoin_consensus::policy::vbytes_ceil(weight));
+            }
+            return Ok(tx_to_json(&tx, Some(extra), rpc_btc_network(ctx.network)));
         }
     }
 
@@ -879,6 +881,8 @@ pub fn testmempoolaccept_package_rows(
                         "wtxid": wtxid,
                         "allowed": true,
                         "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
+                        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
+                        "vsize_bip141": tx.vsize(),
                         "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
                     }));
                 }
@@ -948,6 +952,8 @@ pub fn testmempoolaccept_single_rows(
                     "wtxid": wtxid,
                     "allowed": true,
                     "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
+                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
+                    "vsize_bip141": tx.vsize(),
                     "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
                 }));
             }
@@ -1487,6 +1493,8 @@ pub fn submitpackage_admit(
                 json!({
                     "txid": txid_s,
                     "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
+                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
+                    "vsize_bip141": tx.vsize(),
                     "fees": { "base": sat_btc_json(fee as i64) },
                 }),
             );
@@ -1525,6 +1533,8 @@ pub fn submitpackage_admit(
                     json!({
                         "txid": hash_hex_display(&ok.txid.to_byte_array()),
                         "vsize": rbitcoin_consensus::policy::vbytes_ceil(ok.weight),
+                        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(ok.weight),
+                        "vsize_bip141": tx.vsize(),
                         "fees": submit_fees_json(
                             mp,
                             &ok.txid,
@@ -1656,6 +1666,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
             "wtxid": hash_hex_display(&s.tx.compute_wtxid().to_byte_array()),
             "bytes": raw.len(),
             "vsize": s.tx.vsize(),
+            "vsize_bip141": s.tx.vsize(),
             "weight": weight,
             "from": s.announcers,
         });
