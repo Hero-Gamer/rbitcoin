@@ -6,9 +6,10 @@
 
 HTTP JSON-RPC checks the bearer on the request parts before the body is
 read. A missing or wrong token is 401 with no body bytes required. The
-body cap is the named `RPC_MAX_HTTP_BODY` (2 MiB): a larger body with a
-valid bearer is 413 and the method does not run. A body under that cap
-still dispatches.
+authenticated body cap is the named `RPC_MAX_HTTP_BODY` (32 MiB, Bitcoin
+Core `MAX_SIZE`): a larger body with a valid bearer is 413 and the method
+does not run. REST stays at `REST_MAX_HTTP_BODY` (2 MiB) and does not use
+that ceiling. A body under the cap that applies still dispatches.
 
 `--rpc-work-queue` defaults to 16, matching Core `-rpcworkqueue`. A full
 queue is HTTP 503. **0** is that same default queue.
@@ -27,6 +28,7 @@ accepted-socket cap.
 
 **Regression:** `rbitcoin-rpc` `server::tests::unauthorized_large_content_length_is_401_before_body`,
 `server::tests::oversized_bearer_body_is_413_and_small_body_still_runs`,
+`server::tests::large_block_submit_and_proposal_clear_http_413`,
 `server::tests::waitfor_does_not_hold_the_blocking_pool`,
 `rbitcoin-node` `config::tests::rpc_work_queue_zero_is_the_default_finite_queue`,
 `rbitcoin-esplora` `server::tests::http_sh_join_last1_last_bulk_and_header_trust`.

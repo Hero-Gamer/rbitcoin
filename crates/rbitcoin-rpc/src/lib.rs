@@ -20,7 +20,9 @@ pub use methods::{
     difficulty_rpc_f64, gbt_template, submit_received_block, HubRegtest, RpcActive, RpcContext,
     RpcRegtest, SubmitBlockOutcome,
 };
-pub use server::{run_rpc, RpcConfig, RpcHandle, DEFAULT_RPC_WORK_QUEUE, RPC_MAX_HTTP_BODY};
+pub use server::{
+    run_rpc, RpcConfig, RpcHandle, DEFAULT_RPC_WORK_QUEUE, REST_MAX_HTTP_BODY, RPC_MAX_HTTP_BODY,
+};
 
 /// Root HTTP path for the node RPC endpoint.
 pub fn node_rpc_path() -> &'static str {

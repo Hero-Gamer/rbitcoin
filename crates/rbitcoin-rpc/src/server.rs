@@ -16,8 +16,10 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 
-/// Axum's default request-body cap, named so auth and 413 share one limit.
-pub const RPC_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
+/// Authenticated JSON-RPC body cap. Bitcoin Core `MAX_SIZE` (32 MiB).
+pub const RPC_MAX_HTTP_BODY: usize = 32 * 1024 * 1024;
+/// Unauthenticated REST body cap. REST does not use [`RPC_MAX_HTTP_BODY`].
+pub const REST_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
 /// Core `-rpcworkqueue`. Omitted or `0` is this finite queue.
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
 /// Accept cap, copied from the Electrum public listener. Not a knob.
@@ -353,9 +355,16 @@ pub async fn run_rpc(
 #[doc(hidden)]
 pub fn rpc_app(state: AppState) -> Router {
     Router::new()
-        .route("/", post(rpc_post))
-        .route("/rest/{*path}", get(rest_entry).post(rest_entry))
-        .layer(DefaultBodyLimit::max(RPC_MAX_HTTP_BODY))
+        .route(
+            "/",
+            post(rpc_post).layer(DefaultBodyLimit::max(RPC_MAX_HTTP_BODY)),
+        )
+        .route(
+            "/rest/{*path}",
+            get(rest_entry)
+                .post(rest_entry)
+                .layer(DefaultBodyLimit::max(REST_MAX_HTTP_BODY)),
+        )
         .layer(from_fn_with_state(state.clone(), reject_unauthorized))
         .with_state(state)
 }
