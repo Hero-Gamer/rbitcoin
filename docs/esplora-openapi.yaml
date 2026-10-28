@@ -58,8 +58,8 @@ info:
     - If the as-of block is reorged out while the request runs, the response
       is **404** rather than 503.
 
-    The Electrum counterpart is a trailing `asof:<blockhash>` argument after
-    negotiating `server.version(name, "1.4.2-asof")`; see COMPAT.md.
+    The Electrum counterpart is a trailing `asof:<blockhash>` argument, on
+    any negotiated protocol; see COMPAT.md.
 
     ## Scripthash index
     Address and scripthash routes need `--sh-index`. Without it they return

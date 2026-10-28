@@ -2034,21 +2034,24 @@ async fn electrum_and_esplora_asof_hides_later_spend() {
     let handle = run_electrum(cfg, Arc::clone(&q), params.clone(), tip_tx.clone(), None)
         .await
         .expect("electrum listen");
-    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
-
-    let denied = rpc(
-        &mut stream,
-        1,
+    // The trailing tag is the opt-in: a standard 1.6 connection gets the
+    // as-of answer and keeps its 1.6 `headers` array.
+    let mut plain = TcpStream::connect(handle.local_addr).await.unwrap();
+    let ver = rpc(&mut plain, 1, "server.version", json!(["test", "1.6"])).await;
+    assert_eq!(ver["result"][1], "1.6", "{ver}");
+    let bal = rpc(
+        &mut plain,
+        2,
         "blockchain.scripthash.get_balance",
         json!([sh.clone(), tag_create.clone()]),
     )
     .await;
-    let denied_msg = denied["error"]["message"].as_str().unwrap_or("");
-    assert!(
-        denied_msg.contains("1.4.2-asof"),
-        "asof tag before handshake: {denied}"
-    );
+    assert_eq!(bal["result"]["confirmed"], value, "{bal}");
+    assert_eq!(bal["chain_tip"], asof_create, "{bal}");
+    let hdrs = rpc(&mut plain, 3, "blockchain.block.headers", json!([0, 1])).await;
+    assert!(hdrs["result"]["headers"].is_array(), "{hdrs}");
 
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
     let ver = rpc(&mut stream, 2, "server.version", json!(["test", ASOF])).await;
     assert_eq!(ver["result"][1], ASOF, "{ver}");
     let locked = rpc(&mut stream, 3, "server.version", json!(["test", "1.4"])).await;

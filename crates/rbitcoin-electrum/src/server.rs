@@ -27,7 +27,8 @@ use tokio::task::JoinHandle;
 pub const PROTOCOL_MIN: &str = "1.4";
 #[doc(hidden)]
 pub const PROTOCOL_MAX: &str = "1.6";
-// Dialect version: trailing `asof:<blockhash>`. Not a dotted-int; `protocol_max` stays 1.6.
+// Older as-of clients negotiate this; a trailing `asof:<blockhash>` needs no
+// dialect. Not a dotted-int; `protocol_max` stays 1.6.
 #[doc(hidden)]
 pub const PROTOCOL_ASOF: &str = "1.4.2-asof";
 /// First `server.version` element, read by wallets that branch on it.
@@ -1068,11 +1069,9 @@ fn dispatch_off_worker(
         let r = dispatch_pinned(method, params, q, cfg, p, mp, &mut work, None, false);
         return (r, work, None);
     }
-    let asof_ok = work.protocol.as_str() == PROTOCOL_ASOF;
-    let (r, view) =
-        electrum_at_chain_view(q, method, params, asof_ok, |q, params, view, is_asof| {
-            dispatch_pinned(method, params, q, cfg, p, mp, &mut work, view, is_asof)
-        });
+    let (r, view) = electrum_at_chain_view(q, method, params, |q, params, view, is_asof| {
+        dispatch_pinned(method, params, q, cfg, p, mp, &mut work, view, is_asof)
+    });
     (r, work, view)
 }
 
@@ -2036,14 +2035,13 @@ pub fn electrum_at_chain_view<F>(
     query: &Query,
     method: &str,
     params: &Value,
-    asof_ok: bool,
     mut f: F,
 ) -> (Result<Value, String>, Option<ChainView>)
 where
     F: FnMut(&Query, &Value, Option<&ChainView>, bool) -> Result<Value, String>,
 {
     let kind = electrum_pin_kind(method);
-    match take_trailing_asof(method, params, asof_ok) {
+    match take_trailing_asof(method, params) {
         Ok((stripped, Some(hash))) => match query.pin_view(kind, Some(&hash)) {
             Ok(Some(view)) => {
                 let out = f(query, &stripped, Some(&view), true);
@@ -2313,7 +2311,7 @@ pub fn dispatch_pinned(
             let (params, asof) = if pinned.is_some() {
                 (params.clone(), None)
             } else {
-                take_trailing_asof(method, params, protocol == PROTOCOL_ASOF)?
+                take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
             let (filter, mut include_mempool) = parse_get_history_window(&params)?;
@@ -2356,7 +2354,7 @@ pub fn dispatch_pinned(
             let (params, asof) = if pinned.is_some() {
                 (params.clone(), None)
             } else {
-                take_trailing_asof(method, params, protocol == PROTOCOL_ASOF)?
+                take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
             let mut b = sh_at_view(
@@ -2391,7 +2389,7 @@ pub fn dispatch_pinned(
             let (params, asof) = if pinned.is_some() {
                 (params.clone(), None)
             } else {
-                take_trailing_asof(method, params, protocol == PROTOCOL_ASOF)?
+                take_trailing_asof(method, params)?
             };
             let sh = param_scripthash(&params, 0)?;
             let u = sh_at_view(
@@ -2809,7 +2807,6 @@ pub fn negotiate_protocol(params: &Value) -> Result<String, String> {
 pub fn take_trailing_asof(
     method: &str,
     params: &Value,
-    asof_ok: bool,
 ) -> Result<(Value, Option<[u8; 32]>), String> {
     if !method_stamps_chain_tip(method) {
         return Ok((params.clone(), None));
@@ -2823,9 +2820,6 @@ pub fn take_trailing_asof(
     let Some(hex) = last.strip_prefix("asof:") else {
         return Ok((params.clone(), None));
     };
-    if !asof_ok {
-        return Err("asof requires protocol 1.4.2-asof".into());
-    }
     let Some(hash) = parse_blockhash32(hex) else {
         return Err("asof must be asof:<32-byte hex>".into());
     };
