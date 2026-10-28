@@ -35,8 +35,12 @@ Changed
 - **A disk-only Class C append publishes its length after the slot bytes.**
   The file length follows those bytes. `len` follows the file length. A
   reader that sees the new length does not read a zero fill.
+- **A disk-only Class C get that races a truncate reads as absent.**
+  After the read, a slot past the reloaded length is empty. A past-end
+  pread is empty only when that length no longer covers the index.
 - **Loom and shuttle model the claim order, the idle turn, the UTXO view
-  stamp, the Class C sequence counter, and Class C flush exclusion.**
+  stamp, the Class C sequence counter, disk-only append and truncate, and
+  Class C flush exclusion.**
   They are not required PR checks. The index-release order is not a model:
   it needs a `Query` full of `std` locks. The job shape follows phlip9's
   #1214: cfg-gated model tests, a separate target directory, and the same

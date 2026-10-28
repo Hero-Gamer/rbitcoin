@@ -57,6 +57,33 @@ fn get_racing_truncate_does_not_panic() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A disk-only table returns an empty slot after truncate, without a read.
+#[test]
+fn fd_only_truncate_then_get_is_absent() {
+    let dir = tmp_path();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slots.body");
+    let file = rbitcoin_store::file::TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    file.write_at(ArrayTable::offset(0), &[0u8; 16]).unwrap();
+    drop(file);
+    let prev = std::env::var_os("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+    std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "0");
+    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
+    match &prev {
+        Some(v) => std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", v),
+        None => std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB"),
+    }
+    assert_eq!(t.l2_resident_bytes(), 0, "disk-only table");
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 22)
+        .unwrap();
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 1)
+        .unwrap();
+    assert_eq!(t.get_sample(1).unwrap(), (0, 1));
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A multi-slot store publishes one generation. Each `get` is the previous
 /// value or the new one for that index.
 #[test]

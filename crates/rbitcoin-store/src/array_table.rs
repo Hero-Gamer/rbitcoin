@@ -662,17 +662,39 @@ impl ArrayTable {
     #[doc(hidden)]
     pub fn get_sample(&self, index: u64) -> Result<(u64, u64), StoreError> {
         if !self.in_ram {
-            let len = self.len.load(Ordering::Acquire);
-            if index >= len {
-                return Ok((0, len));
-            }
-            let mut buf = [0u8; 8];
-            self.file.read_at(Self::offset(index), &mut buf)?;
-            return Ok((u64::from_le_bytes(buf), len));
+            return self.get_sample_fd(index);
         }
         Ok(seq_read(&self.seq, || {
             self.sample_ram(index, Ordering::Relaxed)
         }))
+    }
+
+    /// A truncate may shorten `len` and the file after the first load. The
+    /// slot is empty when the reloaded length no longer covers it. A past-end
+    /// pread whose length still covers the index stays an error.
+    fn get_sample_fd(&self, index: u64) -> Result<(u64, u64), StoreError> {
+        let len = self.len.load(Ordering::Acquire);
+        if index >= len {
+            return Ok((0, len));
+        }
+        // Loom branches before the load. `pread` is not a loom access, so the
+        // model yields after `len` has covered `index` and before the read.
+        #[cfg(loom)]
+        loom::thread::yield_now();
+        let mut buf = [0u8; 8];
+        let value = match self.file.read_at(Self::offset(index), &mut buf) {
+            Ok(()) => Some(u64::from_le_bytes(buf)),
+            Err(StoreError::Corrupt("pread past logical end")) => None,
+            Err(e) => return Err(e),
+        };
+        let len = self.len.load(Ordering::Acquire);
+        if index >= len {
+            return Ok((0, len));
+        }
+        match value {
+            Some(value) => Ok((value, len)),
+            None => Err(StoreError::Corrupt("pread past logical end")),
+        }
     }
 
     /// `None` when the published buffer is shorter than `index`. Past `len` is

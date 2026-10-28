@@ -286,7 +286,9 @@ get retries when the length it sampled does not fit the buffer it loaded. A
 bulk bit scan rechecks the counter once at the end. A table past the RAM cap
 is fd write-through and has no sequence counter. An append pwrites the new
 slots, then the file length, then `len`, so a get that sees the new length
-has those bytes.
+has those bytes. A get that sampled a length a truncate has since shortened
+reads as an empty slot. A past-end pread is that empty slot only when the
+reloaded length no longer covers the index.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline
