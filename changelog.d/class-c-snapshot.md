@@ -3,7 +3,8 @@ Changed
 - **Class C stores take a single-writer capability.**
   `ClassCWrite` is not `Send`. Confirm-write, tip-accept, and startup mint
   it on the thread that stores. Archived-body clear runs on
-  `ibd-confirm-write` after the in-flight tip flush joins. Header range
+  `ibd-confirm-write` after the in-flight tip flush joins. The coordinator
+  drops its state lock before that wait. Header range
   puts on that path, and on the standalone Class A commit, wait for the
   same join. Class A body append still
   overlaps the tip flush. A structural reject after that append still

@@ -1173,13 +1173,16 @@ pub fn apply_confirm_events(
         last_progress,
         feed,
     );
-    debug_assert!(
-        pending.is_empty(),
-        "coordinator must release shared around an archived clear"
-    );
+    for item in &pending {
+        send_deferred_archived_clear(hub.query.as_ref(), item);
+    }
+    for item in &pending {
+        finish_deferred_archived_clear(st, Some(hub), item);
+    }
 }
 
-pub(crate) fn take_confirm_events(
+#[doc(hidden)]
+pub fn take_confirm_events(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     rx: &std::sync::mpsc::Receiver<super::confirm::ConfirmEvent>,
@@ -1254,13 +1257,15 @@ pub fn apply_confirm_reject(
     sender: Option<usize>,
     parent: super::confirm::RejectParent,
 ) {
-    let pending = apply_confirm_reject_pending(
+    let Some(item) = apply_confirm_reject_pending(
         st, height, hash, class, err, query, hub, batch_len, feed, sender, parent,
-    );
-    debug_assert!(
-        pending.is_none(),
-        "coordinator must release shared around an archived clear"
-    );
+    ) else {
+        return;
+    };
+    if let Some(q) = query {
+        send_deferred_archived_clear(q, &item);
+    }
+    finish_deferred_archived_clear(st, hub, &item);
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
@@ -1329,7 +1334,8 @@ pub(crate) fn apply_confirm_reject_pending(
 }
 
 /// Mutated clear that must wait until the coordinator has dropped `shared`.
-pub(crate) struct DeferredArchivedClear {
+#[doc(hidden)]
+pub struct DeferredArchivedClear {
     pub height: u32,
     pub hash: BlockHash,
     pub err: String,
@@ -1339,6 +1345,17 @@ pub(crate) struct DeferredArchivedClear {
     pub bad_prev: bool,
     /// This hash occupied `height` after the pre-clear updates.
     pub was_occupant: bool,
+}
+
+pub(crate) fn send_deferred_archived_clear(
+    query: &rbitcoin_query::Query,
+    item: &DeferredArchivedClear,
+) {
+    note_archived_body_clear(
+        item.height,
+        item.hash,
+        query.clear_archived_body(item.hash.as_byte_array()),
+    );
 }
 
 pub(crate) fn note_archived_body_clear(
@@ -1470,12 +1487,7 @@ pub(crate) fn apply_soft_wire_reject(
         was_occupant: st.height_to_hash.get(&height) == Some(&hash),
     };
     if query.is_some() && rbitcoin_net::chain::reject_is_mutated(err) {
-        if rbitcoin_store::coord_shared_lock_held() {
-            return Some(item);
-        }
-        if let Some(q) = query {
-            note_archived_body_clear(height, hash, q.clear_archived_body(hash.as_byte_array()));
-        }
+        return Some(item);
     }
     finish_deferred_archived_clear(st, hub, &item);
     None

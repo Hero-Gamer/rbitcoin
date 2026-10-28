@@ -220,17 +220,11 @@ fn release_archived_clears<'a>(
         return st_guard;
     }
     drop(st_guard);
-    let noted: Vec<_> = pending
-        .into_iter()
-        .inspect(|item| {
-            let result = hub
-                .query
-                .clear_archived_body(bitcoin::hashes::Hash::as_byte_array(&item.hash));
-            events::note_archived_body_clear(item.height, item.hash, result);
-        })
-        .collect();
+    for item in &pending {
+        events::send_deferred_archived_clear(hub.query.as_ref(), item);
+    }
     st_guard = HeldShared::lock(shared);
-    for item in noted {
+    for item in pending {
         events::finish_deferred_archived_clear(&mut st_guard, Some(hub), &item);
     }
     st_guard
