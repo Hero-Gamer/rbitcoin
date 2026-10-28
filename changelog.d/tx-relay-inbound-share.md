@@ -7,3 +7,7 @@ Changed
   under the usual eviction protection. If every one is protected, the new
   peer is closed. Block-relay-only inbounds are never evicted to make that
   room.
+- **A peer that sent `relay=false` no longer gets mempool INVs.** The
+  periodic and forced tx announcements went to it anyway; only our own
+  unbroadcast transactions are announced to it now, as on the immediate
+  announce path.

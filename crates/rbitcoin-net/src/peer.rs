@@ -1593,10 +1593,17 @@ pub fn tx_announce_inbound_gated(
     mp: &crate::tx_relay::MempoolHub,
     txid: &bitcoin::Txid,
 ) -> bool {
-    s.inbound
-        && s.conn_type != crate::peers::PeerConnType::BlockRelay
-        && (s.relay || mp.is_unbroadcast(txid))
-        && mp.relay_enabled()
+    s.inbound && tx_inv_peer_ok(s, mp, txid) && mp.relay_enabled()
+}
+
+/// A tx inv may go to `s`: not block-relay-only, and it asked for txs in
+/// VERSION unless the tx is our own unbroadcast one.
+fn tx_inv_peer_ok(
+    s: &crate::peers::LivePeer,
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+) -> bool {
+    s.conn_type != crate::peers::PeerConnType::BlockRelay && (s.relay || mp.is_unbroadcast(txid))
 }
 
 #[doc(hidden)]
@@ -1645,9 +1652,7 @@ pub fn tx_announce_peer_ok(
     txid: &bitcoin::Txid,
 ) -> bool {
     session.is_none_or(|s| {
-        s.conn_type != crate::peers::PeerConnType::BlockRelay
-            && (s.relay || mp.is_unbroadcast(txid))
-            && (!s.inbound || s.session_noban() || !mp.relay_enabled())
+        tx_inv_peer_ok(s, mp, txid) && (!s.inbound || s.session_noban() || !mp.relay_enabled())
     })
 }
 
@@ -2490,7 +2495,7 @@ pub fn force_announce_txid(hub: &ChainHub, peers: &crate::peers::PeerHub, txid: 
     };
     let w = tx.compute_wtxid();
     for s in peers.live_peers() {
-        if s.conn_type == crate::peers::PeerConnType::BlockRelay {
+        if !tx_inv_peer_ok(&s, mp, &txid) {
             continue;
         }
         if s.has_announced_wtx(&w) {
@@ -2572,7 +2577,7 @@ pub fn tx_inv_candidate_ok(
     if from_this_peer.contains_key(&txid) {
         return false;
     }
-    if session.conn_type == crate::peers::PeerConnType::BlockRelay {
+    if !tx_inv_peer_ok(session, mp, &txid) {
         return false;
     }
     if !mp.relay_enabled() && !mp.is_unbroadcast(&txid) {
@@ -2613,7 +2618,9 @@ pub fn queue_due_tx_invs(
     let Some(mp) = hub.mempool() else {
         return;
     };
-    if session.conn_type == crate::peers::PeerConnType::BlockRelay {
+    if session.conn_type == crate::peers::PeerConnType::BlockRelay
+        || (!session.relay && mp.unbroadcast_count() == 0)
+    {
         return;
     }
     // `-blocksonly` (relay off) still INV locally submitted (unbroadcast)
