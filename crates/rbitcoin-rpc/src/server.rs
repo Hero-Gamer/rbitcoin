@@ -268,6 +268,17 @@ pub async fn run_rpc(
     let mut tasks = Vec::new();
     let mut local_addr = None;
 
+    // Before the TCP accept task: an error past that point would leave it
+    // running with no handle to stop it.
+    #[cfg(unix)]
+    if let Some(parent) = config
+        .socket_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+    {
+        std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
+    }
+
     if let Some(addr) = config.listen {
         let listener = TcpListener::bind(addr)
             .await
@@ -312,9 +323,6 @@ pub async fn run_rpc(
 
     #[cfg(unix)]
     let socket_path_out = if let Some(ref sock) = config.socket_path {
-        if let Some(parent) = sock.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("rpc socket parent: {e}"))?;
-        }
         let _ = std::fs::remove_file(sock);
         let mode = if config.socket_shared { 0o660 } else { 0o600 };
         // A too-long path (`SUN_LEN`) must not drop the TCP listener. Its

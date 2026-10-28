@@ -390,12 +390,14 @@ wait for peers, so `stop`, `addnode`, and status calls remain available while
 it waits; otherwise it binds after catch-up and the scripthash materialize.
 Electrum and Esplora bind only after catch-up finishes and that index
 materializes. On mainnet those can take minutes (a schema backfill) to hours
-(IBD). The health listener answers through all of it.
+(IBD). The health listener answers through all of it. A configured
+listener that cannot bind stops the node with exit 1 when its turn comes,
+so a busy RPC, Electrum, Esplora, or SV2 port can end a run after catch-up.
 
 | Route | Answer |
 |-------|--------|
 | `GET /healthz` | `200 ok` in every phase. The process is up and serving HTTP |
-| `GET /readyz` | `200 ok` when the node follows the tip and every configured listener is up; otherwise `503 not ready: <reason>` |
+| `GET /readyz` | `200 ok` when the node follows the tip; otherwise `503 not ready: <reason>` |
 | `GET /progress` | `200`, JSON: the phase, the long stage running now, and the last one to end ([Progress](#progress)) |
 | `GET /metrics` | Prometheus text format with `--metrics`; 404 without it |
 
@@ -418,7 +420,6 @@ probe-only network.
 | `catch-up` | Initial block download |
 | `indexing` | Tip-mode entry (scripthash materialize), follow peers, listeners |
 | `stopping` | Shutdown flush |
-| `rpc not listening` (also `electrum`, `esplora`) | That listener is configured but did not bind. Its start only warns, so the node keeps following |
 | `initial block download` | Same value as RPC `getblockchaininfo.initialblockdownload` (`--max-tip-age`, `--min-chain-work`). Latches off after the first exit, as in Core |
 | `tip stale (last block Ns ago)` | The non-latching half of that check: the tip block is older than `--max-tip-age` (default 24h). This still fires after IBD has latched off, so a node that later loses every peer stops being ready |
 | `tip N blocks behind headers` | `headers - blocks` is over 6 |

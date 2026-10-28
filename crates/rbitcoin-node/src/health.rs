@@ -100,8 +100,6 @@ pub struct NodeStatus {
     pub peers: OnceLock<Arc<PeerHub>>,
     pub mempool: OnceLock<Arc<MempoolHub>>,
     pub sv2: OnceLock<Arc<rbitcoin_sv2::Sv2TpStats>>,
-    /// Configured listeners that failed to bind (RPC, Electrum, Esplora only warn).
-    pub unbound: OnceLock<Vec<&'static str>>,
 }
 
 impl NodeStatus {
@@ -115,7 +113,6 @@ impl NodeStatus {
             peers: OnceLock::new(),
             mempool: OnceLock::new(),
             sv2: OnceLock::new(),
-            unbound: OnceLock::new(),
         })
     }
 
@@ -136,12 +133,6 @@ impl NodeStatus {
         let _ = self.sv2.set(stats);
     }
 
-    /// Enter [`Phase::Following`] with the configured listeners that did not bind.
-    pub fn follow(&self, unbound: Vec<&'static str>) {
-        let _ = self.unbound.set(unbound);
-        self.enter(Phase::Following);
-    }
-
     #[doc(hidden)]
     pub fn phase(&self) -> Phase {
         Phase::from_u8(self.phase.load(Ordering::Acquire))
@@ -153,7 +144,6 @@ impl NodeStatus {
         let phase = self.phase();
         let mut snap = ReadySnapshot {
             phase,
-            unbound: self.unbound.get().cloned().unwrap_or_default(),
             in_ibd: false,
             blocks: 0,
             headers: 0,
@@ -183,7 +173,6 @@ impl NodeStatus {
 #[doc(hidden)]
 pub struct ReadySnapshot {
     pub phase: Phase,
-    pub unbound: Vec<&'static str>,
     /// Same value as RPC `getblockchaininfo.initialblockdownload`.
     pub in_ibd: bool,
     pub blocks: u32,
@@ -201,9 +190,6 @@ pub struct ReadySnapshot {
 pub fn readiness(s: &ReadySnapshot) -> Result<(), String> {
     if s.phase != Phase::Following {
         return Err(s.phase.as_str().to_string());
-    }
-    if !s.unbound.is_empty() {
-        return Err(format!("{} not listening", s.unbound.join(", ")));
     }
     if s.in_ibd {
         return Err("initial block download".into());

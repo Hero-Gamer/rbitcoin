@@ -2816,74 +2816,75 @@ async fn node_listen_and_exit() {
     pin_health_scrape(health_addr, true, 1.0).await;
     stop_run_p2p(rpc_addr, node).await;
 
-    // Another process holds the Electrum and RPC ports. The binds warn, the
-    // node still follows, and `/readyz` names both. `/metrics` is absent
-    // without `--metrics`.
-    let held_electrum = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let held_rpc = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let health_addr = ephemeral_addr();
-    let mut cfg = listen_and_exit_cfg(&dir);
-    cfg.shindex = true;
-    cfg.listen.electrum = Some(held_electrum.local_addr().unwrap());
-    cfg.rpc.listen = Some(held_rpc.local_addr().unwrap());
-    cfg.listen.health = Some(health_addr);
-    // Deadline starts at tip-follow entry, after `/readyz` has left bring-up.
-    // Two seconds outlives that probe. The process then exits on the timer
-    // because the held RPC port cannot take `stop`.
-    cfg.max_run_secs = Some(2);
-    let node = spawn_run_p2p(cfg);
-    wait_listeners(&[health_addr]).await;
-    assert_eq!(
-        readyz_after_startup(health_addr).await,
-        (503, "not ready: rpc, electrum not listening".into())
-    );
-    let (st, body) = http_get(health_addr, "/metrics").await;
-    assert_eq!(st, 404, "/metrics without --metrics: {body}");
-    let stopped = tokio::time::timeout(Duration::from_secs(30), node).await;
-    assert!(matches!(stopped, Ok(Ok(Ok(())))), "{stopped:?}");
-    drop((held_electrum, held_rpc));
+    // Another process holds a listener the operator asked for. The start
+    // stops, as it does for the health port.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = held.local_addr().unwrap();
+    type Ask = fn(&mut NodeConfig, SocketAddr);
+    let asks: [(&str, Ask); 3] = [
+        ("electrum start", |cfg, addr| {
+            cfg.listen.electrum = Some(addr)
+        }),
+        ("esplora start", |cfg, addr| {
+            cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(addr));
+        }),
+        ("sv2 start", |cfg, addr| {
+            cfg.sv2_tp_listen = Some(addr);
+            cfg.sv2_tp_authority_sec = Some(Sv2AuthoritySecret(SV2_AUTHORITY_SEC));
+        }),
+    ];
+    for (want, ask) in asks {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.shindex = true;
+        ask(&mut cfg, taken);
+        let err = start_and_exit(cfg).await.expect_err(want).to_string();
+        assert!(err.contains(want), "{err}");
+    }
 
-    // RPC is up, so the tip loop wakes on its stop tick. A failed Electrum
-    // or Esplora bind stays failed when the other process releases the port.
-    let held_electrum = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let held_esplora = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let electrum_addr = held_electrum.local_addr().unwrap();
-    let esplora_addr = held_esplora.local_addr().unwrap();
-    let (rpc_addr, health_addr) = (ephemeral_addr(), ephemeral_addr());
+    // RPC binds after Electrum. Its failure still tears the run down, so the
+    // Electrum port is closed once run_p2p returns, and the run never counts
+    // as started for `--startup-notify`.
+    let electrum_published = dir.join("run").join("electrum.addr");
+    let _ = std::fs::remove_file(&electrum_published);
+    let notified = dir.join("startup-notified");
     let mut cfg = listen_and_exit_cfg(&dir);
     cfg.shindex = true;
-    cfg.listen.electrum = Some(electrum_addr);
-    cfg.listen.esplora = Some(rbitcoin_esplora::EsploraListen::Tcp(esplora_addr));
-    cfg.rpc.listen = Some(rpc_addr);
-    cfg.listen.health = Some(health_addr);
-    std::fs::write(dir.join("rpc.token"), "pass").unwrap();
+    cfg.listen.electrum = Some("127.0.0.1:0".parse().unwrap());
+    cfg.rpc.listen = Some(taken);
+    cfg.startup_notify = Some(format!("touch '{}'", notified.display()));
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("held rpc port")
+        .to_string();
+    assert!(err.contains("rpc start: rpc bind"), "{err}");
+    let electrum_addr = published_listener(&dir, "electrum").await;
+    assert!(
+        TcpStream::connect(electrum_addr).await.is_err(),
+        "electrum still accepts after the failed start"
+    );
+    assert!(!notified.exists(), "startup-notify ran for a failed start");
+    drop(held);
+
+    // An RPC socket whose directory cannot exist stops the start too, and
+    // the TCP half of RPC does not outlive it.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            dir.join("rpc.token"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        let rpc_addr = ephemeral_addr();
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.shindex = true;
+        cfg.rpc.listen = Some(rpc_addr);
+        cfg.rpc.socket = true;
+        cfg.rpc.socket_path = Some(dir.join("rpc.token").join("rpc.sock"));
+        let err = start_and_exit(cfg)
+            .await
+            .expect_err("rpc socket under a file")
+            .to_string();
+        assert!(err.contains("rpc start: rpc socket parent"), "{err}");
+        assert!(
+            std::net::TcpListener::bind(rpc_addr).is_ok(),
+            "rpc TCP still bound after the failed start"
+        );
     }
-    cfg.max_run_secs = Some(30);
-    let node = spawn_run_p2p(cfg);
-    wait_listeners(&[rpc_addr, health_addr]).await;
-    assert_eq!(
-        readyz_after_startup(health_addr).await,
-        (503, "not ready: electrum, esplora not listening".into())
-    );
-    drop((held_electrum, held_esplora));
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert!(
-        std::net::TcpListener::bind(electrum_addr).is_ok(),
-        "electrum bind failure is not retried on the tip loop"
-    );
-    assert!(
-        std::net::TcpListener::bind(esplora_addr).is_ok(),
-        "esplora bind failure is not retried on the tip loop"
-    );
-    stop_run_p2p(rpc_addr, node).await;
 
     // Without `--connect` and with seeds on: regtest resolves none, the one
     // saved peer still refuses, and the node exits short of tip mode.
@@ -3332,6 +3333,39 @@ async fn tor_control_onion_lifecycle() {
         let needle = format!("DESTINATION={dest} ");
         assert!(creates.iter().any(|c| c.contains(&needle)), "{creates:?}");
     }
+
+    // A saved Electrum onion key Tor refuses, then an Electrum I2P
+    // destination that cannot be read, ends the start after Electrum bound.
+    // The run still tears down, so that port is closed once run_p2p returns.
+    let onion_key = dir.join("onion").join("electrum.priv");
+    let saved_key = std::fs::read(&onion_key).unwrap();
+    std::fs::write(&onion_key, "ED25519-V3:revoked").unwrap();
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("refused electrum onion key")
+        .to_string();
+    assert!(err.contains("Invalid onion key"), "{err}");
+    assert!(
+        TcpStream::connect(electrum).await.is_err(),
+        "electrum still accepts after the onion error"
+    );
+    std::fs::write(&onion_key, saved_key).unwrap();
+    let i2p_dest = dir.join("i2p").join("electrum.priv");
+    std::fs::remove_file(&i2p_dest).unwrap();
+    std::fs::create_dir(&i2p_dest).unwrap();
+    let mut cfg = services_cfg();
+    cfg.tor.cookie = Some(cookie.clone());
+    let err = start_and_exit(cfg)
+        .await
+        .expect_err("unreadable electrum i2p destination")
+        .to_string();
+    assert!(err.contains("i2p electrum session"), "{err}");
+    assert!(
+        TcpStream::connect(electrum).await.is_err(),
+        "electrum still accepts after the i2p error"
+    );
 }
 
 async fn history_closed(electrum_addr: SocketAddr, scripthash: &str) {
