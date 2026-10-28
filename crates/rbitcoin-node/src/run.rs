@@ -1189,9 +1189,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let mut last_tip = node.tip_height().unwrap_or(0);
         let started = Instant::now();
         let mut last_tip_change = Instant::now();
-        const STALE_TIP_SECS: u64 = 600;
-        const STALE_POLL_SECS: u64 = 60;
         const TIP_PERF_SECS: u64 = 5;
+        let stale_tip = config.stale_tip;
         let mut tip_rx = node.hub.subscribe_tips();
         let mut perf_tick = tokio::time::interval(Duration::from_secs(TIP_PERF_SECS));
         perf_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1200,7 +1199,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         rpc_stop_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         rpc_stop_tick.tick().await;
         // Persistent — a one-shot sleep in the select is reset by perf/RPC ticks.
-        let mut stale_poll = tokio::time::interval(Duration::from_secs(STALE_POLL_SECS));
+        let mut stale_poll = tokio::time::interval(config.stale_poll);
         stale_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         stale_poll.tick().await;
         // Same clock as `--connect` redial. Below-cap full-relay refill uses
@@ -1481,7 +1480,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
 
-            let stagnant = last_tip_change.elapsed() >= Duration::from_secs(STALE_TIP_SECS);
+            let stagnant = last_tip_change.elapsed() >= stale_tip;
             if !stagnant || config.listen.has_pinned_connect() || !config.listen.use_seeds {
                 continue;
             }
@@ -1504,12 +1503,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             let Some(evict_id) = rbitcoin_net::pick_stale_follow_evict(&ids, salt, &groups) else {
                 continue;
             };
-            let mut occupied = node.peers.live_outbound_full_relay_nets();
-            for net in node.peers.in_flight_nets() {
-                if !occupied.contains(&net) {
-                    occupied.push(net);
-                }
-            }
+            let (occupied, _, _) = outbound_slots(&node.peers);
             let replacement = outbound_full_relay_candidates(&shared_peers, 1, &occupied);
             if replacement.is_empty() {
                 continue;
@@ -2949,35 +2943,50 @@ pub async fn tip_follow_next_wake(
 }
 
 /// Dial `outbound-full-relay` until the live count plus in-flight dials
-/// reaches `max_out`. `--connect`, `--trust-peer`, and a `noban` hub do not
-/// use the address book here.
+/// reaches `max_out`. `--connect` and `--trust-peer` do not use the book.
+/// `--trusted` (noban) still fills. Stale rotation does not evict that hub:
+/// `outbound_full_relay_rows` is empty while noban is set.
 pub fn refill_outbound_full_relay(
     config: &NodeConfig,
     peers: &rbitcoin_net::PeerHub,
     shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
     max_out: usize,
 ) {
-    if config.trust_peer_set() || config.listen.has_pinned_connect() || peers.is_noban() {
+    if config.trust_peer_set() || config.listen.has_pinned_connect() {
         return;
     }
-    let live = peers.outbound_full_relay_rows().len();
+    let (occupied, live, pending) = outbound_slots(peers);
     if live >= max_out {
         return;
     }
+    let room = max_out.saturating_sub(live).saturating_sub(pending);
+    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied);
+    queue_outbound_full_relay(peers, shared_peers, &picked);
+}
+
+/// Live outbound full-relay nets, every other live session (so a full-relay
+/// dial does not stick on an address that is already inbound, manual, or
+/// addr-fetch), and in-flight dials. `live` is the quota count. `pending`
+/// is in-flight dials that are not already one of those sessions.
+fn outbound_slots(peers: &rbitcoin_net::PeerHub) -> (Vec<rbitcoin_net::NetAddr>, usize, usize) {
     let mut occupied = peers.live_outbound_full_relay_nets();
+    let live = occupied.len();
+    for peer in peers.live_peers() {
+        if !occupied.contains(&peer.net) {
+            occupied.push(peer.net);
+        }
+    }
     let inflight = peers.in_flight_nets();
     let pending = inflight
         .iter()
         .filter(|net| !occupied.contains(net))
         .count();
-    let room = max_out.saturating_sub(live).saturating_sub(pending);
     for net in inflight {
         if !occupied.contains(&net) {
             occupied.push(net);
         }
     }
-    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied);
-    queue_outbound_full_relay(peers, shared_peers, &picked);
+    (occupied, live, pending)
 }
 
 fn outbound_full_relay_candidates(

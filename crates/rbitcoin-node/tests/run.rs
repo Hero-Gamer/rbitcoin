@@ -1492,3 +1492,96 @@ async fn start_esplora_applies_max_inflight() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn dial_sockets(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rbitcoin_net::DialRequest>,
+) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    while let Ok(req) = rx.try_recv() {
+        assert_eq!(req.typ, PeerConnType::OutboundFullRelay);
+        match req.target {
+            rbitcoin_net::DialTarget::Socket(addr) => out.push(addr),
+            other => panic!("expected a socket dial, got {other}"),
+        }
+    }
+    out
+}
+
+fn book_of(addrs: &[SocketAddr]) -> Arc<std::sync::Mutex<AddrMan>> {
+    let mut book = AddrMan::new();
+    for addr in addrs {
+        book.add(*addr);
+    }
+    Arc::new(std::sync::Mutex::new(book))
+}
+
+/// A live inbound (or any non-quota session) on the first book row must not
+/// consume the only open outbound slot forever.
+#[test]
+fn refill_skips_an_address_that_is_already_live() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let taken: SocketAddr = "45.1.0.1:18444".parse().unwrap();
+    let next: SocketAddr = "45.2.0.1:18444".parse().unwrap();
+    let later: SocketAddr = "45.3.0.1:18444".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&taken, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&taken, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let _inbound = peers.register(taken, taken, &ver, true, PeerConnType::Inbound);
+    let shared = book_of(&[taken, next, later]);
+    let cfg = NodeConfig::default();
+    refill_outbound_full_relay(&cfg, &peers, &shared, 1);
+    let got = dial_sockets(&mut rx);
+    assert_eq!(
+        got,
+        vec![next],
+        "the live inbound address must not be the only candidate for the open slot"
+    );
+}
+
+/// `--trusted` sets noban. Stale rotation still skips that hub. The book
+/// fill does not: an empty noban hub dials up to `--max-outbound`, and a
+/// hub already at the cap does not queue another wave.
+#[test]
+fn trusted_noban_fills_to_max_outbound_and_stops() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    peers.set_noban(true);
+    let a: SocketAddr = "45.4.0.1:18444".parse().unwrap();
+    let b: SocketAddr = "45.5.0.1:18444".parse().unwrap();
+    let shared = book_of(&[a, b]);
+    let cfg = NodeConfig::default();
+    refill_outbound_full_relay(&cfg, &peers, &shared, 2);
+    let got = dial_sockets(&mut rx);
+    assert_eq!(got.len(), 2, "--trusted must still dial the book");
+
+    drop(got);
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&a, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&a, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let _a = peers.register(a, a, &ver, false, PeerConnType::OutboundFullRelay);
+    let _b = peers.register(b, b, &ver, false, PeerConnType::OutboundFullRelay);
+    refill_outbound_full_relay(&cfg, &peers, &shared, 2);
+    assert!(
+        dial_sockets(&mut rx).is_empty(),
+        "a noban hub already at --max-outbound must not queue another wave"
+    );
+}
