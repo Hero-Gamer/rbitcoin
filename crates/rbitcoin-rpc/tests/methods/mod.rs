@@ -2313,6 +2313,9 @@ fn assert_active_block_verbosity(
     assert_eq!(verbose["hex"], json!(hex), "{verbose}");
     assert_eq!(verbose["in_active_chain"], json!(true), "{verbose}");
     assert_eq!(verbose["blockhash"], json!(block_x), "{verbose}");
+    assert!(verbose["confirmations"].as_i64().unwrap() > 0, "{verbose}");
+    assert!(verbose.get("time").is_some(), "{verbose}");
+    assert!(verbose.get("blocktime").is_some(), "{verbose}");
     assert_no_fee_or_prevout(&verbose);
     let v1 = dispatch(
         ctx,
@@ -2439,7 +2442,10 @@ fn assert_inactive_block_and_pruned(
     assert_eq!(inactive["txid"], json!(txid), "{inactive}");
     assert_eq!(inactive["hex"], json!(hex), "{inactive}");
     assert_eq!(inactive["in_active_chain"], json!(false), "{inactive}");
-    assert_eq!(inactive["confirmations"], json!(-1), "{inactive}");
+    assert_eq!(inactive["blockhash"], json!(block_x), "{inactive}");
+    assert_eq!(inactive["confirmations"], json!(0), "{inactive}");
+    assert!(inactive.get("time").is_none(), "{inactive}");
+    assert!(inactive.get("blocktime").is_none(), "{inactive}");
     assert_raw_tx_not_in_block(ctx, txid, json!(1), &block_y);
     let unscoped = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)])
         .unwrap_or_else(|e| panic!("lookup without blockhash must still succeed: {e}"));

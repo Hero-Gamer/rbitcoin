@@ -482,17 +482,23 @@ fn getrawtransaction_in_block(
     if verbosity == 0 {
         return Ok(json!(serialize_hex(&tx)));
     }
-    let confirmations = match (block.active, block.height, ctx.query.tip_height()) {
-        (true, Some(h), Some(tip)) => i64::from(tip.0.saturating_sub(h).saturating_add(1)),
-        _ => -1,
-    };
     let mut extra = serde_json::Map::new();
     extra.insert("in_mempool".into(), json!(false));
     extra.insert("in_active_chain".into(), json!(block.active));
-    extra.insert("confirmations".into(), json!(confirmations));
     extra.insert("blockhash".into(), json!(hash_hex_display(&block.hash)));
-    extra.insert("blocktime".into(), json!(block.timestamp));
-    extra.insert("time".into(), json!(block.timestamp));
+    // Off the active chain Core reports confirmations 0 and omits both
+    // timestamps. getblock uses -1 for that same block.
+    if block.active {
+        let confirmations = match (block.height, ctx.query.tip_height()) {
+            (Some(h), Some(tip)) => i64::from(tip.0.saturating_sub(h).saturating_add(1)),
+            _ => 0,
+        };
+        extra.insert("confirmations".into(), json!(confirmations));
+        extra.insert("blocktime".into(), json!(block.timestamp));
+        extra.insert("time".into(), json!(block.timestamp));
+    } else {
+        extra.insert("confirmations".into(), json!(0));
+    }
     finish_verbose_tx(ctx, &tx, fk, verbosity, extra)
 }
 

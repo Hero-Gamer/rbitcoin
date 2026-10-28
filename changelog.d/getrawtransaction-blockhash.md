@@ -6,3 +6,5 @@ Fixed
   `vin[].prevout`. An unknown txid uses Core's
   `Use gettransaction for wallet transactions.` suffix. A pruned block
   that does not contain the tx is still that `-5`, not the pruned `-8`.
+  An inactive block reports `confirmations` `0` and omits `time` and
+  `blocktime`.
