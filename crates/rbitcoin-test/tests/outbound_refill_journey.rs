@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 
@@ -99,6 +99,9 @@ fn routable_locals(n: u8) -> (Vec<Ipv4Addr>, HostLo) {
 fn user_netns_available() -> bool {
     Command::new("unshare")
         .args(["--net", "--user", "--map-root-user", "--", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
@@ -531,6 +534,11 @@ async fn journey() {
     let others: Vec<SocketAddr> = listeners.iter().skip(1).map(|n| n.local_addr).collect();
     assert_eq!(others.len(), LEARNED_PEERS);
     learned_book(&root, &listeners[0], &others).await;
+    // Later phases dial at most 6 of these. Each listener store reserves a
+    // 256 MiB strong-bit map, and the test runner caps address space at 6 GiB.
+    for node in listeners.drain(6..) {
+        node.shutdown().await;
+    }
     let pinned = listeners[0].local_addr;
     let book: Vec<SocketAddr> = listeners
         .iter()
@@ -547,22 +555,39 @@ async fn journey() {
     }
 }
 
+fn spawn_journey(netns: bool) -> Output {
+    let exe = std::env::current_exe().expect("test executable");
+    let mut cmd;
+    let child: &mut Command = if netns {
+        cmd = Command::new("unshare");
+        cmd.args(["--net", "--user", "--map-root-user", "--"])
+            .arg(&exe)
+            .env("RBITCOIN_REFILL_NS", "1")
+    } else {
+        // Own process: the suite shares one address space, and each listener
+        // store reserves a 256 MiB strong-bit map. GitHub's test runner caps
+        // that space at 6 GiB.
+        cmd = Command::new(&exe);
+        cmd.env("RBITCOIN_REFILL_CHILD", "1")
+    };
+    child
+        .arg("--exact")
+        .arg("outbound_refill_journey::outbound_full_relay_refills_to_max_outbound")
+        .arg("--test-threads=1")
+        .output()
+        .expect("journey process")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn outbound_full_relay_refills_to_max_outbound() {
-    if std::env::var_os("RBITCOIN_REFILL_NS").is_none() && user_netns_available() {
-        let exe = std::env::current_exe().expect("test executable");
-        let output = Command::new("unshare")
-            .args(["--net", "--user", "--map-root-user", "--"])
-            .arg(&exe)
-            .arg("--exact")
-            .arg("outbound_refill_journey::outbound_full_relay_refills_to_max_outbound")
-            .arg("--test-threads=1")
-            .env("RBITCOIN_REFILL_NS", "1")
-            .output()
-            .expect("unshare");
+    let isolated = std::env::var_os("RBITCOIN_REFILL_NS").is_some()
+        || std::env::var_os("RBITCOIN_REFILL_CHILD").is_some();
+    if !isolated {
+        let netns = user_netns_available();
+        let output = spawn_journey(netns);
         assert!(
             output.status.success(),
-            "refill journey failed in netns: {}\n--- stderr ---\n{}\n--- stdout ---\n{}",
+            "refill journey failed (netns={netns}): {}\n--- stderr ---\n{}\n--- stdout ---\n{}",
             output.status,
             output_tail(&output.stderr),
             output_tail(&output.stdout)
