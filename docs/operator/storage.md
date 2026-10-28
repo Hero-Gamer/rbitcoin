@@ -24,7 +24,7 @@ Token meanings and ring depth: [`docs/io-modality.md`](../io-modality.md).
 | IBD concurrent getdata | **1024** | code `IbdConfig::window` |
 | Blocks in transit / peer | **64** | `IbdConfig::per_peer` (16 MiB payload cap per peer) |
 | Live IBD peers | **16** | `--max-outbound` |
-| Inbound P2P sessions | **125** | `--max-inbound`. At capacity, unprotected inbounds are evicted. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
+| Inbound P2P sessions | **200** | `--max-inbound`. Peers that relay transactions hold at most half. At capacity, unprotected inbounds are evicted. Incomplete VERSION/VERACK is dropped after **60 s** (releases the slot). |
 | Milestone (script skip) | mainnet anchor **840000**, testnet3 anchor **2500000**, signet **0**, regtest 0 | `--milestone` (`0` = full scripts; explicit height is height-only) |
 | ConfirmParentCache header plans | always on | Tip-ahead header + tx_fks for multi-block MTP (no create pin FIFO) |
 | Bulk store IO | **uring** (Linux) when available | `RBITCOIN_IO` only. Matrix: [`docs/io-modality.md`](../io-modality.md) |

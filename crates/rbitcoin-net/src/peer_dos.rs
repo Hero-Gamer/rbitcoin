@@ -8,7 +8,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
 /// Default max concurrent **inbound** P2P sessions (post-handshake work).
-pub const DEFAULT_MAX_INBOUND: usize = 125;
+pub const DEFAULT_MAX_INBOUND: usize = 200;
+/// Share of inbound slots, in percent, that peers relaying transactions may
+/// hold (Core `DEFAULT_FULL_RELAY_INBOUND_PCT`). The rest stay open to
+/// block-relay-only peers.
+pub const FULL_RELAY_INBOUND_PCT: usize = 50;
 /// One-second rate window (current second plus the previous second).
 pub const RATE_WINDOW: Duration = Duration::from_secs(1);
 /// Max application messages per peer per window (after decrypt/frame).

@@ -3325,11 +3325,39 @@ impl PeerHub {
 
     /// Disconnect one unprotected inbound when inbound slots are full.
     pub fn try_evict_inbound(&self) -> bool {
+        self.evict_inbound_from(|_| true, "inbound full")
+    }
+
+    /// Core `MaybeDisconnectForTxRelayCapacity`: past
+    /// [`crate::peer_dos::FULL_RELAY_INBOUND_PCT`] of `max_inbound`, a
+    /// tx-relaying `newcomer` evicts another tx-relaying inbound. `false` when
+    /// every other one is protected and `newcomer` must go instead.
+    pub(crate) fn make_room_for_tx_relay_inbound(
+        &self,
+        newcomer: &LivePeer,
+        max_inbound: usize,
+    ) -> bool {
+        if !newcomer.relay {
+            return true;
+        }
+        let cap = max_inbound * crate::peer_dos::FULL_RELAY_INBOUND_PCT / 100;
+        let tx_relay = self
+            .live_peers()
+            .iter()
+            .filter(|p| p.inbound && p.relay && !p.stop.load(Ordering::Relaxed))
+            .count();
+        if tx_relay <= cap {
+            return true;
+        }
+        self.evict_inbound_from(|p| p.relay && p.id != newcomer.id, "tx-relay inbound full")
+    }
+
+    fn evict_inbound_from(&self, eligible: impl Fn(&LivePeer) -> bool, why: &str) -> bool {
         let now = self.now_secs();
         let cands: Vec<crate::eviction::InboundEvictCandidate> = self
             .live_peers()
             .into_iter()
-            .filter(|p| p.inbound && !p.stop.load(Ordering::Relaxed))
+            .filter(|p| p.inbound && !p.stop.load(Ordering::Relaxed) && eligible(p))
             .map(|p| {
                 let (_pt, minping, _pw) = p.ping_rpc_fields(now);
                 crate::eviction::InboundEvictCandidate {
@@ -3349,7 +3377,7 @@ impl PeerHub {
         if let Some(p) = self.get(id) {
             self.note_slot_evict(p.netgroup());
         }
-        rbitcoin_log::info!("p2p: evict inbound peer={id} (inbound full)");
+        rbitcoin_log::info!("p2p: evict inbound peer={id} ({why})");
         self.disconnect_id(id)
     }
 

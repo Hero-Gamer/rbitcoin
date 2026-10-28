@@ -571,6 +571,14 @@ pub fn spawn_inbound_accept(
                                 }
                             };
                         sess.attach_tcp_shutdown(tcp_shutdown);
+                        if !peers.make_room_for_tx_relay_inbound(&sess, max_inbound) {
+                            rbitcoin_log::debug!(
+                                "failed to find a tx-relaying eviction candidate - connection dropped after version message, peer={}",
+                                sess.id
+                            );
+                            peers.disconnect_id(sess.id);
+                            return;
+                        }
                         if let Ok(ah) = ah_rx.await {
                             sess.set_session_abort(ah);
                         }
