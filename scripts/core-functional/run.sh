@@ -119,7 +119,8 @@ sed \
 SHIM="${HERE}/bitcoind"
 # Dummy Core cache dirs so `_initialize_chain` does not remine 199 then
 # delete our store. Real blocks live in RBITCOIN_CACHE (our store/).
-# --keepcache: test_runner would otherwise rmtree BUILDDIR/test/cache.
+# v32.1 test_runner always forwards its own temp --cachedir. Ours is last,
+# so the tests use the preseeded tree. There is no --keepcache flag.
 # --jobs 1: Core create_cache.py only runs when jobs>1; we still skip it.
 # --timeout-factor=4: one argv. test_runner treats a bare "4" as a test
 # name and forwards --timeout-factor with no value. Core's slow-host
@@ -135,7 +136,7 @@ CMD=(
   --jobs
   1
   --timeout-factor=4
-  --keepcache
+  "--cachedir=${CORE_SRC}/test/cache"
   "${NORM[@]}"
 )
 

@@ -297,7 +297,8 @@ and would wipe our store after remine.
 `scripts/core-functional/create_cache.py` mines 199 via `generatetoaddress`
 (Core `_initialize_chain` payees: PRIV_KEYS[0:3] + MiniWallet P2TR) into
 `scripts/core-functional/cache/store` (gitignored). `run.sh` preseeds empty
-`test/cache/node0/regtest/{blocks,chainstate}` and passes `--keepcache`. The
+`test/cache/node0/regtest/{blocks,chainstate}` and passes that directory as
+`--cachedir` after v32.1's own temp cache argument, so the preseed wins. The
 shim copies `RBITCOIN_CACHE/store` only when the dest has those two dirs and
 no `store/` (clean-chain starts stay empty).
 
