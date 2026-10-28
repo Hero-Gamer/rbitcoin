@@ -65,6 +65,390 @@ fn slot(id: usize) -> (PeerSlot, mpsc::UnboundedReceiver<PeerCmd>) {
     )
 }
 
+/// Expire an actually-aged walk ask without waiting five wall-clock seconds.
+fn expire_walk_ask_for(st: &mut IbdWorkState, peer: usize) -> Option<usize> {
+    st.header_walk.reserved = Some(peer);
+    note_lane(st, peer);
+    st.header_walk.walk.at = Instant::now().checked_sub(LOOKAHEAD_ASK + Duration::from_secs(1));
+    assert!(!lane_fresh(&st.header_walk.walk));
+    expire_header_ask(st)
+}
+
+#[test]
+fn header_timeouts_preserve_recent_solicited_block_download() {
+    use rbitcoin_ibd::ibd::peer_io::{
+        ibd_mono_ms, note_block_rx, note_read_progress, note_solicited_block,
+    };
+    use rbitcoin_ibd::ibd::state::InflightReq;
+    use std::sync::atomic::Ordering;
+
+    // Keep the peer task genuinely unfinished, unlike slot()'s disposable task.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut downloading, mut rx) = slot(0);
+    downloading.task = runtime.spawn(std::future::pending::<()>());
+    let (requested, bytes, ms) = solicit_track();
+    downloading.requested = requested;
+    downloading.solicited_bytes = bytes;
+    downloading.solicited_ms = ms;
+    let mut st = IbdWorkState::new(vec![downloading], None, None);
+    let owed = BlockHash::from_byte_array([0xa5; 32]);
+    st.slots[0].track_insert(owed);
+    st.slots[0].getdata_wire.queue(1);
+    st.slots[0].getdata_wire.wrote(1, ibd_mono_ms());
+    st.inflight.insert(owed, InflightReq::new(0));
+    st.body.mark_missing(owed);
+
+    // Zero is the "no data yet" sentinel; start the production monotonic clock.
+    let _ = ibd_mono_ms();
+    std::thread::sleep(Duration::from_millis(2));
+    for miss in 0..HEADER_MISS_DISCONNECT {
+        // A different solicited block arrives immediately before each expiry.
+        // Keep another block outstanding, matching the production capture.
+        let delivered = BlockHash::from_byte_array([0x20 + miss; 32]);
+        st.inflight.insert(delivered, InflightReq::new(0));
+        let slot = &mut st.slots[0];
+        slot.track_insert(delivered);
+        slot.getdata_wire.queue(1);
+        slot.getdata_wire.wrote(1, ibd_mono_ms());
+        let mut progress_mark = 0;
+        note_read_progress(
+            &slot.bytes_rx_total,
+            &slot.any_rx_ms,
+            &mut progress_mark,
+            1_000_000,
+        );
+        assert!(note_solicited_block(
+            &slot.requested,
+            &slot.solicited_bytes,
+            &slot.solicited_ms,
+            &delivered,
+            1_000_000,
+        ));
+        slot.track_remove(&delivered);
+        st.inflight.remove(&delivered);
+        note_block_rx(&mut st.slots, 0, 1_000_000);
+        assert!(!st.slots[0].task.is_finished());
+        assert!(st.slots[0].solicited_ms.load(Ordering::Relaxed) > 0);
+        assert_eq!(st.slots[0].getdata_wire.unwritten(), 0);
+
+        let _ = expire_walk_ask_for(&mut st, 0);
+        if miss == 0 {
+            assert!(
+                st.slots[0].alive,
+                "the first header miss must not drop the peer"
+            );
+            assert_eq!(st.header_walk.header_misses.get(&0), Some(&1));
+        }
+    }
+
+    let alive = st.slots[0].alive;
+    let owns_block = st.slots[0].in_flight.contains(&owed)
+        && st
+            .inflight
+            .get(&owed)
+            .is_some_and(|request| request.holds(0));
+    let still_requested = st.slots[0].requested_set().contains(&owed);
+    let shutdown = std::iter::from_fn(|| rx.try_recv().ok())
+        .any(|command| matches!(command, PeerCmd::Shutdown));
+    assert!(
+        alive && owns_block && still_requested && !shutdown,
+        "header-only timeouts destroyed an active solicited-block download: \
+         alive={alive}, owns_block={owns_block}, still_requested={still_requested}, shutdown={shutdown}"
+    );
+}
+
+#[test]
+fn header_timeouts_still_disconnect_an_idle_peer() {
+    let (idle, mut rx) = slot(0);
+    let mut st = IbdWorkState::new(vec![idle], None, None);
+    assert_eq!(expire_walk_ask_for(&mut st, 0), Some(0));
+    assert!(st.slots[0].alive);
+    assert_eq!(expire_walk_ask_for(&mut st, 0), None);
+    assert!(!st.slots[0].alive);
+    assert!(matches!(rx.try_recv(), Ok(PeerCmd::Shutdown)));
+}
+
+fn productive_block_peer(
+    id: usize,
+    now_ms: u64,
+) -> (
+    tokio::runtime::Runtime,
+    PeerSlot,
+    mpsc::UnboundedReceiver<PeerCmd>,
+    BlockHash,
+) {
+    use std::sync::atomic::Ordering;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (mut peer, rx) = slot(id);
+    peer.task = runtime.spawn(std::future::pending::<()>());
+    let (requested, bytes, ms) = solicit_track();
+    peer.requested = requested;
+    peer.solicited_bytes = bytes;
+    peer.solicited_ms = ms;
+    let owed = BlockHash::from_byte_array([0xa5; 32]);
+    peer.track_insert(owed);
+    peer.getdata_wire.queue(1);
+    peer.getdata_wire.wrote(1, now_ms.saturating_sub(1));
+    peer.solicited_bytes.store(1_000_000, Ordering::Relaxed);
+    peer.solicited_ms
+        .store(now_ms.saturating_sub(1), Ordering::Relaxed);
+    peer.bytes_rx_total.store(1_000_000, Ordering::Relaxed);
+    peer.any_rx_ms.store(now_ms, Ordering::Relaxed);
+    (runtime, peer, rx, owed)
+}
+
+#[test]
+fn header_timeout_grace_requires_recent_solicited_on_wire_work() {
+    use std::sync::atomic::Ordering;
+    let now_ms = 60_000;
+    let (_runtime, mut peer, _rx, owed) = productive_block_peer(0, now_ms);
+    assert!(header_timeout_has_block_progress(&peer, now_ms));
+
+    peer.solicited_bytes.store(0, Ordering::Relaxed);
+    assert!(
+        !header_timeout_has_block_progress(&peer, now_ms),
+        "ping/stream activity is not a solicited body"
+    );
+    peer.solicited_bytes.store(1_000_000, Ordering::Relaxed);
+    peer.solicited_ms
+        .store(now_ms - HEADER_BLOCK_PROGRESS_GRACE_MS, Ordering::Relaxed);
+    assert!(
+        !header_timeout_has_block_progress(&peer, now_ms),
+        "the grace expires at the block-stall boundary"
+    );
+    peer.solicited_ms.store(
+        now_ms - HEADER_BLOCK_PROGRESS_GRACE_MS + 1,
+        Ordering::Relaxed,
+    );
+    assert!(header_timeout_has_block_progress(&peer, now_ms));
+
+    peer.getdata_wire.queue(1);
+    assert!(
+        !header_timeout_has_block_progress(&peer, now_ms),
+        "queued-only work cannot keep the peer"
+    );
+    peer.getdata_wire.wrote(1, now_ms);
+    assert!(header_timeout_has_block_progress(&peer, now_ms));
+    peer.getdata_wire.disarm_window();
+    assert!(!header_timeout_has_block_progress(&peer, now_ms));
+    peer.getdata_wire.arm_window_if_closed(now_ms);
+    peer.track_remove(&owed);
+    assert!(
+        !header_timeout_has_block_progress(&peer, now_ms),
+        "nothing remains to download"
+    );
+    peer.track_insert(owed);
+    peer.getdata_wire.wrote(1, now_ms);
+    peer.alive = false;
+    assert!(!header_timeout_has_block_progress(&peer, now_ms));
+}
+
+#[test]
+fn header_timeouts_move_header_role_without_releasing_block_work() {
+    use rbitcoin_ibd::ibd::state::InflightReq;
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("header-timeout-keep-blocks");
+    hub.ensure_genesis().unwrap();
+    let (_runtime, mut peer, mut rx, owed) =
+        productive_block_peer(0, rbitcoin_ibd::ibd::peer_io::ibd_mono_ms());
+    let (replacement, mut replacement_rx) = slot(1);
+    peer.peer_height = 100_000;
+    let mut st = IbdWorkState::new(vec![peer, replacement], hub.tip_hash(), Some(0));
+    st.inflight.insert(owed, InflightReq::new(0));
+    fill_queue(&mut st);
+    assert_eq!(expire_walk_ask_for(&mut st, 0), Some(0));
+    assert_eq!(expire_walk_ask_for(&mut st, 0), None);
+    assert!(st.slots[0].alive);
+    assert!(st.slots[0].in_flight.contains(&owed));
+    assert!(st.inflight.get(&owed).is_some_and(|r| r.holds(0)));
+    assert!(st.header_walk.header_timeout_peers.contains(&0));
+    assert!(!st.header_walk.walk_quiet.contains(&0));
+    assert_eq!(
+        peer_horizon(&st),
+        100_000,
+        "a timeout is not evidence that the peer lacks the chain"
+    );
+    assert_ne!(st.header_walk.reserved, Some(0));
+    assert!(
+        may_serve(&st, 0, &owed),
+        "header retirement must not make blocks ineligible"
+    );
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.walk.peer, Some(1));
+    assert_eq!(drain_getheaders(&mut replacement_rx), 1);
+    assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, PeerCmd::Shutdown)));
+    assert_eq!(take_header_ask(&mut st, 0), HeaderAsk::Late);
+    assert!(!st.header_walk.header_misses.contains_key(&0));
+    assert!(
+        !st.header_walk.header_timeout_peers.contains(&0),
+        "a late reply clears the soft preference"
+    );
+    assert_eq!(pick_header_peer(&st, 0, None), Some(0));
+    st.header_walk.header_timeout_peers.insert(0);
+    st.header_walk.header_misses.insert(0, 1);
+    forget_walk_peer(&mut st, 0);
+    assert!(!st.header_walk.header_timeout_peers.contains(&0));
+    assert!(!st.header_walk.header_misses.contains_key(&0));
+}
+
+#[test]
+fn header_timeouts_do_not_preserve_ping_only_block_peers() {
+    use std::sync::atomic::Ordering;
+    let (_runtime, peer, mut rx, _owed) =
+        productive_block_peer(0, rbitcoin_ibd::ibd::peer_io::ibd_mono_ms());
+    peer.solicited_bytes.store(0, Ordering::Relaxed);
+    let mut st = IbdWorkState::new(vec![peer], None, None);
+    let _ = expire_walk_ask_for(&mut st, 0);
+    let _ = expire_walk_ask_for(&mut st, 0);
+    assert!(!st.slots[0].alive);
+    assert!(matches!(rx.try_recv(), Ok(PeerCmd::Shutdown)));
+}
+
+#[test]
+fn header_validation_punishment_still_disconnects_productive_block_peer() {
+    let (_runtime, peer, mut rx, _owed) =
+        productive_block_peer(0, rbitcoin_ibd::ibd::peer_io::ibd_mono_ms());
+    assert!(header_timeout_has_block_progress(
+        &peer,
+        rbitcoin_ibd::ibd::peer_io::ibd_mono_ms()
+    ));
+    let mut st = IbdWorkState::new(vec![peer], None, None);
+    punish_header_peer(&mut st, 0);
+    assert!(!st.slots[0].alive);
+    assert!(matches!(rx.try_recv(), Ok(PeerCmd::Shutdown)));
+}
+
+#[test]
+fn probe_and_challenge_timeouts_preserve_productive_block_work() {
+    for probe in [true, false] {
+        let (_runtime, peer, mut rx, owed) =
+            productive_block_peer(0, rbitcoin_ibd::ibd::peer_io::ibd_mono_ms());
+        let mut st = IbdWorkState::new(vec![peer], None, None);
+        let _ = expire_walk_ask_for(&mut st, 0);
+        if probe {
+            st.header_walk.probe_open = Some(0);
+        } else {
+            st.header_walk.challenge_open = Some(0);
+            st.header_walk.challenge_external = true;
+        }
+        let _ = expire_walk_ask_for(&mut st, 0);
+        assert!(st.slots[0].alive);
+        assert!(st.slots[0].in_flight.contains(&owed));
+        assert!(st.header_walk.probe_open.is_none());
+        assert!(st.header_walk.challenge_open.is_none());
+        assert!(!st.header_walk.challenge_external);
+        assert_ne!(st.header_walk.reserved, Some(0));
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|c| matches!(c, PeerCmd::Shutdown)));
+    }
+}
+
+#[test]
+fn header_timeout_deprioritized_sole_block_peer_can_still_answer_headers() {
+    let (_dir, hub) =
+        rbitcoin_net::chain::tiny_regtest_hub_labeled("header-timeout-sole-block-peer");
+    hub.ensure_genesis().unwrap();
+    let (_runtime, peer, mut rx, owed) =
+        productive_block_peer(0, rbitcoin_ibd::ibd::peer_io::ibd_mono_ms());
+    let mut st = IbdWorkState::new(vec![peer], hub.tip_hash(), Some(0));
+    fill_queue(&mut st);
+    let _ = expire_walk_ask_for(&mut st, 0);
+    let _ = expire_walk_ask_for(&mut st, 0);
+    assert!(st.slots[0].alive);
+    assert!(st.header_walk.header_timeout_peers.contains(&0));
+    assert!(!st.header_walk.walk_quiet.contains(&0));
+    assert!(wants_lookahead(&st));
+    assert!(
+        send_getheaders(&mut st, &hub).unwrap(),
+        "soft preference must not deadlock a sole peer's header progress"
+    );
+    assert_eq!(st.header_walk.walk.peer, Some(0));
+    assert!(st.slots[0].in_flight.contains(&owed));
+    assert!(matches!(rx.try_recv(), Ok(PeerCmd::GetHeaders { .. })));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn header_timeout_grace_does_not_keep_a_finished_peer_task() {
+    let (runtime, mut peer, _rx, _owed) = productive_block_peer(0, 60_000);
+    assert!(header_timeout_has_block_progress(&peer, 60_000));
+    peer.task.abort();
+    assert!(runtime.block_on(&mut peer.task).unwrap_err().is_cancelled());
+    assert!(!header_timeout_has_block_progress(&peer, 60_000));
+}
+
+#[test]
+fn first_challenge_timeout_keeps_productive_frontier_ownership() {
+    use rbitcoin_ibd::ibd::state::InflightReq;
+    let (_runtime, peer, _rx, owed) =
+        productive_block_peer(0, rbitcoin_ibd::ibd::peer_io::ibd_mono_ms());
+    let mut st = IbdWorkState::new(vec![peer], None, None);
+    st.inflight.insert(owed, InflightReq::new(0));
+    st.header_walk.challenge_open = Some(0);
+    let _ = expire_walk_ask_for(&mut st, 0);
+    assert!(st.slots[0].alive);
+    assert!(!st.header_walk.header_timeout_peers.contains(&0));
+    assert_eq!(st.header_walk.header_misses.get(&0), Some(&1));
+    assert!(st.inflight[&owed].peers.contains(&0));
+    assert!(st.slots[0].in_flight.contains(&owed));
+    assert!(!st.header_walk.walk_quiet.contains(&0));
+    assert!(wants_lookahead(&st));
+}
+
+#[test]
+fn continued_header_silence_disconnects_even_with_fresh_block_progress() {
+    use rbitcoin_ibd::ibd::peer_io::ibd_mono_ms;
+    use rbitcoin_ibd::ibd::state::InflightReq;
+    use std::sync::atomic::Ordering;
+
+    for lane in ["walk", "probe", "challenge"] {
+        for replacement in [false, true] {
+            let (_runtime, peer, mut rx, owed) = productive_block_peer(0, ibd_mono_ms());
+            let mut slots = vec![peer];
+            if replacement {
+                let (mut other, _rx) = slot(1);
+                other.peer_height = 0;
+                slots.push(other);
+            }
+            let mut st = IbdWorkState::new(slots, None, None);
+            st.inflight.insert(owed, InflightReq::new(0));
+            for miss in 1..=4 {
+                st.slots[0]
+                    .solicited_ms
+                    .store(ibd_mono_ms(), Ordering::Relaxed);
+                assert!(header_timeout_has_block_progress(
+                    &st.slots[0],
+                    ibd_mono_ms()
+                ));
+                if lane == "probe" {
+                    st.header_walk.probe_open = Some(0);
+                } else if lane == "challenge" {
+                    st.header_walk.challenge_open = Some(0);
+                    st.header_walk.challenge_external = true;
+                }
+                let _ = expire_walk_ask_for(&mut st, 0);
+                if miss < 4 {
+                    assert!(
+                        st.slots[0].alive,
+                        "{lane}, replacement={replacement}, miss={miss}"
+                    );
+                    assert_eq!(st.header_walk.header_misses.get(&0), Some(&miss));
+                    assert!(st.inflight[&owed].holds(0));
+                }
+            }
+            assert!(!st.slots[0].alive, "{lane}, replacement={replacement}");
+            assert!(!st.inflight.contains_key(&owed));
+            assert!(!wants_lookahead(&st));
+            assert!(std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|command| matches!(command, PeerCmd::Shutdown)));
+        }
+    }
+}
+
 fn fill_queue(st: &mut IbdWorkState) {
     for i in 0..ORDERED_HEADERS_SOFT_CAP {
         let mut b = [0u8; 32];

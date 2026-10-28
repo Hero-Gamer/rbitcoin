@@ -204,6 +204,21 @@ absolute path. Keep default-tier fixtures small: on tmpfs, test bytes are RAM.
 
 **Speed / reliability (default suite):** prefer `pad_empty_from` / `build_mature_regtest_with_spend` **once per journey** (tx_relay live hub, Electrum protocol, core_analogs assumevalid+mempool) over remine pads. `pin_compose_multi_pack_timed` keeps functional + layout/covered short-circuit gates (multi-ms floor); sticky vs cold assemble is log-only (not a hard timing assert). Schema-13 wire rebuild must stamp create identity from `txid.body` — zero batch identity is treated as missing (regression covered by the spend reconstruct in `consensus_mature_chain_spend_reconstruct_and_scripthash` + multi-vout confirm scenarios). Coverage vs speed: prefer **one** scenario at the real entry over N micro-opens that only paint lines; when adding coverage for reduce/materialize, use a **tiny** target, not production stream depth.
 
+### Opt-in IBD frontier replays
+
+The default header-timeout cases backdate the header lane; assignment coverage
+offers tiny queued bodies on both sides of the racing threshold. The real
+BIP324 replays with repeated five-second header deadlines and delayed supplier
+availability are opt-in, including the 1,100-block full-confirmation case:
+
+```bash
+cargo test -p rbitcoin-ibd --test suite frontier_replay -- --ignored --test-threads=1
+cargo test -p rbitcoin-ibd --test suite frontier_competing -- --ignored --test-threads=1
+```
+
+The default six-block P2P cases still cover out-of-order body delivery and
+frontier reassignment after EOF without waiting for header timeout intervals.
+
 ## Coverage
 
 | Metric | Required |

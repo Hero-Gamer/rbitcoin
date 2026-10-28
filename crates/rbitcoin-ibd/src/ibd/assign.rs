@@ -297,6 +297,13 @@ pub fn assign_work_ordered(
             tip_rate_blocks_per_s,
             bq_stop,
         );
+    if !race_tip && ahead_n > 0 && alive.len() > 1 {
+        if let Some(&hash) = tip_holes.first() {
+            if retire_header_timeout_frontier_owners(st, hash) {
+                issued += cover_tip_holes(st, hub, cfg, &alive, &[hash], 1);
+            }
+        }
+    }
     if race_tip {
         issued += cover_tip_batch_holes(st, hub, cfg, &alive, &tip_holes);
     } else {
@@ -334,6 +341,27 @@ pub fn assign_work_ordered(
             tip_rate_blocks_per_s,
         },
     );
+}
+
+fn retire_header_timeout_frontier_owners(st: &mut IbdWorkState, hash: BlockHash) -> bool {
+    let owners: Vec<_> = st
+        .inflight
+        .get(&hash)
+        .map(|request| {
+            request
+                .peers
+                .iter()
+                .chain(&request.retired)
+                .copied()
+                .filter(|peer| st.header_walk.header_timeout_peers.contains(peer))
+                .collect()
+        })
+        .unwrap_or_default();
+    let retained = !owners.is_empty();
+    for peer in owners {
+        retire_hash_owner(st, hash, peer);
+    }
+    retained
 }
 
 #[doc(hidden)]
