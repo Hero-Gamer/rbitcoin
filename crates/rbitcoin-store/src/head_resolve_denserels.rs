@@ -211,16 +211,32 @@ pub fn resolve_fk_and_range_batch_opts(
     heights: Option<&HeightFence>,
     tip_only: bool,
 ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
+    resolve_fk_and_range_batch_cancellable(table, txids, heights, tip_only, &|| false)
+}
+
+/// Same machine as [`resolve_fk_and_range_batch_opts`]. `cancelled` is asked
+/// before each sealed segment and before each identity shot, so a stop waits
+/// for one segment rather than the whole need. One open probe, one sealed
+/// walk, one `create.loc` batch.
+pub fn resolve_fk_and_range_batch_cancellable(
+    table: &TxTable,
+    txids: &[[u8; 32]],
+    heights: Option<&HeightFence>,
+    tip_only: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
     if txids.is_empty() {
         crate::head_resolve_stats::clear_leftover_miss();
         return Ok(Vec::new());
     }
     match io_backend::read_io_backend() {
         ReadIoBackend::Uring => map_uring_resolve(
-            resolve_fk_and_range_uring(table, txids, heights, tip_only),
-            || resolve_fk_and_range_pread(table, txids, heights, tip_only),
+            resolve_fk_and_range_uring(table, txids, heights, tip_only, cancelled),
+            || resolve_fk_and_range_pread(table, txids, heights, tip_only, cancelled),
         ),
-        ReadIoBackend::Pread => resolve_fk_and_range_pread(table, txids, heights, tip_only),
+        ReadIoBackend::Pread => {
+            resolve_fk_and_range_pread(table, txids, heights, tip_only, cancelled)
+        }
     }
 }
 
@@ -269,6 +285,7 @@ pub fn resolve_identity_core(
     heights: Option<&HeightFence>,
     tip_only: bool,
     session: Option<&mut UringSession>,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<IdentityHits, StoreError> {
     crate::head_resolve_stats::add_keys(txids.len() as u64);
 
@@ -308,12 +325,16 @@ pub fn resolve_identity_core(
         &mut local_age,
         &mut ctx,
         &mut had_id,
+        cancelled,
     )?;
 
     if any_unfinished(&picked, &connected, heights) {
         let n_segs = table.head.segment_count();
         let mut active = unfinished_mask(&picked, &connected, heights);
         for si in (0..n_segs).rev() {
+            if cancelled() {
+                return Err(StoreError::Cancelled("txid batch"));
+            }
             if !active.iter().any(|on| *on) {
                 break;
             }
@@ -340,6 +361,7 @@ pub fn resolve_identity_core(
                 &mut local_age,
                 &mut ctx,
                 &mut had_id,
+                cancelled,
             )?;
             for (i, on) in active.iter_mut().enumerate() {
                 *on = !key_finished(i, &picked, &connected, heights);
@@ -372,8 +394,9 @@ pub fn resolve_fk_and_range_pread(
     txids: &[[u8; 32]],
     heights: Option<&HeightFence>,
     tip_only: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
-    let ident = resolve_identity_core(table, txids, heights, tip_only, None)?;
+    let ident = resolve_identity_core(table, txids, heights, tip_only, None, cancelled)?;
     attach_loc_to_identity(table, txids, ident)
 }
 
@@ -476,6 +499,7 @@ pub fn id_idx_wave(
     local_age: &mut [u64; crate::head_resolve_stats::AGE_CAP],
     ctx: &mut crate::IoCtx<'_>,
     had_id: &mut [bool],
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(), StoreError> {
     use crate::head_resolve_pick::{next_id_shot, walk_id_prefix, ID_FILL_CHUNK};
     use crate::int_map::{U64Map, U64Set};
@@ -493,6 +517,9 @@ pub fn id_idx_wave(
     let mut id_map: U64Map<[u8; 32]> = U64Map::default();
 
     for take in [ID_FILL_CHUNK, usize::MAX] {
+        if cancelled() {
+            return Err(StoreError::Cancelled("txid batch"));
+        }
         let shot = next_id_shot(cands_by_key, &filled, &skip, take);
         let mut need: Vec<Fk> = Vec::new();
         {
@@ -577,9 +604,10 @@ pub fn resolve_fk_and_range_uring(
     txids: &[[u8; 32]],
     heights: Option<&HeightFence>,
     tip_only: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
     let ident = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        resolve_identity_core(table, txids, heights, tip_only, Some(session))
+        resolve_identity_core(table, txids, heights, tip_only, Some(session), cancelled)
     })??;
     attach_loc_to_identity(table, txids, ident)
 }

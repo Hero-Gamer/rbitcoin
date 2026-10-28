@@ -110,7 +110,7 @@ fn resolve_uring_unavailable_falls_back_to_pread() {
 #[test]
 fn uring_fk_and_range_matches_pread() {
     let (dir, t, txids) = seed_table(40);
-    let pread = resolve_fk_and_range_pread(&t, &txids, None, false).unwrap();
+    let pread = resolve_fk_and_range_pread(&t, &txids, None, false, &|| false).unwrap();
     // Public entry (uring when available, else pread) must match pure pread.
     let via = resolve_fk_and_range_batch(&t, &txids).unwrap();
     assert_eq!(pread.len(), via.len());
@@ -334,7 +334,10 @@ fn loc_batch_matches_serial_body_range() {
         assert_eq!(got.map(|p| p.txout), Some(exp), "fk={}", fk.0);
     }
     let got =
-        resolve_fk_and_range_pread(&t, &[txids[0], txids[1], txids[1099]], None, false).unwrap();
+        resolve_fk_and_range_pread(&t, &[txids[0], txids[1], txids[1099]], None, false, &|| {
+            false
+        })
+        .unwrap();
     assert_eq!(got[0].1, Some((first, batch[0].unwrap())));
     assert_eq!(got[1].1, Some((near, batch[1].unwrap())));
     assert_eq!(got[2].1, Some((far, batch[2].unwrap())));

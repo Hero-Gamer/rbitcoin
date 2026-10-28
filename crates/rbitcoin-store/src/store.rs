@@ -1147,6 +1147,27 @@ impl Store {
         txids: &[[u8; 32]],
         mode: TxidResolveMode,
     ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
+        self.resolve_txid_batch(txids, mode, &|| false)
+    }
+
+    /// [`Self::get_fk_by_txid_batch`] that asks `cancelled` before each sealed
+    /// segment and each identity shot. One open probe, one sealed walk, one
+    /// `create.loc` batch. A confirm lookup wave is up to 64k cold reads; a
+    /// stop now waits for one segment rather than the wave.
+    pub fn get_fk_by_txid_batch_cancellable(
+        &self,
+        txids: &[[u8; 32]],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
+        self.resolve_txid_batch(txids, TxidResolveMode::TipOnly, cancelled)
+    }
+
+    fn resolve_txid_batch(
+        &self,
+        txids: &[[u8; 32]],
+        mode: TxidResolveMode,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Vec<crate::tx_table::TxidFkRange>, StoreError> {
         // Snapshot: leftover IO is 0.4–2s. Holding the fence read lock blocks
         // `height_fence_extend`. Confirm extends before `set_many`, so tip
         // cannot publish while this clone is in flight. Clone is Arc (COW on
@@ -1154,11 +1175,16 @@ impl Store {
         let t_fence = std::time::Instant::now();
         let fence = self.fence().clone();
         crate::head_resolve_stats::add_probe(t_fence.elapsed().as_nanos() as u64);
-        crate::head_resolve_denserels::resolve_fk_and_range_batch_with_tip(
+        let tip_only = matches!(mode, TxidResolveMode::TipOnly);
+        if cancelled() {
+            return Err(StoreError::Cancelled("txid batch"));
+        }
+        crate::head_resolve_denserels::resolve_fk_and_range_batch_cancellable(
             &self.txs,
-            &fence,
             txids,
-            matches!(mode, TxidResolveMode::TipOnly),
+            Some(&fence),
+            tip_only,
+            cancelled,
         )
     }
 
