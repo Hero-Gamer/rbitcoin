@@ -4243,6 +4243,32 @@ fn addnode_and_getpeerinfo_attach_hubs_at_dispatch() {
     let _ = std::fs::remove_dir_all(&dir2);
 }
 
+/// Core #35787: a blank `node` is `-8` for every command, so `add` leaves
+/// nothing to redial.
+#[test]
+fn addnode_rejects_a_blank_node() {
+    use rbitcoin_net::PeerHub;
+    let (mut ctx, dir) = ctx_empty();
+    let hub = PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    ctx.peers = Some(hub.clone());
+    for node in ["", " ", "\t\n"] {
+        for cmd in ["add", "remove", "onetry"] {
+            let e = dispatch(&ctx, "addnode", vec![json!(node), json!(cmd)]).unwrap_err();
+            assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{node:?} {cmd}: {e}");
+            assert_eq!(
+                e["message"],
+                json!("Error: Node address cannot be empty"),
+                "{node:?} {cmd}"
+            );
+        }
+    }
+    assert!(hub.remembered_redials().is_empty());
+    assert!(rx.try_recv().is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn getpeerinfo_and_disconnectnode_support_onion_addr() {
     use rbitcoin_net::{PeerConnType, PeerHub};

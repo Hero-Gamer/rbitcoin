@@ -166,6 +166,12 @@ pub fn addnode(
     let cmd = params.req_str(1, "command")?;
     let _v2 = params.opt_bool(2, "v2transport")?;
     let ready = hub.dial_ready().map_err(|e| rpc_error(ERR_MISC, e))?;
+    if node.trim().is_empty() {
+        return Err(rpc_error(
+            ERR_INVALID_PARAMETER,
+            "Error: Node address cannot be empty",
+        ));
+    }
     ready
         .addnode_host(node, cmd, ctx.network.default_p2p_port())
         .map_err(|e| rpc_error(ERR_MISC, e))?;
