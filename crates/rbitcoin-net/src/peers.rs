@@ -1499,7 +1499,7 @@ pub struct PeerHub {
     /// Addr-fetch `getaddr` replies (more than one address) learned into the
     /// book. A self-announce does not count.
     addrfetch_replies: AtomicU64,
-    /// One stored permit when [`Self::note_addrfetch_reply`] runs, so tip-follow
+    /// One stored permit when an addr-fetch reply is learned, so tip-follow
     /// can dial a book that was empty at catch-up.
     addrfetch_learned: Notify,
     /// Network P2P port used when a remembered host omits `:port`. `0` = unset.
@@ -1881,8 +1881,8 @@ impl PeerHub {
         self.addrfetch_learned.notify_one();
     }
 
-    /// Permit from [`Self::note_addrfetch_reply`]. Tip-follow waits on this
-    /// so an empty book is dialed once `getaddr` fills it.
+    /// Wakes when an addr-fetch `getaddr` reply of more than one address is learned.
+    /// Tip-follow dials a book that was empty at catch-up.
     pub fn addrfetch_learned(&self) -> &Notify {
         &self.addrfetch_learned
     }
