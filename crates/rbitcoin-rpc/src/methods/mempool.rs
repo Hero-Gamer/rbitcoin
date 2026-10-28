@@ -318,47 +318,35 @@ struct RawTxBlock {
 fn raw_tx_block(ctx: &RpcContext, hash: [u8; 32]) -> Result<RawTxBlock, Value> {
     let q = ctx.query.as_ref();
     let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
-    if let Some(height) = q.height_of_hash(&hash).map_err(misc)? {
-        q.require_seqsigwit_at(height)
-            .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
-        let (_, header) = q
-            .header_at_height(height)
-            .map_err(misc)?
-            .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block hash not found"))?;
-        let fks = q
-            .block_tx_fks(height)
-            .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
-        return Ok(RawTxBlock {
-            active: true,
-            height: Some(height.0),
-            timestamp: header.timestamp,
-            hash: header.hash,
-            fks,
-        });
-    }
+    let missing = || rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block hash not found");
+    // Membership is this header's tx span. Prune does not remove that span, so
+    // a pruned block that does not hold the tx is "not in this block", not
+    // "this tx is pruned". The tx body is read only after membership.
     let Some((header_fk, header)) = q.get_header_by_hash(&hash).map_err(misc)? else {
-        return Err(rpc_error(
-            ERR_INVALID_ADDRESS_OR_KEY,
-            "Block hash not found",
-        ));
+        return Err(missing());
     };
+    if header.hash != hash {
+        return Err(missing());
+    }
     let Some(fks) = q.header_tx_fks(header_fk, Some(&hash)).map_err(misc)? else {
-        return Err(rpc_error(
-            ERR_INVALID_ADDRESS_OR_KEY,
-            "Block hash not found",
-        ));
+        return Err(missing());
     };
     if fks.is_empty() {
-        return Err(rpc_error(
-            ERR_INVALID_ADDRESS_OR_KEY,
-            "Block hash not found",
-        ));
+        return Err(missing());
     }
+    // height_of_hash is the active chain. Confirm and disconnect do not move
+    // together, so the header now at that height may not be this one. Active
+    // only when the confirmed slot still points at this header.
+    let located = q.height_of_hash(&hash).map_err(misc)?;
+    let active = match located {
+        Some(height) => q.store().confirmed.get(height).map_err(misc)? == Some(header_fk),
+        None => false,
+    };
     Ok(RawTxBlock {
-        active: false,
-        height: None,
+        active,
+        height: located.filter(|_| active).map(|h| h.0),
         timestamp: header.timestamp,
-        hash: header.hash,
+        hash,
         fks,
     })
 }

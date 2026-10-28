@@ -2325,15 +2325,9 @@ fn assert_active_block_verbosity(
     assert_verbosity_2_prevout(ctx, txid, block_x, parent);
 }
 
-fn assert_verbosity_2_prevout(ctx: &RpcContext, txid: &str, block_x: &str, parent: &Value) {
-    let mut named = serde_json::Map::new();
-    named.insert("txid".into(), json!(txid));
-    named.insert("verbosity".into(), json!(2));
-    named.insert("blockhash".into(), json!(block_x));
-    let v2 = dispatch(ctx, "getrawtransaction", RpcParams::named(named)).unwrap();
-    assert_eq!(v2["in_active_chain"], json!(true), "{v2}");
-    assert_btc_amount(&v2["fee"], 1_000.0 / 1e8);
-    let prevout = &v2["vin"][0]["prevout"];
+fn assert_confirmed_spend_v2(obj: &Value, parent: &Value) {
+    assert_btc_amount(&obj["fee"], 1_000.0 / 1e8);
+    let prevout = &obj["vin"][0]["prevout"];
     let parent_cb = &parent["tx"][0];
     assert_eq!(prevout["generated"], json!(true), "{prevout}");
     assert_eq!(prevout["height"], parent["height"], "{prevout}");
@@ -2350,17 +2344,29 @@ fn assert_verbosity_2_prevout(ctx: &RpcContext, txid: &str, block_x: &str, paren
     }
 }
 
-fn assert_unscoped_and_mempool(ctx: &RpcContext, txid: &str, mem_txid: &str, block_x: &str) {
+fn assert_verbosity_2_prevout(ctx: &RpcContext, txid: &str, block_x: &str, parent: &Value) {
+    let mut named = serde_json::Map::new();
+    named.insert("txid".into(), json!(txid));
+    named.insert("verbosity".into(), json!(2));
+    named.insert("blockhash".into(), json!(block_x));
+    let v2 = dispatch(ctx, "getrawtransaction", RpcParams::named(named)).unwrap();
+    assert_eq!(v2["in_active_chain"], json!(true), "{v2}");
+    assert_confirmed_spend_v2(&v2, parent);
+}
+
+fn assert_unscoped_and_mempool(
+    ctx: &RpcContext,
+    txid: &str,
+    mem_txid: &str,
+    block_x: &str,
+    parent: &Value,
+) {
     let no_hash = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)]).unwrap();
     assert!(no_hash.get("in_active_chain").is_none(), "{no_hash}");
     assert_eq!(no_hash["txid"], json!(txid), "{no_hash}");
     let no_hash_v2 = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(2)]).unwrap();
     assert!(no_hash_v2.get("in_active_chain").is_none(), "{no_hash_v2}");
-    assert!(no_hash_v2["fee"].as_f64().is_some(), "{no_hash_v2}");
-    assert!(
-        no_hash_v2["vin"][0].get("prevout").is_some(),
-        "{no_hash_v2}"
-    );
+    assert_confirmed_spend_v2(&no_hash_v2, parent);
     let mem_v2 = dispatch(ctx, "getrawtransaction", vec![json!(mem_txid), json!(2)]).unwrap();
     assert!(mem_v2.get("in_active_chain").is_none(), "{mem_v2}");
     assert_eq!(mem_v2["in_mempool"], json!(true), "{mem_v2}");
@@ -2413,6 +2419,16 @@ fn assert_inactive_block_and_pruned(
     block_y: String,
     genesis_tx: &str,
 ) {
+    let h1_early = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
+    ctx.query.set_pruneheight(Some(Height(1))).unwrap();
+    assert_raw_tx_not_in_block(ctx, txid, json!(true), h1_early.as_str().unwrap());
+    let above_prune = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)])
+        .unwrap_or_else(|e| panic!("unscoped lookup of an unpruned tx must succeed: {e}"));
+    assert!(
+        above_prune.get("in_active_chain").is_none(),
+        "{above_prune}"
+    );
+    ctx.query.set_pruneheight(None).unwrap();
     dispatch(ctx, "invalidateblock", vec![json!(block_x)]).unwrap();
     let inactive = dispatch(
         ctx,
@@ -2468,7 +2484,7 @@ fn getrawtransaction_blockhash_and_verbosity_2() {
 
     let mem_txid = assert_blockhash_misses(&ctx, &txid, &block_x, &block_y);
     assert_active_block_verbosity(&ctx, &txid, &hex, &block_x, &parent);
-    assert_unscoped_and_mempool(&ctx, &txid, &mem_txid, &block_x);
+    assert_unscoped_and_mempool(&ctx, &txid, &mem_txid, &block_x, &parent);
     let genesis_tx = assert_missing_txid_and_rest(&ctx, &txid);
     assert_inactive_block_and_pruned(&ctx, &txid, &hex, &block_x, block_y, &genesis_tx);
     let _ = std::fs::remove_dir_all(&dir);
