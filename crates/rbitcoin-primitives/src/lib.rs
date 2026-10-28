@@ -16,6 +16,8 @@ pub mod merkle;
 #[doc(hidden)]
 pub mod script_sigops;
 #[doc(hidden)]
+pub mod script_worker;
+#[doc(hidden)]
 pub mod scriptnum;
 
 pub use compact::{
@@ -32,6 +34,7 @@ pub use merkle::{
     merkle_branch, merkle_root_from_branch, merkle_root_from_txids, merkle_root_mutated,
 };
 pub use script_sigops::script_sigop_count;
+pub use script_worker::{assert_not_script_worker, on_script_worker, set_script_worker};
 pub use scriptnum::{
     scriptnum_decode, scriptnum_decode_width, scriptnum_encode, scriptnum_is_minimal,
     ScriptNumError,

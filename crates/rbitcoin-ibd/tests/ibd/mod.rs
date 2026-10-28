@@ -15,6 +15,7 @@ mod peer_chain;
 mod peer_io;
 mod perf_log;
 mod progress;
+mod published;
 mod rate;
 mod reorg;
 mod state;

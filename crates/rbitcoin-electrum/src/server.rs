@@ -430,7 +430,7 @@ where
                                 "method": "blockchain.headers.subscribe",
                                 "params": [{ "hex": t.header_hex, "height": t.height }]
                             });
-                            write_line(&mut writer, &msg, idle).await?;
+                            write_line(&mut writer, msg, idle).await?;
                         }
                         if !conn.outpoint_subs.is_empty() {
                             emit_outpoint_notes(
@@ -578,7 +578,7 @@ where
                                 "method": "blockchain.scripthash.subscribe",
                                 "params": [hash_hex_rev(&sh), status_json(status)]
                             });
-                            write_line(&mut writer, &msg, idle).await?;
+                            write_line(&mut writer, msg, idle).await?;
                         }
                     }
                 }
@@ -595,7 +595,7 @@ where
                                 "jsonrpc":"2.0","id": null,
                                 "error": {"code": -32600, "message": "request line too long"}
                             });
-                            let _ = write_line(&mut writer, &resp, idle).await;
+                            let _ = write_line(&mut writer, resp, idle).await;
                             return Err(e);
                         }
                         return Err(e);
@@ -674,7 +674,7 @@ where
                         None => answer_one(&ctx, &mut conn, &mut last_sent_status, &req).await?,
                     },
                 };
-                write_line(&mut writer, &resp, idle).await?;
+                write_line(&mut writer, resp, idle).await?;
                 let _ = &notify;
             }
         }
@@ -856,10 +856,14 @@ struct BatchOut<'w, W> {
 }
 
 impl<W: AsyncWrite + Unpin> BatchOut<'_, W> {
-    async fn slot(&mut self, index: usize, answer: &Value) -> Result<(), std::io::Error> {
+    async fn slot(&mut self, index: usize, answer: Value) -> Result<(), std::io::Error> {
         batch_mark(BatchStep::Write(index));
         let mut slot = vec![if self.opened { b',' } else { b'[' }];
-        slot.extend(serde_json::to_vec(answer).unwrap_or_else(|_| b"{}".to_vec()));
+        slot.extend(
+            crate::json_cpu::encode_json_body(Arc::new(answer))
+                .await
+                .map_err(|_| std::io::Error::other("json encode join failed"))?,
+        );
         self.opened = true;
         write_bytes_within(self.writer, &slot, self.idle).await
     }
@@ -904,12 +908,12 @@ async fn answer_batch<W: AsyncWrite + Unpin>(
     items: Vec<Value>,
 ) -> Result<(), std::io::Error> {
     if items.is_empty() {
-        return write_line(writer, &invalid_request(Value::Null, "empty batch"), idle).await;
+        return write_line(writer, invalid_request(Value::Null, "empty batch"), idle).await;
     }
     if items.len() > MAX_BATCH_ITEMS {
         return write_line(
             writer,
-            &invalid_request(Value::Null, "batch too large"),
+            invalid_request(Value::Null, "batch too large"),
             idle,
         )
         .await;
@@ -947,7 +951,7 @@ async fn answer_batch<W: AsyncWrite + Unpin>(
         while let Some(oldest) = window.pop_front() {
             land(ctx, conn, last_sent, &mut out, oldest).await?;
         }
-        out.slot(index, &answer).await?;
+        out.slot(index, answer).await?;
     }
     while let Some(oldest) = window.pop_front() {
         land(ctx, conn, last_sent, &mut out, oldest).await?;
@@ -1011,7 +1015,7 @@ async fn land<W: AsyncWrite + Unpin>(
         stamped,
         Took::Ran(ran),
     );
-    out.slot(flight.index, &answer).await
+    out.slot(flight.index, answer).await
 }
 
 /// The wall time a reply reports. A single request counts from when it was
@@ -1215,7 +1219,7 @@ where
         Err(e) => {
             write_line(
                 writer,
-                &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+                json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
                 idle,
             )
             .await?;
@@ -1225,7 +1229,7 @@ where
     if conn.sp_scan_busy {
         write_line(
             writer,
-            &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": "silent payment scan already running"}}),
+            json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": "silent payment scan already running"}}),
             idle,
         )
         .await?;
@@ -1240,7 +1244,7 @@ where
         0,
         None,
     );
-    write_line(writer, &rpc_result(&id, &result, None), idle).await?;
+    write_line(writer, rpc_result(&id, &result, None), idle).await?;
     conn.sp_scan_busy = true;
     let last = tip.unwrap_or(sub.start);
     let scanned = scan_sp_off_connection(reader, query, chain, &sub, last).await;
@@ -1259,7 +1263,7 @@ where
             "history": hits,
         }
     });
-    write_line(writer, &note, idle).await?;
+    write_line(writer, note, idle).await?;
     conn.sp_sub = Some(sub);
     Ok(())
 }
@@ -1304,7 +1308,7 @@ pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
             "history": hits,
         }
     });
-    write_line(writer, &note, idle).await
+    write_line(writer, note, idle).await
 }
 
 pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
@@ -1335,7 +1339,7 @@ pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
             "method": "blockchain.outpoint.subscribe",
             "params": [txid_hex(&txid), vout, status],
         });
-        write_line(writer, &note, idle).await?;
+        write_line(writer, note, idle).await?;
     }
     Ok(())
 }
@@ -1528,7 +1532,7 @@ where
         )
         .await?;
     }
-    write_line(writer, &crate::tweaks::done_notify(), idle).await?;
+    write_line(writer, crate::tweaks::done_notify(), idle).await?;
     Ok(())
 }
 
@@ -1551,7 +1555,7 @@ pub async fn tweaks_sub_err<W: AsyncWrite + Unpin>(
     );
     write_line(
         writer,
-        &json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
+        json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": e}}),
         idle,
     )
     .await
@@ -1615,7 +1619,7 @@ pub async fn serve_tweaks_empty_ok<W: AsyncWrite + Unpin>(
     meter_dispatch_wall(t0.elapsed().as_micros() as u64);
     tweaks_sub_ok_log(peer, params_v, wall_ms);
     write_rpc_result(writer, id, first, idle).await?;
-    write_line(writer, &crate::tweaks::done_notify(), idle).await
+    write_line(writer, crate::tweaks::done_notify(), idle).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1715,7 +1719,7 @@ where
                             if req.get("method").and_then(|m| m.as_str()) == Some("server.ping") {
                                 write_line(
                                     writer,
-                                    &json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
+                                    json!({"jsonrpc":"2.0","id": ping_id, "result": null}),
                                     idle,
                                 )
                                 .await?;
@@ -1759,12 +1763,14 @@ pub async fn write_bytes_within<W: AsyncWrite + Unpin>(
 
 pub async fn write_line<W: AsyncWrite + Unpin>(
     writer: &mut W,
-    msg: &Value,
+    msg: Value,
     deadline: Duration,
 ) -> Result<(), std::io::Error> {
-    let mut s = serde_json::to_string(msg).unwrap_or_else(|_| "{}".into());
-    s.push('\n');
-    write_bytes_within(writer, s.as_bytes(), deadline).await
+    let mut s = crate::json_cpu::encode_json_body(Arc::new(msg))
+        .await
+        .map_err(|_| std::io::Error::other("json encode join failed"))?;
+    s.push(b'\n');
+    write_bytes_within(writer, &s, deadline).await
 }
 
 #[doc(hidden)]
@@ -1922,7 +1928,7 @@ pub async fn emit_sh_notes<W: AsyncWrite + Unpin>(
             "method": "blockchain.scripthash.subscribe",
             "params": [hash_hex_rev(&sh), status_json(status)]
         });
-        write_line(writer, &msg, idle).await?;
+        write_line(writer, msg, idle).await?;
     }
     Ok(())
 }

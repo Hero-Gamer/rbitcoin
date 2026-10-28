@@ -201,6 +201,7 @@ pub fn handle_pwrite_all(
     if bytes.is_empty() {
         return Ok(());
     }
+    rbitcoin_primitives::assert_not_script_worker("store write");
     let handle = IoHandle::from_file(file);
     let mut done = 0usize;
     while done < bytes.len() {
@@ -230,6 +231,7 @@ pub fn handle_pread_all(
     if buf.is_empty() {
         return Ok(());
     }
+    rbitcoin_primitives::assert_not_script_worker("store read");
     crate::coord_io::note_store_read();
     let handle = IoHandle::from_file(file);
     let mut done = 0usize;

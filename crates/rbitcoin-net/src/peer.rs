@@ -5188,12 +5188,17 @@ pub fn cmpct_announce_from_block(
     cmpct_version: u32,
 ) -> Option<NetworkMessage> {
     crate::reactor::assert_not_reactor("cmpct announce");
-    let nonce = rand_nonce();
     let ver = cmpct_version.clamp(1, 2);
     let pref = hub
         .cmpct_prefill_indexes(&block.block_hash())
         .unwrap_or_else(|| vec![0]);
-    let hsi = HeaderAndShortIds::from_block(block, nonce, ver, &pref)
+    cmpct_from_parts(block, rand_nonce(), ver, &pref)
+}
+
+/// Short ids for a block already in hand. No store read.
+fn cmpct_from_parts(block: &Block, nonce: u64, ver: u32, pref: &[usize]) -> Option<NetworkMessage> {
+    crate::reactor::assert_not_reactor("cmpct short ids");
+    let hsi = HeaderAndShortIds::from_block(block, nonce, ver, pref)
         .or_else(|_| HeaderAndShortIds::from_block(block, nonce, ver, &[0]))
         .ok()?;
     rbitcoin_log::info!(
@@ -5203,6 +5208,22 @@ pub fn cmpct_announce_from_block(
     Some(NetworkMessage::CmpctBlock(CmpctBlock {
         compact_block: hsi,
     }))
+}
+
+async fn cmpct_from_parts_cpu(
+    block: Block,
+    nonce: u64,
+    ver: u32,
+    pref: Vec<usize>,
+) -> Result<Option<NetworkMessage>, NetError> {
+    match rbitcoin_consensus::script_pool::run_cpu(move || {
+        cmpct_from_parts(&block, nonce, ver, &pref)
+    })
+    .await
+    {
+        Some(msg) => Ok(msg),
+        None => Err(NetError::Protocol("cmpct relay join failed")),
+    }
 }
 
 /// BIP152 compact tip announcement (coinbase prefilled). `None` if the body
@@ -5223,9 +5244,9 @@ fn ensure_peer_header(hub: &ChainHub, header: &bitcoin::block::Header) -> Result
     rbitcoin_query::confirm_run::waive_batch(hub.query.trust_peer(), || hub.ensure_header(header))
 }
 
-/// Tip `cmpctblock`. The body load and the short-id pass are
-/// `cmpct_announce_msg`, so both run on the blocking pool. A missing body
-/// is `None` and the caller sends headers.
+/// Tip `cmpctblock`. The body load stays on the blocking pool. Short ids
+/// run on `rbtc-scripts-*` once that body is in hand. A missing body is
+/// `None` and the caller sends headers.
 async fn cmpct_tip_announce(
     hub: &ChainHub,
     hash: &BlockHash,
@@ -5236,21 +5257,31 @@ async fn cmpct_tip_announce(
     };
     let permit = block_reconstruct_permit().await?;
     let hash = *hash;
-    tokio::task::spawn_blocking(move || {
+    let ver = cmpct_version.clamp(1, 2);
+    let loaded = tokio::task::spawn_blocking(move || {
         let _region = crate::reactor::BlockingRegion::enter();
         let _permit = permit;
-        cmpct_announce_msg(owned.as_ref(), &hash, cmpct_version)
+        let block = block_for_peer(owned.cache.as_ref(), owned.query.as_ref(), &hash).ok()??;
+        let pref = owned
+            .cmpct_prefill_indexes(&block.block_hash())
+            .unwrap_or_else(|| vec![0]);
+        Some((block, pref, rand_nonce()))
     })
     .await
-    .map_err(|_| NetError::Protocol("cmpct announce join failed"))
+    .map_err(|_| NetError::Protocol("cmpct announce join failed"))?;
+    let Some((block, pref, nonce)) = loaded else {
+        return Ok(None);
+    };
+    cmpct_from_parts_cpu(block, nonce, ver, pref).await
 }
 
-/// Header persist, prefill, and short ids for a block already in hand.
+/// Header persist and prefill for a block already in hand, then short ids.
 ///
-/// An `Arc` hub does all three on the blocking pool. A stack hub (tests)
-/// does them inline. `Ok(None)` is a header the store refused or a body
-/// that did not become a compact message. A closed permit or a failed
-/// join is `Err`, the same class as [`cmpct_tip_announce`].
+/// An `Arc` hub persists the header on the blocking pool and builds short
+/// ids on `rbtc-scripts-*`. A stack hub (tests) does both inline.
+/// `Ok(None)` is a header the store refused or a body that did not become
+/// a compact message. A closed permit or a failed join is `Err`, the same
+/// class as [`cmpct_tip_announce`].
 async fn cmpct_announce_off_session(
     hub: &ChainHub,
     block: Block,
@@ -5263,18 +5294,34 @@ async fn cmpct_announce_off_session(
     let joined = tokio::task::spawn_blocking(move || {
         let _region = crate::reactor::BlockingRegion::enter();
         let _permit = permit;
-        hb_relay_message(owned.as_ref(), &block, cmpct_version)
+        hb_relay_prepare(owned.as_ref(), block, cmpct_version)
     })
     .await;
-    map_cmpct_relay_join(joined)
+    let Some((block, ver, pref, nonce)) = map_cmpct_relay_join(joined)? else {
+        return Ok(None);
+    };
+    cmpct_from_parts_cpu(block, nonce, ver, pref).await
 }
 
-fn hb_relay_message(hub: &ChainHub, block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
+fn hb_relay_prepare(
+    hub: &ChainHub,
+    block: Block,
+    cmpct_version: u32,
+) -> Option<(Block, u32, Vec<usize>, u64)> {
     if ensure_peer_header(hub, &block.header).is_err() {
         return None;
     }
-    hub.remember_cmpct_prefill_from_block(block);
-    cmpct_announce_from_block(hub, block, cmpct_version)
+    hub.remember_cmpct_prefill_from_block(&block);
+    let ver = cmpct_version.clamp(1, 2);
+    let pref = hub
+        .cmpct_prefill_indexes(&block.block_hash())
+        .unwrap_or_else(|| vec![0]);
+    Some((block, ver, pref, rand_nonce()))
+}
+
+fn hb_relay_message(hub: &ChainHub, block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
+    let (block, ver, pref, nonce) = hb_relay_prepare(hub, block.clone(), cmpct_version)?;
+    cmpct_from_parts(&block, nonce, ver, &pref)
 }
 
 /// A panicked or cancelled blocking job is not "no compact message".

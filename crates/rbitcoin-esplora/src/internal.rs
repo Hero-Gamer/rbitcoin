@@ -3,7 +3,9 @@
 use crate::handlers::{outspend_json, spawn_join};
 #[cfg(unix)]
 use crate::server::not_found;
-use crate::server::{block_hash_hex, parse_hash32, pin_or_reject, store_err, AppState};
+use crate::server::{
+    block_hash_hex, json_reply_here, parse_hash32, pin_or_reject, store_err, AppState,
+};
 #[cfg(unix)]
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, build_tx_json_from_tx_with_status, tx_status_json,
@@ -13,7 +15,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query as AxumQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use bitcoin::hashes::Hash;
 use bitcoin::Txid;
 #[cfg(unix)]
@@ -167,7 +168,7 @@ async fn post_tx_batch(
                 out.push(v);
             }
         }
-        Json(out).into_response()
+        json_reply_here(out)
     })
     .await
 }
@@ -186,7 +187,7 @@ pub async fn post_internal_mempool_txs(State(st): State<AppState>, body: Bytes) 
 #[doc(hidden)]
 pub fn mempool_tx_page(st: &AppState, last: Option<&Txid>, max: usize) -> Response {
     let Some(mp) = st.mempool.as_ref() else {
-        return Json(Value::Array(Vec::new())).into_response();
+        return json_reply_here(Value::Array(Vec::new()));
     };
     let snap = mp.mempool_tx_snapshot();
     let parts: Vec<Option<&str>> = snap
@@ -248,7 +249,7 @@ pub async fn get_mempool_txids_page(
     AxumQuery(q): AxumQuery<MaxTxs>,
 ) -> Response {
     let max = cap_max_txs(&q);
-    spawn_join(move || Json(mempool_txid_page(&st, None, max)).into_response()).await
+    spawn_join(move || json_reply_here(mempool_txid_page(&st, None, max))).await
 }
 
 pub async fn get_mempool_txids_page_cursor(
@@ -261,7 +262,7 @@ pub async fn get_mempool_txids_page_cursor(
     };
     let last = Txid::from_byte_array(id);
     let max = cap_max_txs(&q);
-    spawn_join(move || Json(mempool_txid_page(&st, Some(&last), max)).into_response()).await
+    spawn_join(move || json_reply_here(mempool_txid_page(&st, Some(&last), max))).await
 }
 
 #[cfg(unix)]
@@ -307,7 +308,7 @@ pub async fn get_internal_block_txs(
                 Err(e) => return store_err(e),
             }
         }
-        Json(out).into_response()
+        json_reply_here(out)
     })
     .await
 }
@@ -346,7 +347,7 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
         }
         out.push(Value::Array(slots));
     }
-    Json(out).into_response()
+    json_reply_here(out)
 }
 
 #[cfg(unix)]
@@ -410,7 +411,7 @@ pub async fn post_outspends_by_outpoint(State(st): State<AppState>, body: Bytes)
                 Err(e) => return store_err(e),
             }
         }
-        Json(out).into_response()
+        json_reply_here(out)
     })
     .await
 }

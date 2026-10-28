@@ -683,3 +683,133 @@ fn parse_v2_regtest_rejects_empty_and_unknown_short_id() {
     assert!(parse_v2_regtest(&[]).is_err());
     assert!(parse_v2_regtest(&[99u8, 1, b'd']).is_err());
 }
+
+/// Park every `rbtc-scripts-*` worker inside a detached job.
+struct ScriptHold {
+    gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl ScriptHold {
+    fn all() -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+        let n = rbitcoin_consensus::script_pool::worker_spawn_count();
+        assert!(n >= 1, "script pool did not start");
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let entered = Arc::new(AtomicUsize::new(0));
+        for _ in 0..n {
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&gate);
+            rbitcoin_consensus::script_pool::spawn_detached(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*gate;
+                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while !*g {
+                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                }
+            });
+        }
+        let start = Instant::now();
+        while entered.load(Ordering::SeqCst) < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "script workers did not park"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Self { gate }
+    }
+}
+
+impl Drop for ScriptHold {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.gate;
+        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+fn poll_until<T, F>(mut fut: std::pin::Pin<Box<F>>, limit: std::time::Duration) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread;
+    use std::time::Instant;
+    struct Unpark(thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let start = Instant::now();
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => {
+                assert!(
+                    start.elapsed() < limit,
+                    "encode waited on rbtc-scripts for a short payload"
+                );
+                thread::park_timeout(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// A short payload encodes on the caller while every script worker is parked.
+/// A block encode stays pending until those workers are released, and the
+/// bytes match `encode_v2_contents`.
+#[test]
+fn encode_v2_payload_keeps_a_short_message_on_the_caller() {
+    use bitcoin::blockdata::constants::genesis_block;
+    use std::time::Duration;
+    let hold = ScriptHold::all();
+    let short = poll_until(
+        Box::pin(encode_v2_payload(NetworkMessage::Verack)),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    assert_eq!(short, encode_v2_contents(NetworkMessage::Verack).unwrap());
+    let one = genesis_block(Network::Regtest).header;
+    let headers = poll_until(
+        Box::pin(encode_v2_payload(NetworkMessage::Headers(vec![one; 8]))),
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    assert_eq!(
+        headers,
+        encode_v2_contents(NetworkMessage::Headers(vec![one; 8])).unwrap()
+    );
+
+    let mut heavy = Box::pin(encode_v2_payload(NetworkMessage::Block(genesis_block(
+        Network::Regtest,
+    ))));
+    use std::future::Future;
+    let waker = {
+        use std::sync::Arc;
+        use std::task::{Wake, Waker};
+        struct Unpark(std::thread::Thread);
+        impl Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        Waker::from(Arc::new(Unpark(std::thread::current())))
+    };
+    let mut cx = std::task::Context::from_waker(&waker);
+    assert!(
+        matches!(heavy.as_mut().poll(&mut cx), std::task::Poll::Pending),
+        "block encode ran while rbtc-scripts workers were held"
+    );
+    drop(hold);
+    let got = poll_until(heavy, Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        got,
+        encode_v2_contents(NetworkMessage::Block(genesis_block(Network::Regtest))).unwrap()
+    );
+}

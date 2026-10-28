@@ -599,3 +599,46 @@ fn write_tmp_rename_installs_dest_only() {
     assert_eq!(std::fs::read(&dest).unwrap(), b"spill");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A script worker must not `pread`. The flag is cleared on drop so later
+/// tests on this thread can still read.
+#[test]
+fn script_worker_cannot_pread() {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rbitcoin-script-pread-{id}"));
+    let _ = std::fs::remove_file(&path);
+    let f = TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    f.write_at(FILE_HEADER_LEN as u64, &[1, 2, 3, 4]).unwrap();
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            rbitcoin_primitives::set_script_worker(false);
+        }
+    }
+    let _clear = Clear;
+    rbitcoin_primitives::set_script_worker(true);
+    let mut buf = [0u8; 4];
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.pread_exact(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+    }));
+    assert!(panicked.is_err(), "pread_exact on rbtc-scripts must panic");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        f.pwrite_all(FILE_HEADER_LEN as u64, &[9, 9, 9, 9]).unwrap();
+    }));
+    assert!(panicked.is_err(), "pwrite_all on rbtc-scripts must panic");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut session = rbitcoin_store::uring_session::UringSession::try_open_kind(
+            rbitcoin_store::uring_session::SessionKind::Pool,
+            32,
+        )
+        .expect("pool session");
+        session.submit().unwrap();
+    }));
+    assert!(
+        panicked.is_err(),
+        "io_uring submit on rbtc-scripts must panic"
+    );
+    drop(_clear);
+    let _ = std::fs::remove_file(&path);
+}

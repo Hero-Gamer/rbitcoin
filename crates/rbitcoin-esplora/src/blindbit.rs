@@ -11,7 +11,7 @@
 //! eligible tx.
 
 use crate::handlers::spawn_join;
-use crate::server::{block_hash_hex, AppState};
+use crate::server::{block_hash_hex, json_reply_here, AppState};
 use axum::extract::{Extension, Path, Query as UrlQuery, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -252,7 +252,7 @@ pub async fn info(State(st): State<AppState>, Extension(p): Extension<BlindbitPe
         let Some(height) = served_height(&st.query) else {
             return error(StatusCode::SERVICE_UNAVAILABLE, "no height indexed");
         };
-        Json(json!({
+        json_reply_here(json!({
             // `spdk` parses this with `Network::from_core_arg`.
             "network": st.network.to_core_arg(),
             "height": height,
@@ -261,7 +261,6 @@ pub async fn info(State(st): State<AppState>, Extension(p): Extension<BlindbitPe
             "tweaks_full_with_dust_filter": true,
             "tweaks_cut_through_with_dust_filter": true,
         }))
-        .into_response()
     })
     .await
 }
@@ -271,7 +270,7 @@ pub async fn block_height(
     Extension(p): Extension<BlindbitPermit>,
 ) -> Response {
     held(p, move || match served_height(&st.query) {
-        Some(h) => Json(json!({ "block_height": h })).into_response(),
+        Some(h) => json_reply_here(json!({ "block_height": h })),
         None => error(StatusCode::SERVICE_UNAVAILABLE, "no height indexed"),
     })
     .await
@@ -283,7 +282,7 @@ pub async fn block_hash(
     Path(raw): Path<String>,
 ) -> Response {
     held(p, move || match served_block(&st.query, &raw) {
-        Ok(b) => Json(json!({ "block_hash": block_hash_hex(&b.hash) })).into_response(),
+        Ok(b) => json_reply_here(json!({ "block_hash": block_hash_hex(&b.hash) })),
         Err(r) => r,
     })
     .await
@@ -305,7 +304,7 @@ fn tweak_list(st: &AppState, raw: &str, dust: &DustParam, cut_through: bool) -> 
                 .filter(|r| keeps_dust(r, dust_limit))
                 .map(|r| rbitcoin_primitives::hex_encode(r.tweak))
                 .collect();
-            Json(list).into_response()
+            json_reply_here(list)
         }
         Err(r) => r,
     }
@@ -368,7 +367,7 @@ fn utxos_json(st: &AppState, raw: &str) -> Response {
             }));
         }
     }
-    Json(out).into_response()
+    json_reply_here(out)
 }
 
 pub async fn utxos(
@@ -449,7 +448,7 @@ fn spent_index_json(st: &AppState, raw: &str) -> Response {
         .iter()
         .map(rbitcoin_primitives::hex_encode)
         .collect();
-    Json(json!({ "block_hash": block_hash_hex(&hash), "data": data })).into_response()
+    json_reply_here(json!({ "block_hash": block_hash_hex(&hash), "data": data }))
 }
 
 pub async fn spent_index(
@@ -474,13 +473,12 @@ fn filter_json(st: &AppState, raw: &str, spent: bool) -> Response {
         sp_filter_bytes(&hash, elements.new_keys.iter().map(|k| k.as_slice()))
     };
     match bytes {
-        Ok(data) => Json(json!({
+        Ok(data) => json_reply_here(json!({
             "filter_type": SP_FILTER_TYPE,
             "block_height": h,
             "block_hash": block_hash_hex(&hash),
             "data": rbitcoin_primitives::hex_encode(&data),
-        }))
-        .into_response(),
+        })),
         Err(e) => store_error(e),
     }
 }
@@ -534,7 +532,7 @@ pub async fn forward_tx(
     held(permit, move || match mp.accept_tx_from(&tx, None) {
         Ok(r) => {
             mp.mark_local_origin(r.txid);
-            Json(block_hash_hex(&r.txid.to_byte_array())).into_response()
+            json_reply_here(block_hash_hex(&r.txid.to_byte_array()))
         }
         Err(e) => error(StatusCode::BAD_REQUEST, &e.to_string()),
     })

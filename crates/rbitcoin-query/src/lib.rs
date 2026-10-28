@@ -500,6 +500,8 @@ pub struct Query {
     /// IBD tip barrier on `rbtc-tip-flush`, or the failure of one. The next
     /// `tip_commit` taker joins it.
     pub tip_flush: Mutex<connect::TipFlush>,
+    /// Long-lived IBD Class C barrier thread. Absent in tip mode.
+    pub tip_flush_worker: connect::TipFlushWorker,
     /// Test hook: IBD tip flush threads wait before writing while this is set.
     #[cfg(debug_assertions)]
     pub tip_flush_hold: Arc<std::sync::atomic::AtomicBool>,
@@ -664,6 +666,7 @@ impl Query {
             owned_sizes_published: arc_swap::ArcSwap::from_pointee(ProcessOwnedSizes::default()),
             tip_commit: Mutex::new(()),
             tip_flush: Mutex::new(connect::TipFlush::Idle),
+            tip_flush_worker: connect::TipFlushWorker::default(),
             #[cfg(debug_assertions)]
             tip_flush_hold: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(debug_assertions)]
@@ -1563,6 +1566,7 @@ impl Drop for Query {
         if let Err(e) = self.join_tip_flush() {
             rbitcoin_log::warn!("store: IBD tip flush failed before close: {e}");
         }
+        self.stop_tip_flush_worker();
     }
 }
 

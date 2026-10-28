@@ -512,6 +512,7 @@ impl UringSession {
     /// Slow-log after 5 s of zero completions; poison at the drain hard cap.
     /// A lost CQE / phantom pending must not park lookup forever.
     pub fn submit_and_wait_one(&mut self) -> Result<(), StoreError> {
+        rbitcoin_primitives::assert_not_script_worker("store read");
         self.check_live()?;
         if self.pending.is_empty() {
             return Ok(());
@@ -580,6 +581,7 @@ impl UringSession {
 
     /// Kick submission without waiting (non-blocking).
     pub fn submit(&mut self) -> Result<(), StoreError> {
+        rbitcoin_primitives::assert_not_script_worker("store read");
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             SessionBackend::Uring(ring) => {
@@ -930,6 +932,7 @@ impl UringSession {
     #[cfg(target_os = "linux")]
     #[doc(hidden)]
     pub fn uring_final_harvest(&mut self, unexpected: &mut bool) {
+        rbitcoin_primitives::assert_not_script_worker("store read");
         let SessionBackend::Uring(ring) = &mut self.backend else {
             return;
         };

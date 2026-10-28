@@ -14,12 +14,14 @@
 //! No rayon / crossbeam.
 
 use arc_swap::ArcSwap;
-use std::cell::Cell;
 use std::collections::VecDeque;
+use std::future::Future;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 
 /// Jobs claimed per steal. Amortizes `next` / `in_wave` / `Arc<Wave>` traffic
@@ -28,13 +30,9 @@ pub const STEAL_CHUNK: usize = 32;
 
 use crate::error::ConsensusError;
 
-thread_local! {
-    static ON_STEAL_WORKER: Cell<bool> = const { Cell::new(false) };
-}
-
 #[doc(hidden)]
 pub fn on_steal_worker() -> bool {
-    ON_STEAL_WORKER.with(|c| c.get())
+    rbitcoin_primitives::on_script_worker()
 }
 
 /// Type-erased `f(&items[i])`. `ctx` is valid until the publisher drops the
@@ -589,7 +587,7 @@ pub fn workers() -> &'static ScriptWorkers {
             let Ok(h) = thread::Builder::new()
                 .name(format!("rbtc-scripts-{i}"))
                 .spawn(move || {
-                    ON_STEAL_WORKER.with(|c| c.set(true));
+                    rbitcoin_primitives::set_script_worker(true);
                     loop {
                         if steal_or_job(pool) {
                             continue;
@@ -725,10 +723,88 @@ where
     wake_steal_workers();
 }
 
+struct CpuState<T> {
+    value: Option<T>,
+    waker: Option<Waker>,
+    done: bool,
+}
+
+struct CpuFinish<T> {
+    state: Arc<Mutex<CpuState<T>>>,
+    value: Option<T>,
+}
+
+impl<T> Drop for CpuFinish<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut slot = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(value) = self.value.take() {
+                slot.value = Some(value);
+            }
+            slot.done = true;
+            slot.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+}
+
+/// A [`run_cpu`] join. `None` means the worker dropped the reply.
+#[doc(hidden)]
+pub struct CpuJob<T> {
+    state: Arc<Mutex<CpuState<T>>>,
+}
+
+impl<T> Future for CpuJob<T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<T>> {
+        let mut slot = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(value) = slot.value.take() {
+            return Poll::Ready(Some(value));
+        }
+        if slot.done {
+            return Poll::Ready(None);
+        }
+        slot.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+/// Run `work` on `rbtc-scripts-*` and await it.
+///
+/// The caller parks. It does not hold a blocking-pool thread. A published
+/// steal chunk is claimed before this job. `None` means the guest panicked
+/// and the worker dropped the reply. The worker stays in the pool.
+pub fn run_cpu<T, F>(work: F) -> CpuJob<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let state = Arc::new(Mutex::new(CpuState {
+        value: None,
+        waker: None,
+        done: false,
+    }));
+    let finish = CpuFinish {
+        state: Arc::clone(&state),
+        value: None,
+    };
+    spawn_detached(move || {
+        let mut finish = finish;
+        if let Ok(value) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            finish.value = Some(value);
+        }
+    });
+    CpuJob { state }
+}
+
 /// Run `work` on the shared `rbtc-scripts` pool and join the result.
 ///
 /// Used by mempool accept so the peer/tokio stack never runs the interpreter
-/// (even for a single input). Returns `None` if the pool is gone.
+/// (even for a single input). Returns `None` if the pool is gone. Callers
+/// that can await should use [`run_cpu`] so they do not hold a blocking thread.
 pub fn run_detached_join<T, F>(work: F) -> Option<T>
 where
     T: Send + 'static,

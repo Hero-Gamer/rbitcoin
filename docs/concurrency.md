@@ -10,7 +10,7 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Confirm **lookup** | 1 OS thread | pack/hold from BQ stamped Σ inputs; emit: decode BQ raw + TipOnly `head_fk` + **`take_raw` onto loadq** (`Arc<Block>` + `TxPrecompute`). Does **not** plan_batch / structure |
 | Confirm **load** | 1 OS thread | `confirm_wire_lookup_stamp` (structure with **loadq `pres`**, plan_batch binds carried BQ keys, skeleton bind) + pin `txout` + assemble |
 | Confirm **scripts** | 1 OS thread (`ibd-confirm`) publishes waves + `rbtc-scripts` steal (lock-free claim). The interpreter runs here, not on a peer IO task (`verify_tx_scripts_detached`) | **none** — pure CPU |
-| Confirm **write** | 1 OS thread (`ibd-confirm-write`) + 1 process-wide `ibd-confirm-head` + at most one `rbtc-tip-flush` (the Class C barrier, spawned per write batch) | **sole Class A appender** (`txout`+`seqsigwit`+`spent`; IBD encodes ins from `Arc<Block>` + SpendEdges) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. `tx.head` write-behind insert runs on **`ibd-confirm-head`** (not a per-batch spawn). `--datadir-hdd` starts that insert after spend annotate; otherwise it overlaps structural and Class C. Class A **never leads tip** (same commit era on a clean run; no archive-ahead DONTNEED). A crash inside the era can leave it above the tip ([crash-recovery.md](./crash-recovery.md#class-a-archive)). When `index_live` is set, this thread appends that index after `confirmed[h]` is set (one put per confirm batch) and does not read Class A for it. Startup `prepare_live_indexes` seals a restart gap of at most one write drain (14 × 144 heights) before confirm; a larger gap is left for `rbtc-idx-wb` |
+| Confirm **write** | 1 OS thread (`ibd-confirm-write`) + 1 process-wide `ibd-confirm-head` + one `rbtc-tip-flush` for the confirm engine (the Class C barrier) | **sole Class A appender** (`txout`+`seqsigwit`+`spent`; IBD encodes ins from `Arc<Block>` + SpendEdges) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. `tx.head` write-behind insert runs on **`ibd-confirm-head`** (not a per-batch spawn). `--datadir-hdd` starts that insert after spend annotate; otherwise it overlaps structural and Class C. Class A **never leads tip** (same commit era on a clean run; no archive-ahead DONTNEED). A crash inside the era can leave it above the tip ([crash-recovery.md](./crash-recovery.md#class-a-archive)). When `index_live` is set, this thread appends that index after `confirmed[h]` is set (one put per confirm batch) and does not read Class A for it. Startup `prepare_live_indexes` seals a restart gap of at most one write drain (14 × 144 heights) before confirm; a larger gap is left for `rbtc-idx-wb` |
 | IBD main loop | 1 tokio task | none (orchestration only). Event drain + confirm-offer every turn; getdata assign ≤50 ms (immediate if inflight empty); main-loop `getheaders`/`locator_hashes` ≤500 ms (empty path immediate); peer stall/relative-slow and work-path hygiene ≤1 s. Full-batch header continuation stays on the Headers event. Tip hash is the snapshot confirm published with `confirmed[]` (`published_tip`); each admitted header's parent stays on the work state. Those two reads are not store IO. The write holds `tip_commit` from the tip-height check through `flush_class_c_tip`; in IBD, through starting it on `rbtc-tip-flush`, and the next `tip_commit` taker joins that flush first. IBD rewind tries that lock, and treats a flush still running as held, and retries on the next pass. |
 
 **IoSession TLS:** one completion session per OS thread (`with_thread_local`). Harvest / poison / drain / do-not-flatten: [`io-modality.md`](./io-modality.md). `RBITCOIN_IO=pread` disables the session. SH k-way merge submits 256 KiB ahead preads on that TLS session and waits only when promote needs a page that has not completed.
@@ -44,14 +44,16 @@ Three thread kinds only. **Tokio workers must not wait on a `std` mutex/rwlock, 
 | Kind | Who | Notes |
 |------|-----|--------|
 | Reactor | `tokio-rt-worker` × nCPU | epoll, timers, framing. Node caps `spawn_blocking` at nCPU (min 4), not tokio’s 512. |
-| Role | `tip-accept`, `ibd-confirm-*`, `rbtc-sh-wb`, `rbtc-idx-wb` | Sole writer for a resource. Not a job pool. |
-| Work pool | `rbtc-scripts-*` steal; tokio blocking pool | Independent jobs. Mempool accept / Electrum / Esplora / RPC run here. |
+| Role | `tip-accept`, `ibd-header`, `ibd-confirm-*`, `rbtc-tip-flush`, `rbtc-sh-wb`, `rbtc-idx-wb` | Sole writer for a resource. Not a job pool. |
+| Work pool | `rbtc-scripts-*` steal; tokio blocking pool | Independent jobs. Mempool accept / Electrum / Esplora / RPC store joins run on the blocking pool. Heavy v2 encode, compact short ids, and JSON of at least 4 KiB run on `rbtc-scripts-*`. |
 
 | Role | Notes |
 |------|--------|
 | `peer_session` (split read/write) | Serve getdata. Full-block, compact, and `getblocktxn` reconstruct run on the blocking pool (block-decode permit). Inbound `cmpctblock` reconstruct uses that same permit. `headers` persist and `getheaders` / `getblocks` replies run on the blocking pool under the header-decode permit. The session applies notes, ban, and queued `getdata` after that join. Offers reconstructed blocks to **`tip-accept`** (does **not** take `connect_lock` or run confirm on the tokio worker). A reconstructed/received body whose header has valid PoW and **extends the current tip** is announced as `cmpctblock` to peers who sent `sendcmpct` announce=1 and already have the parent **before** connect (Core `NewPoWValidBlock`). That is not a connected tip. P2P `tx` is `accept_tx_async` (blocking pool). INV / getdata / compact **first-pass** fill use mempool **`try_read` only** (busy write → skip that item; never park). A pending compact owns those clones; `blocktxn` apply does not `try_read` again. Handshake `FeeFilter` reads the **atomic** published fee floor (no `inner`). 50 ms tick: age-INV is a due-log cursor (newly due only); `clock_due` / unbroadcast may full-walk ≤1/30 s. `any_tx_inv_due` is min live `accept_at`, not a map walk. `PeerHub::on_session_heartbeat` (headers-sync stall timeout). While the writer is past the 4 MiB send budget, or a paused `getdata` tail waits for serve room, the reader reads no frame; the heartbeat still runs, so the ping timeout still fires. Inbound accept is `inbound_connect_and_handshake` (60 s VERSION/VERACK); timeout drops the `max_inbound` permit. |
 | `tip-accept` | **One** process-wide OS thread. Queue depth 8. Sole production thread for `accept_block` / `accept_branch` / `accept_received_block` / `generate_to_script` / `connect_lock` at tip. Confirm is **`confirm_wire_run_preverified`** (lookup stamp, load pin/assemble, `confirm_scripts_phase` → `rbtc-scripts-*`, write + `ibd-confirm-head` drain). TLS uring is this thread’s `with_thread_local` session. SIGINT stays on tokio; the current job finishes, then the session sees shutdown. Dropping the session’s join future **detaches** (does not condvar-wait on the worker). |
-| `rbtc-sh-wb` | **One** Class B scripthash appender. Used for tip follow **and** short catch-up when a durable SH head already exists. Confirm enqueues RAM records; `connect_at` / `note_confirmed_tip` **release** after `tip_tx`. This thread `put_create_batch_append` only for released heights, then advances `sh_indexed_through`. Apply errors re-queue and halt. Post-IBD Class A collect uses pack sessions (not a second appender); it runs while still Direct so this thread no-ops. The Class A tail backfill holds `sh.appender` across each chunk append, the same exclusion as this thread. `RBITCOIN_SH_FORCE_REBUILD` on a durable head enters Tip before that tail, so the lock is what keeps the two from appending one scripthash at once. There is no process-local head map. |
+| `ibd-header` | **One** thread for the catch-up. Persists header batches, loads the walk origin, and reseeds. Joined when IBD stops. |
+| `rbtc-tip-flush` | **One** thread for the IBD confirm engine. Runs the Class C barrier. The next commit waits for the in-flight barrier. Joined when the engine stops. Tip mode flushes that barrier inline on `tip-accept`. |
+| `rbtc-sh-wb` | **One** Class B scripthash appender. A durable `--sh-index` head starts it before catch-up. Direct catch-up starts it only after materialize enters Tip. Absent for the whole Direct catch-up, including a cancelled or failed materialize. Confirm enqueues RAM records; `connect_at` / `note_confirmed_tip` **release** after `tip_tx`. This thread `put_create_batch_append` only for released heights, then advances `sh_indexed_through`. Apply errors re-queue and halt. The Class A tail holds `sh.appender` and finishes inside tip entry before this thread starts. The same lock is the exclusion if a tail and the worker ever overlap. There is no process-local head map. |
 | `rbtc-idx-wb` / `rbtc-idx-cpu` | **One** block index builder for BIP158 basic filters (`--block-filter-index`) and BIP-352 tweaks (`--sp-tweaks`), spawned at tip entry only when an enabled watermark is still behind the tip after startup repair. Live batches append on the confirm write thread; this reader does not walk a chain that was indexed as it connected. Waits on the same release gate as `rbtc-sh-wb` (`index_released_through`). The IO thread plans windows (≤64 heights / ≤50k creates) from the lower index watermark to the released tip and reads each with `read_index_window` on one completion session (locators, block spans, parent locators + P2TR-output `seqsigwit` + parent txids, parent records). One CPU worker, at most two windows behind, publishes one job per height to `rbtc-scripts-*` (filter GCS and tweak EC). That wave claims one height, so a short window still spreads across the pool. The CPU worker commits each index once per window under the index write-behind mutex, only if its watermark and every `confirmed[h]` are unchanged; `disconnect_tip_with` takes that mutex before truncating both. A failed commit (reorg) makes the IO thread re-plan from the watermarks. Apply errors halt the node. |
 | Electrum / Esplora | Confirmed SH reads join durable index **plus a RAM SH head** (pending jobs keyed by scripthash) and pin that visible height (live tip while jobs sit, never above published tip). A tx is in mempool overlay **or** SH (pending/durable), not both and not neither. Reorg reaccepts then drops pending. Headers subscribe is live tip. |
 | Epoch finalize | Single-threaded control path; flushes table maps / fd durability |
@@ -146,11 +148,12 @@ the body is missing, so the session check is gone.
 
 **Fixed.** A compact tip announcement used to call `block_for_peer` on the
 session inside `on_tip_event`, then build short ids there.
-`cmpct_announce_msg` now does both on the blocking pool, under the
-block-decode permit. A missing body still falls through to a headers
-announcement. High-bandwidth relay of a body already in hand persists that
-header, builds the prefill, and builds those short ids on that pool
-too, and only when a high-bandwidth peer would be offered the block.
+The body load stays on the blocking pool, under the block-decode permit.
+Short ids run on `rbtc-scripts-*` once that body is in hand. A missing
+body still falls through to a headers announcement. High-bandwidth relay
+of a body already in hand persists that header and builds the prefill on
+the blocking pool, then builds those short ids on `rbtc-scripts-*`, and
+only when a high-bandwidth peer would be offered the block.
 A failed high-bandwidth join is logged and skips that announcement.
 A failed compact tip-announce join still ends that session.
 An unsolicited compact block that does not
@@ -196,10 +199,26 @@ body was found. `is_connected` is the published height index and does not
 read the header file. The per-item getdata loop was the batch, and that
 moved.
 
-**Deferred.** Mempool accept, Electrum, Esplora, RPC, block decode,
-compact reconstruct, and header jobs share Tokio's blocking pool (nCPU,
-minimum 4). A private pool would be a second pool. RPC can delay a
-reconstruct until one replacement lane exists.
+**Fixed.** Block-sized pure CPU leaves the blocking pool for
+`rbtc-scripts-*` through `run_cpu`. That is v2 encode when
+`encode_is_cpu_heavy` (a short header batch and an inv list of 64 or fewer
+stay on the caller), compact short ids after the body is in hand, and
+Electrum or Esplora JSON of at least 4 KiB, including block templates.
+Under 4 KiB, JSON stays on the
+thread that did the store join. `run_cpu` parks the awaiting task. A guest
+panic drops that reply and leaves the worker in the pool. A script worker
+that calls store IO panics, including `pread_exact`, `pwrite_all`, and an
+io_uring submit. A published steal chunk still runs before the
+guest.
+`run_cpu_uses_one_script_worker_after_the_wave`,
+`run_cpu_panic_keeps_the_worker`, and `script_worker_cannot_pread` are the
+pins.
+
+**Deferred.** Mempool accept, Electrum, Esplora, and RPC store joins, block
+and header decode, compact reconstruct, header persist, and full-block
+serve stay on Tokio's blocking pool (nCPU, minimum 4). The cap stays there
+while block decode still occupies that pool. A private pool would be a
+second pool. RPC can delay a reconstruct until one replacement lane exists.
 
 **Fixed.** Each failed async `try_send` on a full tip-accept queue
 increments `FULL_QUEUE_SPINS`, then the sender parks on `Notify`. A yield

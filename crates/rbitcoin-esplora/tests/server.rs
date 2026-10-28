@@ -916,6 +916,106 @@ async fn block_txs_past_end_is_not_found() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+struct ScriptHold {
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl ScriptHold {
+    fn all() -> Self {
+        let n = rbitcoin_consensus::script_pool::worker_spawn_count();
+        assert!(n >= 1, "script pool did not start");
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..n {
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&gate);
+            rbitcoin_consensus::script_pool::spawn_detached(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*gate;
+                let mut g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while !*g {
+                    g = cv.wait(g).unwrap_or_else(|p| p.into_inner());
+                }
+            });
+        }
+        let start = Instant::now();
+        while entered.load(Ordering::SeqCst) < n {
+            assert!(
+                start.elapsed() < Duration::from_secs(2),
+                "script workers did not park"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Self { gate }
+    }
+}
+
+impl Drop for ScriptHold {
+    fn drop(&mut self) {
+        let (lock, cv) = &*self.gate;
+        *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+/// A template at 4 KiB keeps `cache-control: no-store` and does not encode
+/// until a script worker is free.
+#[test]
+fn heavy_template_encode_waits_for_a_script_worker() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Wake, Waker};
+    use std::thread;
+
+    let chars = rbitcoin_electrum::JSON_CPU_MIN - 2;
+    let body = Arc::new(Value::String("a".repeat(chars)));
+    assert!(rbitcoin_electrum::json_is_cpu_heavy(&body));
+    let hold = ScriptHold::all();
+    let resp = handlers::gbt_json(&body);
+    let cc = resp
+        .headers()
+        .get(axum::http::header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cc, "no-store");
+
+    struct Unpark(thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut pending = Box::pin(ensure_json(resp));
+    assert!(
+        matches!(pending.as_mut().poll(&mut cx), Poll::Pending),
+        "a template at 4 KiB encoded while script workers were held"
+    );
+    drop(hold);
+    let start = Instant::now();
+    let ready = loop {
+        match pending.as_mut().poll(&mut cx) {
+            Poll::Ready(resp) => break resp,
+            Poll::Pending => {
+                assert!(start.elapsed() < Duration::from_secs(2));
+                thread::park_timeout(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(ready.status(), axum::http::StatusCode::OK);
+    let mut body_fut = Box::pin(axum::body::to_bytes(ready.into_body(), usize::MAX));
+    let bytes = loop {
+        match body_fut.as_mut().poll(&mut cx) {
+            Poll::Ready(bytes) => break bytes.expect("template body"),
+            Poll::Pending => {
+                assert!(start.elapsed() < Duration::from_secs(2));
+                thread::park_timeout(Duration::from_millis(10));
+            }
+        }
+    };
+    assert_eq!(bytes.as_ref(), serde_json::to_vec(body.as_ref()).unwrap());
+}
+
 include!("esplora_sh_journey.rs");
 include!("esplora_http_journey.rs");
 include!("blindbit_journey.rs");

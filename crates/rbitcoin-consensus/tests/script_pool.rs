@@ -855,3 +855,106 @@ fn second_stage_keeps_the_first_publisher_wake() {
     a.join().expect("stage a");
     b.join().expect("stage b");
 }
+
+static CPU_ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+fn note_cpu_wave(_: &u32) -> Result<(), ConsensusError> {
+    CPU_ORDER.lock().unwrap_or_else(|p| p.into_inner()).push(1);
+    Ok(())
+}
+
+fn block_on_cpu<T>(job: CpuJob<T>) -> Option<T> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Unpark(thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let mut job = Pin::new(Box::new(job));
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    loop {
+        match job.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => return v,
+            Poll::Pending => thread::park(),
+        }
+    }
+}
+
+/// `None` when `limit` passes with the job still pending. The waiter thread
+/// is left behind on timeout so a dead script worker cannot hang the suite.
+fn block_on_cpu_timeout<T: Send + 'static>(job: CpuJob<T>, limit: Duration) -> Option<Option<T>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(block_on_cpu(job));
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+/// `run_cpu` finishes on `rbtc-scripts-*`. The caller parks; it does not
+/// take a blocking-pool thread. A published steal chunk runs before the guest.
+#[test]
+fn run_cpu_uses_one_script_worker_after_the_wave() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    CPU_ORDER.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    let n = worker_spawn_count();
+    let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+    let wave = start_for_each_pooled(vec![1u32], note_cpu_wave, 1)
+        .unwrap()
+        .expect("published wave");
+    let name = block_on_cpu(run_cpu(|| {
+        CPU_ORDER.lock().unwrap_or_else(|p| p.into_inner()).push(2);
+        thread::current().name().unwrap_or("").to_string()
+    }))
+    .expect("script worker");
+    wave.finish().unwrap();
+    occupy.release();
+    assert!(name.starts_with("rbtc-scripts-"), "guest ran on {name}");
+    assert_eq!(
+        CPU_ORDER
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_slice(),
+        &[1, 2],
+        "the steal chunk finishes before the guest"
+    );
+}
+
+/// A panicking guest drops the reply and leaves that worker in the pool.
+/// The other workers are held, so the next job can run only on the one
+/// that just panicked.
+#[test]
+fn run_cpu_panic_keeps_the_worker() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let n = worker_spawn_count();
+    let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+    let lost = block_on_cpu_timeout(
+        run_cpu(|| -> u8 { panic!("run_cpu guest") }),
+        Duration::from_secs(2),
+    );
+    assert_eq!(lost, Some(None), "a panicking guest must drop the reply");
+    let next = block_on_cpu_timeout(run_cpu(|| 7u8), Duration::from_secs(2));
+    occupy.release();
+    assert_eq!(
+        next,
+        Some(Some(7)),
+        "the script worker must take the next job"
+    );
+}
+
+/// A guest that enters store IO trips the script-worker guard.
+#[test]
+fn run_cpu_guest_cannot_touch_store_io() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let hit = block_on_cpu(run_cpu(|| {
+        std::panic::catch_unwind(|| {
+            rbitcoin_primitives::assert_not_script_worker("store read");
+        })
+        .is_err()
+    }))
+    .expect("script worker");
+    assert!(hit, "store read on a script worker must panic");
+}

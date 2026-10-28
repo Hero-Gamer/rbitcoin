@@ -1189,6 +1189,128 @@ fn enter_tip_mode_cancel_does_not_name_missing_cold_progress() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Materialize holds the worker for the whole extract. A reactor thread
+/// must not be that worker.
+#[test]
+fn enter_tip_mode_refuses_a_reactor_worker() {
+    let dir = scratch_dir("tip-reactor");
+    let query = Arc::new(Query::open_or_create_tiny(&dir).unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    let on_worker = Arc::clone(&query);
+    let panicked = rt.block_on(async move {
+        tokio::spawn(async move {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                enter_tip_mode(&on_worker, None, false);
+            }))
+            .is_err()
+        })
+        .await
+        .expect("reactor task")
+    });
+    assert!(panicked, "enter_tip_mode must not run on a tokio-rt-worker");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same call is the blocking-pool job `run_p2p` uses after catch-up.
+#[test]
+fn enter_tip_mode_runs_in_a_blocking_region() {
+    let dir = scratch_dir("tip-blocking");
+    let query = Arc::new(Query::open_or_create_tiny(&dir).unwrap());
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    let on_pool = Arc::clone(&query);
+    rt.block_on(async move {
+        tokio::task::spawn_blocking(move || {
+            let _region = rbitcoin_net::BlockingRegion::enter();
+            enter_tip_mode(&on_pool, None, false);
+        })
+        .await
+        .expect("blocking tip entry")
+    });
+    assert!(!query.enqueues_sh_writebehind());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Direct catch-up, a failed materialize, and `--sh-index` off do not start
+/// the appender. A durable Tip head starts one `rbtc-sh-wb`. A second start
+/// does not spawn another.
+#[test]
+fn sh_writebehind_starts_only_after_tip_entry() {
+    let dir = scratch_dir("sh-wb-gate");
+    let query = Arc::new(Query::open_or_create_tiny(&dir).unwrap());
+    query.enter_direct_index_mode_sh(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut slot = None;
+    ensure_sh_writebehind(&mut slot, Arc::clone(&query), Arc::clone(&stop), || {});
+    assert!(slot.is_none(), "direct catch-up does not start rbtc-sh-wb");
+
+    let cancel = Arc::new(AtomicBool::new(true));
+    let gates = enter_tip_mode(&query, Some(cancel), true);
+    assert!(gates.tip_follow_ready);
+    assert!(!gates.sh_tip_ready);
+    assert!(query.index_mode().unwrap().is_direct());
+    ensure_sh_writebehind(&mut slot, Arc::clone(&query), Arc::clone(&stop), || {});
+    assert!(
+        slot.is_none(),
+        "cancelled materialize stays Direct and does not start rbtc-sh-wb"
+    );
+
+    let gates = enter_tip_mode(&query, None, false);
+    assert!(gates.sh_tip_ready);
+    ensure_sh_writebehind(&mut slot, Arc::clone(&query), Arc::clone(&stop), || {});
+    assert!(slot.is_none(), "shindex off does not start rbtc-sh-wb");
+
+    query.set_sh_index_enabled(true);
+    query.enter_tip_index_mode();
+    ensure_sh_writebehind(&mut slot, Arc::clone(&query), Arc::clone(&stop), || {});
+    let first = slot.as_ref().expect("durable tip").thread().id();
+    ensure_sh_writebehind(&mut slot, Arc::clone(&query), Arc::clone(&stop), || {});
+    assert_eq!(
+        slot.as_ref().expect("same appender").thread().id(),
+        first,
+        "a second start must not replace rbtc-sh-wb"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut comms = linux_task_comms();
+        while Instant::now() < deadline
+            && comms.iter().filter(|name| *name == "rbtc-sh-wb").count() < 1
+        {
+            std::thread::sleep(Duration::from_millis(10));
+            comms = linux_task_comms();
+        }
+        let n = comms.iter().filter(|name| *name == "rbtc-sh-wb").count();
+        assert_eq!(n, 1, "one rbtc-sh-wb, saw {comms:?}");
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    slot.take().expect("rbtc-sh-wb").join().expect("rbtc-sh-wb");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(target_os = "linux")]
+fn linux_task_comms() -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return names;
+    };
+    for task in tasks.flatten() {
+        if let Ok(raw) = std::fs::read_to_string(task.path().join("comm")) {
+            names.push(raw.trim_end_matches('\n').to_string());
+        }
+    }
+    names
+}
+
 #[tokio::test]
 async fn max_run_deadline_wakes_without_the_perf_tick() {
     let mut perf = tokio::time::interval(Duration::from_secs(30));
