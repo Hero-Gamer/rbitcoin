@@ -1468,6 +1468,9 @@ pub fn ip_skips_discourage(ip: IpAddr) -> bool {
 pub struct PeerHub {
     pub next_id: AtomicU64,
     pub live: RwLock<HashMap<u64, Arc<LivePeer>>>,
+    /// One tx-relay inbound count-and-evict at a time, so two newcomers
+    /// cannot both claim one victim.
+    tx_relay_room: Mutex<()>,
     pub added: Mutex<HashSet<crate::NetAddr>>,
     /// Raw `addnode add` strings. Re-resolved on each redial so a Warnet name
     /// that is not in DNS yet is kept.
@@ -1606,6 +1609,7 @@ impl PeerHub {
         Arc::new(Self {
             next_id: AtomicU64::new(0),
             live: RwLock::new(HashMap::new()),
+            tx_relay_room: Mutex::new(()),
             added: Mutex::new(HashSet::new()),
             manual_hosts: Mutex::new(HashSet::new()),
             connect_hosts: Mutex::new(Vec::new()),
@@ -3332,14 +3336,12 @@ impl PeerHub {
     /// [`crate::peer_dos::FULL_RELAY_INBOUND_PCT`] of `max_inbound`, a
     /// tx-relaying `newcomer` evicts another tx-relaying inbound. `false` when
     /// every other one is protected and `newcomer` must go instead.
-    pub(crate) fn make_room_for_tx_relay_inbound(
-        &self,
-        newcomer: &LivePeer,
-        max_inbound: usize,
-    ) -> bool {
+    #[doc(hidden)]
+    pub fn make_room_for_tx_relay_inbound(&self, newcomer: &LivePeer, max_inbound: usize) -> bool {
         if !newcomer.relay {
             return true;
         }
+        let _room = self.tx_relay_room.lock().unwrap_or_else(|e| e.into_inner());
         let cap = max_inbound * crate::peer_dos::FULL_RELAY_INBOUND_PCT / 100;
         let tx_relay = self
             .live_peers()
