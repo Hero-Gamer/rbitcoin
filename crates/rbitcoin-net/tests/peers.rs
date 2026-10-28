@@ -1499,3 +1499,66 @@ fn external_ip_uses_the_clearnet_bogon_filter() {
         false
     ));
 }
+
+/// Tx-relaying newcomers finish their handshakes at the same moment. Each
+/// check evicts its own peer: none is closed while an unprotected resident
+/// is left, and the tx-relay share still holds once every check returns.
+/// TCP handshakes cannot finish this close together, so the checks run on
+/// threads against one hub.
+#[test]
+fn concurrent_tx_relay_newcomers_keep_the_inbound_share() {
+    const MAX_INBOUND: usize = 60;
+    let share = MAX_INBOUND / 2;
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    for round in 0..300 {
+        let hub = PeerHub::new();
+        for i in 0..share {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8 + 1)), 8333);
+            hub.register(addr, bind, &ver("/resident/"), true, PeerConnType::Inbound);
+        }
+        let newcomers: Vec<_> = (11..19)
+            .map(|net| {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(net, 0, 0, 1)), 8333);
+                hub.register(addr, bind, &ver("/newcomer/"), true, PeerConnType::Inbound)
+            })
+            .collect();
+        let go = AtomicBool::new(false);
+        let closed = std::thread::scope(|s| {
+            let checks: Vec<_> = newcomers
+                .iter()
+                .map(|newcomer| {
+                    let (hub, go) = (&hub, &go);
+                    s.spawn(move || {
+                        while !go.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        let stays = hub.make_room_for_tx_relay_inbound(newcomer, MAX_INBOUND);
+                        if !stays {
+                            hub.disconnect_id(newcomer.id);
+                        }
+                        stays
+                    })
+                })
+                .collect();
+            go.store(true, Ordering::Release);
+            checks
+                .into_iter()
+                .map(|c| c.join().unwrap())
+                .filter(|stays| !stays)
+                .count()
+        });
+        let tx_relay = hub
+            .snapshot()
+            .iter()
+            .filter(|p| p.inbound && p.relay)
+            .count();
+        assert_eq!(
+            closed, 0,
+            "round {round}: a newcomer closed with residents to evict"
+        );
+        assert_eq!(
+            tx_relay, share,
+            "round {round}: tx-relaying inbounds after the checks"
+        );
+    }
+}

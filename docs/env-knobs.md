@@ -40,7 +40,7 @@ for signet/mainnet sync. **Not** CLI.
 | `RBITCOIN_HEAD_SLOTS_HEADER` | scale default | Header hash-head initial slots (power of two) |
 | `RBITCOIN_SH_FORCE_REBUILD` | off | Sticky SH rebuild (also in OPERATOR) |
 | `RBITCOIN_SH_MERGE_WORKERS` | min(n-cpu, max(1, free-RAM/1.5 GiB)) | SH extract (collect, merge, BDZ, fuse, pass 2, pack). `1` = serial. Unset = auto (see [`ibd-memory.md`](./ibd-memory.md)) |
-| `RBITCOIN_P2P_MAX_INBOUND` | 125 | Only if `--max-inbound` / conf omitted |
+| `RBITCOIN_P2P_MAX_INBOUND` | 200 | Only if `--max-inbound` / conf omitted |
 | `RBITCOIN_URING_DRAIN_HARD_SECS` | 120 | `drain_all` zero-CQE abort (Linux/pool/IOCP). Raise if completions are slow but still arriving |
 | `RBITCOIN_RPC_WAIT_TIP_IDLE` | off | `getblockcount` / `getbestblockhash` / `wait_height` wait until the tip-accept lane is empty. Default (unset) waits only for the job that was running when the RPC arrived. The Core-functional bitcoind shim sets `1` so `sync_blocks` stays deterministic. **Not** a production operator knob |
 | `RBITCOIN_RPC_PACKAGE_DIALECT` | off | `submitpackage` uses Core `IsChildWithParents` (`-25 package topology disallowed`). Default (unset) still package-evaluates a child-with-parents remainder that failed min relay, the dynamic mempool floor, or missing inputs; a child that is not that shape stays `bad-txns-inputs-missingorspent`. A member whose own feerate exceeds `maxfeerate` is rejected either way and does not rescue the package. The Core-functional bitcoind shim sets `1`. **Not** a production operator knob |

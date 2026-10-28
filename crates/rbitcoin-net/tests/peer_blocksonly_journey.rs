@@ -3,6 +3,16 @@ fn relay_peer(
     ip: [u8; 4],
     conn: rbitcoin_net::peers::PeerConnType,
 ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
+    peer_with_relay(peers, ip, conn, true)
+}
+
+/// A peer whose `version.relay` is `relay`.
+fn peer_with_relay(
+    peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+    ip: [u8; 4],
+    conn: rbitcoin_net::peers::PeerConnType,
+    relay: bool,
+) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
     use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_network::VersionMessage;
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 18444);
@@ -15,7 +25,7 @@ fn relay_peer(
         nonce: 1,
         user_agent: "/rbitcoin:test/".into(),
         start_height: 0,
-        relay: true,
+        relay,
     };
     let inbound = conn == rbitcoin_net::peers::PeerConnType::Inbound;
     peers.register(addr, addr, &ver, inbound, conn)
@@ -281,15 +291,15 @@ fn relay_on_purges_confirmed(hub: &rbitcoin_net::chain::ChainHub, confirmed: Vec
     assert_eq!(mp.live_count(), 0, "relay on purges what the chain confirmed");
 }
 
-/// `force_announce_txid` INVs only to a full-relay peer with a writer that
-/// has not seen the wtx and whose feefilter the tx clears. Isolated
+/// `force_announce_txid` INVs only to a full-relay peer that asked for txs,
+/// has a writer, has not seen the wtx, and whose feefilter the tx clears. Isolated
 /// broadcast keeps a local-origin tx off standing peers until it confirms.
 fn force_announce_picks_peers(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
     heights: [u32; 3],
 ) {
-    use rbitcoin_net::peers::PeerConnType::{BlockRelay, OutboundFullRelay};
+    use rbitcoin_net::peers::PeerConnType::{BlockRelay, Inbound, OutboundFullRelay};
     let mp = hub.mempool().unwrap();
     let relayed = spend_coinbase(hub, heights[0]);
     let local = spend_coinbase(hub, heights[1]);
@@ -298,6 +308,8 @@ fn force_announce_picks_peers(
 
     let block_relay = relay_peer(peers, [127, 0, 0, 1], BlockRelay);
     let mut block_relay_rx = writer_of(&block_relay);
+    let no_tx_relay = peer_with_relay(peers, [127, 0, 0, 1], Inbound, false);
+    let mut no_tx_relay_rx = writer_of(&no_tx_relay);
     let no_writer = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let seen = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);
     let mut seen_rx = writer_of(&seen);
@@ -317,6 +329,10 @@ fn force_announce_picks_peers(
     seen.note_announced_wtx(relayed.compute_wtxid());
     rbitcoin_net::force_announce_txid(hub, peers, relayed.compute_txid());
     assert!(block_relay_rx.try_recv().is_err(), "block-relay skips INV");
+    assert!(
+        no_tx_relay_rx.try_recv().is_err(),
+        "a peer that sent relay=false skips INV"
+    );
     assert!(seen_rx.try_recv().is_err(), "already-announced skips INV");
     assert!(pricey_rx.try_recv().is_err(), "minfeefilter skips INV");
     assert_eq!(tx_invs(&mut ok_rx), vec![relayed.compute_wtxid()]);
@@ -416,6 +432,7 @@ fn force_announce_picks_peers(
     );
     for s in [
         block_relay,
+        no_tx_relay,
         no_writer,
         seen,
         pricey,
@@ -434,7 +451,8 @@ fn force_announce_picks_peers(
 /// Relay on: inbound waits 30s even for an unbroadcast tx, never gets a tx
 /// accepted before it connected, and idle ticks neither clone bodies nor
 /// rescan live wtxids once the age cursor caught up (`mempool_reorg.py:71`,
-/// `p2p_tx_privacy.py`).
+/// `p2p_tx_privacy.py`). An inbound that sent `relay=false` gets only our
+/// unbroadcast tx, and nothing walks the mempool for it once that is gone.
 fn relay_on_inbound_age_gate(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
@@ -445,6 +463,7 @@ fn relay_on_inbound_age_gate(
     let mp = hub.mempool().unwrap();
     set_relay_clock(hub, peers, now);
     let inbound = relay_peer(peers, [127, 0, 0, 1], Inbound);
+    let block_only = peer_with_relay(peers, [127, 0, 0, 1], Inbound, false);
     let txs: Vec<_> = heights.map(|h| spend_coinbase(hub, h)).collect();
     for tx in &txs {
         mp.accept_tx(tx).expect("accept");
@@ -505,9 +524,29 @@ fn relay_on_inbound_age_gate(
     );
     assert!(out_rx.try_recv().is_err(), "second age tick must not re-INV");
 
+    queue_due_tx_invs(hub, block_only.as_ref(), &CappedSet::new(), &out_tx);
+    assert_eq!(
+        tx_invs(&mut out_rx),
+        vec![txs[0].compute_wtxid()],
+        "a relay=false inbound gets only the unbroadcast tx"
+    );
+    mp.mark_broadcast(&txs[0].compute_txid());
+    block_only.request_tx_inv();
+    let _ = mp.sample_reset_perf();
+    queue_due_tx_invs(hub, block_only.as_ref(), &CappedSet::new(), &out_tx);
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a relay=false inbound gets no mempool INV"
+    );
+    assert_eq!(
+        mp.sample_reset_perf().list_live_wtxids,
+        0,
+        "a relay=false inbound does not walk the mempool"
+    );
+
     hub.generate_to_script(1, op_true(), txs).unwrap();
     assert_eq!(mp.live_count(), 0);
-    for s in [inbound, late, outbound] {
+    for s in [inbound, block_only, late, outbound] {
         peers.unregister(s.id);
     }
 }

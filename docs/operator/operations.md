@@ -84,7 +84,7 @@ Clean smoke:
 | `--i2p-accept-incoming` | `i2p_accept_incoming=` | **off** — persist `{datadir}/i2p/p2p.priv` and STREAM FORWARD to the P2P bind |
 | `--milestone HEIGHT` | `milestone=` | mainnet anchor at 840000; testnet3 anchor at 2500000; signet 0; explicit height is height-only |
 | `--max-outbound N` | `max_outbound=` | 16 live download peers |
-| `--max-inbound N` | `max_inbound=` | 125 inbound sessions; **0** = no inbound slots (outbound-only) |
+| `--max-inbound N` | `max_inbound=` | 200 inbound sessions. Peers that relay transactions hold at most half; the rest are for block-relay-only peers. **0** = no inbound slots (outbound-only) |
 | `--mempool-size-mb N` | `mempool_size_mb=` | **300** → 300e6 WU (`N × 1_000_000` weight, not MiB) |
 | `--conf FILE` | | none |
 | `--log-level LEVEL` | `log_level=` | `info` |

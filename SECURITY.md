@@ -56,7 +56,8 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   invalid chain data or rejecting valid data. Report both.
 - **P2P:** BIP324 v2-only. DoS parity with Bitcoin Core is **not** claimed, but
   mitigations are intentional operator surface: max inbound sessions
-  (`--max-inbound`, default 125), per-session message/byte
+  (`--max-inbound`, default 200; peers that relay transactions hold at
+  most half), per-session message/byte
   rate windows, misbehavior score disconnect. Peer AEAD is the
   `chacha20-poly1305` 0.1 that `bip324` 0.11 links. That is current
   `rust-bitcoin/bip324` master, not a local pin. `noise_sv2` already uses

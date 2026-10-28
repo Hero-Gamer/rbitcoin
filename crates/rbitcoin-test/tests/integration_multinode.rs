@@ -1641,7 +1641,96 @@ async fn p2p_feeler_completes_and_closes() {
         .expect("p2p_feeler_completes_and_closes wall timeout (20s)");
 }
 
-/// `max_inbound=1`: a second outbound follow is refused; the first session stays.
+/// Completed inbound sessions on `node`: address and `version.relay`.
+fn completed_inbound(node: &P2PNode) -> Vec<(SocketAddr, bool)> {
+    node.peers
+        .snapshot()
+        .into_iter()
+        .filter(|p| p.inbound && !p.subver.is_empty())
+        .map(|p| (p.addr, p.relay))
+        .collect()
+}
+
+async fn wait_completed_inbound(
+    node: &P2PNode,
+    what: &str,
+    done: impl Fn(&[(SocketAddr, bool)]) -> bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = completed_inbound(node);
+        if done(&rows) {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{what}: {rows:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An inbound session whose VERSION carried a chosen `relay` flag.
+struct RawInbound {
+    addr: SocketAddr,
+    reader: rbitcoin_net::v2::V2Reader,
+    _writer: rbitcoin_net::v2::V2Writer,
+}
+
+impl RawInbound {
+    /// Handshake with `node`. `None` when the node closes the session first.
+    async fn connect(node: SocketAddr, relay: bool) -> Option<Self> {
+        use bitcoin::p2p::address::Address;
+        use bitcoin::p2p::message::NetworkMessage;
+        use bitcoin::p2p::message_network::VersionMessage;
+        use bitcoin::p2p::{Magic, ServiceFlags};
+        use rbitcoin_net::v2::{open_v2, read_v2_frame, write_v2_msg};
+
+        let stream = tokio::net::TcpStream::connect(node).await.ok()?;
+        let addr = stream.local_addr().ok()?;
+        let (mut reader, mut writer, _, _) = open_v2(stream, Magic::REGTEST, false).await.ok()?;
+        let version = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+            timestamp: 0,
+            receiver: Address::new(&node, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: u64::from(addr.port()),
+            user_agent: "/raw-inbound/".into(),
+            start_height: 0,
+            relay,
+        };
+        write_v2_msg(&mut writer, NetworkMessage::Version(version))
+            .await
+            .ok()?;
+        loop {
+            let frame = read_v2_frame(&mut reader, Magic::REGTEST).await.ok()?;
+            if matches!(frame.decode().payload(), NetworkMessage::Verack) {
+                break;
+            }
+        }
+        write_v2_msg(&mut writer, NetworkMessage::Verack)
+            .await
+            .ok()?;
+        Some(Self {
+            addr,
+            reader,
+            _writer: writer,
+        })
+    }
+
+    /// True when the node closes this session within `limit`.
+    async fn closed_within(&mut self, limit: Duration) -> bool {
+        let drain = async {
+            while rbitcoin_net::v2::read_v2_frame(&mut self.reader, bitcoin::p2p::Magic::REGTEST)
+                .await
+                .is_ok()
+            {}
+        };
+        tokio::time::timeout(limit, drain).await.is_ok()
+    }
+}
+
+/// `max_inbound=2`: tx-relaying inbounds hold half the slots (Core #28463).
+/// A second tx-relaying inbound is closed, a block-relay-only inbound takes
+/// the other slot, and a follow past both slots is refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p2p_inbound_full_rejects_extra() {
     let fut = async {
@@ -1649,7 +1738,7 @@ async fn p2p_inbound_full_rejects_extra() {
         let seed_dir = TempDir::new().unwrap();
         let a_dir = TempDir::new().unwrap();
         let b_dir = TempDir::new().unwrap();
-        let seed = start_node_inbound(&seed_dir, 1).await;
+        let seed = start_node_inbound(&seed_dir, 2).await;
         let mut a = start_node(&a_dir).await;
         let mut b = start_node(&b_dir).await;
 
@@ -1657,46 +1746,57 @@ async fn p2p_inbound_full_rejects_extra() {
             .await
             .expect("first follow handshake")
             .expect("first follow");
-        let wait = tokio::time::Instant::now() + Duration::from_secs(3);
-        loop {
-            let n = seed
-                .peers
-                .snapshot()
-                .into_iter()
-                .filter(|p| p.inbound && !p.subver.is_empty())
-                .count();
-            if n >= 1 {
-                break;
-            }
-            if tokio::time::Instant::now() >= wait {
-                panic!(
-                    "first follow must occupy the inbound slot (seed={:?})",
-                    seed.peers.snapshot()
-                );
+        wait_completed_inbound(
+            &seed,
+            "the first follow must hold the tx-relay slot",
+            |rows| rows.len() == 1,
+        )
+        .await;
+        let first = completed_inbound(&seed)[0];
+        assert!(first.1, "a follow advertises tx relay");
+
+        let mut second_tx = RawInbound::connect(seed.local_addr, true)
+            .await
+            .expect("second tx-relay inbound handshake");
+        assert!(
+            second_tx.closed_within(Duration::from_secs(5)).await,
+            "a second tx-relay inbound must be closed at max_inbound=2: {:?}",
+            completed_inbound(&seed)
+        );
+        wait_completed_inbound(
+            &seed,
+            "the first follow must stay alone after the close",
+            |rows| rows == [first],
+        )
+        .await;
+
+        // The closed session returns its slot when its task ends.
+        let block_only = loop {
+            if let Some(s) = RawInbound::connect(seed.local_addr, false).await {
+                break s;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        };
+        wait_completed_inbound(
+            &seed,
+            "a block-relay-only inbound must take the other slot",
+            |rows| rows.len() == 2 && rows.contains(&(block_only.addr, false)),
+        )
+        .await;
 
-        let second =
+        let extra =
             tokio::time::timeout(Duration::from_secs(5), b.follow_from(seed.local_addr)).await;
-        if let Ok(Ok(())) = second {
+        if let Ok(Ok(())) = extra {
             panic!(
-                "second follow must not complete handshake at max_inbound=1 (seed={:?} b={:?})",
+                "a follow past both slots must not complete handshake (seed={:?} b={:?})",
                 seed.peers.snapshot(),
                 b.peers.snapshot()
             );
         }
-
-        let n = seed
-            .peers
-            .snapshot()
-            .into_iter()
-            .filter(|p| p.inbound && !p.subver.is_empty())
-            .count();
         assert_eq!(
-            n,
-            1,
-            "first inbound must stay; extra must be refused: {:?}",
+            completed_inbound(&seed).len(),
+            2,
+            "both inbounds must stay; extra must be refused: {:?}",
             seed.peers.snapshot()
         );
         assert!(
@@ -1716,6 +1816,63 @@ async fn p2p_inbound_full_rejects_extra() {
     tokio::time::timeout(Duration::from_secs(20), fut)
         .await
         .expect("p2p_inbound_full_rejects_extra wall timeout (20s)");
+}
+
+/// `max_inbound=52` holds 26 tx-relaying inbounds. With all 26 connected
+/// and one block-relay-only inbound, a new tx-relaying inbound evicts an
+/// older tx-relaying peer. Protection keeps 25 of those 26 (netgroup, 4
+/// block, 4 tx, 8 ping, 8 longest-connected), so the newest is the victim.
+/// The block-relay-only peer and the newcomer stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p2p_tx_relay_inbound_past_half_evicts_a_tx_peer() {
+    let fut = async {
+        let seed_dir = TempDir::new().unwrap();
+        let seed = start_node_inbound(&seed_dir, 52).await;
+        let mut tx_relay = Vec::new();
+        for _ in 0..26 {
+            tx_relay.push(
+                RawInbound::connect(seed.local_addr, true)
+                    .await
+                    .expect("tx-relay inbound under half the slots"),
+            );
+        }
+        let block_only = RawInbound::connect(seed.local_addr, false)
+            .await
+            .expect("block-relay-only inbound");
+        wait_completed_inbound(
+            &seed,
+            "26 tx-relay inbounds and one block-relay-only inbound",
+            |rows| rows.len() == 27,
+        )
+        .await;
+
+        let newcomer = RawInbound::connect(seed.local_addr, true)
+            .await
+            .expect("newcomer tx-relay inbound handshake");
+        let newest = tx_relay.last_mut().unwrap();
+        assert!(
+            newest.closed_within(Duration::from_secs(5)).await,
+            "the newest older tx-relay inbound must be evicted: {:?}",
+            completed_inbound(&seed)
+        );
+        let evicted = newest.addr;
+        wait_completed_inbound(
+            &seed,
+            "the block-relay-only peer and the newcomer must stay",
+            |rows| {
+                rows.len() == 27
+                    && rows.contains(&(newcomer.addr, true))
+                    && rows.contains(&(block_only.addr, false))
+                    && !rows.iter().any(|(addr, _)| *addr == evicted)
+            },
+        )
+        .await;
+
+        seed.shutdown().await;
+    };
+    tokio::time::timeout(Duration::from_secs(20), fut)
+        .await
+        .expect("p2p_tx_relay_inbound_past_half_evicts_a_tx_peer wall timeout (20s)");
 }
 
 /// Seeder restarts with empty RAM cache; peer IBD-syncs via reconstruct.

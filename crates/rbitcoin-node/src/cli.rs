@@ -369,7 +369,7 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
   signet 0, regtest 0. Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default 300 → 300e6 WU; N × 1_000_000 weight, not MiB).\n\
-Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
+Peers: --max-outbound (default 16 live download), --max-inbound (default 200; half for tx-relaying peers).\n\
 Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the same grammar as --connect.\n\
   It turns listening off and sets max-inbound to 0. A second address, a different --connect,\n\
   --seed-node, --listen, --listen-onion, or --max-inbound greater than 0 is a start error.\n\
