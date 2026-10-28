@@ -696,7 +696,14 @@ fn chain_ops_estimate_fee_param_gates(ctx: &RpcContext) {
             );
         }
         // Core v31.1 reads conf_target as an int32: 2^32 + 1 does not wrap to 1.
-        for wide in [json!(4_294_967_297_u64), json!(2_147_483_648_u64), json!(2.5)] {
+        let float = |token: &str| serde_json::from_str::<Value>(token).unwrap();
+        for wide in [
+            json!(4_294_967_297_u64),
+            json!(2_147_483_648_u64),
+            json!(2.5),
+            float("6.0"),
+            float("1e1"),
+        ] {
             let e = dispatch(ctx, method, vec![wide.clone()]).unwrap_err();
             assert_eq!(e["code"], ERR_MISC, "{method} {wide}: {e}");
             assert_eq!(e["message"], "JSON integer out of range", "{method} {wide}");
