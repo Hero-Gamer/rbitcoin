@@ -497,8 +497,395 @@ async fn oversized_bearer_body_is_413_and_small_body_still_runs() {
 }
 
 #[test]
-fn rpc_max_http_body_is_two_mebibytes() {
-    assert_eq!(RPC_MAX_HTTP_BODY, 2_097_152);
+fn rpc_body_caps_match_core_max_size_and_rest_two_mebibytes() {
+    assert_eq!(RPC_MAX_HTTP_BODY, 32 * 1024 * 1024);
+    assert_eq!(REST_MAX_HTTP_BODY, 2 * 1024 * 1024);
+}
+
+/// Witness v0 counts opcodes above `OP_16`. 201 `OP_DROP`s plus `OP_TRUE`
+/// is the largest clean script, so each input's 520-byte stack is the
+/// padding that pushes a block past 1 MiB without passing 4M weight.
+fn witness_pad_script() -> bitcoin::ScriptBuf {
+    let mut bytes = vec![0x75u8; 201];
+    bytes.push(0x51);
+    bitcoin::ScriptBuf::from_bytes(bytes)
+}
+
+fn over_one_mebibyte_block(hub: &rbitcoin_net::ChainHub) -> bitcoin::Block {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::hashes::Hash;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{
+        Amount, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxMerkleNode,
+        TxOut, Witness,
+    };
+    use rbitcoin_consensus::regtest_pad::{
+        grind_regtest_pow, mine_regtest_paying, regtest_coinbase, REGTEST_POW_BITS,
+    };
+
+    let script = witness_pad_script();
+    let spk = ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::hash(script.as_bytes()));
+    let subsidy =
+        rbitcoin_consensus::block_subsidy(1, &rbitcoin_consensus::ChainParams::regtest()) as u64;
+    let n = 11u64;
+    let each = subsidy / n;
+    let outputs: Vec<TxOut> = (0..n)
+        .map(|i| {
+            let value = if i + 1 == n {
+                subsidy - each * (n - 1)
+            } else {
+                each
+            };
+            TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: spk.clone(),
+            }
+        })
+        .collect();
+    let mut coinbase = regtest_coinbase(1, Amount::from_sat(subsidy), spk);
+    coinbase.output = outputs;
+    let mut funding = bitcoin::Block {
+        header: Header {
+            version: Version::from_consensus(4),
+            prev_blockhash: hub.tip_hash().expect("genesis"),
+            merkle_root: TxMerkleNode::from_byte_array([0u8; 32]),
+            time: hub
+                .tip_header()
+                .expect("genesis header")
+                .time
+                .saturating_add(1),
+            bits: CompactTarget::from_consensus(REGTEST_POW_BITS),
+            nonce: 0,
+        },
+        txdata: vec![coinbase],
+    };
+    funding.header.merkle_root = funding.compute_merkle_root().expect("funding merkle");
+    grind_regtest_pow(&mut funding.header);
+    let txid = funding.txdata[0].compute_txid();
+    hub.accept_block(funding).expect("fund the padded spends");
+    hub.generate_to_script(99, ScriptBuf::from_bytes(vec![0x51]), Vec::new())
+        .expect("mature the coinbase");
+    assert_eq!(
+        hub.tip_height(),
+        Some(100),
+        "height-1 coinbase spends at 101"
+    );
+
+    let item = vec![0u8; 520];
+    let mut stack: Vec<Vec<u8>> = (0..201).map(|_| item.clone()).collect();
+    stack.push(script.into_bytes());
+    let refs: Vec<&[u8]> = stack.iter().map(Vec::as_slice).collect();
+    let witness = Witness::from_slice(&refs);
+    let spend = Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: (0..n)
+            .map(|vout| TxIn {
+                previous_output: OutPoint {
+                    txid,
+                    vout: vout as u32,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: witness.clone(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(subsidy),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let block = mine_regtest_paying(
+        hub.tip_hash().expect("mature tip"),
+        hub.tip_header()
+            .expect("mature header")
+            .time
+            .saturating_add(1),
+        101,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend],
+    );
+    let raw_len = bitcoin::consensus::encode::serialize(&block).len();
+    assert!(
+        raw_len > 1024 * 1024,
+        "block must be over 1 MiB, got {raw_len}"
+    );
+    assert!(
+        block.weight().to_wu() <= 4_000_000,
+        "weight {}",
+        block.weight()
+    );
+    block
+}
+
+fn http_status(text: &str) -> u16 {
+    text.split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}
+
+fn http_json(text: &str) -> serde_json::Value {
+    let body = text
+        .find("\r\n\r\n")
+        .map(|i| text[i + 4..].trim())
+        .unwrap_or("");
+    if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(body).unwrap_or(serde_json::Value::String(body.to_string()))
+    }
+}
+
+async fn write_http<S>(stream: &mut S, head: &str, body: &[u8]) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(head.as_bytes()).await.expect("write head");
+    stream.write_all(body).await.expect("write body");
+    let mut buf = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        stream.read_to_end(&mut buf),
+    )
+    .await
+    .expect("HTTP reply")
+    .expect("read reply");
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+async fn post_authed<S>(mut stream: S, bearer: &str, body: &[u8]) -> String
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let head = format!(
+        "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: Bearer {bearer}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    write_http(&mut stream, &head, body).await
+}
+
+/// `submitblock` and a proposal of one block past 1 MiB, on TCP and the unix
+/// socket. A body past the cap, a bad credential, and REST stay rejected.
+#[tokio::test]
+async fn large_block_submit_and_proposal_clear_http_413() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-big-block").expect("temp dir");
+    let hub = rbitcoin_net::ChainHub::new(
+        Query::open_or_create_tiny(dir.join("store")).unwrap(),
+        rbitcoin_consensus::ChainParams::regtest(),
+        rbitcoin_consensus::Milestone::NONE,
+    );
+    hub.ensure_genesis().unwrap();
+    let block = over_one_mebibyte_block(&hub);
+    let want_hash = block.block_hash().to_string();
+    let hex = rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&block));
+    let submit = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "1.0",
+        "id": 1,
+        "method": "submitblock",
+        "params": [hex],
+    }))
+    .unwrap();
+    let proposal = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "1.0",
+        "id": 1,
+        "method": "getblocktemplate",
+        "params": [{"mode": "proposal", "data": hex, "rules": ["segwit"]}],
+    }))
+    .unwrap();
+    let two_mib = 2 * 1024 * 1024;
+    let max_size = 32 * 1024 * 1024;
+    assert!(
+        submit.len() > two_mib && submit.len() <= max_size,
+        "submit body {}",
+        submit.len()
+    );
+    assert!(
+        proposal.len() > two_mib && proposal.len() <= max_size,
+        "proposal body {}",
+        proposal.len()
+    );
+
+    let query = Arc::clone(&hub.query);
+    let socket_path = cfg!(unix).then(|| dir.join("rpc.sock"));
+    let cfg = RpcConfig {
+        listen: Some("127.0.0.1:0".parse().unwrap()),
+        socket_path: socket_path.clone(),
+        socket_shared: false,
+        datadir: dir.path().to_path_buf(),
+        network: Network::Regtest,
+        token_path: None,
+        cookie_path: None,
+        cookie_perms: RpcCookiePerms::Owner,
+        subversion: None,
+        work_queue: None,
+        rest: true,
+        alert_notify: None,
+        blocksonly: false,
+        package_dialect: false,
+    };
+    let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+    let token = handle.auth.token.clone();
+
+    let proposal_tcp = post_authed(
+        tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap(),
+        &token,
+        &proposal,
+    )
+    .await;
+    println!("PROPOSAL_TCP {proposal_tcp}");
+    let proposal_json = http_json(&proposal_tcp);
+    assert_eq!(
+        http_status(&proposal_tcp),
+        200,
+        "proposal must not be HTTP 413: {proposal_json}"
+    );
+    assert!(
+        proposal_json["result"].is_null() && proposal_json["error"].is_null(),
+        "proposal {proposal_json}"
+    );
+
+    #[cfg(unix)]
+    {
+        let proposal_unix = post_authed(
+            tokio::net::UnixStream::connect(socket_path.as_ref().unwrap())
+                .await
+                .unwrap(),
+            &token,
+            &proposal,
+        )
+        .await;
+        println!("PROPOSAL_UNIX {proposal_unix}");
+        let unix_json = http_json(&proposal_unix);
+        assert_eq!(
+            http_status(&proposal_unix),
+            200,
+            "unix proposal {unix_json}"
+        );
+        assert!(
+            unix_json["result"].is_null() && unix_json["error"].is_null(),
+            "unix proposal {unix_json}"
+        );
+    }
+
+    let submit_tcp = post_authed(
+        tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap(),
+        &token,
+        &submit,
+    )
+    .await;
+    println!("SUBMIT {submit_tcp}");
+    let submit_json = http_json(&submit_tcp);
+    assert_eq!(
+        http_status(&submit_tcp),
+        200,
+        "submitblock must not be HTTP 413: {submit_json}"
+    );
+    assert!(
+        submit_json["result"].is_null() && submit_json["error"].is_null(),
+        "submitblock {submit_json}"
+    );
+    let count = post_rpc(
+        tcp_addr(&handle),
+        &handle.auth,
+        "getblockcount",
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap();
+    let best = post_rpc(
+        tcp_addr(&handle),
+        &handle.auth,
+        "getbestblockhash",
+        serde_json::json!([]),
+    )
+    .await
+    .unwrap();
+    println!("TIP count={count} best={best}");
+    assert_eq!(count["result"], 101, "new tip {count}");
+    assert_eq!(best["result"], want_hash, "new tip {best}");
+
+    let mut over = br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#.to_vec();
+    over.resize(RPC_MAX_HTTP_BODY + 1, b' ');
+    let over_tcp = post_authed(
+        tokio::net::TcpStream::connect(tcp_addr(&handle))
+            .await
+            .unwrap(),
+        &token,
+        &over,
+    )
+    .await;
+    println!("OVER_CAP {over_tcp}");
+    assert_eq!(http_status(&over_tcp), 413, "{over_tcp}");
+    assert!(
+        !over_tcp.contains("\"result\""),
+        "a body over the cap must not run: {over_tcp}"
+    );
+
+    let wrong = status_before_body(
+        tcp_addr(&handle),
+        "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: Bearer not-the-token\r\nContent-Length: 8000000\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    println!("BAD_CREDENTIAL {wrong}");
+    assert!(
+        wrong.contains("401") || wrong.contains("Unauthorized"),
+        "wrong credential must be 401 before the body: {wrong}"
+    );
+    let missing = status_before_body(
+        tcp_addr(&handle),
+        "POST / HTTP/1.1\r\nHost: rpc\r\nContent-Length: 8000000\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    println!("MISSING_CREDENTIAL {missing}");
+    assert!(
+        missing.contains("401") || missing.contains("Unauthorized"),
+        "missing credential must be 401 before the body: {missing}"
+    );
+
+    let rest_body = vec![b'{'; two_mib + 1];
+    let mut rest = tokio::net::TcpStream::connect(tcp_addr(&handle))
+        .await
+        .unwrap();
+    let rest_head = format!(
+        "POST /rest/block/aa.json HTTP/1.1\r\nHost: rpc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        rest_body.len()
+    );
+    let rest_text = write_http(&mut rest, &rest_head, &rest_body).await;
+    println!("REST {rest_text}");
+    assert_eq!(
+        http_status(&rest_text),
+        413,
+        "REST must stay at 2 MiB: {rest_text}"
+    );
+    assert!(
+        !rest_text.contains("\"result\""),
+        "REST over the cap must not run: {rest_text}"
+    );
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+async fn status_before_body(addr: SocketAddr, head: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_millis(800), stream.read(&mut buf))
+        .await
+        .expect("401 before any body bytes")
+        .unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 #[tokio::test]
