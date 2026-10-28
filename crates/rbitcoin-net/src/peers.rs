@@ -13,7 +13,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 /// Per-peer outbound queue cap (a few megabytes). Not a configuration knob.
 ///
@@ -235,20 +235,28 @@ impl std::fmt::Display for DialTarget {
     }
 }
 
+/// One in-flight dial of `net`. `n` stacks only when [`PeerHub::dial_in_flight`]
+/// is taken again for the same target; [`PeerHub::claim_dial`] refuses that.
+#[derive(Clone, Copy, Debug)]
+pub struct InFlightCount {
+    pub n: usize,
+    pub net: crate::NetAddr,
+}
+
 /// An outbound dial counted in [`PeerHub::dial_in_flight`]; dropping it
 /// ends the count.
 #[derive(Debug)]
 pub struct DialInFlight {
-    pub counts: Arc<Mutex<HashMap<String, usize>>>,
+    pub counts: Arc<Mutex<HashMap<String, InFlightCount>>>,
     pub key: String,
 }
 
 impl Drop for DialInFlight {
     fn drop(&mut self) {
         let mut g = self.counts.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(n) = g.get_mut(&self.key) {
-            *n -= 1;
-            if *n == 0 {
+        if let Some(slot) = g.get_mut(&self.key) {
+            slot.n -= 1;
+            if slot.n == 0 {
                 g.remove(&self.key);
             }
         }
@@ -1487,10 +1495,13 @@ pub struct PeerHub {
     host_sockets: Mutex<HashMap<String, SocketAddr>>,
     /// Outbound dials still before session registration, by target. The
     /// redial pass skips these, so a slow connect is not stacked every 2 s.
-    pub dials_in_flight: Arc<Mutex<HashMap<String, usize>>>,
+    pub dials_in_flight: Arc<Mutex<HashMap<String, InFlightCount>>>,
     /// Addr-fetch `getaddr` replies (more than one address) learned into the
     /// book. A self-announce does not count.
     addrfetch_replies: AtomicU64,
+    /// One stored permit when an addr-fetch reply is learned, so tip-follow
+    /// can dial a book that was empty at catch-up.
+    addrfetch_learned: Notify,
     /// Network P2P port used when a remembered host omits `:port`. `0` = unset.
     pub connect_default_port: AtomicU16,
     pub dial_tx: Mutex<Option<mpsc::UnboundedSender<DialRequest>>>,
@@ -1619,6 +1630,7 @@ impl PeerHub {
             host_sockets: Mutex::new(HashMap::new()),
             dials_in_flight: Arc::new(Mutex::new(HashMap::new())),
             addrfetch_replies: AtomicU64::new(0),
+            addrfetch_learned: Notify::new(),
             connect_default_port: AtomicU16::new(0),
             dial_tx: Mutex::new(None),
             hb_selected: Mutex::new(Vec::new()),
@@ -1866,6 +1878,13 @@ impl PeerHub {
 
     pub(crate) fn note_addrfetch_reply(&self) {
         self.addrfetch_replies.fetch_add(1, Ordering::Release);
+        self.addrfetch_learned.notify_one();
+    }
+
+    /// Wakes when an addr-fetch `getaddr` reply of more than one address is learned.
+    /// Tip-follow dials a book that was empty at catch-up.
+    pub fn addrfetch_learned(&self) -> &Notify {
+        &self.addrfetch_learned
     }
 
     pub fn set_addrman(&self, am: std::sync::Arc<Mutex<crate::seeds::AddrMan>>) {
@@ -3032,12 +3051,14 @@ impl PeerHub {
     /// fails, whichever path ends it.
     pub fn dial_in_flight(&self, target: &DialTarget) -> DialInFlight {
         let key = target.to_string();
-        *self
+        let net = target.net_addr();
+        let _ = self
             .dials_in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .entry(key.clone())
-            .or_insert(0) += 1;
+            .and_modify(|slot| slot.n += 1)
+            .or_insert(InFlightCount { n: 1, net });
         DialInFlight {
             counts: Arc::clone(&self.dials_in_flight),
             key,
@@ -3056,11 +3077,53 @@ impl PeerHub {
         if g.contains_key(&key) {
             return None;
         }
-        g.insert(key.clone(), 1);
+        g.insert(
+            key.clone(),
+            InFlightCount {
+                n: 1,
+                net: target.net_addr(),
+            },
+        );
         Some(DialInFlight {
             counts: Arc::clone(&self.dials_in_flight),
             key,
         })
+    }
+
+    /// Targets with a dial queued or still connecting.
+    pub fn in_flight_nets(&self) -> Vec<crate::NetAddr> {
+        self.dials_in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(|slot| slot.net)
+            .collect()
+    }
+
+    /// Queue one `outbound-full-relay` dial.
+    ///
+    /// False when that target is already live, already in flight, or the
+    /// dialer is gone. [`Self::claim_dial`] is the only gate, so a second
+    /// call does not stack a connect.
+    #[doc(hidden)]
+    pub fn dial_outbound_full_relay(&self, addr: crate::NetAddr) -> bool {
+        let target = DialTarget::from_net(addr);
+        let Some(claim) = self.claim_dial(&target) else {
+            return false;
+        };
+        if self.is_target_live(&target) {
+            return false;
+        }
+        let Ok(ready) = self.dial_ready() else {
+            return false;
+        };
+        self.enqueue_dial(
+            &ready.tx,
+            target,
+            PeerConnType::OutboundFullRelay,
+            Some(claim),
+        )
+        .is_ok()
     }
 
     #[doc(hidden)]
@@ -3496,4 +3559,19 @@ pub fn parse_peer_addr_with_port(
         .find(|a| a.is_ipv4())
         .or_else(|| addrs.first().copied())
         .ok_or_else(bad)
+}
+
+#[cfg(test)]
+mod addrfetch_notify {
+    use super::PeerHub;
+
+    #[tokio::test]
+    async fn reply_wakes_tip_follow() {
+        let hub = PeerHub::new();
+        let notified = hub.addrfetch_learned().notified();
+        hub.note_addrfetch_reply();
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("an addr-fetch reply must wake tip-follow");
+    }
 }

@@ -522,6 +522,12 @@ pub struct NodeConfig {
     /// Default [`rbitcoin_net::REDIAL_INTERVAL`]. Not a conf key; a test that
     /// waits for the redial sets [`rbitcoin_net::REDIAL_INTERVAL_TEST`].
     pub connect_redial: Duration,
+    /// Unchanged-tip wait before one outbound full-relay peer is rotated.
+    /// Default 600s. Not a conf key; a test sets a short wait.
+    pub stale_tip: Duration,
+    /// How often tip-follow checks [`Self::stale_tip`]. Default 60s.
+    /// Not a conf key.
+    pub stale_poll: Duration,
     /// `--trust-peer` as a [`rbitcoin_net::NetAddr`] (IP, onion, I2P, CJDNS).
     pub trust_peer: Option<rbitcoin_net::NetAddr>,
     /// `--trust-peer` clearnet DNS name. Mutually exclusive with [`Self::trust_peer`].
@@ -613,6 +619,8 @@ impl Default for NodeConfig {
             prefill_compact: true,
             check_blocks: None,
             connect_redial: rbitcoin_net::REDIAL_INTERVAL,
+            stale_tip: Duration::from_secs(600),
+            stale_poll: Duration::from_secs(60),
             trust_peer: None,
             trust_peer_host: None,
         }
