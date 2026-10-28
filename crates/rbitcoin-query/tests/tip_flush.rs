@@ -52,7 +52,12 @@ fn two_ibd_flushes_share_one_named_thread() {
     assert_eq!(q.tip_flush_os_tid(), tid);
     drop(q);
     drop(dir);
-    assert!(task_comm(tid).is_none(), "drop joins rbtc-tip-flush");
+    // Linux can retain a /proc task entry briefly after a successful join.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while task_comm(tid).is_some() {
+        assert!(Instant::now() < deadline, "drop joins rbtc-tip-flush");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn task_comm(tid: u64) -> Option<String> {
