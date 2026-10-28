@@ -77,6 +77,12 @@ pub struct TipFlushJob {
 pub struct TipFlushWorker {
     tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<TipFlushJob>>>,
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Live threads of this worker. A second spawn would leave this above one.
+    #[cfg(debug_assertions)]
+    alive: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Linux tid of this worker. Zero until the thread publishes it.
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    os_tid: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Default for TipFlushWorker {
@@ -84,8 +90,37 @@ impl Default for TipFlushWorker {
         Self {
             tx: std::sync::Mutex::new(None),
             thread: std::sync::Mutex::new(None),
+            #[cfg(debug_assertions)]
+            alive: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(all(debug_assertions, target_os = "linux"))]
+            os_tid: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
+}
+
+/// Decrements the worker's live count when the barrier thread exits.
+#[cfg(debug_assertions)]
+struct TipFlushAlive(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(debug_assertions)]
+impl TipFlushAlive {
+    fn arm(alive: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        alive.fetch_add(1, Ordering::Release);
+        Self(alive)
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for TipFlushAlive {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+fn linux_task_id() -> Option<u64> {
+    let path = std::fs::read_link("/proc/thread-self").ok()?;
+    path.file_name()?.to_str()?.parse().ok()
 }
 
 impl Query {
@@ -275,9 +310,19 @@ impl Query {
         let store = Arc::clone(&self.store);
         #[cfg(debug_assertions)]
         let hold = Arc::clone(&self.tip_flush_hold);
+        #[cfg(debug_assertions)]
+        let alive = Arc::clone(&self.tip_flush_worker.alive);
+        #[cfg(all(debug_assertions, target_os = "linux"))]
+        let os_tid = Arc::clone(&self.tip_flush_worker.os_tid);
         let handle = std::thread::Builder::new()
             .name("rbtc-tip-flush".into())
             .spawn(move || {
+                #[cfg(debug_assertions)]
+                let _alive = TipFlushAlive::arm(alive);
+                #[cfg(all(debug_assertions, target_os = "linux"))]
+                if let Some(tid) = linux_task_id() {
+                    os_tid.store(tid, Ordering::Release);
+                }
                 while let Ok(job) = rx.recv() {
                     // Pause after the flush excludes stores, not before it starts.
                     #[cfg(debug_assertions)]
@@ -323,7 +368,25 @@ impl Query {
         false
     }
 
-    /// IBD tip flush threads wait before writing until the returned flag is cleared.
+    /// Live `rbtc-tip-flush` threads of this query. Other queries do not count.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn tip_flush_alive(&self) -> usize {
+        self.tip_flush_worker
+            .alive
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Linux tid of this query's barrier thread, or zero before it publishes.
+    #[cfg(all(debug_assertions, target_os = "linux"))]
+    #[doc(hidden)]
+    pub fn tip_flush_os_tid(&self) -> u64 {
+        self.tip_flush_worker
+            .os_tid
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// IBD tip flush threads pause after they exclude stores, until this flag clears.
     #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn hold_tip_flushes(&self) -> Arc<std::sync::atomic::AtomicBool> {
