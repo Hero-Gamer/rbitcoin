@@ -15,7 +15,8 @@ pub const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
 #[doc(hidden)]
 pub const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
 #[doc(hidden)]
-pub const VERSIONBITS_NUM_BITS: i32 = 29;
+/// BIP 323: only bits 0–4 can warn. Bits 5–28 are reserved and stay quiet.
+pub const VERSIONBITS_NUM_BITS: i32 = 5;
 
 /// Period / threshold for unknown-bit warnings.
 pub fn warn_period_threshold(network: Network) -> (u32, u32) {
@@ -45,7 +46,7 @@ pub fn unknown_rules_warning(bit: i32) -> String {
 /// A bit locked in during period `p` is ACTIVE from period `p + 2`, and
 /// ACTIVE is final, so each completed period is read once and only periods
 /// completed since the last call are read. RAM is a few words; the trade is
-/// one header pass per new period instead of 29 passes from genesis per RPC
+/// one header pass per new period instead of 5 passes from genesis per RPC
 /// call (≈4.7 s per `getnetworkinfo` at mainnet height 968k).
 pub struct UnknownBitsScan {
     /// Periods `0..scanned_periods` are counted.

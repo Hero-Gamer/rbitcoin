@@ -512,6 +512,7 @@ fn chain_ops_fresh_tip_age_template_and_header_cap() {
 fn chain_ops_echo_overlap(ctx: &RpcContext) {
     let empty = dispatch(ctx, "echo", vec![]).unwrap();
     assert_eq!(empty, json!([]));
+    assert_eq!(dispatch(ctx, "echojson", vec![]).unwrap(), json!([]));
     let named_echo = dispatch(ctx, "echo", named(json!({"arg0": 0, "arg9": 9}))).unwrap();
     let mut want = vec![Value::Null; 10];
     want[0] = json!(0);
@@ -680,12 +681,82 @@ fn chain_ops_estimate_fee_param_gates(ctx: &RpcContext) {
         e["message"].as_str().unwrap().contains("JSON value of type number is not of expected type string"),
         "{e}"
     );
+}
+
+fn chain_ops_estimate_fee_options(ctx: &RpcContext) {
     let e = dispatch(ctx, "estimatesmartfee", vec![json!(1), json!("foo")]).unwrap_err();
     assert_eq!(e["code"], ERR_INVALID_PARAMETER);
     assert!(e["message"].as_str().unwrap().contains("Invalid estimate_mode parameter"), "{e}");
     let e = dispatch(ctx, "estimatesmartfee", vec![json!(1), json!("ECONOMICAL"), json!(1)]).unwrap_err();
+    assert_eq!(e["code"], ERR_TYPE_ERROR);
+    assert!(
+        e["message"].as_str().unwrap().contains("not of expected type object"),
+        "{e}"
+    );
+    let e = dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": 1})],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_TYPE_ERROR);
+    assert_eq!(
+        e["message"],
+        "JSON value of type number for field fee_rate_estimator is not of expected type string"
+    );
+    let e = dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({"verbosity": "foo"})],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_TYPE_ERROR);
+    assert_eq!(
+        e["message"],
+        "JSON value of type string for field verbosity is not of expected type number"
+    );
+    let e = dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "foo"})],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+    assert!(
+        e["message"].as_str().unwrap().contains("Invalid fee_rate_estimator parameter"),
+        "{e}"
+    );
+    let e = dispatch(
+        ctx,
+        "estimatesmartfee",
+        named(json!({"conf_target": 1, "fee_rate_estimator": true})),
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+    assert_eq!(e["message"], "Unknown named parameter fee_rate_estimator");
+    let mixed = RpcParams::from_json(&json!({"args": [1], "fee_rate_estimator": true})).unwrap();
+    let e = dispatch(ctx, "estimatesmartfee", mixed).unwrap_err();
+    assert_eq!(e["code"], ERR_INVALID_PARAMETER);
+    assert_eq!(e["message"], "Unknown named parameter fee_rate_estimator");
+    let e = dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({"block_policy_only": true})],
+    )
+    .unwrap_err();
+    assert_eq!(e["code"], ERR_TYPE_ERROR);
+    assert_eq!(e["message"], "Unexpected key block_policy_only");
+    let e = dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({}), json!(1)],
+    )
+    .unwrap_err();
     assert_eq!(e["code"], ERR_MISC);
     assert!(e["message"].as_str().unwrap().contains("estimatesmartfee"), "{e}");
+}
+
+fn chain_ops_estimate_fee_conf_target(ctx: &RpcContext) {
     for method in ["estimatesmartfee", "estimaterawfee"] {
         for bad in [json!(0), json!(1009), json!(-1)] {
             let e = dispatch(ctx, method, vec![bad]).unwrap_err();
@@ -709,6 +780,9 @@ fn chain_ops_estimate_fee_param_gates(ctx: &RpcContext) {
             assert_eq!(e["message"], "JSON integer out of range", "{method} {wide}");
         }
     }
+}
+
+fn chain_ops_estimate_fee_accepted(ctx: &RpcContext) {
     dispatch(ctx, "estimatesmartfee", vec![json!(1)]).unwrap();
     dispatch(ctx, "estimatesmartfee", vec![json!(1), json!("ECONOMICAL")]).unwrap();
     let raw = dispatch(ctx, "estimaterawfee", vec![json!(1)]).unwrap();
@@ -717,6 +791,28 @@ fn chain_ops_estimate_fee_param_gates(ctx: &RpcContext) {
     dispatch(ctx, "estimaterawfee", vec![json!(1), json!(1)]).unwrap();
     dispatch(ctx, "estimatesmartfee", vec![json!(1), json!("unset")]).unwrap();
     dispatch(ctx, "estimatesmartfee", vec![json!(1), json!("conservative")]).unwrap();
+    dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "block_policy"})],
+    )
+    .unwrap();
+    dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![json!(1), json!("ECONOMICAL"), json!({"fee_rate_estimator": "mempool_policy"})],
+    )
+    .unwrap();
+    dispatch(
+        ctx,
+        "estimatesmartfee",
+        vec![
+            json!(1),
+            json!("ECONOMICAL"),
+            json!({"verbosity": 1, "fee_rate_estimator": "auto"}),
+        ],
+    )
+    .unwrap();
 }
 
 fn chain_ops_mempoolinfo_constants(ctx: &RpcContext) {
@@ -793,6 +889,9 @@ fn chain_ops_genesis_client_edges(ctx: &RpcContext) {
     chain_ops_genesis_not_an_ordinary_tx(ctx);
     chain_ops_estimate_fee_edges(ctx);
     chain_ops_estimate_fee_param_gates(ctx);
+    chain_ops_estimate_fee_options(ctx);
+    chain_ops_estimate_fee_conf_target(ctx);
+    chain_ops_estimate_fee_accepted(ctx);
     chain_ops_mempoolinfo_constants(ctx);
     chain_ops_missing_methods(ctx);
     chain_ops_decode_segwit_coinbase(ctx);

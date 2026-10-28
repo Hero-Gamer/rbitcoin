@@ -88,7 +88,7 @@ assert_fail_msg "missing table" "missing [release]" \
   python3 "$PIN" --inventory "$WORKDIR/empty.toml"
 
 REAL="$ROOT/scripts/core-functional/inventory.toml"
-assert_ok_msg "real inventory x86_64" "sha256=b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e" \
+assert_ok_msg "real inventory x86_64" "sha256=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963" \
   python3 "$PIN" --inventory "$REAL" --arch x86_64-linux-gnu
 
 if [[ "$FAIL" -ne 0 ]]; then

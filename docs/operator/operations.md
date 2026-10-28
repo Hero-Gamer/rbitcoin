@@ -130,7 +130,7 @@ Clean smoke:
 | `--limit-cluster-count N` | `limit_cluster_count=` | unset — hub default |
 | `--limit-cluster-size KVB` | `limit_cluster_size=` | unset — hub default |
 | `--peer-timeout SECS` | `peer_timeout=` | unset — net default; `0` is InitError |
-| `--external-ip IP` | `external_ip=` | empty — `getnetworkinfo.localaddresses` |
+| `--external-ip IP` | `external_ip=` | empty — an IP or a v3 `.onion` in `getnetworkinfo.localaddresses`. An onion does not make onion reachable |
 | `--seed-node HOST` | `seed_node=` | extra seeds (repeatable) |
 | `--mock-time UNIX` | `mock_time=` | unset — wall clock; `0` allowed |
 | `--max-tip-age SECS` | `max_tip_age=` | unset — hub relay-inhibited age (default 24h) |

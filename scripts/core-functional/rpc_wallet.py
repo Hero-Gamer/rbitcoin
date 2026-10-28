@@ -16,8 +16,14 @@ import urllib.request
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+from urllib.parse import unquote
 
-from rpc_proxy import RpcError, shim_miniwallet_scantxoutset, wait_esplora_tip
+from rpc_proxy import (
+    RpcError,
+    current_rpc_path,
+    shim_miniwallet_scantxoutset,
+    wait_esplora_tip,
+)
 from core_dest import decode_destination
 from rpc_util import (
     COIN,
@@ -110,6 +116,9 @@ class WalletTx:
     amount_sat: int  # net to wallet excluding fee (negative for send)
     fee_sat: int
     sent: bool
+    comment: str = ""
+    replaces_txid: str | None = None
+    replaced_by_txid: str | None = None
 
 
 @dataclass
@@ -153,10 +162,22 @@ class WalletHub:
         p.register("gettransaction", self.gettransaction)
         p.register("getrawtransaction", self.getrawtransaction)
         p.register("scantxoutset", self.scantxoutset)
+        p.register("unloadwallet", self.unloadwallet)
+        p.register("bumpfee", self.bumpfee)
 
     def _cur(self) -> Wallet:
         if not self.wallets:
             raise RpcError(ERR_WALLET_NOT_FOUND, "No wallet is loaded.")
+        path = current_rpc_path().split("?", 1)[0]
+        if path.startswith("/wallet/"):
+            name = unquote(path[len("/wallet/") :].strip("/"))
+            found = self.wallets.get(name)
+            if found is None:
+                raise RpcError(
+                    ERR_WALLET_NOT_FOUND,
+                    "Requested wallet does not exist or is not loaded",
+                )
+            return found
         return next(iter(self.wallets.values()))
 
     def _node(self, method: str, params: Any) -> Any:
@@ -210,6 +231,10 @@ class WalletHub:
             # In-memory only: "load" of a name we created is enough.
             raise RpcError(ERR_WALLET, f"Wallet file verification failed. Failed to load database path")
         return {"name": name, "warning": ""}
+
+    def unloadwallet(self, _params: Any) -> dict[str, Any]:
+        # The harness wallet is in memory. Keep it so loadwallet still finds it.
+        return {"warning": ""}
 
     def listwallets(self, _params: Any) -> list[str]:
         return list(self.wallets.keys())
@@ -583,6 +608,21 @@ class WalletHub:
                 return chosen
         raise RpcError(ERR_INSUFFICIENT, "Insufficient funds")
 
+    def _same_vin_donor(
+        self, w: Wallet, vinset: set[tuple[str, int]], txid: str
+    ) -> WalletTx | None:
+        # A bumped tx and the tx it replaced share inputs. The replacement
+        # carries replaces_txid; prefer that over the original send.
+        donors = [
+            other
+            for other in w.txs.values()
+            if other.txid != txid and set(other.vin) == vinset
+        ]
+        for other in reversed(donors):
+            if other.replaces_txid:
+                return other
+        return donors[-1] if donors else None
+
     def _record_tx(self, w: Wallet, tx: CTransaction, fee_sat: int) -> WalletTx:
         txid = tx.txid_hex
         vin = [("%064x" % i.prevout.hash, int(i.prevout.n)) for i in tx.vin]
@@ -597,6 +637,8 @@ class WalletHub:
             else:
                 if bytes(o.scriptPubKey)[:1] != bytes([OP_RETURN]):
                     external += int(o.nValue)
+        vinset = set(vin)
+        donor = self._same_vin_donor(w, vinset, txid)
         rec = WalletTx(
             txid=txid,
             hex=tx.serialize().hex(),
@@ -605,6 +647,8 @@ class WalletHub:
             amount_sat=-external,
             fee_sat=fee_sat,
             sent=True,
+            comment=donor.comment if donor is not None else "",
+            replaces_txid=donor.replaces_txid if donor is not None else None,
         )
         w.txs[txid] = rec
         return rec
@@ -650,8 +694,10 @@ class WalletHub:
         return {"complete": True, "txid": txid, "hex": hx}
 
     def sendtoaddress(self, params: Any) -> str:
+        w = self._cur()
         addr = pget(params, 0, "address")
         amount = pget(params, 1, "amount")
+        comment = pget(params, 2, "comment", None)
         subtract = bool(pget(params, 4, "subtractfeefromamount", False))
         fee_rate = pget(params, 6, "fee_rate", None)
         outs: list[dict[str, Any]] = [{str(addr): amount}]
@@ -660,6 +706,10 @@ class WalletHub:
             send_params["fee_rate"] = fee_rate
         # subtractfeefromamount: reduce the unique output by the fee after fund.
         res = self.send(send_params)
+        if comment:
+            rec = w.txs.get(res["txid"])
+            if rec is not None:
+                rec.comment = str(comment)
         if subtract:
             # Best-effort: already broadcast. Fixture tests that need exact
             # subtractfeefromamount use sendtoaddress before generate; we
@@ -831,9 +881,7 @@ class WalletHub:
     def gettransaction(self, params: Any) -> dict[str, Any]:
         w = self._cur()
         txid = str(pget(params, 0, "txid"))
-        rec = w.txs.get(txid)
-        if rec is None:
-            raise RpcError(ERR_INVALID_ADDRESS, "Invalid or non-wallet transaction id")
+        rec = self._ensure_tx(w, txid)
         raw = self._node_or_none("getrawtransaction", [txid, True])
         conf = 0
         hx = rec.hex
@@ -852,7 +900,7 @@ class WalletHub:
                     conf = c
         else:
             conf = self._conflict_conf(w, rec)
-        return {
+        out: dict[str, Any] = {
             "amount": sat_btc(rec.amount_sat),
             "fee": sat_btc(-rec.fee_sat) if rec.sent else 0,
             "confirmations": conf,
@@ -861,6 +909,112 @@ class WalletHub:
             "walletconflicts": self._conflicts(w, rec),
             "hex": hx,
             "details": [],
+        }
+        if rec.comment:
+            out["comment"] = rec.comment
+        if rec.replaces_txid:
+            out["replaces_txid"] = rec.replaces_txid
+        if rec.replaced_by_txid:
+            out["replaced_by_txid"] = rec.replaced_by_txid
+        return out
+
+    def _ensure_tx(self, w: Wallet, txid: str) -> WalletTx:
+        found = w.txs.get(txid)
+        if found is not None:
+            return found
+        raw = self._node_or_none("getrawtransaction", [txid, False])
+        if not isinstance(raw, str):
+            raise RpcError(ERR_INVALID_ADDRESS, "Invalid or non-wallet transaction id")
+        try:
+            tx = tx_from_hex(raw)
+        except Exception as e:
+            raise RpcError(ERR_INVALID_ADDRESS, "Invalid or non-wallet transaction id") from e
+        vins = [("%064x" % i.prevout.hash, int(i.prevout.n)) for i in tx.vin]
+        vinset = set(vins)
+        donor = self._same_vin_donor(w, vinset, txid)
+        if donor is None:
+            raise RpcError(ERR_INVALID_ADDRESS, "Invalid or non-wallet transaction id")
+        cloned = WalletTx(
+            txid=txid,
+            hex=raw,
+            vin=vins,
+            our_out=set(donor.our_out),
+            amount_sat=donor.amount_sat,
+            fee_sat=donor.fee_sat,
+            sent=donor.sent,
+            comment=donor.comment,
+            replaces_txid=donor.replaces_txid,
+            replaced_by_txid=donor.replaced_by_txid,
+        )
+        w.txs[txid] = cloned
+        return cloned
+
+    def bumpfee(self, params: Any) -> dict[str, Any]:
+        w = self._cur()
+        txid = str(pget(params, 0, "txid"))
+        rec = self._ensure_tx(w, txid)
+        if rec.replaced_by_txid:
+            raise RpcError(
+                ERR_WALLET,
+                f"Cannot bump transaction {txid} which was already bumped by transaction {rec.replaced_by_txid}",
+            )
+        fee_rate = None
+        if isinstance(params, dict) and params.get("fee_rate") is not None:
+            fee_rate = params["fee_rate"]
+        options = pget(params, 1, "options", None)
+        if isinstance(options, dict) and options.get("fee_rate") is not None:
+            fee_rate = options["fee_rate"]
+        try:
+            tx = tx_from_hex(rec.hex)
+        except Exception as e:
+            raise RpcError(ERR_WALLET, "Signing transaction failed") from e
+        vsize = max(1, int(tx.get_vsize()))
+        if fee_rate is None:
+            new_fee = rec.fee_sat + vsize
+        else:
+            new_fee = int(Decimal(str(fee_rate)) * vsize)
+            if new_fee <= rec.fee_sat:
+                new_fee = rec.fee_sat + vsize
+        delta = new_fee - rec.fee_sat
+        if delta <= 0:
+            raise RpcError(ERR_WALLET, "Insufficient funds")
+        payers = sorted(range(len(tx.vout)), key=lambda i: int(tx.vout[i].nValue), reverse=True)
+        paid = False
+        for i in payers:
+            if int(tx.vout[i].nValue) > delta:
+                tx.vout[i].nValue = int(tx.vout[i].nValue) - delta
+                paid = True
+                break
+        if not paid:
+            raise RpcError(ERR_WALLET, "Insufficient funds")
+        for vin in tx.vin:
+            vin.scriptSig = b""
+            vin.nSequence = 0xFFFFFFFD
+        if tx.wit.vtxinwit:
+            for wit in tx.wit.vtxinwit:
+                wit.scriptWitness.stack.clear()
+        signed = self._sign(w, tx.serialize_without_witness().hex(), None, None)
+        if not signed.get("complete"):
+            raise RpcError(ERR_WALLET, "Signing transaction failed")
+        hx = signed["hex"]
+        new_txid = str(self._broadcast(hx))
+        new_rec = w.txs.get(new_txid)
+        if new_rec is None:
+            new_rec = self._record_tx(w, tx_from_hex(hx), new_fee)
+        new_rec.comment = rec.comment
+        new_rec.replaces_txid = rec.txid
+        new_rec.fee_sat = new_fee
+        vinset = set(new_rec.vin)
+        for other in w.txs.values():
+            if other.txid == new_txid:
+                continue
+            if set(other.vin) == vinset:
+                other.replaced_by_txid = new_txid
+        return {
+            "txid": new_txid,
+            "origfee": sat_btc(rec.fee_sat),
+            "fee": sat_btc(new_fee),
+            "errors": [],
         }
 
     def _conf_via_esplora(self, txid: str) -> int:

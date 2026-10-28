@@ -442,8 +442,7 @@ pub async fn satisfy_http_wait(
         return false;
     }
     let params = match parsed.get("params") {
-        Some(serde_json::Value::Array(a)) => RpcParams::positional(a.clone()),
-        Some(serde_json::Value::Object(m)) => RpcParams::named(m.clone()),
+        Some(v) => RpcParams::from_json(v).unwrap_or_else(RpcParams::empty),
         _ => RpcParams::empty(),
     };
     let mut tips = ctx.chain.as_ref().map(|c| c.subscribe_tips());
@@ -789,21 +788,24 @@ pub fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
     };
     let params = match req.get("params") {
         None | Some(serde_json::Value::Null) => crate::methods::RpcParams::empty(),
-        Some(serde_json::Value::Array(a)) => crate::methods::RpcParams::positional(a.clone()),
-        Some(serde_json::Value::Object(m)) => crate::methods::RpcParams::named(m.clone()),
-        Some(_) => {
-            let err = serde_json::json!({
-                "code": -32602,
-                "message": "params must be array or object",
-            });
-            if notification {
-                return OneOut::Notification;
+        Some(v) => match crate::methods::RpcParams::from_json(v) {
+            Some(p) => p,
+            None => {
+                let err = serde_json::json!({
+                    "code": -32602,
+                    "message": "params must be array or object",
+                });
+                if notification {
+                    return OneOut::Notification;
+                }
+                return OneOut::Reply(match ver {
+                    JsonRpcVer::V2 => {
+                        reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err))
+                    }
+                    JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
+                });
             }
-            return OneOut::Reply(match ver {
-                JsonRpcVer::V2 => reply_v2(id.unwrap_or(serde_json::Value::Null), None, Some(err)),
-                JsonRpcVer::V1 => reply_v1(id, None, Some(err)),
-            });
-        }
+        },
     };
     if method == "getblocktemplate" && !crate::methods::http_wait_satisfied() {
         rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");

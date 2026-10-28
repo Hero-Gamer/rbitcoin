@@ -15,8 +15,9 @@ from typing import Any, Callable
 
 from rpc_proxy import RpcError
 
-# Core PER_UTXO_OVERHEAD: sizeof(COutPoint) + sizeof(uint32_t) + sizeof(bool).
-PER_UTXO_OVERHEAD = 41
+# Core v32.1 coins-DB overhead: sizeof(COutPoint) + sizeof(uint32_t).
+# The spent-flag byte is no longer counted.
+PER_UTXO_OVERHEAD = 40
 MAX_SCRIPT_SIZE = 10_000
 SIZE_STATS = ("utxo_size_inc", "utxo_size_inc_actual")
 

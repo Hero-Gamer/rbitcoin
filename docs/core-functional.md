@@ -1,10 +1,10 @@
 # Bitcoin Core functional tests (rbitcoin)
 
-Pin: **Bitcoin Core v31.1** (`9be056a8a72b624dae9623b2f7bded92c2a21c91`).
+Pin: **Bitcoin Core v32.1** (`f0de87f040621468b956f01f526a43a010310501`).
 
 `scripts/core-functional/` holds the inventory, checkers, runner, and
 the test-only bitcoind shim. Core’s Python tests and `src/test/data` live in the
-**`third_party/bitcoin` submodule** (v31.1). We do **not** copy the 267
+**`third_party/bitcoin` submodule** (v32.1). We do **not** copy the 284
 `*.py` files into this repo. Official `bitcoind` binaries for differential
 fuzz are **not** built from the submodule (sparse `src/test/data` + `test`
 only); `fetch-bitcoind.sh` downloads the `[release]` tarball into
@@ -103,8 +103,8 @@ python3 scripts/core-functional/check_inventory.py
 ```
 
 `--tests-dir PATH` compares against a Core checkout’s `test/functional`.
-Without it, the checker uses `scripts/core-functional/v31.1-tests.txt`
-(the v31.1 filename list).
+Without it, the checker uses `scripts/core-functional/v32.1-tests.txt`
+(the v32.1 filename list).
 
 ## Inventory schema
 
@@ -123,7 +123,7 @@ inventory checker only reads `[[test]]` rows and ignores `[release]`.
 | `analog` | required when `reason` is `no-prune`, `core-internal`, `no-utxo-set`, or `rpc-missing` (`none` if we will not re-home; otherwise a scenario name or follow-up) |
 | `log_map` | optional; later `debuglog_map.toml` keys |
 
-A file on disk (or in `v31.1-tests.txt`) that is missing from the inventory,
+A file on disk (or in `v32.1-tests.txt`) that is missing from the inventory,
 or an inventory row with no file, **fails the checker**.
 
 `run` means an **unmodified** Core script is green against rbitcoin **and**
@@ -245,7 +245,7 @@ older maintenance tags after a newer major. Bump `third_party/bitcoin`,
 the JSON corpora, and the inventory when it fires.
 
 ```bash
-python3 scripts/core-functional/check_core_release.py --latest v31.1
+python3 scripts/core-functional/check_core_release.py --latest v32.1
 ./scripts/core-functional/check_core_release.test.sh
 # live list (network):
 python3 scripts/core-functional/check_core_release.py
@@ -297,7 +297,8 @@ and would wipe our store after remine.
 `scripts/core-functional/create_cache.py` mines 199 via `generatetoaddress`
 (Core `_initialize_chain` payees: PRIV_KEYS[0:3] + MiniWallet P2TR) into
 `scripts/core-functional/cache/store` (gitignored). `run.sh` preseeds empty
-`test/cache/node0/regtest/{blocks,chainstate}` and passes `--keepcache`. The
+`test/cache/node0/regtest/{blocks,chainstate}` and passes that directory as
+`--cachedir` after v32.1's own temp cache argument, so the preseed wins. The
 shim copies `RBITCOIN_CACHE/store` only when the dest has those two dirs and
 no `store/` (clean-chain starts stay empty).
 

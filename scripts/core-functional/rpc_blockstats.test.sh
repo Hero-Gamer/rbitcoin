@@ -7,8 +7,8 @@ python3 - <<'PY'
 from rpc_blockstats import getblockstats_with_sizes, utxo_size_stats
 from rpc_proxy import RpcError
 
-P2WPKH = "0014" + "11" * 20  # 22 bytes: 8 + 1 + 22 + 41 = 72
-OP_RETURN = "6a"  # 1 byte: 8 + 1 + 1 + 41 = 51
+P2WPKH = "0014" + "11" * 20  # 22 bytes: 8 + 1 + 22 + 40 = 71
+OP_RETURN = "6a"  # 1 byte: 8 + 1 + 1 + 40 = 50
 coinbase = {
     "vin": [{"is_coinbase": True}],
     "vout": [{"scriptpubkey": P2WPKH}, {"scriptpubkey": OP_RETURN}],
@@ -17,10 +17,10 @@ spend = {
     "vin": [{"is_coinbase": False, "prevout": {"scriptpubkey": P2WPKH}}],
     "vout": [{"scriptpubkey": P2WPKH}, {"scriptpubkey": P2WPKH}],
 }
-assert utxo_size_stats(5, [coinbase, spend]) == (72 + 51 + 144 - 72, 72 + 144 - 72)
-assert utxo_size_stats(0, [coinbase]) == (123, 0), "genesis enters no UTXO"
-big = "00" * 300  # compact size 3 bytes: 8 + 3 + 300 + 41
-assert utxo_size_stats(1, [{"vin": [{"is_coinbase": True}], "vout": [{"scriptpubkey": big}]}]) == (352, 352)
+assert utxo_size_stats(5, [coinbase, spend]) == (71 + 50 + 142 - 71, 71 + 142 - 71)
+assert utxo_size_stats(0, [coinbase]) == (121, 0), "genesis enters no UTXO"
+big = "00" * 300  # compact size 3 bytes: 8 + 3 + 300 + 40
+assert utxo_size_stats(1, [{"vin": [{"is_coinbase": True}], "vout": [{"scriptpubkey": big}]}]) == (351, 351)
 oversize = "00" * 10_001
 assert utxo_size_stats(1, [{"vin": [{"is_coinbase": True}], "vout": [{"scriptpubkey": oversize}]}])[1] == 0
 
@@ -46,13 +46,13 @@ def esplora(path):
 
 
 got = getblockstats_with_sizes([5], forward, esplora)
-assert got == {**FULL, "utxo_size_inc": 195, "utxo_size_inc_actual": 144}, got
+assert got == {**FULL, "utxo_size_inc": 192, "utxo_size_inc_actual": 142}, got
 
 got = getblockstats_with_sizes({"hash_or_height": 5, "stats": ["utxo_size_inc"]}, forward, esplora)
-assert got == {"utxo_size_inc": 195}, got
+assert got == {"utxo_size_inc": 192}, got
 
 got = getblockstats_with_sizes([5, ["minfee", "utxo_size_inc_actual"]], forward, esplora)
-assert got == {"minfee": 7, "utxo_size_inc_actual": 144}, got
+assert got == {"minfee": 7, "utxo_size_inc_actual": 142}, got
 
 try:
     getblockstats_with_sizes([5, ["minfee", "aaa"]], forward, esplora)

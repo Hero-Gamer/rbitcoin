@@ -102,6 +102,8 @@ pub struct ListenOpts {
     pub max_inbound: u32,
     pub max_inbound_explicit: bool,
     pub external_ips: Vec<std::net::IpAddr>,
+    /// v3 `.onion` hosts from `--external-ip`. Advertised, not a reachability bit.
+    pub external_onions: Vec<String>,
     pub peer_timeout_secs: Option<u64>,
     /// SOCKS5 for all P2P outbound (`--proxy`).
     pub proxy: Option<SocketAddr>,
@@ -141,6 +143,7 @@ impl Default for ListenOpts {
             max_inbound: DEFAULT_MAX_INBOUND,
             max_inbound_explicit: false,
             external_ips: Vec::new(),
+            external_onions: Vec::new(),
             peer_timeout_secs: None,
             proxy: None,
             onion: None,
@@ -1200,7 +1203,21 @@ impl NodeConfig {
         }
         Ok(())
     }
+}
 
+/// BIP155 v3 onion: 56 lowercase base32 characters plus `.onion`.
+fn v3_onion_host(val: &str) -> Option<String> {
+    let name = val.strip_suffix(".onion")?;
+    if name.len() != 56 {
+        return None;
+    }
+    if !name.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')) {
+        return None;
+    }
+    Some(val.to_string())
+}
+
+impl NodeConfig {
     /// Apply one conf / CLI-equivalent `key=value`. Unknown keys are not errors.
     pub fn apply_kv(&mut self, key: &str, val: &str) -> Result<ConfApply, NodeError> {
         let key_l = key.to_ascii_lowercase().replace('-', "_");
@@ -1660,10 +1677,14 @@ impl NodeConfig {
                         "conf external_ip requires an address".into(),
                     ));
                 }
-                let ip: std::net::IpAddr = val
-                    .parse()
-                    .map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
-                self.listen.external_ips.push(ip);
+                if let Some(host) = v3_onion_host(val) {
+                    self.listen.external_onions.push(host);
+                } else {
+                    let ip: std::net::IpAddr = val
+                        .parse()
+                        .map_err(|e| NodeError::Config(format!("conf external_ip: {e}")))?;
+                    self.listen.external_ips.push(ip);
+                }
             }
             "peer_timeout" => {
                 let n: u64 = val

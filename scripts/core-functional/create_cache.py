@@ -6,8 +6,9 @@ Core's `_initialize_chain` mines 199 blocks then **deletes** everything except
 
 1. This script mines 199 via `generatetoaddress` (Core payee schedule:
    PRIV_KEYS[0:3] + MiniWallet P2TR) into `scripts/core-functional/cache/store`.
-2. `run.sh` preseeds empty `test/cache/node0/regtest/{blocks,chainstate}` so Core
-   skips remine, and passes `--keepcache` so test_runner does not wipe it.
+2. `run.sh` preseeds empty `test/cache/node0/regtest/{blocks,chainstate}` and
+   passes that directory last as `--cachedir`, so v32.1's temp cache does not
+   win and Core skips remine.
 3. The bitcoind shim copies `RBITCOIN_CACHE/store` when the dest looks like a
    Core cache copy (has `blocks/` + `chainstate/`, no `store/`).
 

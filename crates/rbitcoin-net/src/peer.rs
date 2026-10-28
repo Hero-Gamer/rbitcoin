@@ -2887,6 +2887,12 @@ pub fn handle_peer_control_msg(
         NetworkMessage::FeeFilter(amt) => on_feefilter(session, *amt),
         NetworkMessage::SendHeaders => on_sendheaders(follow),
         NetworkMessage::SendCmpct(sc) => on_sendcmpct(follow, session, sc),
+        // rust-bitcoin rejects announce bytes other than 0 or 1 at decode,
+        // so a bad sendcmpct arrives as Unknown. BIP152 disconnects that.
+        NetworkMessage::Unknown { command, .. } if command.as_ref() == "sendcmpct" => {
+            rbitcoin_log::info!("invalid sendcmpct announce field");
+            punish_disconnect(&mut follow.ban_score, session);
+        }
         NetworkMessage::WtxidRelay => on_wtxid_relay(follow, session),
         NetworkMessage::SendAddrV2 => on_sendaddrv2(follow, session),
         _ => return Ok(false),
@@ -3463,6 +3469,19 @@ pub async fn serve_getdata_tail(
             break;
         };
         match &item {
+            // A block-relay-only session does not serve transactions and
+            // does not answer notfound for them (`p2p_blocksonly`).
+            Inventory::Transaction(_) | Inventory::WitnessTransaction(_) | Inventory::WTx(_)
+                if session
+                    .is_some_and(|s| s.conn_type == crate::peers::PeerConnType::BlockRelay) => {}
+            // MSG_FILTERED_BLOCK. NODE_BLOOM is off, so this is a disconnect.
+            Inventory::Unknown { inv_type, .. } if *inv_type & 0x3fff_ffff == 3 => {
+                rbitcoin_log::info!(
+                    "filtered block request received when NODE_BLOOM service disabled"
+                );
+                punish_disconnect(&mut follow.ban_score, session);
+                return Ok(());
+            }
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
             // The header check and the body reconstruct both run on the
@@ -4475,7 +4494,15 @@ pub async fn on_cmpctblock(
         .await?;
         return Ok(());
     }
-    on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash).await
+    // getblocktxn only after SENDCMPCT version 2, and only when this node
+    // asked for the block or selected the peer for high-bandwidth. A live
+    // peer who has not negotiated that does not get a round trip. Callers
+    // with no session (in-tree compact helpers) still fetch.
+    let fetch_missing = session.is_none()
+        || (follow.cmpct_version == 2
+            && (follow.requested_blocks.contains(&hash)
+                || session.is_some_and(|s| s.hb_to.load(Ordering::Relaxed))));
+    on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash, fetch_missing).await
 }
 
 #[doc(hidden)]
@@ -4486,6 +4513,11 @@ pub fn on_cmpctblock_reject_early(
     hsi: &HeaderAndShortIds,
     hash: BlockHash,
 ) -> Result<bool, NetError> {
+    // `-blocksonly` does not reconstruct compact blocks, solicited or not.
+    // The peer still gets a full-block getdata from the headers path.
+    if hub.blocks_only.load(Ordering::Acquire) {
+        return Ok(true);
+    }
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
         rbitcoin_log::info!("p2p: previous compact block reconstruction attempt failed");
         misbehaving(&mut follow.ban_score, session);
@@ -4557,6 +4589,7 @@ pub async fn on_cmpctblock_reconstruct(
     session: Option<&crate::peers::LivePeer>,
     hsi: &HeaderAndShortIds,
     hash: BlockHash,
+    fetch_missing: bool,
 ) -> Result<(), NetError> {
     // Reconstruct after the message is in hand. The permit is the same
     // budget as block decode and compact serve. Session state stays here.
@@ -4570,6 +4603,9 @@ pub async fn on_cmpctblock_reconstruct(
     })
     .await
     .map_err(|_| NetError::Protocol("compact reconstruct join failed"))?;
+    if !fetch_missing && matches!(outcome, Some(CmpctReconstruct::NeedTxn(_, _))) {
+        return Ok(());
+    }
     match outcome {
         Some(CmpctReconstruct::Block(block, fill)) => {
             on_cmpct_got_block(hub, out_tx, follow, session, hsi, hash, block, fill).await

@@ -168,7 +168,7 @@ DRY_OUT="$("$RUN" --dry-run --inventory "$INV" --tests-dir "$TESTS" \
 if printf '%s' "$DRY_OUT" | grep -q -- '--v2transport' \
   && printf '%s' "$DRY_OUT" | grep -q -- '--jobs' \
   && printf '%s' "$DRY_OUT" | grep -q -- '--timeout-factor=4' \
-  && printf '%s' "$DRY_OUT" | grep -q -- '--keepcache' \
+  && printf '%s' "$DRY_OUT" | grep -q -- '--cachedir=' \
   && printf '%s' "$DRY_OUT" | grep -q 'feature_help.py'; then
   echo "ok - dry-run run name"
   PASS=$((PASS + 1))
@@ -228,7 +228,7 @@ if printf '%s' "$DRY_REAL" | grep -q 'feature_uacomment.py' \
   && printf '%s' "$DRY_REAL" | grep -q 'p2p_block_sync.py' \
   && printf '%s' "$DRY_REAL" | grep -q 'p2p_permissions.py' \
   && printf '%s' "$DRY_REAL" | grep -q -- '--v2transport' \
-  && printf '%s' "$DRY_REAL" | grep -q -- '--keepcache'; then
+  && printf '%s' "$DRY_REAL" | grep -q -- '--cachedir='; then
   echo "ok - real inventory dry-run production-green set"
   PASS=$((PASS + 1))
 else

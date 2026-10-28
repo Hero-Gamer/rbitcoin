@@ -662,6 +662,8 @@ async fn partial_for_a_block_connected_elsewhere_frees_the_slot() {
     );
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    stalling.hb_to.store(true, Ordering::Relaxed);
     let cmpct = |blk: &bitcoin::Block| CmpctBlock {
         compact_block: HeaderAndShortIds::from_block(blk, 0xbeef, 2, &[]).unwrap(),
     };
@@ -829,6 +831,8 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
         );
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
         let mut follow = PeerFollowState::new();
+        follow.cmpct_version = 2;
+        session.hb_to.store(true, Ordering::Relaxed);
         let frame = frame_for(NetworkMessage::CmpctBlock(CmpctBlock {
             compact_block: hsi,
         }));
@@ -5025,7 +5029,7 @@ fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
             let (out_tx, _rx) = mpsc::unbounded_channel();
             let mut follow = PeerFollowState::new();
             follow.requested_blocks.insert(hash);
-            on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash)
+            on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash, true)
                 .await
                 .expect("reconstruct");
         })

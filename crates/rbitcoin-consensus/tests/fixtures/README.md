@@ -10,8 +10,8 @@
 Core JSON under `src/test/data/` (`script_tests.json`, `tx_valid.json`,
 `tx_invalid.json`, `sighash.json`, `bip341_wallet_vectors.json`, …) is
 **not** checked in here. Each `cargo test` run hard-links or copies named
-files from Bitcoin Core **v31.1**
-(`9be056a8a72b624dae9623b2f7bded92c2a21c91`) at
+files from Bitcoin Core **v32.1**
+(`f0de87f040621468b956f01f526a43a010310501`) at
 `third_party/bitcoin/src/test/data/` into `$CARGO_TARGET_DIR/core-data/`.
 
 ```bash
