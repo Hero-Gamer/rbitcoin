@@ -13,9 +13,10 @@ Changed
 - **In-RAM Class C gets take no reader-writer lock.** One sequence counter
   covers a store. The odd bit is sequentially consistent, a release fence
   runs before the slot stores, and the even advance publishes them. Header
-  pairs, which have no flush flag, still take a relaxed odd step and that
-  same release fence. A get acquire-fences before it checks the counter
-  again. `header_txs` reads first and count under one counter. A header
+  pairs have no flush flag. Their odd step is that same sequentially
+  consistent compare-exchange, then the release fence. A get acquire-fences
+  before it checks the counter again. `header_txs` reads first and count
+  under one counter. A header
   column load acquires that store, then the same fence checks the counter.
   `strong_tx` keeps its bits in that slot buffer. One flush serves the
   arrays and the bit image. The bit image's length is the body in bytes.
