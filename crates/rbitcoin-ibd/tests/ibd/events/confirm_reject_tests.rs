@@ -3769,8 +3769,11 @@ fn a_block_too_far_ahead_waits_and_then_connects() {
     let ahead = now + 2 * 3600 + 3;
     let block = mine(gen, (ahead - 1_300_000_000) as u32, 1, vec![]);
     let hash = block.block_hash();
-    // Stored while the clock was ahead.
-    let fk = rbitcoin_consensus::with_now(ahead, || hub.ensure_header_fk(&block.header)).unwrap();
+    // Stored while the node clock was ahead. Header checks read that clock,
+    // not a bare `with_now` around the call.
+    hub.clock.set_mock(i64::try_from(ahead).unwrap());
+    let fk = hub.ensure_header_fk(&block.header).unwrap();
+    hub.clock.set_mock(0);
 
     let mut st = IbdWorkState::new(vec![dummy_slot(1)], Some(gen), Some(0));
     let feed = Arc::new(ConfirmFeed::new());

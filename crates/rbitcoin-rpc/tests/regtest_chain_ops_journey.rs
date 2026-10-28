@@ -1110,8 +1110,9 @@ fn chain_ops_mocktime(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wpkh: &S
         (mock..mock + 600).contains(&t),
         "generate time {t} should honor mock {mock}"
     );
+    let parent = hub.tip_hash().unwrap();
     let far = rbitcoin_consensus::mine_regtest_paying(
-        hub.tip_hash().unwrap(),
+        parent,
         (mock + 3 * 3600) as u32,
         3,
         p2wpkh.clone(),
@@ -1119,7 +1120,81 @@ fn chain_ops_mocktime(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wpkh: &S
     );
     let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&far))]).unwrap();
     assert_eq!(r, "time-too-new", "future header vs mock now");
+    dispatch(ctx, "setmocktime", vec![json!(mock + 3 * 3600)]).unwrap();
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&far))]).unwrap();
+    assert!(r.is_null(), "same block once the clock catches up: {r}");
+    assert_eq!(best_hash(ctx), json!(far.block_hash().to_string()));
+
+    let sibling = rbitcoin_consensus::mine_regtest_paying(
+        parent,
+        (mock + 6 * 3600) as u32,
+        3,
+        p2wpkh.clone(),
+        vec![],
+    );
+    for attempt in ["first", "second"] {
+        let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&sibling))]).unwrap();
+        assert_eq!(r, "time-too-new", "{attempt} submit of a future fork block");
+    }
+    assert_eq!(best_hash(ctx), json!(far.block_hash().to_string()));
+    // The sibling is still hours ahead of the wall clock. `setmocktime` is
+    // the node clock the next submit must use.
+    dispatch(ctx, "setmocktime", vec![json!(mock + 6 * 3600)]).unwrap();
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&sibling))]).unwrap();
+    assert_eq!(
+        r, "inconclusive",
+        "equal-work fork once the node clock reaches its time: {r}"
+    );
+    assert_eq!(best_hash(ctx), json!(far.block_hash().to_string()));
+    let child = rbitcoin_consensus::mine_regtest_paying(
+        sibling.block_hash(),
+        (mock + 6 * 3600 + 1) as u32,
+        4,
+        p2wpkh.clone(),
+        vec![],
+    );
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&child))]).unwrap();
+    assert!(
+        r.is_null(),
+        "heavier fork connects once the node clock allows its parent: {r}"
+    );
+    assert_eq!(best_hash(ctx), json!(child.block_hash().to_string()));
+
+    // The node clock is still the mock that accepted `child`, so this header's
+    // time is legal. Wrong nBits on the non-tip parent is bad-diffbits, and
+    // that verdict is remembered. Proof-of-work meets the stated target.
+    let mut bad_bits = rbitcoin_consensus::mine_regtest_paying(
+        sibling.block_hash(),
+        child.header.time,
+        4,
+        p2wpkh.clone(),
+        vec![],
+    );
+    bad_bits.header.bits = bitcoin::CompactTarget::from_consensus(0x207f_fffe);
+    regrind(&mut bad_bits);
+    let first = dispatch(ctx, "submitblock", vec![json!(block_hex(&bad_bits))]).unwrap();
+    assert_eq!(first, "bad-diffbits", "side block with the wrong bits");
+    let second = dispatch(ctx, "submitblock", vec![json!(block_hex(&bad_bits))]).unwrap();
+    assert_eq!(second, "duplicate-invalid", "bad-diffbits is remembered");
+    assert_eq!(best_hash(ctx), json!(child.block_hash().to_string()));
+
     dispatch(ctx, "setmocktime", vec![json!(0)]).unwrap();
+
+    // Parent is on the best chain and is not the tip, so this is a side
+    // header. Both submits must say time-too-old: that block can never become
+    // valid, and Core still answers time-too-old the second time.
+    let too_old = rbitcoin_consensus::mine_regtest_paying(
+        sibling.block_hash(),
+        1,
+        4,
+        p2wpkh.clone(),
+        vec![],
+    );
+    for attempt in ["first", "second"] {
+        let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&too_old))]).unwrap();
+        assert_eq!(r, "time-too-old", "{attempt} submit of a too-old side block");
+    }
+    assert_eq!(best_hash(ctx), json!(child.block_hash().to_string()));
 }
 
 fn chain_ops_coinbase_only_blocks(ctx: &RpcContext) {

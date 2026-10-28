@@ -3332,7 +3332,7 @@ fn invalid_held_child_does_not_poison_later_apply() {
         NetError::Consensus(s) => {
             assert!(s.contains("bad-txns-inputs-missingorspent"), "got {s}");
         }
-        NetError::ConnectFailed { msg, hash } => {
+        NetError::ConnectFailed { msg, hash, .. } => {
             assert!(msg.contains("bad-txns-inputs-missingorspent"), "got {msg}");
             assert_eq!(hash, bad.block_hash().to_byte_array());
         }
@@ -3864,8 +3864,11 @@ fn hostile_peer_session() {
         let bad = mine_with_extra(honest.block_hash(), t2, 2, extra);
         hub.note_asked_block(bad.block_hash());
         let err = hub.accept_received_block(bad.clone()).expect_err(want);
+        let reason = err
+            .consensus_rules()
+            .map(rbitcoin_consensus::block_reject_reason);
         assert!(
-            matches!(&err, NetError::Consensus(s) if s.contains(want)),
+            reason.as_deref().is_some_and(|s| s.contains(want)),
             "{want}: {err:?}"
         );
         assert!(hub.is_block_invalid(&bad.block_hash()), "{want} cached");
@@ -3879,14 +3882,11 @@ fn hostile_peer_session() {
     let err = hub
         .accept_received_block(future.clone())
         .expect_err("header more than two hours ahead of mock");
-    let msg = match &err {
-        NetError::Consensus(s) => s.as_str(),
-        other => panic!("expected Consensus time-too-new, got {other:?}"),
-    };
-    assert!(
-        msg.contains("time-too-new") || msg.contains("future"),
-        "got {msg}"
-    );
+    let msg = err
+        .consensus_rules()
+        .map(rbitcoin_consensus::block_reject_reason)
+        .unwrap_or_else(|| panic!("expected a rule failure, got {err:?}"));
+    assert!(msg.contains("time-too-new"), "got {msg}");
     assert!(
         !hub.is_block_invalid(&future.block_hash()),
         "time-too-new must not cache BLOCK_FAILED"
@@ -4183,7 +4183,7 @@ fn store_fault_during_header_check_is_not_a_failed_block() {
     );
     let bad = connect_failed_for_header(hash, NetError::Consensus("bad-diffbits".into()));
     match bad {
-        NetError::ConnectFailed { hash: h, msg } => {
+        NetError::ConnectFailed { hash: h, msg, .. } => {
             assert_eq!(h, hash);
             assert!(msg.contains("bad-diffbits"), "{msg}");
         }

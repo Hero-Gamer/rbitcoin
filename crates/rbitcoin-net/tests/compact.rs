@@ -668,7 +668,7 @@ fn assert_mutated_not_block_failed(
                 "got {s}"
             );
         }
-        NetError::ConnectFailed { msg, hash: h } => {
+        NetError::ConnectFailed { msg, hash: h, .. } => {
             assert!(
                 msg.contains("merkle")
                     || msg.contains("bad-txnmrklroot")

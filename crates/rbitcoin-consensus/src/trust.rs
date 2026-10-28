@@ -99,6 +99,7 @@ fn apply_block(s: &str) -> bool {
             | "coinbase excess value"
             | "bad-cb-amount"
             | "signet solution invalid"
+            | "bad-signet-blksig"
     ) || s.starts_with("signet:")
 }
 

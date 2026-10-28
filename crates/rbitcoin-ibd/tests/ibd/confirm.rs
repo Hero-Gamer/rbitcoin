@@ -1577,6 +1577,7 @@ fn from_net_maps_wire_and_string_classes() {
         ConfirmRejectClass::from_net(&NetError::ConnectFailed {
             hash: [0u8; 32],
             msg: "script verification failed".into(),
+            rules: None,
         }),
         ConfirmRejectClass::ConsensusInvalid
     );
@@ -1587,6 +1588,28 @@ fn from_net_maps_wire_and_string_classes() {
     assert_eq!(
         ConfirmRejectClass::from_net(&NetError::Timeout),
         ConfirmRejectClass::Cascade
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::Rules(
+            rbitcoin_consensus::ConsensusError::BadHeader("timestamp <= median-time-past"),
+        )),
+        ConfirmRejectClass::ConsensusInvalid
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::Rules(
+            rbitcoin_consensus::ConsensusError::BadHeader("timestamp too far in future"),
+        )),
+        ConfirmRejectClass::Cascade
+    );
+    assert_eq!(
+        ConfirmRejectClass::from_net(&NetError::ConnectFailed {
+            hash: [0u8; 32],
+            msg: "time-too-old".into(),
+            rules: Some(rbitcoin_consensus::ConsensusError::BadHeader(
+                "timestamp <= median-time-past",
+            )),
+        }),
+        ConfirmRejectClass::ConsensusInvalid
     );
 }
 

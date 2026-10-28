@@ -1,7 +1,7 @@
 use rbitcoin_primitives::ScriptNumError;
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConsensusError {
     /// Programmer invariant inside a rule helper. Not a block reject and not a
     /// store fault. The confirm pipeline must not cache it as a failed block.
@@ -90,6 +90,7 @@ pub fn block_reject_reason(err: &ConsensusError) -> String {
         ConsensusError::BadBlock("bip34 height encoding" | "bip34 coinbase script empty") => {
             "bad-cb-height".into()
         }
+        ConsensusError::BadBlock("signet solution invalid") => "bad-signet-blksig".into(),
         ConsensusError::BadBlock("block weight too large") => "bad-blk-weight".into(),
         ConsensusError::BadBlock(s) => (*s).into(),
         ConsensusError::BadHeader("timestamp <= median-time-past") => "time-too-old".into(),

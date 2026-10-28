@@ -54,6 +54,14 @@ do not restate them here.
    same job. Confirm-stage IO has the same rule in
    [`invariants.md`](./invariants.md).
 
+10. **First cause.** A wrong result is fixed in the type that already owns
+    the fact. Do not add a downstream parser of that type's `Display`, or
+    of any other rendered text, to recover a distinction the type already
+    made. `ConsensusError` owns a header failure. `block_reject_reason` is
+    the BIP22 text. A caller that needs the reason matches the error. A
+    change that replaces a text parser deletes that parser in the same
+    change (rule 9).
+
 ---
 
 ## Extract under tests
