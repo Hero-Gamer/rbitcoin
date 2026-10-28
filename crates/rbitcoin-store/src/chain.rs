@@ -476,6 +476,11 @@ impl StrongTxTable {
 /// only, and the writer assigns contiguous fks per block.
 /// `first.body[header_fk-1]` is the first tx fk (0 = no body).
 /// `count.body[header_fk-1]` is the tx count (0 = no body).
+///
+/// `put_range`, `put_lists_batch`, `put_ranges_batch`, and `clear_body` store
+/// the first column, then the count, under one pair counter. If the count
+/// store returns an error, `get_range` can accept the new first with the
+/// previous count once the call returns.
 pub struct HeaderTxsTable {
     pub first: ArrayTable,
     pub count: ArrayTable,

@@ -903,7 +903,15 @@ impl ArrayTable {
             return Ok(());
         }
         self.len.store(new_len, Ordering::Relaxed);
-        self.mark_unstored(0);
+        // The mark is a bit index on a byte body and an element index
+        // otherwise. `fetch_min` keeps a dirtier prefix. A clean image marks
+        // the cut, so the flush shortens without rewriting that prefix.
+        let mark = if self.byte_body {
+            new_len.saturating_mul(8)
+        } else {
+            new_len
+        };
+        self.mark_unstored(mark);
         Ok(())
     }
 
@@ -959,11 +967,12 @@ impl ArrayTable {
         let mut end = FlushGuard(&self.flushing, &self.disk_len, &self.unstored_from, None);
         between(self, FlushStep::Write);
         // A byte body counts `len` in bytes and the mark in bits. Slot tables
-        // count elements. The kept prefix is not rewritten, and the file is
-        // not padded out to a word.
+        // count elements. Write the dirty prefix the new length still names,
+        // including when that length is below the last flush. The file length
+        // then drops bytes at and above `n`. The file is not padded to a word.
         let stride = if self.byte_body { 1 } else { ELEM };
         let start = if self.byte_body { from / 8 } else { from }.min(disk);
-        if n >= disk && start < n {
+        if start < n {
             let mut scratch = [0u8; FLUSH_SCRATCH];
             let mut off = 0u64;
             let mut max_chunk = 0usize;
