@@ -1153,14 +1153,16 @@ pub fn read_confirmed_prevout(
     )))
 }
 
-/// Hard consensus rejects stick. A mutated body, a missing parent, and a
-/// block that is only too far in the future stay retryable. A warn-and-apply
-/// fault stays retryable while `--trust-peer` is on.
+/// Hard consensus rejects stick. A mutated body, a missing parent, a block
+/// that is only too far in the future, and a block older than median time
+/// stay retryable. A warn-and-apply fault stays retryable while
+/// `--trust-peer` is on. `bad-diffbits` sticks.
 fn submit_reason_sticks(hub: &rbitcoin_net::ChainHub, block: &Block, reason: &str) -> bool {
     !submit_reason_is_mutated(block, reason)
         && reason != "high-hash"
         && reason != "prev-blk-not-found"
         && reason != "time-too-new"
+        && reason != "time-too-old"
         && !(hub.query.trust_peer() && rbitcoin_consensus::reason_is_warn_and_apply(reason))
 }
 
@@ -1297,6 +1299,9 @@ pub fn submit_reject_reason(e: &rbitcoin_net::NetError) -> String {
     if matches!(e, rbitcoin_net::NetError::UnknownParent) {
         return "prev-blk-not-found".into();
     }
+    if let Some(rules) = e.consensus_rules() {
+        return rbitcoin_consensus::block_reject_reason(rules);
+    }
     let s = e.to_string();
     let s = s.strip_prefix("consensus: ").unwrap_or(s.as_str());
     let s = s.strip_prefix("protocol: ").unwrap_or(s);
@@ -1305,12 +1310,6 @@ pub fn submit_reject_reason(e: &rbitcoin_net::NetError) -> String {
     }
     if s.contains("pow invalid") || s.contains("InvalidPow") || s.contains("high-hash") {
         return "high-hash".into();
-    }
-    if s.contains("signet solution invalid") {
-        return "bad-signet-blksig".into();
-    }
-    if s.contains("timestamp too far in future") {
-        return "time-too-new".into();
     }
     for needle in [
         "bad-txns-nonfinal",

@@ -58,6 +58,10 @@ fn block_reject_reason_bip113_and_bip112_needles() {
         "bad-diffbits"
     );
     assert_eq!(
+        block_reject_reason(&ConsensusError::BadBlock("signet solution invalid")),
+        "bad-signet-blksig"
+    );
+    assert_eq!(
         block_reject_reason(&ConsensusError::InvalidPow),
         "high-hash"
     );

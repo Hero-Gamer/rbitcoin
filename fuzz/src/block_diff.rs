@@ -1119,6 +1119,7 @@ pub fn verdict_from_accept(
         Err(
             NetError::Protocol(_)
             | NetError::Consensus(_)
+            | NetError::Rules(_)
             | NetError::ConnectFailed { .. }
             | NetError::Mutated(_)
             | NetError::BadPrev
@@ -2499,6 +2500,7 @@ mod tests {
             verdict_from_accept(Err(NetError::ConnectFailed {
                 hash: [0u8; 32],
                 msg: "bad-txns-inputs-missingorspent".into(),
+                rules: None,
             }))
             .unwrap(),
             DiffVerdict::Reject

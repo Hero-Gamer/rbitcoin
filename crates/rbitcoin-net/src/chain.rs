@@ -498,14 +498,27 @@ pub fn reject_is_mutated(reason: &str) -> bool {
         || reason.contains("unexpected witness")
 }
 
+fn rules_connect_failed(hash: [u8; 32], err: &rbitcoin_consensus::ConsensusError) -> NetError {
+    NetError::ConnectFailed {
+        hash,
+        msg: rbitcoin_consensus::block_reject_reason(err),
+        rules: Some(err.clone()),
+    }
+}
+
 /// Core logs a contextual header reject (`bad-version`, `time-too-new`) with
-/// its reason. The returned error keeps the store-facing Display string.
+/// its BIP22 reason. The error keeps the [`rbitcoin_consensus::ConsensusError`].
 /// A consensus header failure names the block so it can be marked invalid.
 /// A store fault stays a store fault: it must not be cached as `BLOCK_FAILED`.
 #[doc(hidden)]
 pub fn connect_failed_for_header(hash: [u8; 32], e: NetError) -> NetError {
     match e {
-        NetError::Consensus(msg) => NetError::ConnectFailed { hash, msg },
+        NetError::Rules(err) => rules_connect_failed(hash, &err),
+        NetError::Consensus(msg) => NetError::ConnectFailed {
+            hash,
+            msg,
+            rules: None,
+        },
         other => other,
     }
 }
@@ -527,7 +540,7 @@ pub fn header_reject(header: &Header, e: &rbitcoin_query::ConfirmError) -> NetEr
         "{}",
         rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
     );
-    NetError::Consensus(rules.to_string())
+    NetError::from_consensus(rules.clone())
 }
 
 /// Inputs a connected block spends, excluding the coinbase null prevout.
@@ -562,7 +575,17 @@ fn soften_parent_header(
     result
 }
 
+fn rules_are_temporary_time(e: &rbitcoin_consensus::ConsensusError) -> bool {
+    matches!(
+        rbitcoin_consensus::block_reject_reason(e).as_str(),
+        "time-too-old" | "time-too-new"
+    )
+}
+
 pub fn accept_err_is_temporary_time(e: &NetError) -> bool {
+    if let Some(rules) = e.consensus_rules() {
+        return rules_are_temporary_time(rules);
+    }
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
             let s = s.to_ascii_lowercase();
@@ -578,6 +601,9 @@ pub fn accept_err_is_temporary_time(e: &NetError) -> bool {
 /// Warn-and-apply faults stay retryable so the trusted session can deliver
 /// the same block. Hard rejects still stick.
 pub fn accept_err_is_warn_and_apply(e: &NetError) -> bool {
+    if let Some(rules) = e.consensus_rules() {
+        return rbitcoin_consensus::is_warn_and_apply(rules);
+    }
     let Some(reason) = (match e {
         NetError::Consensus(s) | NetError::Mutated(s) | NetError::ConnectFailed { msg: s, .. } => {
             Some(s.as_str())
@@ -1584,7 +1610,7 @@ impl ChainHub {
             self.forget_asked_block(&hash);
             return;
         }
-        if e.failing_block_hash().is_some() {
+        if e.failing_block_hash().is_some() || matches!(e, NetError::Rules(_)) {
             let _ = self.note_failed_connect(hash);
             self.refresh_header_report();
             return;
@@ -3250,13 +3276,19 @@ impl ChainHub {
                 return Err(e);
             }
             // `ConnectFailed` displays its own "consensus: " prefix.
-            let msg = match &e {
-                NetError::Consensus(m) | NetError::Mutated(m) => m.clone(),
-                other => other.to_string(),
-            };
-            let failed = NetError::ConnectFailed {
-                hash: b.block_hash().to_byte_array(),
-                msg,
+            let hash = b.block_hash().to_byte_array();
+            let failed = match &e {
+                NetError::Rules(err) => rules_connect_failed(hash, err),
+                NetError::Consensus(m) | NetError::Mutated(m) => NetError::ConnectFailed {
+                    hash,
+                    msg: m.clone(),
+                    rules: None,
+                },
+                other => NetError::ConnectFailed {
+                    hash,
+                    msg: other.to_string(),
+                    rules: None,
+                },
             };
             let prefix = &blocks[..i];
             if !prefix.is_empty() && work_better(self.branch_header_work(prefix)?, old_work) {
@@ -3800,7 +3832,7 @@ impl ChainHub {
                     if reject_is_mutated(&reason) {
                         NetError::Mutated(reason)
                     } else {
-                        NetError::Consensus(reason)
+                        NetError::Rules(e)
                     }
                 }
                 rbitcoin_query::ConfirmError::Store(se) => {

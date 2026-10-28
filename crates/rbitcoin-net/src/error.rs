@@ -20,6 +20,10 @@ pub enum NetError {
     },
     BadMagic,
     Consensus(String),
+    /// A consensus rule failure. Callers match this variant. [`Self::Consensus`]
+    /// stays the string bag for faults that are not a rule (`header parent
+    /// unknown`, `Block not found`, `zero target`).
+    Rules(rbitcoin_consensus::ConsensusError),
     /// Local store / engine fault during connect (IO, invariant, io_uring).
     /// Not a verdict on the block: never cached as invalid.
     Store(String),
@@ -37,6 +41,9 @@ pub enum NetError {
     ConnectFailed {
         hash: [u8; 32],
         msg: String,
+        /// Set when the failure is a [`rbitcoin_consensus::ConsensusError`].
+        /// Classification uses this. `msg` is the BIP22 text for Display.
+        rules: Option<rbitcoin_consensus::ConsensusError>,
     },
 }
 
@@ -56,6 +63,7 @@ impl fmt::Display for NetError {
             }
             NetError::BadMagic => f.write_str("wrong network magic"),
             NetError::Consensus(s) => write!(f, "consensus: {s}"),
+            NetError::Rules(e) => write!(f, "consensus: {e}"),
             NetError::Store(s) => write!(f, "store: {s}"),
             NetError::Cancelled => f.write_str("confirm cancelled"),
             NetError::Mutated(s) => write!(f, "consensus: {s}"),
@@ -89,7 +97,16 @@ impl NetError {
             rbitcoin_consensus::ConsensusError::BadPrev => NetError::BadPrev,
             // Pool-adapted store text. Not a block verdict.
             rbitcoin_consensus::ConsensusError::Internal(m) => NetError::store(m),
-            other => NetError::Consensus(other.to_string()),
+            other => NetError::Rules(other),
+        }
+    }
+
+    /// The rule failure inside this error, when the failure is a consensus rule.
+    pub fn consensus_rules(&self) -> Option<&rbitcoin_consensus::ConsensusError> {
+        match self {
+            NetError::Rules(e) => Some(e),
+            NetError::ConnectFailed { rules: Some(e), .. } => Some(e),
+            _ => None,
         }
     }
 
@@ -105,6 +122,17 @@ impl NetError {
     pub fn is_mutated(&self) -> bool {
         match self {
             NetError::Mutated(_) => true,
+            NetError::Rules(e) => {
+                crate::chain::reject_is_mutated(&rbitcoin_consensus::block_reject_reason(e))
+            }
+            NetError::ConnectFailed {
+                rules: Some(e),
+                msg,
+                ..
+            } => {
+                crate::chain::reject_is_mutated(&rbitcoin_consensus::block_reject_reason(e))
+                    || crate::chain::reject_is_mutated(msg)
+            }
             NetError::ConnectFailed { msg, .. } | NetError::Consensus(msg) => {
                 crate::chain::reject_is_mutated(msg)
             }

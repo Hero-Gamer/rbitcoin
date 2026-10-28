@@ -195,7 +195,7 @@ impl RpcRegtest for HubRegtest {
     ) -> Result<Vec<BlockHash>, String> {
         self.0
             .generate_to_script_for_rpc(nblocks, script_pubkey, extra_txs)
-            .map_err(|e| e.to_string())
+            .map_err(|e| mine::submit_reject_reason(&e))
     }
 
     fn assemble_block_to_script(
@@ -205,7 +205,7 @@ impl RpcRegtest for HubRegtest {
     ) -> Result<Block, String> {
         self.0
             .assemble_block_to_script(script_pubkey, extra_txs)
-            .map_err(|e| e.to_string())
+            .map_err(|e| mine::submit_reject_reason(&e))
     }
 
     fn submit_block(&self, block: Block) -> SubmitBlockOutcome {

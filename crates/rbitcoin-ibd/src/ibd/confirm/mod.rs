@@ -464,6 +464,10 @@ impl ConfirmRejectClass {
             rbitcoin_net::error::NetError::Cancelled => Self::Cancelled,
             rbitcoin_net::error::NetError::Mutated(_) => Self::SoftWire,
             rbitcoin_net::error::NetError::BadPrev => Self::SoftWire,
+            rbitcoin_net::error::NetError::Rules(e) => Self::from_consensus(e),
+            rbitcoin_net::error::NetError::ConnectFailed { rules: Some(e), .. } => {
+                Self::from_consensus(e)
+            }
             rbitcoin_net::error::NetError::ConnectFailed { msg, .. } => Self::from_err_str(msg),
             rbitcoin_net::error::NetError::Consensus(s) => Self::from_err_str(s),
             other => Self::from_err_str(&other.to_string()),

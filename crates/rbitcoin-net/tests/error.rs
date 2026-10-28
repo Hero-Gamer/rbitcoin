@@ -19,6 +19,12 @@ fn display_and_source_surface() {
         ),
         (NetError::BadMagic, "wrong network magic"),
         (NetError::Consensus("c".into()), "consensus: c"),
+        (
+            NetError::Rules(rbitcoin_consensus::ConsensusError::BadHeader(
+                "timestamp <= median-time-past",
+            )),
+            "consensus: bad header: timestamp <= median-time-past",
+        ),
         (NetError::Store("s".into()), "store: s"),
         (NetError::Cancelled, "confirm cancelled"),
         (
@@ -35,6 +41,7 @@ fn display_and_source_surface() {
             NetError::ConnectFailed {
                 hash: [1u8; 32],
                 msg: "bad spend".into(),
+                rules: None,
             },
             "consensus: bad spend",
         ),

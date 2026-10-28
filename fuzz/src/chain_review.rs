@@ -126,6 +126,7 @@ fn hub_verdict(hub: &ChainHub, block: Block) -> Result<(Fate, String), String> {
                 Ok((Fate::Mutated, s))
             }
         }
+        Err(NetError::Rules(e)) => Ok((Fate::Reject, rbitcoin_consensus::block_reject_reason(&e))),
         Err(NetError::Consensus(s)) => Ok((Fate::Reject, s)),
         Err(NetError::ConnectFailed { msg, .. }) => Ok((Fate::Reject, msg)),
         Err(e @ (NetError::BadPrev | NetError::SideBlock | NetError::UnknownParent)) => {
@@ -408,12 +409,14 @@ fn batch_accept(hub: &ChainHub, blocks: &[(Height, Block)]) -> Result<bool, Stri
         Ok(Some(loaded)) => match confirm_scripts_phase(loaded.batch) {
             Ok(scripts) => match hub.confirm_write(scripts.batch) {
                 Ok(_) => Ok(true),
-                Err(NetError::Consensus(_) | NetError::Mutated(_)) => Ok(false),
+                Err(NetError::Consensus(_) | NetError::Rules(_) | NetError::Mutated(_)) => {
+                    Ok(false)
+                }
                 Err(e) => Err(format!("batch write: {e}")),
             },
             Err(_) => Ok(false),
         },
-        Err(NetError::Consensus(_) | NetError::Mutated(_)) => Ok(false),
+        Err(NetError::Consensus(_) | NetError::Rules(_) | NetError::Mutated(_)) => Ok(false),
         Err(e) => Err(format!("batch load: {e}")),
     }
 }
