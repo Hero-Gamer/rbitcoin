@@ -4494,11 +4494,14 @@ pub async fn on_cmpctblock(
         .await?;
         return Ok(());
     }
-    // Unsolicited compact from a non-HB peer is not fetched (no getblocktxn).
-    // A body that is already complete is still checked, so a cached-invalid
-    // child disconnects above.
-    let fetch_missing = follow.requested_blocks.contains(&hash)
-        || session.is_some_and(|s| s.hb_to.load(Ordering::Relaxed));
+    // getblocktxn only after SENDCMPCT version 2, and only when this node
+    // asked for the block or selected the peer for high-bandwidth. A live
+    // peer who has not negotiated that does not get a round trip. Callers
+    // with no session (in-tree compact helpers) still fetch.
+    let fetch_missing = session.is_none()
+        || (follow.cmpct_version == 2
+            && (follow.requested_blocks.contains(&hash)
+                || session.is_some_and(|s| s.hb_to.load(Ordering::Relaxed))));
     on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash, fetch_missing).await
 }
 
@@ -4513,11 +4516,6 @@ pub fn on_cmpctblock_reject_early(
     // `-blocksonly` does not reconstruct compact blocks, solicited or not.
     // The peer still gets a full-block getdata from the headers path.
     if hub.blocks_only.load(Ordering::Acquire) {
-        return Ok(true);
-    }
-    // No SENDCMPCT version 2: ignore the compact block entirely, including
-    // an invalid child. Core `m_provides_cmpctblocks`.
-    if follow.cmpct_version != 2 {
         return Ok(true);
     }
     if session.is_some_and(|s| s.has_failed_cmpct(&hash)) {
@@ -4605,7 +4603,7 @@ pub async fn on_cmpctblock_reconstruct(
     })
     .await
     .map_err(|_| NetError::Protocol("compact reconstruct join failed"))?;
-    if !fetch_missing && !matches!(outcome, Some(CmpctReconstruct::Block(_, _))) {
+    if !fetch_missing && matches!(outcome, Some(CmpctReconstruct::NeedTxn(_, _))) {
         return Ok(());
     }
     match outcome {

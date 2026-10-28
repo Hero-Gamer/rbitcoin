@@ -7,10 +7,10 @@ Changed
 - **A `sendcmpct` announce byte other than 0 or 1 disconnects that peer.**
 - **`-blocksonly` ignores an incoming compact block,** including one it
   asked for as a full block. It still serves compact blocks.
-- **An unsolicited compact block is fetched only from a high-bandwidth
-  peer,** or when this node already asked for that block. A compact block
-  whose transactions are already in the message is still checked. A peer
-  that has not sent `sendcmpct` version 2 is ignored.
+- **`getblocktxn` is sent only to a high-bandwidth peer,** or for a block
+  this node already asked for, and only after that peer sent `sendcmpct`
+  version 2. A compact block whose transactions are already in the message
+  is still checked. Bad proof of work still disconnects.
 - **A filtered-block `getdata` disconnects the peer.** `NODE_BLOOM` is off.
 - **`--external-ip` accepts a v3 onion.** It is listed in
   `getnetworkinfo` local addresses. That does not make onion reachable.
