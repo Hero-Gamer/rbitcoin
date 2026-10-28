@@ -273,8 +273,15 @@ that even value. An acquire load of the counter does not by itself keep the
 slot loads from moving after it. Gets are not `SeqCst`.
 `header_txs` `get_range` uses one counter for the first and the count. A
 column load acquires that store, then the same acquire fence checks the
-counter again. A flush excludes new stores, then reads the dirty range and
-the live slots. The odd bit and the flushing flag are `SeqCst` in both
+counter again. A range put, a batch put, and `clear_body` store the first
+column, then the count, while that counter is odd. If the count store
+returns an error, the counter is even again and `get_range` can accept the
+new first with the old count. Confirm joins the tip flush before those
+stores, so a flush does not reject the count column on that path. The
+error still leaves the pair torn. A flush excludes new stores, then reads the dirty range and
+the live slots. A shrink writes that prefix when it still sits below the
+new length, then shortens the file. A truncate that did not store into the
+kept prefix only shortens. The odd bit and the flushing flag are `SeqCst` in both
 directions. A `SeqCst` fence sits between the odd store and the flag load,
 and between the flag store and the flusher's counter load. A relaxed odd bit
 and a release store of the flag do not exclude each other, and a `SeqCst`

@@ -47,7 +47,7 @@ Open revalidation runs in `Query::open_or_create` **before** P2P can extend tip.
   3. Then `set_unstrong` → flush strong.
   - Mid-kill after tip shrink: leftover strong is **not on the new fence** → repairable.
   - Never unstrong while tip is still high — permanent unstrong-at-tip.
-- Append-only tip extension writes **suffix only**. In-prefix full rewrites residual; tip-last connect + tip-first disconnect + BQ re-drive mitigate.
+- Append-only tip extension writes **suffix only**. In-prefix full rewrites residual; tip-last connect + tip-first disconnect + BQ re-drive mitigate. A shrink flush writes a dirty kept prefix, then shortens the file. Disconnect does not store into that prefix, so its flush only shortens.
 - Prefer **loss of uncommitted tip progress** over **tip-ahead-of-strong** or **tip-high-with-unstrong**.
 
 ## Class A (archive)

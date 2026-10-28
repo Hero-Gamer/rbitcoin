@@ -493,6 +493,69 @@ fn write_behind_truncate_flush_reopen() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A store in the kept prefix, then a truncate below the last flushed
+/// length, must still be on disk after the flush. Shortening the file is
+/// not a substitute for that rewrite.
+#[test]
+fn shrink_flush_persists_a_dirty_kept_slot() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    {
+        let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 1), (1, 2), (2, 3), (3, 4)],
+        )
+        .unwrap();
+        t.flush().unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 20)
+            .unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 3)
+            .unwrap();
+        t.flush().unwrap();
+    }
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 3);
+    assert_eq!(t.get(0).unwrap(), 1);
+    assert_eq!(
+        t.get(1).unwrap(),
+        20,
+        "dirty kept slot must survive the shrink"
+    );
+    assert_eq!(t.get(2).unwrap(), 3);
+    assert_eq!(t.get(3).unwrap(), 0);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A truncate that did not store into the kept prefix only shortens the file.
+#[test]
+fn clean_shrink_shortens_without_rewriting() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    )
+    .unwrap();
+    t.flush().unwrap();
+    t.flush_chunk_max.store(0, Ordering::Relaxed);
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 2)
+        .unwrap();
+    t.flush().unwrap();
+    assert_eq!(
+        t.flush_chunk_max.load(Ordering::Relaxed),
+        0,
+        "a clean prefix is not rewritten"
+    );
+    assert_eq!(t.file.logical_len(), FILE_HEADER_LEN as u64 + 2 * ELEM);
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!((t.get(0).unwrap(), t.get(1).unwrap()), (1, 2));
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Tip extension is append-only: after first flush, only suffix is written.
 #[test]
 fn append_only_flush_extends_without_losing_prefix() {
