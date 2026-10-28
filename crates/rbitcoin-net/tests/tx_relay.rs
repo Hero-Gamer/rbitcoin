@@ -4364,10 +4364,11 @@ fn fee_estimates_follow_the_floor_after_a_package_rollback() {
 }
 
 /// Arrivals priced above the flow ladder fill the next blocks at every
-/// ladder rate. The near targets quote the ladder top, not min relay for
-/// a pool thinner than one block.
+/// ladder rate, so flow has no price for the near targets. A pool thinner
+/// than one block then quotes block history, or nothing, never min relay
+/// and never the ladder top.
 #[test]
-fn arrivals_above_the_ladder_quote_its_top() {
+fn arrivals_above_the_ladder_leave_near_targets_to_history() {
     let (_store, q, cbs) = pad_cbs(3);
     let dir = tmp();
     let hub = MempoolHub::open(&dir, q).unwrap();
@@ -4382,10 +4383,17 @@ fn arrivals_above_the_ladder_quote_its_top() {
     for _ in 0..3 {
         hub.note_fee_flow_admit(rbitcoin_mempool::BLOCK_WEIGHT_WU, 2_000 * vsize);
     }
-    let top = *rbitcoin_mempool::fine_candidate_rates().last().unwrap();
+    for target in [1, 2] {
+        let btc = hub.estimate_fee_btc_per_kb(target);
+        assert!(btc < 0.0, "target {target} without history: {btc}");
+    }
+    for height in 1..=2_100 {
+        record_fee_sample(&hub, height, 2_000);
+    }
+    hub.mark_fee_dirty();
     for target in [1, 2] {
         let sat = (hub.estimate_fee_btc_per_kb(target) * 100_000_000.0).round() as u64;
-        assert_eq!(sat, top, "target {target}");
+        assert_eq!(sat, 2_000, "target {target}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

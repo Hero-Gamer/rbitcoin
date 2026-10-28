@@ -164,8 +164,8 @@ pub fn first_bucket_above(rate_sat_per_kvb: u64) -> usize {
 /// `stock_above(R) + projected_in(R, H) ≤ effective_capacity(N)`.
 ///
 /// `stock_above` is a callback (live mining-chunk weight strictly above R).
-/// When no candidate fits, the demand is priced above the ladder and the
-/// answer is its top rate. `None` only for an empty ladder.
+/// `None` when no candidate fits: demand priced above the ladder is not a
+/// rate this projection can quote.
 pub fn min_rate_for_capacity<F>(
     stock_above: F,
     inflow_wu_per_s_by_bucket: &[u64],
@@ -184,12 +184,7 @@ where
         let stressed = (suffix[idx] as f64 * lam).round() as u64;
         stock_above(r).saturating_add(stressed) <= cap
     };
-    candidate_rates
-        .iter()
-        .copied()
-        .filter(|&r| fits(r))
-        .min()
-        .or_else(|| candidate_rates.iter().copied().max())
+    candidate_rates.iter().copied().filter(|&r| fits(r)).min()
 }
 
 /// Default candidate ladder: bucket edges.

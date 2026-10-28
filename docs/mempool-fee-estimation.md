@@ -53,8 +53,8 @@ This avoids fee-estimates holding the hub lock for multi-second full-pool linear
    `c(N)` is 0.999 at N=1 and 0.99 for N≥2. `fill(0.999)=0.80`,
    `fill(0.99)=0.95`; `λ(0.999)=2`, `λ(0.99)=1`. Inflow horizon is capped at
    ~4 admit half-lives so a 150 s EMA is not stretched to a week. When no
-   ladder rate fits, the projected rate is the ladder top (1000 sat/vB):
-   demand priced above the ladder does not read as missing flow.
+   ladder rate fits, there is no projected rate: the ladder cannot price that
+   demand, so the depth falls back to the frontier, then to history.
 5. **Frontier** is the marginal chunk at `N×4e6` WU. The flow rate is the
    higher of the projected rate and the frontier. If the pool is thinner
    than N blocks, stock does **not** set a far rate (no last-chunk-as-far),
