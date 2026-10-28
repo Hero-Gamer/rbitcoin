@@ -89,6 +89,25 @@ fn tor_control_password_rejects_a_line_break() {
 }
 
 #[test]
+fn external_ip_accepts_a_v3_onion_and_rejects_garbage() {
+    let mut c = NodeConfig::default();
+    let onion = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+    assert_eq!(
+        c.apply_kv("external_ip", onion).unwrap(),
+        ConfApply::Applied
+    );
+    assert_eq!(c.listen.external_onions, vec![onion.to_string()]);
+    assert!(c.listen.external_ips.is_empty());
+    let err = c
+        .apply_kv("external_ip", "not-an-address")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("external_ip"), "{err}");
+    c.apply_kv("external_ip", "42.42.42.42").unwrap();
+    assert_eq!(c.listen.external_ips.len(), 1);
+}
+
+#[test]
 fn apply_kv_is_the_conf_setter_and_unknown_is_not_error() {
     let mut c = NodeConfig::default();
     assert_eq!(

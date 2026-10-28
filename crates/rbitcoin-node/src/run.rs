@@ -533,6 +533,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     if node.local_addr.port() != 0 {
         node.peers.set_listen_port(node.local_addr.port());
     }
+    for host in &config.listen.external_onions {
+        node.peers
+            .set_wallet_onion(host.clone(), node.local_addr.port());
+    }
     let external = external_ips_with_cjdns_bind(
         &config.listen.external_ips,
         node.local_addr,

@@ -27,6 +27,13 @@ from rpcauth import password_to_hmac
 # GBT longpoll can sit ~80s; stay under Core's client-side patience.
 FORWARD_TIMEOUT_S = 180.0
 
+# Wallet methods select `/wallet/<name>` on the request thread.
+_request_path = threading.local()
+
+
+def current_rpc_path() -> str:
+    return getattr(_request_path, "path", "") or ""
+
 # Node maxfeerate is sat/vB. Core tests speak BTC/kvB.
 _MAXFEERATE_METHODS = {
     "sendrawtransaction": 1,
@@ -531,6 +538,7 @@ class RpcProxy:
                 length = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(length) if length else b""
                 auth = self.headers.get("Authorization", "")
+                _request_path.path = self.path
                 status, body = proxy.handle_http(raw, auth)
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")

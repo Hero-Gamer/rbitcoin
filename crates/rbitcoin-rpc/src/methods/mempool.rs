@@ -140,7 +140,6 @@ pub fn sat_btc_json(sat: i64) -> Value {
 }
 
 /// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
-/// Shared getrawmempool-verbose / getmempoolentry graph + unbroadcast fields.
 pub fn mempool_graph_json(mp: &MempoolHub, txid: &Txid, fee: u64, weight: u64) -> Value {
     // Core `vsize` is sigop-adjusted; `weight` stays raw.
     let adj = mp.get_live_adjusted_weight(txid).unwrap_or(weight);
@@ -1041,15 +1040,73 @@ pub fn parse_conf_target(v: &Value) -> Result<u32, Value> {
         })
 }
 
+fn check_estimate_options(v: &Value) -> Result<(), Value> {
+    if v.is_null() {
+        return Ok(());
+    }
+    let Some(obj) = v.as_object() else {
+        return Err(rpc_error(
+            ERR_TYPE_ERROR,
+            format!(
+                "JSON value of type {} is not of expected type object",
+                json_type_name(v)
+            ),
+        ));
+    };
+    for (key, val) in obj {
+        match key.as_str() {
+            "fee_rate_estimator" => {
+                let Some(name) = val.as_str() else {
+                    return Err(rpc_error(
+                        ERR_TYPE_ERROR,
+                        format!(
+                            "JSON value of type {} for field fee_rate_estimator is not of expected type string",
+                            json_type_name(val)
+                        ),
+                    ));
+                };
+                if !matches!(name, "auto" | "block_policy" | "mempool_policy") {
+                    return Err(rpc_error(
+                        ERR_INVALID_PARAMETER,
+                        "Invalid fee_rate_estimator parameter, must be one of: \"auto\", \"block_policy\", \"mempool_policy\"",
+                    ));
+                }
+            }
+            "verbosity" => {
+                if !val.is_number() {
+                    return Err(rpc_error(
+                        ERR_TYPE_ERROR,
+                        format!(
+                            "JSON value of type {} for field verbosity is not of expected type number",
+                            json_type_name(val)
+                        ),
+                    ));
+                }
+            }
+            other => {
+                return Err(rpc_error(ERR_TYPE_ERROR, format!("Unexpected key {other}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
+///
+/// The third `options` object is checked (`fee_rate_estimator`, `verbosity`)
+/// and does not select a different feerate. A top-level `fee_rate_estimator`
+/// stays an unknown named parameter.
 pub fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    params.reject_unknown(&["conf_target", "estimate_mode"])?;
+    params.reject_unknown(&["conf_target", "estimate_mode", "options"])?;
     // Core requires conf_target (`rpc_estimatefee.py`).
     if params.get(0, "conf_target").is_none() {
         return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
     }
-    if params.pos_len() > 2 {
+    if params.pos_len() > 3 {
         return Err(rpc_error(ERR_MISC, method_help("estimatesmartfee")));
+    }
+    if let Some(options) = params.get(2, "options") {
+        check_estimate_options(options)?;
     }
     let conf_target = parse_conf_target(params.get(0, "conf_target").unwrap())?;
     if let Some(mode_v) = params.get(1, "estimate_mode") {

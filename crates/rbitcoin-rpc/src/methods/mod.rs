@@ -338,6 +338,31 @@ impl RpcParams {
         }
     }
 
+    /// JSON-RPC `params`. An object key `args` holding an array is the
+    /// positional list (Core mixed named calls), not a parameter name.
+    pub fn from_json(v: &Value) -> Option<Self> {
+        match v {
+            Value::Null => Some(Self::empty()),
+            Value::Array(a) => Some(Self::positional(a.clone())),
+            Value::Object(m) => {
+                let mut named = m.clone();
+                let pos = match named.get("args") {
+                    Some(Value::Array(a)) => {
+                        let pos = a.clone();
+                        named.remove("args");
+                        pos
+                    }
+                    _ => Vec::new(),
+                };
+                Some(Self {
+                    pos,
+                    named: if named.is_empty() { None } else { Some(named) },
+                })
+            }
+            _ => None,
+        }
+    }
+
     pub fn get(&self, index: usize, name: &str) -> Option<&Value> {
         if let Some(m) = &self.named {
             if let Some(v) = m.get(name) {
@@ -499,7 +524,7 @@ impl Drop for ActiveCall<'_> {
 pub fn dispatch_inner(ctx: &RpcContext, method: &str, params: RpcParams) -> Result<Value, Value> {
     match method {
         "help" => help(&params),
-        "echo" => echo(&params),
+        "echo" | "echojson" => echo(&params),
         "getrpcinfo" => {
             params.reject_unknown(&[])?;
             Ok(getrpcinfo(ctx))
@@ -713,6 +738,7 @@ pub fn echo(params: &RpcParams) -> Result<Value, Value> {
 pub const METHOD_LIST: &[&str] = &[
     "help",
     "echo",
+    "echojson",
     "getrpcinfo",
     "uptime",
     "stop",
@@ -781,9 +807,11 @@ pub const METHOD_LIST: &[&str] = &[
 pub const NAMED_HELP: &[(&str, &str)] = &[
     (
         "estimatesmartfee",
-        "estimatesmartfee conf_target (estimate_mode)\n\
+        "estimatesmartfee conf_target (estimate_mode options)\n\
          Returns this node's 10-minute inclusion frontier feerate (BTC/kvB), \
-         not Core historical multi-horizon. See docs/mempool-fee-estimation.md.",
+         not Core historical multi-horizon. `options.fee_rate_estimator` and \
+         `options.verbosity` are checked and do not change the feerate. \
+         See docs/mempool-fee-estimation.md.",
     ),
     (
         "estimaterawfee",
@@ -928,6 +956,10 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
     (
         "echo",
         "echo\necho ( arg0 ... arg9 ) — return arguments as a positional array.",
+    ),
+    (
+        "echojson",
+        "echojson\nechojson ( arg0 ... arg9 ) — return arguments as a positional array.",
     ),
 ];
 

@@ -5025,7 +5025,7 @@ fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
             let (out_tx, _rx) = mpsc::unbounded_channel();
             let mut follow = PeerFollowState::new();
             follow.requested_blocks.insert(hash);
-            on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash)
+            on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash, true)
                 .await
                 .expect("reconstruct");
         })
