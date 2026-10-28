@@ -3387,6 +3387,13 @@ impl ChainHub {
                 )));
             }
         }
+        // Subscribers last saw this tip, so the restored blocks are not news.
+        // One event for it, with the restored length, has Electrum read every
+        // status again for the txs the prefix left in the pool.
+        if let Some(mut tip) = reorg.tips.pop() {
+            tip.reorg_branch_len = old_path.len() as u32;
+            reorg.tips = vec![tip];
+        }
         Ok(())
     }
 
