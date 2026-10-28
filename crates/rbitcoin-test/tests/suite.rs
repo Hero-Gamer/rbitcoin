@@ -8,4 +8,5 @@ mod i2p_dest;
 mod integration_multinode;
 mod jsonrpc;
 mod mine;
+mod outbound_refill_journey;
 mod scenarios;

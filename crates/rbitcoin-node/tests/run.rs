@@ -1,4 +1,3 @@
-use rbitcoin_ibd::IbdConfig;
 use rbitcoin_net::{AddrMan, Dialer, PeerConnType, TipEvent};
 use rbitcoin_node::config::{parse_btc_to_sat, NodeConfig, NodeEnv};
 use rbitcoin_node::run::*;
@@ -414,6 +413,7 @@ fn tip_follow_checks_stale_on_perf_and_rpc_stop() {
     assert!(tip_follow_checks_stale(TipFollowWakeKind::Poll));
     assert!(tip_follow_checks_stale(TipFollowWakeKind::TipSame));
     assert!(!tip_follow_checks_stale(TipFollowWakeKind::TipChanged));
+    assert!(!tip_follow_checks_stale(TipFollowWakeKind::Refill));
     assert!(!tip_follow_checks_stale(TipFollowWakeKind::Stop));
 }
 
@@ -437,6 +437,10 @@ async fn stale_interval_fires_alongside_faster_perf_tick() {
     let mut stale = tokio::time::interval(Duration::from_millis(50));
     stale.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     stale.tick().await;
+    let mut refill = tokio::time::interval(Duration::from_secs(30));
+    refill.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refill.tick().await;
+    let learned = tokio::sync::Notify::new();
     let (_tx, mut tip_rx) = broadcast::channel::<TipEvent>(8);
     let start = Instant::now();
     let mut saw_poll = false;
@@ -449,6 +453,8 @@ async fn stale_interval_fires_alongside_faster_perf_tick() {
                 &mut perf,
                 &mut tip_rx,
                 &mut stale,
+                &mut refill,
+                &learned,
                 None,
             ),
         )
@@ -764,38 +770,6 @@ fn follow_connect_timeout_i2p_is_longer_than_clearnet() {
         follow_connect_timeout(&Dialer::Direct, i2p),
         Duration::from_secs(90)
     );
-}
-
-#[test]
-fn catch_up_retry_config_uses_production_not_for_test() {
-    let peers = std::sync::Arc::new(std::sync::Mutex::new(rbitcoin_net::AddrMan::new()));
-    let cfg = catch_up_retry_config(std::sync::Arc::clone(&peers), Dialer::Direct, 4096);
-    let prod = IbdConfig::default();
-    let test = IbdConfig::for_test();
-
-    assert_eq!(cfg.target_peers, 1);
-    assert_eq!(cfg.assign_stop_bytes, 4096, "the node's block-queue cap");
-    assert_eq!(
-        cfg.initial_dial_waves, 1,
-        "a stale-tip retry dials one wave"
-    );
-    assert_eq!(
-        cfg.peerless,
-        rbitcoin_ibd::Peerless::GiveUp,
-        "the tip-follow supervisor owns the retry clock"
-    );
-    assert!(cfg.peers.is_some());
-    // Production class (main catch-up path), not for_test knobs.
-    assert_eq!(cfg.window, prod.window);
-    assert_eq!(cfg.window, rbitcoin_ibd::DEFAULT_IBD_WINDOW);
-    assert_eq!(cfg.per_peer, prod.per_peer);
-    assert_eq!(cfg.stall, prod.stall);
-    assert_eq!(cfg.connect_timeout, prod.connect_timeout);
-    assert_eq!(cfg.headers_batch, prod.headers_batch);
-    // Guard against reintroducing for_test() base fields.
-    assert_ne!(cfg.window, test.window);
-    assert_ne!(cfg.stall, test.stall);
-    assert_ne!(cfg.connect_timeout, test.connect_timeout);
 }
 
 #[test]
@@ -1319,6 +1293,10 @@ async fn max_run_deadline_wakes_without_the_perf_tick() {
     let mut stale = tokio::time::interval(Duration::from_secs(30));
     stale.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     stale.tick().await;
+    let mut refill = tokio::time::interval(Duration::from_secs(30));
+    refill.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refill.tick().await;
+    let learned = tokio::sync::Notify::new();
     let (_tx, mut tip_rx) = broadcast::channel::<TipEvent>(8);
     let start = Instant::now();
     let wake = tokio::time::timeout(
@@ -1329,6 +1307,8 @@ async fn max_run_deadline_wakes_without_the_perf_tick() {
             &mut perf,
             &mut tip_rx,
             &mut stale,
+            &mut refill,
+            &learned,
             Some(Instant::now() + Duration::from_millis(40)),
         ),
     )
