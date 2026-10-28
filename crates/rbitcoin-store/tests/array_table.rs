@@ -2,7 +2,7 @@ use rbitcoin_primitives::TableKind;
 use rbitcoin_store::array_table::*;
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::file::FILE_HEADER_LEN;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 fn tmp_path() -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
@@ -15,8 +15,9 @@ fn tmp_path() -> std::path::PathBuf {
     ))
 }
 
-/// `get` checks `len` before taking the read lock, so a `truncate` can
-/// land in between. The reader must see the shorter table, not panic.
+/// `get` samples `len` and the slot under one sequence counter. A `truncate`
+/// between those loads retries. The reader sees the previous value or the
+/// shortened table, not a mix and not a panic.
 #[test]
 fn get_racing_truncate_does_not_panic() {
     use std::sync::atomic::AtomicBool;
@@ -24,7 +25,11 @@ fn get_racing_truncate_does_not_panic() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
-    t.set(1023, 7).unwrap();
+    let wide: Vec<_> = (0..1024u64)
+        .map(|i| (i, if i == 1023 { 7 } else { 0 }))
+        .collect();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &wide)
+        .unwrap();
     assert!(t.l2_resident_bytes() > 0, "test needs the in-RAM image");
     let stop = Arc::new(AtomicBool::new(false));
     let readers: Vec<_> = (0..4)
@@ -40,8 +45,10 @@ fn get_racing_truncate_does_not_panic() {
         .collect();
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
-        t.truncate(0).unwrap();
-        t.set(1023, 7).unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 0)
+            .unwrap();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &wide)
+            .unwrap();
     }
     stop.store(true, Ordering::Relaxed);
     for r in readers {
@@ -50,69 +57,305 @@ fn get_racing_truncate_does_not_panic() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A `set` that lands while flush marks the table clean is written by
-/// the next flush. The IBD tip flush runs beside the next batch's archive.
+/// A disk-only append publishes the named slots, and a zero gap publishes
+/// zeros in the holes, before a reader can see the new length.
 #[test]
-fn set_during_flush_clean_is_flushed_next() {
+fn fd_only_append_publishes_values_and_zero_gap() {
+    let dir = tmp_path();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slots.body");
+    let file = rbitcoin_store::file::TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    file.write_at(ArrayTable::offset(0), &[0u8; 8]).unwrap();
+    drop(file);
+    let prev = std::env::var_os("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+    std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "0");
+    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
+    match &prev {
+        Some(v) => std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", v),
+        None => std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB"),
+    }
+    assert_eq!(t.l2_resident_bytes(), 0, "disk-only table");
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.set(&write, 0, 7).unwrap();
+    assert_eq!(t.get_sample(0).unwrap(), (7, 1));
+    t.set_zero_gap(&write, 3, 9).unwrap();
+    assert_eq!(t.get_sample(0).unwrap(), (7, 4));
+    assert_eq!(t.get_sample(1).unwrap(), (0, 4));
+    assert_eq!(t.get_sample(2).unwrap(), (0, 4));
+    assert_eq!(t.get_sample(3).unwrap(), (9, 4));
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A disk-only table returns an empty slot after truncate, without a read.
+#[test]
+fn fd_only_truncate_then_get_is_absent() {
+    let dir = tmp_path();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slots.body");
+    let file = rbitcoin_store::file::TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    file.write_at(ArrayTable::offset(0), &[0u8; 16]).unwrap();
+    drop(file);
+    let prev = std::env::var_os("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+    std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "0");
+    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
+    match &prev {
+        Some(v) => std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", v),
+        None => std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB"),
+    }
+    assert_eq!(t.l2_resident_bytes(), 0, "disk-only table");
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 22)
+        .unwrap();
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 1)
+        .unwrap();
+    assert_eq!(t.get_sample(1).unwrap(), (0, 1));
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A multi-slot store publishes one generation. Each `get` is the previous
+/// value or the new one for that index.
+#[test]
+fn get_during_set_many_is_old_or_new() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
+    let n = 32u64;
+    let old: Vec<_> = (0..n).map(|i| (i, 10 + i)).collect();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &old)
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (t, stop) = (Arc::clone(&t), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for i in 0..n {
+                        let v = t.get(i).unwrap();
+                        assert!(v == 10 + i || v == 100 + i, "mixed slot {i} value {v}");
+                    }
+                }
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        let new: Vec<_> = (0..n).map(|i| (i, 100 + i)).collect();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &new)
+            .unwrap();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &old)
+            .unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        assert!(r.join().is_ok(), "get panicked during set_many");
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A store that lands after the flush has noticed it is dirty, and before
+/// new stores are excluded, is still in this flush. Sampling the dirty index
+/// before that exclusion would clear the mark and leave the slot off disk.
+#[test]
+fn store_before_exclude_is_in_this_flush() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
-    t.set_many(&[(0, 10), (1, 11), (2, 12), (3, 13)]).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(0, 1), (1, 2)])
+        .unwrap();
     t.flush().unwrap();
-    t.set(3, 23).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9)
+        .unwrap();
     t.flush_dirty_between(|t, step| {
-        if step == FlushStep::Clean {
-            t.set(1, 21).unwrap();
+        if step == FlushStep::Admit {
+            t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 7)
+                .unwrap();
         }
     })
     .unwrap();
+    let mut buf = [0u8; 8];
+    t.file.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        7,
+        "earlier slot must be in this flush"
+    );
+    assert_eq!(
+        t.unstored_from.load(Ordering::Acquire),
+        u64::MAX,
+        "the mark must stay set until that slot is persisted"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Flush persists the live slots of the dirty range recorded at start.
+/// A store from the write hook is refused; the bytes on disk are the slots
+/// after that hook, so the flush did not keep a detached image. A store
+/// after flush returns is absent here and present in the next flush.
+#[test]
+fn flush_writes_live_slots_and_refuses_a_store_until_it_finishes() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
+    let n = 600u64;
+    let pairs: Vec<(u64, u64)> = (0..n).map(|i| (i, i + 1)).collect();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
+        .unwrap();
+    t.flush().unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 5)
+        .unwrap();
+    let mut during = Ok(());
+    t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Write {
+            t.poke_live_slot(0, 77);
+            during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9);
+            let _ = t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(2, 8)]);
+            let _ = t.truncate(&rbitcoin_store::ClassCWrite::for_test(), n - 1);
+        }
+    })
+    .unwrap();
+    let slot0 = {
+        let mut buf = [0u8; 8];
+        t.file.read_at(FILE_HEADER_LEN as u64, &mut buf).unwrap();
+        u64::from_le_bytes(buf)
+    };
+    assert!(
+        during.is_err() && slot0 == 77,
+        "store during flush refused={during:?} live slot0={slot0}"
+    );
+    assert!(n * ELEM > FLUSH_SCRATCH as u64);
+    let chunk = t.flush_chunk_max.load(Ordering::Relaxed);
+    assert!(chunk > 0 && chunk <= FLUSH_SCRATCH, "flush chunk {chunk}");
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 9)
+        .unwrap();
+    let mut buf = [0u8; 8];
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        2,
+        "store after flush stays off disk"
+    );
+    t.flush().unwrap();
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(buf), 9);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A rewrite whose length equals the last flushed length still publishes
+/// that length. A torn longer HWM must not survive the flush.
+#[test]
+fn same_length_rewrite_publishes_logical_len() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    )
+    .unwrap();
+    t.flush().unwrap();
+    let published = FILE_HEADER_LEN as u64 + 4 * ELEM;
+    assert_eq!(t.file.logical_len(), published);
+    t.file.set_logical_len(published + 64).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 99)
+        .unwrap();
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.disk_len.load(Ordering::Acquire), 4);
+    t.flush().unwrap();
+    assert_eq!(t.file.logical_len(), published);
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.get(1).unwrap(), 99);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A failed `write_at` leaves the recorded range dirty. The retry writes
+/// those slots and does not truncate the table.
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_write_keeps_the_range_dirty() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 1), (1, 2), (2, 3), (3, 4)],
+    )
+    .unwrap();
+    t.flush().unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 42)
+        .unwrap();
+    let mut swapped = None;
+    let failed = t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Write {
+            swapped = Some(crate::dev_full::DevFull::on(&t.file.read_file));
+        }
+    });
+    drop(swapped);
+    assert!(
+        failed.is_err(),
+        "write_at must fail while the fd is /dev/full"
+    );
+    assert_eq!(t.len(), 4, "a failed persist must not truncate");
+    let mut buf = [0u8; 8];
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(
+        u64::from_le_bytes(buf),
+        2,
+        "failed persist must not publish the slot"
+    );
+    t.flush().unwrap();
+    t.file
+        .read_at(FILE_HEADER_LEN as u64 + 8, &mut buf)
+        .unwrap();
+    assert_eq!(u64::from_le_bytes(buf), 42);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A store during the clean step is refused. The store after flush returns
+/// is what the next flush persists.
+#[test]
+fn set_after_flush_is_flushed_next() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::ArrayLink).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 10), (1, 11), (2, 12), (3, 13)],
+    )
+    .unwrap();
+    t.flush().unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 3, 23)
+        .unwrap();
+    let mut during = Ok(());
+    t.flush_dirty_between(|t, step| {
+        if step == FlushStep::Clean {
+            during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 21);
+        }
+    })
+    .unwrap();
+    assert!(during.is_err(), "store during clean must be refused");
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
+    assert_eq!((t.get(1).unwrap(), t.get(3).unwrap()), (11, 23));
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 21)
+        .unwrap();
     t.flush().unwrap();
     drop(t);
     let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
     assert_eq!((t.get(1).unwrap(), t.get(3).unwrap()), (21, 23));
     let _ = std::fs::remove_file(&path);
-}
-
-/// Two flushes of one table never leave the older image on disk. A body
-/// repair flushes `header_txs` beside the IBD tip flush.
-#[test]
-fn concurrent_flushes_keep_the_newer_image() {
-    use std::sync::Arc;
-    let path = tmp_path();
-    let _ = std::fs::remove_file(&path);
-    let t = Arc::new(ArrayTable::create(&path, TableKind::ArrayLink).unwrap());
-    t.set_many(&[(0, 10), (1, 11)]).unwrap();
-    t.flush().unwrap();
-    t.set(0, 20).unwrap();
-    let (done, finished) = std::sync::mpsc::channel();
-    let mut other = Some(Arc::clone(&t));
-    let mut second = None;
-    t.flush_dirty_between(|_, step| {
-        let Some(t2) = other.take().filter(|_| step == FlushStep::Write) else {
-            return;
-        };
-        let done = done.clone();
-        second = Some(std::thread::spawn(move || {
-            t2.set(1, 21).unwrap();
-            t2.flush().unwrap();
-            done.send(()).unwrap();
-        }));
-        let _ = finished.recv_timeout(std::time::Duration::from_millis(200));
-    })
-    .unwrap();
-    second.unwrap().join().unwrap();
-    drop(t);
-    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
-    assert_eq!((t.get(0).unwrap(), t.get(1).unwrap()), (20, 21));
-    let _ = std::fs::remove_file(&path);
-}
-
-#[test]
-fn dirty_epoch_bump_from_max_stays_dirty() {
-    let e = AtomicU64::new(u64::MAX);
-    dirty_epoch_bump(&e);
-    assert_ne!(e.load(Ordering::Acquire), 0);
-    assert_eq!(e.load(Ordering::Acquire), 1);
 }
 
 #[test]
@@ -122,14 +365,24 @@ fn array_set_get_grow_set_many_truncate_flush() {
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.len(), 0);
     assert_eq!(t.get(0).unwrap(), 0);
-    t.set(3, 30).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 0), (1, 0), (2, 0), (3, 30)],
+    )
+    .unwrap();
     assert_eq!(t.len(), 4);
     assert_eq!(t.get(0).unwrap(), 0);
     assert_eq!(t.get(3).unwrap(), 30);
-    t.set(1, 11).unwrap();
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 1, 11)
+        .unwrap();
     assert_eq!(t.get(1).unwrap(), 11);
-    t.set_many(&[]).unwrap();
-    t.set_many(&[(10, 100), (5, 50)]).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[])
+        .unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(4, 0), (5, 50), (6, 0), (7, 0), (8, 0), (9, 0), (10, 100)],
+    )
+    .unwrap();
     assert_eq!(t.len(), 11);
     assert_eq!(t.get(5).unwrap(), 50);
     assert_eq!(t.get(10).unwrap(), 100);
@@ -139,9 +392,13 @@ fn array_set_get_grow_set_many_truncate_flush() {
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
     assert_eq!(t.len(), 11);
     assert_eq!(t.get(3).unwrap(), 30);
-    t.truncate(4).unwrap();
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 4)
+        .unwrap();
     assert_eq!(t.len(), 4);
-    assert!(matches!(t.truncate(99), Err(StoreError::Corrupt(_))));
+    assert!(matches!(
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 99),
+        Err(StoreError::Corrupt(_))
+    ));
     t.flush().unwrap();
     {
         let mut raw = std::fs::read(&path).unwrap();
@@ -162,10 +419,16 @@ fn write_behind_no_flush_reopen_keeps_old_image() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 10), (1, 20)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 10), (1, 20)],
+        )
+        .unwrap();
         t.flush().unwrap();
-        t.set(0, 999).unwrap();
-        t.set(2, 30).unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 999)
+            .unwrap();
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 2, 30)
+            .unwrap();
         assert_eq!(t.get(0).unwrap(), 999);
         assert_eq!(t.len(), 3);
     }
@@ -183,9 +446,14 @@ fn write_behind_flush_reopen_sees_new_image() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 1), (1, 2)]).unwrap();
+        t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(0, 1), (1, 2)])
+            .unwrap();
         t.flush().unwrap();
-        t.set_many(&[(0, 7), (1, 8), (2, 9)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 7), (1, 8), (2, 9)],
+        )
+        .unwrap();
         t.flush().unwrap();
     }
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
@@ -202,14 +470,20 @@ fn write_behind_truncate_flush_reopen() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 1), (1, 2), (2, 3), (3, 4)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 1), (1, 2), (2, 3), (3, 4)],
+        )
+        .unwrap();
         t.flush().unwrap();
-        t.truncate(2).unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 2)
+            .unwrap();
         assert_eq!(t.len(), 2);
         drop(t);
         let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
         assert_eq!(t.len(), 4);
-        t.truncate(2).unwrap();
+        t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 2)
+            .unwrap();
         t.flush().unwrap();
     }
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
@@ -226,10 +500,15 @@ fn append_only_flush_extends_without_losing_prefix() {
     let _ = std::fs::remove_file(&path);
     {
         let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-        t.set_many(&[(0, 100), (1, 101)]).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 100), (1, 101)],
+        )
+        .unwrap();
         t.flush().unwrap();
-        // Pure tip extension (dirty_lo = 2 >= disk_len = 2).
-        t.set(2, 102).unwrap();
+        // Pure tip extension (unstored index 2, disk length 2).
+        t.set(&rbitcoin_store::ClassCWrite::for_test(), 2, 102)
+            .unwrap();
         t.flush().unwrap();
     }
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
@@ -241,17 +520,15 @@ fn append_only_flush_extends_without_losing_prefix() {
 }
 
 #[test]
-fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
+fn contiguous_image_flush_async_and_env_cap() {
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
-    t.set(3, 42).unwrap();
-    assert_eq!(t.len(), 4);
-    assert_eq!(t.get(0).unwrap(), 0);
-    assert_eq!(t.get(1).unwrap(), 0);
-    assert_eq!(t.get(2).unwrap(), 0);
-    assert_eq!(t.get(3).unwrap(), 42);
-    t.set_many(&[(1, 11), (5, 55), (3, 33)]).unwrap();
+    t.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(0, 0), (1, 11), (2, 0), (3, 33), (4, 0), (5, 55)],
+    )
+    .unwrap();
     assert_eq!(t.len(), 6);
     assert_eq!(t.get(1).unwrap(), 11);
     assert_eq!(t.get(3).unwrap(), 33);
@@ -259,7 +536,8 @@ fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
     t.flush_async().unwrap();
     t.flush_dirty().unwrap();
     t.flush().unwrap();
-    t.truncate(0).unwrap();
+    t.truncate(&rbitcoin_store::ClassCWrite::for_test(), 0)
+        .unwrap();
     t.flush().unwrap();
     assert_eq!(t.len(), 0);
     drop(t);
@@ -278,40 +556,83 @@ fn set_gap_zeros_prefix_and_env_cap_and_flush_async() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A store from another thread while flush is in its write step is refused.
+/// The store after that flush joins is what the next flush persists.
 #[test]
-fn concurrent_set_during_flush_persists_new() {
-    use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
+fn store_on_another_thread_during_flush_is_refused() {
     use std::sync::Arc;
     let path = tmp_path();
     let _ = std::fs::remove_file(&path);
     let t = Arc::new(ArrayTable::create(&path, TableKind::Confirmed).unwrap());
-    let n = 32_768u64;
-    let pairs: Vec<(u64, u64)> = (0..n).map(|i| (i, i)).collect();
-    t.set_many(&pairs).unwrap();
+    t.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[(0, 1), (1, 2)])
+        .unwrap();
     t.flush().unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 5)
+        .unwrap();
+    let (started, start_rx) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
     let flush_t = {
         let t = Arc::clone(&t);
-        let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            while !stop.load(AtomOrd::Relaxed) {
-                t.flush_dirty().unwrap();
-            }
+            t.flush_dirty_between(|_, step| {
+                if step == FlushStep::Write {
+                    started.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }
+            })
+            .unwrap();
         })
     };
-    for i in 1..2_000u64 {
-        t.set(0, i).unwrap();
-    }
-    stop.store(true, AtomOrd::Relaxed);
+    start_rx.recv().unwrap();
+    let during = t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 9);
+    release.send(()).unwrap();
     flush_t.join().unwrap();
-    let want = t.get(0).unwrap();
+    assert!(during.is_err(), "store during flush refused={during:?}");
+    drop(t);
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.get(0).unwrap(), 5);
+    t.set(&rbitcoin_store::ClassCWrite::for_test(), 0, 9)
+        .unwrap();
     t.flush().unwrap();
     drop(t);
     let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
-    assert_eq!(
-        t.get(0).unwrap(),
-        want,
-        "set that races flush must still persist"
-    );
+    assert_eq!(t.get(0).unwrap(), 9);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Truncate keeps the logical length. A later store may overwrite a slot
+/// below that length or append the next index. It may not skip ahead: the
+/// bytes above the length are still in the buffer, and a skip would publish
+/// them again.
+#[test]
+fn sparse_set_after_truncate_is_corrupt() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.set_many(&write, &[(0, 10), (1, 11), (2, 12), (3, 13)])
+        .unwrap();
+    t.truncate(&write, 1).unwrap();
+    assert!(matches!(t.set(&write, 3, 99), Err(StoreError::Corrupt(_))));
+    assert_eq!(t.len(), 1);
+    assert_eq!(t.get(0).unwrap(), 10);
+    t.set(&write, 1, 77).unwrap();
+    assert_eq!((t.len(), t.get(0).unwrap(), t.get(1).unwrap()), (2, 10, 77));
+    t.set_many(&write, &[(2, 20), (3, 21)]).unwrap();
+    assert_eq!(t.len(), 4);
+    assert_eq!(t.get(3).unwrap(), 21);
+    t.set(&write, 0, 1).unwrap();
+    assert_eq!(t.get(0).unwrap(), 1);
+    assert!(matches!(
+        t.set_many(&write, &[(5, 50)]),
+        Err(StoreError::Corrupt(_))
+    ));
+    assert_eq!(t.len(), 4);
+    t.set_zero_gap(&write, 6, 60).unwrap();
+    assert_eq!(t.len(), 7);
+    assert_eq!(t.get(4).unwrap(), 0);
+    assert_eq!(t.get(5).unwrap(), 0);
+    assert_eq!(t.get(6).unwrap(), 60);
+    assert_eq!(t.get(0).unwrap(), 1);
     let _ = std::fs::remove_file(&path);
 }

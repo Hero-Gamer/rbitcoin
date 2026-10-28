@@ -34,5 +34,12 @@ io-uring = "0.7"
 name = "suite"
 path = "tests/suite.rs"
 
+[[test]]
+name = "model"
+path = "tests/model/main.rs"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [lints]
 workspace = true

@@ -1792,16 +1792,25 @@ pub fn stamp_reject_operator_msg(err: &str, stats: &rbitcoin_query::ConfirmStats
 /// `on_extra` runs only for additionally drained parts (queue depth). Non-contig
 /// leftover is returned for the next write iteration (ordered scripts should
 /// never hit that path).
+/// Archived-body clear waiting on the write thread. Not pushed back onto the
+/// channel: `std` mpsc has no unread.
+#[doc(hidden)]
+pub struct ArchivedBodyClear {
+    pub hash: [u8; 32],
+    pub reply: std::sync::mpsc::Sender<Result<bool, rbitcoin_store::StoreError>>,
+}
+
 #[doc(hidden)]
 pub fn drain_script_ok_write_queue(
     first: rbitcoin_query::ScriptOkBatch,
-    rx: &std::sync::mpsc::Receiver<rbitcoin_query::ScriptOkBatch>,
+    rx: &std::sync::mpsc::Receiver<rbitcoin_query::ConfirmWriteMsg>,
     max_parts: usize,
     mut on_extra: impl FnMut(&rbitcoin_query::ScriptOkBatch),
 ) -> (
     rbitcoin_query::ScriptOkBatch,
     usize,
     Option<rbitcoin_query::ScriptOkBatch>,
+    Option<ArchivedBodyClear>,
 ) {
     let mut batch = first;
     let mut parts = 1usize;
@@ -1811,7 +1820,10 @@ pub fn drain_script_ok_write_queue(
             break;
         }
         match rx.try_recv() {
-            Ok(more) => {
+            Ok(rbitcoin_query::ConfirmWriteMsg::ClearArchived { hash, reply }) => {
+                return (batch, parts, None, Some(ArchivedBodyClear { hash, reply }));
+            }
+            Ok(rbitcoin_query::ConfirmWriteMsg::Batch(more)) => {
                 on_extra(&more);
                 match batch.append_contiguous(more) {
                     Ok(()) => {
@@ -1831,7 +1843,7 @@ pub fn drain_script_ok_write_queue(
                                 leftover.len()
                             );
                         }
-                        return (batch, parts, Some(leftover));
+                        return (batch, parts, Some(leftover), None);
                     }
                 }
             }
@@ -1839,7 +1851,23 @@ pub fn drain_script_ok_write_queue(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
-    (batch, parts, None)
+    (batch, parts, None, None)
+}
+
+fn finish_archived_clear(query: &rbitcoin_query::Query, clear: ArchivedBodyClear) {
+    let result = (|| {
+        let _commit = query.lock_tip_commit()?;
+        query.clear_archived_body_here(&clear.hash)
+    })();
+    let _ = clear.reply.send(result);
+}
+
+struct ConfirmWriteDetach<'a>(&'a rbitcoin_query::Query);
+
+impl Drop for ConfirmWriteDetach<'_> {
+    fn drop(&mut self) {
+        self.0.detach_confirm_write();
+    }
 }
 
 /// OS-thread occupancy for the confirm pipeline (lookup / load / scripts / write).
@@ -1976,7 +2004,8 @@ pub fn spawn_confirm_engine(
     type ScriptsIn = (rbitcoin_query::LoadedBatch, u64);
     let (mat_tx, mat_rx) = std::sync::mpsc::sync_channel::<ScriptsIn>(caps.script);
     let (write_tx, write_rx) =
-        std::sync::mpsc::sync_channel::<rbitcoin_query::ScriptOkBatch>(caps.write);
+        std::sync::mpsc::sync_channel::<rbitcoin_query::ConfirmWriteMsg>(caps.write);
+    hub.query.attach_confirm_write(write_tx.clone());
     let (load_tx, load_rx) = std::sync::mpsc::sync_channel::<LoadBatch>(caps.load);
     // A write fault that does not re-arm lookup: plan drops reserved fks +
     // last_loaded so re-lookup after Class A partial commit does not drift
@@ -1998,24 +2027,45 @@ pub fn spawn_confirm_engine(
             move || {
             info!("ibd: confirm write on dedicated OS thread");
             let stats = hub_wb.query.confirm_stats_arc();
+            let _detach = ConfirmWriteDetach(&hub_wb.query);
             // Non-contig leftover already note_write_recv'd; write it next iter.
             let mut leftover: Option<rbitcoin_query::ScriptOkBatch> = None;
+            let mut pending_clear: Option<ArchivedBodyClear> = None;
             loop {
+                if let Some(clear) = pending_clear.take() {
+                    finish_archived_clear(&hub_wb.query, clear);
+                    continue;
+                }
                 let t_recv = Instant::now();
                 let first = match leftover.take() {
                     Some(b) => b,
-                    None => match write_rx.recv() {
-                        Ok(b) => {
+                    None => match write_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(rbitcoin_query::ConfirmWriteMsg::Batch(b)) => {
                             let n = b.len();
                             let wire = b.approx_wire_bytes();
                             let parents = b.parent_count();
                             q_wb.note_write_recv(n, wire, parents);
                             b
                         }
-                        Err(_) => break,
+                        Ok(rbitcoin_query::ConfirmWriteMsg::ClearArchived { hash, reply }) => {
+                            finish_archived_clear(
+                                &hub_wb.query,
+                                ArchivedBodyClear { hash, reply },
+                            );
+                            continue;
+                        }
+                        // Query keeps a sender so clear can arrive. That sender
+                        // also keeps `recv` from seeing disconnect at shutdown.
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
+                                break;
+                            }
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                     },
                 };
-                let (batch, parts, next_left) = drain_script_ok_write_queue(
+                let (batch, parts, next_left, clear) = drain_script_ok_write_queue(
                     first,
                     &write_rx,
                     write_drain_max_parts(write_queue_cap()),
@@ -2027,6 +2077,7 @@ pub fn spawn_confirm_engine(
                     },
                 );
                 leftover = next_left;
+                pending_clear = clear;
                 confirm_thr_stats::add_write_recv_wait(&stats, t_recv.elapsed());
                 if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
                     break;
@@ -2257,7 +2308,10 @@ pub fn spawn_confirm_engine(
             }
             info!("ibd: confirm write exit");
         })
-        .expect("spawn ibd-confirm-write");
+        .unwrap_or_else(|e| {
+            hub.query.detach_confirm_write();
+            panic!("spawn ibd-confirm-write: {e}");
+        });
 
     let hub_sc = Arc::clone(&hub);
     let feed_sc = Arc::clone(&feed);
@@ -2297,7 +2351,10 @@ pub fn spawn_confirm_engine(
                     let ww = outcome.batch.approx_wire_bytes();
                     let parents = outcome.batch.parent_count();
                     let t_send = Instant::now();
-                    if write_tx.send(outcome.batch).is_err() {
+                    if write_tx
+                        .send(rbitcoin_query::ConfirmWriteMsg::Batch(outcome.batch))
+                        .is_err()
+                    {
                         info!("ibd: confirm write channel closed");
                         return false;
                     }

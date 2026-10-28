@@ -229,6 +229,33 @@ jobs:
       - name: cargo test store and query
         run: cargo test -p rbitcoin-store -p rbitcoin-query
 
+  # Forward rustc. Same wait as pread: a red `test` does not compile it.
+  # Product MSRV stays rust-toolchain.toml. This job checks the dialect still
+  # builds on the channel in rust-forward.toml, beside pread.
+  rust-forward:
+    name: rust-forward
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [qc, test]
+    env:
+      CARGO_TARGET_DIR: target/forward
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install forward toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-forward.toml)
+          test -n "$channel"
+          rustup toolchain install --profile minimal "$channel"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: ci-rust-forward
+          workspaces: ". -> target/forward"
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
   # Line-coverage 91% floor + CRAP --fail-above 30 (allowlist in .cargo-crap.toml).
   # Slow; waits for qc and test so a red check does not start
   # this job. Required. Job+step timeouts so a hung llvm-cov test binary

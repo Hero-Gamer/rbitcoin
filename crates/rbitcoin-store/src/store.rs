@@ -307,7 +307,7 @@ pub struct Store {
     pub spend_reorg_gen: std::sync::atomic::AtomicU64,
     /// Even while confirmed spentness is stable. Odd while a confirm annotate
     /// or a disconnect is publishing a change.
-    pub utxo_view: std::sync::atomic::AtomicU64,
+    pub utxo_view: crate::sync::atomic::AtomicU64,
     /// Confirm readers wait here while a `--datadir-hdd` write holds the spindle.
     /// Flag off never locks, so [`Self::spindle_wait`] returns immediately.
     pub spindle: std::sync::Mutex<()>,
@@ -320,12 +320,12 @@ pub struct SpindleHold<'a> {
 
 /// Holds [`Store::utxo_view`] odd until drop.
 pub struct UtxoViewGuard<'a> {
-    pub view: &'a std::sync::atomic::AtomicU64,
+    pub view: &'a crate::sync::atomic::AtomicU64,
 }
 
 impl Drop for UtxoViewGuard<'_> {
     fn drop(&mut self) {
-        use std::sync::atomic::Ordering;
+        use crate::sync::atomic::Ordering;
         self.view.fetch_add(1, Ordering::Release);
     }
 }
@@ -412,7 +412,7 @@ impl Store {
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
-            utxo_view: std::sync::atomic::AtomicU64::new(0),
+            utxo_view: crate::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             spindle: std::sync::Mutex::new(()),
             path,
@@ -475,7 +475,7 @@ impl Store {
             spend_snapshot: std::sync::atomic::AtomicU64::new(0),
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
-            utxo_view: std::sync::atomic::AtomicU64::new(0),
+            utxo_view: crate::sync::atomic::AtomicU64::new(0),
             spend_marker: std::sync::Mutex::new(()),
             spindle: std::sync::Mutex::new(()),
             path,
@@ -1571,12 +1571,13 @@ impl Store {
         }
         let n_ranges = ranges.len();
         let mut cleared = 0u64;
+        let write = crate::array_table::ClassCWrite::new();
         for (lo, hi) in ranges {
             let ones = self.strong_tx.count_strong_in_fk_range(lo, hi)?;
             if ones == 0 {
                 continue;
             }
-            self.clear_class_c_run(lo, hi)?;
+            self.clear_class_c_run(&write, lo, hi)?;
             cleared = cleared.saturating_add(ones);
         }
         let ms = t0.elapsed().as_millis();
@@ -1613,16 +1614,22 @@ impl Store {
     }
 
     #[doc(hidden)]
-    pub fn clear_class_c_run(&self, start: u64, end: u64) -> Result<u64, StoreError> {
+    pub fn clear_class_c_run(
+        &self,
+        write: &crate::array_table::ClassCWrite,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, StoreError> {
         if end <= start {
             return Ok(0);
         }
         let count = end - start;
         if count <= u64::from(u32::MAX) {
-            self.strong_tx.set_unstrong_range(Fk(start), count as u32)?;
+            self.strong_tx
+                .set_unstrong_range(write, Fk(start), count as u32)?;
         } else {
             for id in start..end {
-                self.strong_tx.set_unstrong(Fk(id))?;
+                self.strong_tx.set_unstrong(write, Fk(id))?;
             }
         }
         Ok(count)
@@ -1743,7 +1750,7 @@ impl Store {
     /// Odd for the guard's life. Callers who sample an even stamp and read
     /// coins can trust that read only when the stamp is unchanged afterward.
     pub fn hold_utxo_view(&self) -> UtxoViewGuard<'_> {
-        use std::sync::atomic::Ordering;
+        use crate::sync::atomic::Ordering;
         let prev = self.utxo_view.fetch_add(1, Ordering::AcqRel);
         debug_assert_eq!(
             prev & 1,
@@ -1757,7 +1764,7 @@ impl Store {
 
     /// `Some` even generation, or `None` while [`Self::hold_utxo_view`] is held.
     pub fn utxo_view_stamp(&self) -> Option<u64> {
-        use std::sync::atomic::Ordering;
+        use crate::sync::atomic::Ordering;
         let v = self.utxo_view.load(Ordering::Acquire);
         (v & 1 == 0).then_some(v)
     }

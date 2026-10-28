@@ -1373,7 +1373,12 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     let first = tx_fks[0];
     q.store()
         .strong_tx
-        .set_strong_range(first, tx_fks.len() as u32, header_fk)
+        .set_strong_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            first,
+            tx_fks.len() as u32,
+            header_fk,
+        )
         .unwrap();
     assert_eq!(q.tip_height(), Some(tip_before));
     assert!(
@@ -1417,7 +1422,12 @@ fn confirm_survives_partial_class_c_without_tip_advance() {
     let fks2 = q.store().header_txs.get_list(hfk2).unwrap().unwrap();
     q.store()
         .strong_tx
-        .set_strong_range(fks2[0], fks2.len() as u32, hfk2)
+        .set_strong_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            fks2[0],
+            fks2.len() as u32,
+            hfk2,
+        )
         .unwrap();
     q.flush().unwrap();
     drop(q);
@@ -1608,7 +1618,10 @@ fn pin_plan_none_stamp_of_archived_spend(
     );
 
     let n = fks.len() as u32;
-    q.store().header_txs.put_range(hfk, fks[0], n + 1).unwrap();
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), hfk, fks[0], n + 1)
+        .unwrap();
     match confirm_wire_lookup_stamp(q, params, ms, &items, None) {
         Err(rbitcoin_query::ConfirmError::Store(StoreError::Corrupt(m))) => {
             assert_eq!(m, "invariant: archived stamp tx_fks/txids length");
@@ -1616,7 +1629,10 @@ fn pin_plan_none_stamp_of_archived_spend(
         Err(e) => panic!("list/wire length mismatch must be Corrupt, got {e}"),
         Ok(_) => panic!("list/wire length mismatch must fail the stamp"),
     }
-    q.store().header_txs.put_range(hfk, fks[0], n).unwrap();
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), hfk, fks[0], n)
+        .unwrap();
 }
 
 /// Resume: spend archived with create_fk (archive sticky/head); confirm spends.

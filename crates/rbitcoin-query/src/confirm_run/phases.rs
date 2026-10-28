@@ -433,6 +433,7 @@ pub fn class_c_commit(
     query: &Query,
     prepared: &mut [Prepared],
     write_create_pins: &FkMap<crate::CreatePin>,
+    header_ranges: &[(rbitcoin_primitives::Fk, rbitcoin_primitives::Fk, u32)],
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConfirmError> {
     use std::sync::atomic::Ordering as QOrd;
 
@@ -453,7 +454,7 @@ pub fn class_c_commit(
         Some(write_create_pins)
     };
     let out = query
-        .confirm_blocks_run_with_create_pins(&items, pins)
+        .confirm_blocks_run_with_create_pins(&items, pins, header_ranges)
         .map_err(ConfirmError::from)?;
     let strong_d = query
         .confirm_stats()

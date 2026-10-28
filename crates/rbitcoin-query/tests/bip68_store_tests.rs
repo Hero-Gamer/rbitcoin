@@ -40,7 +40,11 @@ fn bip68_height_zero_time_lock_uses_the_median() {
     query
         .store()
         .confirmed
-        .set(rbitcoin_primitives::Height(0), header_fk)
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(0),
+            header_fk,
+        )
         .unwrap();
     query.store().rebuild_height_fence().unwrap();
     let params = Box::leak(Box::new(rbitcoin_consensus::ChainParams::regtest()));

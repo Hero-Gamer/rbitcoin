@@ -72,7 +72,9 @@ fn clean_header_chain_revalidate_no_shrink() {
         parent_hash = rec.hash;
         let fk = s.put_header(&rec).unwrap();
         prev = fk;
-        s.confirmed.set(Height(h), fk).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), fk)
+            .unwrap();
     }
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
@@ -105,15 +107,23 @@ fn poison_prev_edge_shrinks_tip() {
     let s = Store::create_tiny(&dir).unwrap();
     let g = hdr(Fk::NULL, [0u8; 32], 0);
     let g_fk = s.put_header(&g).unwrap();
-    s.confirmed.set(Height(0), g_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), g_fk)
+        .unwrap();
     let a = hdr(g_fk, g.hash, 1);
     let a_fk = s.put_header(&a).unwrap();
-    s.confirmed.set(Height(1), a_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), a_fk)
+        .unwrap();
     let b = hdr(a_fk, a.hash, 2);
     let b_fk = s.put_header(&b).unwrap();
-    s.confirmed.set(Height(2), b_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(2), b_fk)
+        .unwrap();
     // Steal tip height 2 to point at G (false conf edge).
-    s.confirmed.set(Height(2), g_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(2), g_fk)
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     rbitcoin_store::spend_durable::SpendDurable::new(5, 5)
         .store(s.path())
@@ -142,7 +152,9 @@ fn tip_seal_clamps_unsealed_extension() {
     let s = Store::create_tiny(&dir).unwrap();
     let g = hdr(Fk::NULL, [0u8; 32], 0);
     let g_fk = s.put_header(&g).unwrap();
-    s.confirmed.set(Height(0), g_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), g_fk)
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     let seal = TipSeal::load(s.path())
         .unwrap()
@@ -154,7 +166,9 @@ fn tip_seal_clamps_unsealed_extension() {
     // simulate by writing a higher tip then restoring old seal file.
     let a = hdr(g_fk, g.hash, 1);
     let a_fk = s.put_header(&a).unwrap();
-    s.confirmed.set(Height(1), a_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), a_fk)
+        .unwrap();
     s.confirmed.flush().unwrap();
     // Overwrite seal with the old tip-0 seal (as if barrier never finished).
     seal.store(s.path()).unwrap();
@@ -172,11 +186,15 @@ fn merkle_mismatch_clears_body_and_shrinks() {
     let s = Store::create_tiny(&dir).unwrap();
     let g = hdr(Fk::NULL, [0u8; 32], 0);
     let g_fk = s.put_header(&g).unwrap();
-    s.confirmed.set(Height(0), g_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), g_fk)
+        .unwrap();
     let tx_fk = put_coinbase(&s, 9);
     let txid = s.txs.body_txid(tx_fk).unwrap();
     // Header merkle is salt-based, not txid → S3 fail.
-    s.header_txs.put_range(g_fk, tx_fk, 1).unwrap();
+    s.header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), g_fk, tx_fk, 1)
+        .unwrap();
     // Ensure genesis hash still consistent with its merkle field (no rewrite).
     let _ = txid;
     s.flush_class_c_tip().unwrap();
@@ -218,9 +236,15 @@ fn tip_window_missing_strong_shrinks() {
         let rec = hdr_merkle(prev, parent_hash, h as u8, txid);
         parent_hash = rec.hash;
         let hfk = s.put_header(&rec).unwrap();
-        s.header_txs.put_range(hfk, tx_fk, 1).unwrap();
-        s.strong_tx.set_strong(tx_fk, hfk).unwrap();
-        s.confirmed.set(Height(h), hfk).unwrap();
+        s.header_txs
+            .put_range(&rbitcoin_store::ClassCWrite::for_test(), hfk, tx_fk, 1)
+            .unwrap();
+        s.strong_tx
+            .set_strong(&rbitcoin_store::ClassCWrite::for_test(), tx_fk, hfk)
+            .unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), hfk)
+            .unwrap();
         prev = hfk;
         tip_tx = tx_fk;
     }
@@ -230,7 +254,9 @@ fn tip_window_missing_strong_shrinks() {
     s.txs.flush().unwrap();
     s.header_txs.flush().unwrap();
     assert_eq!(s.confirmed.tip_height(), Some(Height(2)));
-    s.strong_tx.set_unstrong(tip_tx).unwrap();
+    s.strong_tx
+        .set_unstrong(&rbitcoin_store::ClassCWrite::for_test(), tip_tx)
+        .unwrap();
 
     let r = s.revalidate_tip_window_n(6).unwrap();
     assert_eq!(
@@ -260,7 +286,9 @@ fn trailing_null_confirmed_slots_trimmed_in_one_open() {
         parent_hash = rec.hash;
         let fk = s.put_header(&rec).unwrap();
         prev = fk;
-        s.confirmed.set(Height(h), fk).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), fk)
+            .unwrap();
     }
     s.headers.flush().unwrap();
     s.confirmed.flush().unwrap();
@@ -305,7 +333,9 @@ fn revalidate_n_zero_and_empty_store() {
 
     let rec = hdr(Fk::NULL, [0u8; 32], 0);
     let fk = s.put_header(&rec).unwrap();
-    s.confirmed.set(Height(0), fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), fk)
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
     let r = s.revalidate_tip_window_n(0).unwrap();
@@ -323,7 +353,9 @@ fn genesis_nonzero_prev_fk_and_header_txs_oob_shrink() {
     let dummy_fk = s.put_header(&dummy).unwrap();
     let g = hdr(dummy_fk, dummy.hash, 0);
     let g_fk = s.put_header(&g).unwrap();
-    s.confirmed.set(Height(0), g_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), g_fk)
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
     let r = s.revalidate_tip_window_n(6).unwrap();
@@ -335,8 +367,17 @@ fn genesis_nonzero_prev_fk_and_header_txs_oob_shrink() {
     let s = Store::create_tiny(&dir).unwrap();
     let g = hdr(Fk::NULL, [0u8; 32], 0);
     let g_fk = s.put_header(&g).unwrap();
-    s.confirmed.set(Height(0), g_fk).unwrap();
-    s.header_txs.put_range(g_fk, Fk(1_000_000), 1).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), g_fk)
+        .unwrap();
+    s.header_txs
+        .put_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            g_fk,
+            Fk(1_000_000),
+            1,
+        )
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
     s.header_txs.flush().unwrap();
@@ -352,7 +393,9 @@ fn tip_seal_hash_mismatch_drops_tip_block() {
     let s = Store::create_tiny(&dir).unwrap();
     let g = hdr(Fk::NULL, [0u8; 32], 0);
     let g_fk = s.put_header(&g).unwrap();
-    s.confirmed.set(Height(0), g_fk).unwrap();
+    s.confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), g_fk)
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     let mut seal = TipSeal::load(s.path())
         .unwrap()
@@ -381,9 +424,17 @@ fn checkblocks_zero_walks_below_default_window() {
             genesis_fk = fk;
         }
         prev = fk;
-        s.confirmed.set(Height(h), fk).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), fk)
+            .unwrap();
     }
-    s.confirmed.set(Height(1), genesis_fk).unwrap();
+    s.confirmed
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Height(1),
+            genesis_fk,
+        )
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
     // A marker at the tip keeps the default window short. Without one,
@@ -421,9 +472,17 @@ fn durable_through_widens_past_the_six_block_window() {
             genesis_fk = fk;
         }
         prev = fk;
-        s.confirmed.set(Height(h), fk).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), fk)
+            .unwrap();
     }
-    s.confirmed.set(Height(1), genesis_fk).unwrap();
+    s.confirmed
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Height(1),
+            genesis_fk,
+        )
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
     rbitcoin_store::spend_durable::SpendDurable::new(0, 0)
@@ -453,9 +512,17 @@ fn missing_marker_revalidates_from_genesis() {
             genesis_fk = fk;
         }
         prev = fk;
-        s.confirmed.set(Height(h), fk).unwrap();
+        s.confirmed
+            .set(&rbitcoin_store::ClassCWrite::for_test(), Height(h), fk)
+            .unwrap();
     }
-    s.confirmed.set(Height(1), genesis_fk).unwrap();
+    s.confirmed
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Height(1),
+            genesis_fk,
+        )
+        .unwrap();
     s.flush_class_c_tip().unwrap();
     s.headers.flush().unwrap();
     assert!(rbitcoin_store::spend_durable::SpendDurable::load(s.path())

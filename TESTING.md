@@ -42,6 +42,9 @@ The Linux `pread` job runs the same store and query suites with
 `RBITCOIN_IO=pread` after `qc` and `test`, in parallel with `coverage`.
 The `test` job does not set `RBITCOIN_IO`, so it stays on io_uring.
 `pread` is Actions-only. It is not part of the local gate list.
+`rust-forward` is the same wait: `cargo check --workspace --all-targets`
+on the channel in `rust-forward.toml`, beside `pread`. Product builds stay
+on rustc 1.95. It is not part of the local gate list.
 
 When adding or folding a pin:
 
@@ -134,6 +137,7 @@ Host **gnu** objects are not interchangeable with **musl** release or with
 | **Dev** | `target/dev` (`CARGO_TARGET_DIR`; `nix-shell` / `nix develop` set `$PWD/target/dev` when unset — rustup users should export it) | fmt, clippy, `cargo test`, ad-hoc `cargo build` |
 | **Coverage** | `target/cov` (forced in `scripts/coverage.sh`) | `./scripts/coverage.sh` only |
 | **Musl release** | Nix store via crane (`cargoArtifacts` + app) | `nix build .#rbitcoin-musl` — **not** `./target` |
+| **Model** | `target/model-loom`, `target/model-shuttle` (`CARGO_TARGET_DIR_MODEL` overrides the script default) | `./scripts/model-check.sh loom` and `./scripts/model-check.sh shuttle`. Not part of `cargo test --workspace`. |
 
 Override dev dir only when intentional: `CARGO_TARGET_DIR=…` (Nix shell
 reads it; rustup users export it). Override coverage dir:
@@ -218,6 +222,26 @@ cargo test -p rbitcoin-ibd --test suite frontier_competing -- --ignored --test-t
 
 The default six-block P2P cases still cover out-of-order body delivery and
 frontier reassignment after EOF without waiting for header timeout intervals.
+
+## Model checking
+
+`./scripts/model-check.sh` builds `--test model` with `--cfg loom` or `--cfg shuttle` and its own target dir. These jobs are not required PR checks. [`.github/workflows/model.yml`](./.github/workflows/model.yml) runs them on pull request, push, and dispatch. The nightly cron raises the budget: loom preemption bound 4 (`LOOM_MAX_PREEMPTIONS`), shuttle 50_000 iterations at PCT depth 5 (`MODEL_SHUTTLE_ITERS`, `MODEL_SHUTTLE_DEPTH`), seeded with the GitHub run id. The harness follows phlip9's #1214: cfg-gated model tests, a separate target directory, and the same pull-request and nightly jobs. This pull request is an alternative to that ArrayTable model. Those scenarios stay on #1214.
+
+| Engine | Subject | What a bad schedule shows |
+|--------|---------|---------------------------|
+| loom | script-pool `claim_chunk` | `next` advances before `in_wave`, so `is_complete` frees the wave under a claim that still applies |
+| shuttle | script-pool idle turn (`park_if_still_idle`) | the worker parks after the epoch bump and the unpark have both missed it. The check does not start the OS pool |
+| loom | `Store::hold_utxo_view` / `utxo_view_stamp` | a stamp is visible while the hold is live |
+| loom | Class C sequence counter (`get_sample`, `get_range`) | a new length arrives with the slot from before that store, or a header first/count pair mixes two generations |
+| loom | Class C flush exclusion (`set`, `flush_dirty_between`) | a store returns Ok, the flush marks the table clean, and the slot it sampled is the one left on disk |
+
+A `Relaxed` even publish fails both sequence closures. `get_sample` then sees a new length with the slot from before that store. `get_range` mixes two header generations (`(Fk(50), 4)`). Storing the length before the slots, while the even step stays a release, still passes: readers wait for that even value. The slot closure is one `set` against one `get_sample`. The header closure stores `(Fk(10), 4)` before either thread starts, then races one `put_range` of `(Fk(50), 9)` against one `get_range`. Each stays at preemption bound 2. A higher nightly bound does not raise that cap. The bound does not explore every aarch64 reorder of a release on the odd advance, so the fence order is part of the protocol and not something this model is claimed to exhaust. Neither closure flushes, so they do not cover exclusion.
+
+The flush model calls `ArrayTable::set` and `flush_dirty_between`. A relaxed odd increment and a release store of `flushing` fail it: the store returns Ok, the mark is clean, and disk still holds the slot the flush sampled (`disk=5`, `sampled=5`). The odd bit and `flushing` are `SeqCst` in both directions. A `SeqCst` fence between the odd store and the flag load, and between the flag store and the counter load, is the order this model checks: loom 0.7 does not order `SeqCst` accesses with each other. `check_at_most(3)` keeps the model at preemption bound 3 when the nightly job sets `LOOM_MAX_PREEMPTIONS=4`. The pull-request budget stays 2, which is enough for that lost store. `strong_tx` uses that same flush. Its body length is in bytes.
+
+`enqueue_sh_pending` then `release_index_writebehind` is not a model. The enqueue takes `Query`'s scripthash pending and RAM-head locks. Reproducing that order needs a `Query` full of `std` locks, so this harness leaves it out.
+
+PR budget: loom preemption bound 2, shuttle 2_000 PCT iterations and 2_000 random iterations at depth 3, seed `0x5eed_a77a_7ab1_e5ee`. `MODEL_LOOM_EXHAUSTIVE=1` removes the loom bound.
 
 ## Coverage
 

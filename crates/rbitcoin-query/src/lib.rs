@@ -497,6 +497,9 @@ pub struct Query {
     /// starting it) / disconnect flush. Rewind tries it and retries; it does not
     /// disconnect mid-flush.
     pub tip_commit: Mutex<()>,
+    /// Confirm-write channel, installed while `ibd-confirm-write` is alive.
+    /// Archived-body clear sends here instead of storing Class C itself.
+    pub confirm_write: Mutex<Option<std::sync::mpsc::SyncSender<crate::ConfirmWriteMsg>>>,
     /// IBD tip barrier on `rbtc-tip-flush`, or the failure of one. The next
     /// `tip_commit` taker joins it.
     pub tip_flush: Mutex<connect::TipFlush>,
@@ -665,6 +668,7 @@ impl Query {
             sh_runs_published: AtomicUsize::new(0),
             owned_sizes_published: arc_swap::ArcSwap::from_pointee(ProcessOwnedSizes::default()),
             tip_commit: Mutex::new(()),
+            confirm_write: Mutex::new(None),
             tip_flush: Mutex::new(connect::TipFlush::Idle),
             tip_flush_worker: connect::TipFlushWorker::default(),
             #[cfg(debug_assertions)]
@@ -2437,11 +2441,50 @@ impl Query {
     ///
     /// Use when reconstruct fails header checks (merkle mismatch): peer re-getdata
     /// can supply a good body for the same block hash.
+    pub fn attach_confirm_write(&self, tx: std::sync::mpsc::SyncSender<crate::ConfirmWriteMsg>) {
+        *self.confirm_write.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+    }
+
+    /// Drop the sender when `ibd-confirm-write` exits so a later clear does
+    /// not wait on a thread that is gone.
+    pub fn detach_confirm_write(&self) {
+        *self.confirm_write.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
     pub fn clear_archived_body(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
+        debug_assert!(
+            !rbitcoin_store::coord_shared_lock_held(),
+            "archived clear waits while the coordinator holds shared"
+        );
+        let tx = self
+            .confirm_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(tx) = tx {
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            tx.send(crate::ConfirmWriteMsg::ClearArchived {
+                hash: *hash,
+                reply: reply_tx,
+            })
+            .map_err(|_| StoreError::Cancelled("confirm write stopped"))?;
+            return reply_rx
+                .recv()
+                .map_err(|_| StoreError::Cancelled("confirm write stopped"))?;
+        }
+        self.clear_archived_body_here(hash)
+    }
+
+    /// Clear on the calling thread. The confirm-write thread calls this after
+    /// it joins the tip flush. With no sender installed (unit tests, before
+    /// the engine) [`Self::clear_archived_body`] calls it inline.
+    #[doc(hidden)]
+    pub fn clear_archived_body_here(&self, hash: &[u8; 32]) -> Result<bool, QueryError> {
         let Some((fk, _)) = self.get_header_by_hash(hash)? else {
             return Ok(false);
         };
-        let cleared = self.store.header_txs.clear_body(fk)?;
+        let write = rbitcoin_store::ClassCWrite::new();
+        let cleared = self.store.header_txs.clear_body(&write, fk)?;
         if cleared {
             self.store.header_txs.flush()?;
         }

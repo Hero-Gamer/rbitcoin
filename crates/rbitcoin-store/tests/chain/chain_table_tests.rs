@@ -15,40 +15,98 @@ fn tmp() -> std::path::PathBuf {
     p
 }
 
+/// `get_range` samples first and count together. A paired update or a clear
+/// returns the previous pair, the new pair, or no body. Never a new first
+/// with the old count, and never a zeroed first with the old count.
+#[test]
+fn get_range_during_put_and_clear_is_one_pair() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = tmp();
+    let ht = Arc::new(HeaderTxsTable::create(&dir).unwrap());
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    ht.put_range(&write, Fk(1), Fk(10), 4).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let readers: Vec<_> = (0..4)
+        .map(|_| {
+            let (ht, stop) = (Arc::clone(&ht), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match ht.get_range(Fk(1)).unwrap() {
+                        Some((Fk(10), 4)) => {}
+                        Some((Fk(50), 9)) => {}
+                        None => {}
+                        other => panic!("torn header range {other:?}"),
+                    }
+                }
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        let write = rbitcoin_store::ClassCWrite::for_test();
+        ht.put_range(&write, Fk(1), Fk(50), 9).unwrap();
+        ht.clear_body(&write, Fk(1)).unwrap();
+        ht.put_range(&write, Fk(1), Fk(10), 4).unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    for r in readers {
+        assert!(r.join().is_ok(), "get_range panicked");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many chain surface arms
 #[test]
 fn confirmed_tx_height_header_txs_surface() {
     let dir = tmp();
     let c = ConfirmedTable::create(&dir).unwrap();
     assert!(c.tip_height().is_none());
-    c.set(Height(0), Fk(1)).unwrap();
-    c.set(Height(1), Fk(2)).unwrap();
+    c.set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(1))
+        .unwrap();
+    c.set(&rbitcoin_store::ClassCWrite::for_test(), Height(1), Fk(2))
+        .unwrap();
     assert_eq!(c.tip_height(), Some(Height(1)));
     assert_eq!(c.get(Height(0)).unwrap(), Some(Fk(1)));
-    c.set_many(&[]).unwrap();
-    c.set_many(&[(Height(2), Fk(3)), (Height(3), Fk(4))])
+    c.set_many(&rbitcoin_store::ClassCWrite::for_test(), &[])
         .unwrap();
+    c.set_many(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(Height(2), Fk(3)), (Height(3), Fk(4))],
+    )
+    .unwrap();
     assert_eq!(c.tip_height(), Some(Height(3)));
     assert!(matches!(
-        c.set(Height(4), Fk::NULL),
+        c.set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Height(4),
+            Fk::NULL
+        ),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        c.set_many(&[(Height(5), Fk::NULL)]),
+        c.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(Height(5), Fk::NULL)]
+        ),
         Err(StoreError::InvalidFk)
     ));
-    c.disconnect_tip(Height(3)).unwrap();
+    c.disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(3))
+        .unwrap();
     assert_eq!(c.tip_height(), Some(Height(2)));
     assert!(matches!(
-        c.disconnect_tip(Height(0)),
+        c.disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(0)),
         Err(StoreError::Corrupt(_))
     ));
-    c.disconnect_tip(Height(2)).unwrap();
-    c.disconnect_tip(Height(1)).unwrap();
-    c.disconnect_tip(Height(0)).unwrap();
+    c.disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(2))
+        .unwrap();
+    c.disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(1))
+        .unwrap();
+    c.disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(0))
+        .unwrap();
     assert!(c.tip_height().is_none());
     assert!(matches!(
-        c.disconnect_tip(Height(0)),
+        c.disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(0)),
         Err(StoreError::Corrupt(_))
     ));
     c.flush().unwrap();
@@ -56,7 +114,8 @@ fn confirmed_tx_height_header_txs_surface() {
 
     let ht = HeaderTxsTable::create(&dir).unwrap();
     assert!(ht.get_range(Fk(1)).unwrap().is_none());
-    ht.put_range(Fk(1), Fk(100), 3).unwrap();
+    ht.put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(100), 3)
+        .unwrap();
     assert_eq!(ht.get_range(Fk(1)).unwrap(), Some((Fk(100), 3)));
     assert_eq!(
         ht.get_list(Fk(1)).unwrap().unwrap(),
@@ -64,40 +123,63 @@ fn confirmed_tx_height_header_txs_surface() {
     );
     assert!(ht.has_body(Fk(1)).unwrap());
     assert!(!ht.has_body(Fk(2)).unwrap());
-    ht.put_list(Fk(2), &[Fk(200), Fk(201)]).unwrap();
+    ht.put_list(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        Fk(2),
+        &[Fk(200), Fk(201)],
+    )
+    .unwrap();
     assert!(matches!(
-        ht.put_list(Fk(3), &[]),
+        ht.put_list(&rbitcoin_store::ClassCWrite::for_test(), Fk(3), &[]),
         Err(StoreError::Corrupt(_))
     ));
     // Non-contiguous triggers debug_assert in debug builds; only empty is a
     // stable Err path under RUSTFLAGS=-Dwarnings debug tests.
     assert!(matches!(
-        ht.put_range(Fk::NULL, Fk(1), 1),
+        ht.put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk::NULL, Fk(1), 1),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        ht.put_range(Fk(3), Fk::NULL, 1),
+        ht.put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(3), Fk::NULL, 1),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        ht.put_range(Fk(3), Fk(1), 0),
+        ht.put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(3), Fk(1), 0),
         Err(StoreError::InvalidFk)
     ));
-    ht.put_lists_batch(&[]).unwrap();
-    ht.put_lists_batch(&[(Fk(3), &[Fk(300)] as &[_]), (Fk(4), &[Fk(400), Fk(401)])])
+    ht.put_lists_batch(&rbitcoin_store::ClassCWrite::for_test(), &[])
         .unwrap();
+    ht.put_lists_batch(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(Fk(3), &[Fk(300)] as &[_]), (Fk(4), &[Fk(400), Fk(401)])],
+    )
+    .unwrap();
     assert!(matches!(
-        ht.put_lists_batch(&[(Fk(5), &[] as &[_])]),
+        ht.put_lists_batch(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(Fk(5), &[] as &[_])]
+        ),
         Err(StoreError::Corrupt(_))
     ));
-    ht.put_ranges_batch(&[]).unwrap();
-    ht.put_ranges_batch(&[(Fk(5), Fk(500), 2)]).unwrap();
+    ht.put_ranges_batch(&rbitcoin_store::ClassCWrite::for_test(), &[])
+        .unwrap();
+    ht.put_ranges_batch(
+        &rbitcoin_store::ClassCWrite::for_test(),
+        &[(Fk(5), Fk(500), 2)],
+    )
+    .unwrap();
     assert!(matches!(
-        ht.put_ranges_batch(&[(Fk::NULL, Fk(1), 1)]),
+        ht.put_ranges_batch(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(Fk::NULL, Fk(1), 1)]
+        ),
         Err(StoreError::InvalidFk)
     ));
     assert!(matches!(
-        ht.put_ranges_batch(&[(Fk(6), Fk::NULL, 1)]),
+        ht.put_ranges_batch(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(Fk(6), Fk::NULL, 1)]
+        ),
         Err(StoreError::InvalidFk)
     ));
     assert_eq!(ht.count_bodies().unwrap(), 5);
@@ -105,13 +187,25 @@ fn confirmed_tx_height_header_txs_surface() {
 
     // clear_body: drop association without freeing tx rows (merkle soft-reget path).
     assert!(matches!(
-        ht.clear_body(Fk::NULL),
+        ht.clear_body(&rbitcoin_store::ClassCWrite::for_test(), Fk::NULL),
         Err(StoreError::InvalidFk)
     ));
-    assert!(!ht.clear_body(Fk(99)).unwrap(), "no body → false");
-    assert!(ht.clear_body(Fk(1)).unwrap(), "had body → true");
+    assert!(
+        !ht.clear_body(&rbitcoin_store::ClassCWrite::for_test(), Fk(99))
+            .unwrap(),
+        "no body → false"
+    );
+    assert!(
+        ht.clear_body(&rbitcoin_store::ClassCWrite::for_test(), Fk(1))
+            .unwrap(),
+        "had body → true"
+    );
     assert!(!ht.has_body(Fk(1)).unwrap());
-    assert!(!ht.clear_body(Fk(1)).unwrap(), "already clear → false");
+    assert!(
+        !ht.clear_body(&rbitcoin_store::ClassCWrite::for_test(), Fk(1))
+            .unwrap(),
+        "already clear → false"
+    );
     assert_eq!(ht.count_bodies().unwrap(), 4);
 
     ht.flush().unwrap();
@@ -132,7 +226,8 @@ fn header_txs_contains_tx_range_edges() {
     let ht = HeaderTxsTable::create(&dir).unwrap();
     assert!(!ht.contains_tx(Fk(1), Fk::NULL).unwrap());
     assert!(!ht.contains_tx(Fk(1), Fk(1)).unwrap(), "no body");
-    ht.put_range(Fk(1), Fk(10), 3).unwrap();
+    ht.put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(10), 3)
+        .unwrap();
     assert!(ht.contains_tx(Fk(1), Fk(10)).unwrap());
     assert!(ht.contains_tx(Fk(1), Fk(12)).unwrap());
     assert!(!ht.contains_tx(Fk(1), Fk(9)).unwrap());

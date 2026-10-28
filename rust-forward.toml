@@ -1,0 +1,6 @@
+# Forward compiler for CI job `rust-forward`. Product MSRV stays
+# rust-toolchain.toml. This channel is the newest rustc the tree is held to.
+# Later pulls move the channel and fix what that compiler names.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"

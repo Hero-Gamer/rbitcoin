@@ -73,9 +73,9 @@ use dial::{
     redial_want, release_peer_block_work,
 };
 pub use events::drain_ready_peer_and_body_events;
-use events::{apply_confirm_events, apply_peer_event, disconnect_all_peers, update_confirm_lag};
 #[cfg(debug_assertions)]
 pub use events::{apply_confirm_reject, apply_headers_event};
+use events::{apply_peer_event, disconnect_all_peers, update_confirm_lag};
 use exit::{
     all_peers_dead_action, best_chain_remainder, dark_empty_after, empty_path_header_fan,
     header_lag_behind_peers, ibd_caught_up, may_spawn_redial, path_drained,
@@ -191,6 +191,66 @@ fn settle_disconnected_heavier<'a>(
     drop(st_guard);
     let _ = reorg::apply_off_lock_rewind(shared, hub, &cands, &invalid);
     HeldShared::lock(shared)
+}
+
+/// Apply confirm events, dropping `shared` while a mutated body clear waits
+/// on the confirm-write thread. The post-clear updates run after the reply,
+/// and only while this hash still occupies its height.
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
+fn release_archived_clears<'a>(
+    mut st_guard: HeldShared<'a>,
+    shared: &'a std::sync::Mutex<state::IbdWorkState>,
+    hub: &ChainHub,
+    rx: &std::sync::mpsc::Receiver<confirm::ConfirmEvent>,
+    archive_write_next: &AtomicU32,
+    max_ready_shared: &AtomicU32,
+    last_progress: &mut Instant,
+    feed: Option<&confirm::ConfirmFeed>,
+) -> HeldShared<'a> {
+    let pending = events::take_confirm_events(
+        &mut st_guard,
+        hub,
+        rx,
+        archive_write_next,
+        max_ready_shared,
+        last_progress,
+        feed,
+    );
+    if pending.is_empty() {
+        return st_guard;
+    }
+    drop(st_guard);
+    for item in &pending {
+        events::send_deferred_archived_clear(hub.query.as_ref(), item);
+    }
+    st_guard = HeldShared::lock(shared);
+    for item in pending {
+        events::finish_deferred_archived_clear(&mut st_guard, Some(hub), &item);
+    }
+    st_guard
+}
+
+/// Drive confirm events the way the coordinator loop does.
+#[doc(hidden)]
+pub fn apply_confirm_events_for_test(
+    shared: &std::sync::Mutex<state::IbdWorkState>,
+    hub: &ChainHub,
+    rx: &std::sync::mpsc::Receiver<confirm::ConfirmEvent>,
+) {
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let st_guard = HeldShared::lock(shared);
+    let _ = release_archived_clears(
+        st_guard,
+        shared,
+        hub,
+        rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        None,
+    );
 }
 
 /// Same drop, header walk, and commit as the coordinator assign turn.
@@ -718,18 +778,19 @@ pub async fn ibd_cancellable(
         let pending_redial = {
             let mut st_guard = HeldShared::lock(&shared);
             let now_cadence = Instant::now();
+            let tip_before_confirm = hub.tip_height();
+            st_guard = release_archived_clears(
+                st_guard,
+                &shared,
+                hub.as_ref(),
+                &confirm_ev_rx,
+                &archive_write_next,
+                &max_ready_shared,
+                &mut last_progress,
+                Some(confirm_feed.as_ref()),
+            );
             {
                 let st = &mut *st_guard;
-                let tip_before_confirm = hub.tip_height();
-                apply_confirm_events(
-                    st,
-                    hub.as_ref(),
-                    &confirm_ev_rx,
-                    &archive_write_next,
-                    &max_ready_shared,
-                    &mut last_progress,
-                    Some(confirm_feed.as_ref()),
-                );
                 if hub.tip_height() < tip_before_confirm {
                     confirm_feed.clear();
                 }
@@ -802,19 +863,22 @@ pub async fn ibd_cancellable(
                 cadence.mark_assign(now_cadence);
             }
 
-            let st = &mut *st_guard;
-            offer_confirm_ready(
-                &confirm_feed,
-                &st.height_to_hash,
-                &st.path_prev,
-                &mut st.body,
-                hub.as_ref(),
-                &mut st.max_ready_height,
-                &max_ready_shared,
-            );
-            update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
-            apply_confirm_events(
-                st,
+            {
+                let st = &mut *st_guard;
+                offer_confirm_ready(
+                    &confirm_feed,
+                    &st.height_to_hash,
+                    &st.path_prev,
+                    &mut st.body,
+                    hub.as_ref(),
+                    &mut st.max_ready_height,
+                    &max_ready_shared,
+                );
+                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
+            }
+            st_guard = release_archived_clears(
+                st_guard,
+                &shared,
                 hub.as_ref(),
                 &confirm_ev_rx,
                 &archive_write_next,
@@ -822,6 +886,7 @@ pub async fn ibd_cancellable(
                 &mut last_progress,
                 Some(confirm_feed.as_ref()),
             );
+            let st = &mut *st_guard;
             if !drain_ready_peer_and_body_events(
                 st,
                 hub.as_ref(),
@@ -1263,19 +1328,22 @@ pub async fn ibd_cancellable(
                     break;
                 }
                 let mut st_guard = HeldShared::lock(&shared);
-                let st = &mut *st_guard;
-                offer_confirm_ready(
-                    &confirm_feed,
-                    &st.height_to_hash,
-                    &st.path_prev,
-                    &mut st.body,
-                    hub.as_ref(),
-                    &mut st.max_ready_height,
-                    &max_ready_shared,
-                );
-                update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
-                apply_confirm_events(
-                    st,
+                {
+                    let st = &mut *st_guard;
+                    offer_confirm_ready(
+                        &confirm_feed,
+                        &st.height_to_hash,
+                        &st.path_prev,
+                        &mut st.body,
+                        hub.as_ref(),
+                        &mut st.max_ready_height,
+                        &max_ready_shared,
+                    );
+                    update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
+                }
+                st_guard = release_archived_clears(
+                    st_guard,
+                    &shared,
                     hub.as_ref(),
                     &confirm_ev_rx,
                     &archive_write_next,
@@ -1283,6 +1351,7 @@ pub async fn ibd_cancellable(
                     &mut last_progress,
                     Some(confirm_feed.as_ref()),
                 );
+                let st = &mut *st_guard;
                 if let Some(msg) = st.halt.take() {
                     warn!("ibd: engine fault halt: {msg}");
                     halt_err = Some(msg);

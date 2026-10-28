@@ -779,7 +779,11 @@ fn stamp_uses_inflight_when_confirmed_tip_leads_fence() {
 
     q.store()
         .confirmed
-        .set(Height(1), rbitcoin_primitives::Fk(2))
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            Height(1),
+            rbitcoin_primitives::Fk(2),
+        )
         .unwrap();
     assert_eq!(q.tip_height(), Some(Height(1)));
     assert_eq!(
@@ -809,7 +813,10 @@ fn stamp_uses_inflight_when_confirmed_tip_leads_fence() {
     );
     // Dummy height-1 confirmed row was only to tear tip vs fence; stamp
     // still connects at tip+1 from genesis.
-    q.store().confirmed.disconnect_tip(Height(1)).unwrap();
+    q.store()
+        .confirmed
+        .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(1))
+        .unwrap();
     assert_eq!(q.tip_height(), Some(Height(0)));
 
     let b1 = mine_with_txs(

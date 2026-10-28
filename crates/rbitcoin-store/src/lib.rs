@@ -107,6 +107,8 @@ pub mod spender_table;
 pub mod store;
 #[doc(hidden)]
 pub mod store_secret;
+#[doc(hidden)]
+pub mod sync;
 pub mod testutil;
 #[doc(hidden)]
 pub mod tx_head_mphf;
@@ -121,6 +123,10 @@ pub mod uring_session;
 #[doc(hidden)]
 pub mod var_table;
 
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub use crate::array_table::bind_tip_flush_hold;
+pub use crate::array_table::ClassCWrite;
 pub use crate::chain::HeaderTxsTable;
 pub use crate::compact::output_flags;
 pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};

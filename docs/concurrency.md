@@ -10,8 +10,8 @@ Short map of who may write which tables. **Format is unstable until 1.0.**
 | Confirm **lookup** | 1 OS thread | pack/hold from BQ stamped Σ inputs; emit: decode BQ raw + TipOnly `head_fk` + **`take_raw` onto loadq** (`Arc<Block>` + `TxPrecompute`). Does **not** plan_batch / structure |
 | Confirm **load** | 1 OS thread | `confirm_wire_lookup_stamp` (structure with **loadq `pres`**, plan_batch binds carried BQ keys, skeleton bind) + pin `txout` + assemble |
 | Confirm **scripts** | 1 OS thread (`ibd-confirm`) publishes waves + `rbtc-scripts` steal (lock-free claim). The interpreter runs here, not on a peer IO task (`verify_tx_scripts_detached`) | **none** — pure CPU |
-| Confirm **write** | 1 OS thread (`ibd-confirm-write`) + 1 process-wide `ibd-confirm-head` + one `rbtc-tip-flush` for the confirm engine (the Class C barrier) | **sole Class A appender** (`txout`+`seqsigwit`+`spent`; IBD encodes ins from `Arc<Block>` + SpendEdges) + structural + Class C + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. `tx.head` write-behind insert runs on **`ibd-confirm-head`** (not a per-batch spawn). `--datadir-hdd` starts that insert after spend annotate; otherwise it overlaps structural and Class C. Class A **never leads tip** (same commit era on a clean run; no archive-ahead DONTNEED). A crash inside the era can leave it above the tip ([crash-recovery.md](./crash-recovery.md#class-a-archive)). When `index_live` is set, this thread appends that index after `confirmed[h]` is set (one put per confirm batch) and does not read Class A for it. Startup `prepare_live_indexes` seals a restart gap of at most one write drain (14 × 144 heights) before confirm; a larger gap is left for `rbtc-idx-wb` |
-| IBD main loop | 1 tokio task | none (orchestration only). Event drain + confirm-offer every turn; getdata assign ≤50 ms (immediate if inflight empty); main-loop `getheaders`/`locator_hashes` ≤500 ms (empty path immediate); peer stall/relative-slow and work-path hygiene ≤1 s. Full-batch header continuation stays on the Headers event. Tip hash is the snapshot confirm published with `confirmed[]` (`published_tip`); each admitted header's parent stays on the work state. Those two reads are not store IO. The write holds `tip_commit` from the tip-height check through `flush_class_c_tip`; in IBD, through starting it on `rbtc-tip-flush`, and the next `tip_commit` taker joins that flush first. IBD rewind tries that lock, and treats a flush still running as held, and retries on the next pass. |
+| Confirm **write** | 1 OS thread (`ibd-confirm-write`) + 1 process-wide `ibd-confirm-head` + one `rbtc-tip-flush` for the confirm engine (the Class C barrier) | **sole Class A appender** (`txout`+`seqsigwit`+`spent`; IBD encodes ins from `Arc<Block>` + SpendEdges) + structural + Class C (`ClassCWrite`, minted on this thread, not `Send`) + spend annotate on **`spent.body`** + tip GC; **`block_queue_dequeue_height`**. Archived-body clear is an item on this thread's channel: it joins the in-flight tip flush, then clears and flushes, before the next Class C store. The coordinator drops its state lock for that wait, then retakes the lock and marks the hash missing only when that hash still occupies the height. Header range puts on this path wait for that same join, including when a later phase rejects the batch. Class A body append still overlaps the flush. Class C still flushes once per confirm batch. `tx.head` write-behind insert runs on **`ibd-confirm-head`** (not a per-batch spawn). `--datadir-hdd` starts that insert after spend annotate; otherwise it overlaps structural and Class C. Class A **never leads tip** (same commit era on a clean run; no archive-ahead DONTNEED). A crash inside the era can leave it above the tip ([crash-recovery.md](./crash-recovery.md#class-a-archive)). When `index_live` is set, this thread appends that index after `confirmed[h]` is set (one put per confirm batch) and does not read Class A for it. Startup `prepare_live_indexes` seals a restart gap of at most one write drain (14 × 144 heights) before confirm; a larger gap is left for `rbtc-idx-wb` |
+| IBD main loop | 1 tokio task | none (orchestration only; archived-body clear is sent to confirm-write, which stores it). Event drain + confirm-offer every turn; getdata assign ≤50 ms (immediate if inflight empty); main-loop `getheaders`/`locator_hashes` ≤500 ms (empty path immediate); peer stall/relative-slow and work-path hygiene ≤1 s. Full-batch header continuation stays on the Headers event. Tip hash is the snapshot confirm published with `confirmed[]` (`published_tip`); each admitted header's parent stays on the work state. Those two reads are not store IO. The write holds `tip_commit` from the tip-height check through `flush_class_c_tip`; in IBD, through starting it on `rbtc-tip-flush`, and the next `tip_commit` taker joins that flush first. IBD rewind tries that lock, and treats a flush still running as held, and retries on the next pass. |
 
 **IoSession TLS:** one completion session per OS thread (`with_thread_local`). Harvest / poison / drain / do-not-flatten: [`io-modality.md`](./io-modality.md). `RBITCOIN_IO=pread` disables the session. SH k-way merge submits 256 KiB ahead preads on that TLS session and waits only when promote needs a page that has not completed.
 
@@ -50,7 +50,7 @@ Three thread kinds only. **Tokio workers must not wait on a `std` mutex/rwlock, 
 | Role | Notes |
 |------|--------|
 | `peer_session` (split read/write) | Serve getdata. Full-block, compact, and `getblocktxn` reconstruct run on the blocking pool (block-decode permit). Inbound `cmpctblock` reconstruct uses that same permit. `headers` persist and `getheaders` / `getblocks` replies run on the blocking pool under the header-decode permit. The session applies notes, ban, and queued `getdata` after that join. Offers reconstructed blocks to **`tip-accept`** (does **not** take `connect_lock` or run confirm on the tokio worker). A reconstructed/received body whose header has valid PoW and **extends the current tip** is announced as `cmpctblock` to peers who sent `sendcmpct` announce=1 and already have the parent **before** connect (Core `NewPoWValidBlock`). That is not a connected tip. P2P `tx` is `accept_tx_async` (blocking pool). INV / getdata / compact **first-pass** fill use mempool **`try_read` only** (busy write → skip that item; never park). A pending compact owns those clones; `blocktxn` apply does not `try_read` again. Handshake `FeeFilter` reads the **atomic** published fee floor (no `inner`). 50 ms tick: age-INV is a due-log cursor (newly due only); `clock_due` / unbroadcast may full-walk ≤1/30 s. `any_tx_inv_due` is min live `accept_at`, not a map walk. `PeerHub::on_session_heartbeat` (headers-sync stall timeout). While the writer is past the 4 MiB send budget, or a paused `getdata` tail waits for serve room, the reader reads no frame; the heartbeat still runs, so the ping timeout still fires. Inbound accept is `inbound_connect_and_handshake` (60 s VERSION/VERACK); timeout drops the `max_inbound` permit. |
-| `tip-accept` | **One** process-wide OS thread. Queue depth 8. Sole production thread for `accept_block` / `accept_branch` / `accept_received_block` / `generate_to_script` / `connect_lock` at tip. Confirm is **`confirm_wire_run_preverified`** (lookup stamp, load pin/assemble, `confirm_scripts_phase` → `rbtc-scripts-*`, write + `ibd-confirm-head` drain). TLS uring is this thread’s `with_thread_local` session. SIGINT stays on tokio; the current job finishes, then the session sees shutdown. Dropping the session’s join future **detaches** (does not condvar-wait on the worker). |
+| `tip-accept` | **One** process-wide OS thread. Queue depth 8. Sole production thread for `accept_block` / `accept_branch` / `accept_received_block` / `generate_to_script` / `connect_lock` at tip. Mints `ClassCWrite` for that connect's Class C stores. Confirm is **`confirm_wire_run_preverified`** (lookup stamp, load pin/assemble, `confirm_scripts_phase` → `rbtc-scripts-*`, write + `ibd-confirm-head` drain). TLS uring is this thread’s `with_thread_local` session. SIGINT stays on tokio; the current job finishes, then the session sees shutdown. Dropping the session’s join future **detaches** (does not condvar-wait on the worker). |
 | `ibd-header` | **One** thread for the catch-up. Persists header batches, loads the walk origin, and reseeds. Joined when IBD stops. |
 | `rbtc-tip-flush` | **One** thread for the IBD confirm engine. Runs the Class C barrier. The next commit waits for the in-flight barrier. Joined when the engine stops. Tip mode flushes that barrier inline on `tip-accept`. |
 | `rbtc-sh-wb` | **One** Class B scripthash appender. A durable `--sh-index` head starts it before catch-up. Direct catch-up starts it only after materialize enters Tip. Absent for the whole Direct catch-up, including a cancelled or failed materialize. Confirm enqueues RAM records; `connect_at` / `note_confirmed_tip` **release** after `tip_tx`. This thread `put_create_batch_append` only for released heights, then advances `sh_indexed_through`. Apply errors re-queue and halt. The Class A tail holds `sh.appender` and finishes inside tip entry before this thread starts. The same lock is the exclusion if a tail and the worker ever overlap. There is no process-local head map. |
@@ -137,7 +137,10 @@ and no environment knob for these choices.
 capped by how many workers are parked. A worker is on that idle list only
 while it is not holding a job. The epoch check still runs after the debug
 park delay, so a wave published after the steal check is not missed.
-`steal_publish_wakes_idle_workers` is the pin.
+`steal_publish_wakes_idle_workers` is the pin. A claim increments
+`in_wave`, then release-increments `next`. `is_complete` acquire-loads
+`next` before it reads `in_wave`, so it does not drop the wave under a
+claim that still applies.
 
 **Fixed.** `serve_getdata_tail` used to call `ChainHub::knows_header` on
 the session worker for every block `getdata`. An unknown hash took
@@ -256,6 +259,37 @@ Single Class A writer is intentional. Multi‑GiB **FdOnly grow** is fallocate-o
 (no remap). Hash heads do not rewrite occupied tables while serving; a leftover
 undersized `header.head` may be **rewritten via `header.head.grow` then rename** once on open. Class C tip tables use L2
 write-behind (barrier `flush_class_c_tip`); large tables stay L0.
+In-RAM gets of `confirmed`, `header_txs`, and `strong_tx` take no reader-writer
+lock. `strong_tx` packs its bits into the same slot buffer and flush as those
+arrays. Its length is the body in bytes and is not rounded up to a word.
+The writer advances a sequence counter from even to odd with a
+compare-exchange, so a second writer waits. The `ClassCWrite` token does
+not do that exclusion. It then release-fences, stores the slots, and
+advances the counter to even. The odd advance does not publish
+those stores: a release on it would publish only the writes that came before
+it, and a `SeqCst` increment does not either. A get loads the counter, loads
+the slots, acquire-fences, and keeps the sample only when the counter is still
+that even value. An acquire load of the counter does not by itself keep the
+slot loads from moving after it. Gets are not `SeqCst`.
+`header_txs` `get_range` uses one counter for the first and the count. A
+column load acquires that store, then the same acquire fence checks the
+counter again. A flush excludes new stores, then reads the dirty range and
+the live slots. The odd bit and the flushing flag are `SeqCst` in both
+directions. A `SeqCst` fence sits between the odd store and the flag load,
+and between the flag store and the flusher's counter load. A relaxed odd bit
+and a release store of the flag do not exclude each other, and a `SeqCst`
+access is not that fence. The flag clears with `SeqCst` after the disk length
+and the clean mark, which stay release stores. The flush does not bump the
+counter, so a get during the flush does not retry because of the flush. Readers stay up
+during IBD. Slot-table growth keeps the previous buffer until the table is dropped. `strong_tx` is one anonymous reservation of the 256 MiB cap: a grow commits the used prefix and does not keep a second image. A
+get retries when the length it sampled does not fit the buffer it loaded. A
+bulk bit scan rechecks the counter once at the end. A table past the RAM cap
+is fd write-through and has no sequence counter. An append pwrites the new
+slots, then the file length, then `len`, so a get that sees the new length
+has those bytes. A zero gap pwrites zeros across that new span before the
+named slots. A get that sampled a length a truncate has since shortened
+reads as an empty slot. A past-end pread is that empty slot only when the
+reloaded length no longer covers the index.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline

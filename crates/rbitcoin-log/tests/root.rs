@@ -175,7 +175,8 @@ fn init_from_env_off_and_level() {
 unsafe extern "C" {
     safe fn dup(fd: i32) -> i32;
     safe fn dup2(oldfd: i32, newfd: i32) -> i32;
-    safe fn close(fd: i32) -> i32;
+    // `close` is a runtime symbol. rustc 1.99 rejects a safe declaration.
+    unsafe fn close(fd: i32) -> i32;
 }
 
 #[cfg(unix)]
@@ -200,7 +201,8 @@ fn stderr_line_is_plain_when_not_a_terminal() {
     log_at_style(Level::Info, Style::Plain, format_args!("hidden-info"));
     let _ = io::stderr().flush();
     assert_eq!(dup2(saved, 2), 2);
-    close(saved);
+    // SAFETY: `saved` is the fd from `dup` above, and stderr is already restored.
+    unsafe { close(saved) };
     let body = std::fs::read_to_string(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     init(Level::Info);

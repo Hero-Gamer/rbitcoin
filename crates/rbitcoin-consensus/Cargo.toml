@@ -43,5 +43,15 @@ name = "suite"
 path = "tests/suite.rs"
 required-features = ["corpus"]
 
+[[test]]
+name = "model"
+path = "tests/model/main.rs"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = "0.9"
+
 [lints]
 workspace = true

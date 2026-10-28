@@ -3388,6 +3388,183 @@ fn batched_scripts_reject_offers_the_wave_back() {
     rig.finish();
 }
 
+/// A mutated clear is handed back before any confirm-write send. The debug
+/// lock flag is not set on this path.
+#[test]
+fn mutated_clear_is_deferred_without_the_debug_lock_flag() {
+    use rbitcoin_ibd::ibd::confirm::ConfirmEvent;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("clear-deferred-no-flag");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let height = hub.tip_height().unwrap() + 1;
+    let hash = h(0x46);
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(height - 1));
+    st.record_height(hash, height);
+    st.body.mark_archived(hash);
+    let (tx, rx_clear) = std::sync::mpsc::sync_channel(0);
+    hub.query.attach_confirm_write(tx);
+    let saw = Arc::new(AtomicBool::new(false));
+    let saw_w = Arc::clone(&saw);
+    let worker = std::thread::spawn(move || {
+        let Ok(msg) = rx_clear.recv_timeout(std::time::Duration::from_secs(2)) else {
+            return;
+        };
+        saw_w.store(true, Ordering::Relaxed);
+        let rbitcoin_query::ConfirmWriteMsg::ClearArchived { reply, .. } = msg else {
+            return;
+        };
+        let _ = reply.send(Ok(false));
+    });
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+    ev_tx
+        .send(ConfirmEvent::Reject {
+            height,
+            hash,
+            class: ConfirmRejectClass::SoftWire,
+            err: "consensus: bad-txnmrklroot".to_string(),
+            batch_len: 1,
+            sender: None,
+            parent: RejectParent::default(),
+        })
+        .unwrap();
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let pending = rbitcoin_ibd::ibd::events::take_confirm_events(
+        &mut st,
+        &hub,
+        &ev_rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        None,
+    );
+    assert_eq!(pending.len(), 1, "mutated clear is deferred");
+    assert!(
+        !saw.load(Ordering::Relaxed),
+        "clear is not sent inside take_confirm_events"
+    );
+    worker.join().unwrap();
+    hub.query.detach_confirm_write();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A mutated soft reject clears the archived body without the coordinator
+/// lock, and only then marks that hash missing.
+#[test]
+fn mutated_clear_drops_the_coordinator_lock_before_mark_missing() {
+    use rbitcoin_ibd::ibd::confirm::ConfirmEvent;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("clear-drops-coord-lock");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let height = hub.tip_height().unwrap() + 1;
+    let hash = h(0x44);
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(height - 1));
+    st.record_height(hash, height);
+    st.body.mark_archived(hash);
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    hub.query.attach_confirm_write(tx);
+    let shared = Arc::new(Mutex::new(st));
+    let missing_during = Arc::new(AtomicBool::new(false));
+    let shared_w = Arc::clone(&shared);
+    let missing_w = Arc::clone(&missing_during);
+    let worker = std::thread::spawn(move || {
+        let Ok(msg) = rx.recv_timeout(std::time::Duration::from_secs(2)) else {
+            return;
+        };
+        let rbitcoin_query::ConfirmWriteMsg::ClearArchived { reply, .. } = msg else {
+            panic!("clear must be the write-channel item");
+        };
+        let st = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+        missing_w.store(st.body.is_missing(&hash), Ordering::Relaxed);
+        drop(st);
+        reply.send(Ok(false)).unwrap();
+    });
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+    ev_tx
+        .send(ConfirmEvent::Reject {
+            height,
+            hash,
+            class: ConfirmRejectClass::SoftWire,
+            err: "consensus: bad-txnmrklroot".to_string(),
+            batch_len: 1,
+            sender: None,
+            parent: RejectParent::default(),
+        })
+        .unwrap();
+    rbitcoin_ibd::apply_confirm_events_for_test(&shared, &hub, &ev_rx);
+    worker.join().unwrap();
+    let st = shared.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        !missing_during.load(Ordering::Relaxed),
+        "mark_missing follows the clear"
+    );
+    assert!(st.body.is_missing(&hash));
+    hub.query.detach_confirm_write();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A header that takes the height while the clear waits is not marked missing.
+#[test]
+fn mutated_clear_skips_mark_missing_when_the_height_changes_hands() {
+    use rbitcoin_ibd::ibd::confirm::ConfirmEvent;
+    use std::sync::{Arc, Mutex};
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("clear-height-replaced");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let height = hub.tip_height().unwrap() + 1;
+    let hash = h(0x44);
+    let other = h(0x45);
+    let mut st = IbdWorkState::new(Vec::new(), Some(tip), Some(height - 1));
+    st.record_height(hash, height);
+    st.body.mark_archived(hash);
+    let (tx, rx) = std::sync::mpsc::sync_channel(0);
+    hub.query.attach_confirm_write(tx);
+    let shared = Arc::new(Mutex::new(st));
+    let shared_w = Arc::clone(&shared);
+    let worker = std::thread::spawn(move || {
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("clear");
+        let rbitcoin_query::ConfirmWriteMsg::ClearArchived { reply, .. } = msg else {
+            panic!("clear must be the write-channel item");
+        };
+        let mut st = shared_w.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!st.body.is_missing(&hash), "mark_missing follows the clear");
+        st.record_height(other, height);
+        drop(st);
+        reply.send(Ok(false)).unwrap();
+    });
+    let (ev_tx, ev_rx) = std::sync::mpsc::channel();
+    ev_tx
+        .send(ConfirmEvent::Reject {
+            height,
+            hash,
+            class: ConfirmRejectClass::SoftWire,
+            err: "consensus: bad-txnmrklroot".to_string(),
+            batch_len: 1,
+            sender: None,
+            parent: RejectParent::default(),
+        })
+        .unwrap();
+    rbitcoin_ibd::apply_confirm_events_for_test(&shared, &hub, &ev_rx);
+    worker.join().unwrap();
+    let st = shared.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(!st.body.is_missing(&hash));
+    assert!(!st.body.is_missing(&other));
+    assert_eq!(st.height_to_hash.get(&height), Some(&other));
+    hub.query.detach_confirm_write();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Peer 2 serves a mutated tip+1 in one wave with tip+2. The wave reject
 /// is isolated, and the confirm engine retakes tip+1 and rejects it alone
 /// before IBD applies either reject. Applied together, the mutated sender

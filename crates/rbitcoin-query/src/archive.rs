@@ -1373,6 +1373,9 @@ pub fn seqsigwit_rows_for_prune(
     Ok(rows)
 }
 
+/// `committed`, Class A locators, and header ranges still to store.
+pub type ArchiveHeadParents = (bool, Vec<rbitcoin_store::CreateLocPair>, Vec<(Fk, Fk, u32)>);
+
 impl Query {
     /// Class A plan + commit from wire blocks. Does not set tip.
     pub fn archive_class_a_from_wire(&self, items: &[WirePlanNeed<'_>]) -> Result<(), QueryError> {
@@ -1715,23 +1718,39 @@ impl Query {
         &self,
         plan: ArchiveWritePlan,
     ) -> Result<(bool, Vec<rbitcoin_store::CreateLocPair>), QueryError> {
-        self.archive_commit_plan_defer_head_parents(plan)
+        let (committed, loc, ranges) = self.archive_commit_plan_defer_head_parents(plan)?;
+        if !ranges.is_empty() {
+            // Class A append above overlaps the in-flight tip flush. This put
+            // is Class C, so it waits until that flush stops excluding stores.
+            let _commit = self.lock_tip_commit()?;
+            let t = std::time::Instant::now();
+            let write = rbitcoin_store::ClassCWrite::new();
+            self.store.header_txs.put_ranges_batch(&write, &ranges)?;
+            self.confirm_stats()
+                .note_write_commit(0, 0, 0, 0, 0, t.elapsed().as_nanos() as u64, 0);
+        }
+        Ok((committed, loc))
     }
 
     /// Class A commit. Fees and sizes were recorded before this call
     /// (confirm assemble, or [`stamp_wire_plan_txstat`] on the Class A wire
     /// planner). A non-empty plan whose vectors do not match `packed` is
-    /// corrupt. This function does not walk prevouts.
+    /// corrupt. This function does not walk prevouts. It does not store
+    /// header ranges: the returned list is Class C. [`Self::archive_commit_plan_defer_head`]
+    /// stores it after `tip_commit` joins the in-flight tip flush. The
+    /// confirm-write path does the same put after that join, including when a
+    /// later phase of that write rejects the batch. `header_txs` is what a retry
+    /// uses to skip a second body append.
     pub fn archive_commit_plan_defer_head_parents(
         &self,
         mut plan: ArchiveWritePlan,
-    ) -> Result<(bool, Vec<rbitcoin_store::CreateLocPair>), QueryError> {
+    ) -> Result<ArchiveHeadParents, QueryError> {
         use std::time::Instant;
         if plan.packed.is_empty() {
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), Vec::new()));
         }
         if !plan.retain_headers_needing_body(|hfk| self.store.header_txs.has_body(hfk))? {
-            return Ok((false, Vec::new()));
+            return Ok((false, Vec::new(), Vec::new()));
         }
         let edge_rows = commit_input_edge_rows(&plan)?;
         let seqsigwit_est = seqsigwit_append_est(&plan);
@@ -1803,14 +1822,7 @@ impl Query {
         }
         let head_ns = t.elapsed().as_nanos() as u64;
 
-        let t = Instant::now();
-        if !plan.per_header_ranges.is_empty() {
-            self.store
-                .header_txs
-                .put_ranges_batch(&plan.per_header_ranges)?;
-        }
-        let htxs_ns = t.elapsed().as_nanos() as u64;
-
+        let ranges = std::mem::take(&mut plan.per_header_ranges);
         let total_ns = t0.elapsed().as_nanos() as u64;
         self.confirm_stats().note_write_commit(
             total_ns,
@@ -1818,10 +1830,10 @@ impl Query {
             body_ns,
             head_ns,
             0,
-            htxs_ns,
+            0,
             n_blocks.max(1),
         );
-        Ok((true, loc))
+        Ok((true, loc, ranges))
     }
 
     /// Drain write-behind `tx.head` inserts (page-grouped).

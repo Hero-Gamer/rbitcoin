@@ -37,8 +37,11 @@ fn eight_notes_do_not_publish_and_checkpoint_keeps_the_snapshot() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let s = rbitcoin_store::Store::create_tiny(&dir).unwrap();
+    let pairs: Vec<_> = (0..=7u32)
+        .map(|h| (rbitcoin_primitives::Height(h), rbitcoin_primitives::Fk(1)))
+        .collect();
     s.confirmed
-        .set(rbitcoin_primitives::Height(7), rbitcoin_primitives::Fk(1))
+        .set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
         .unwrap();
     for _ in 0..8 {
         s.note_spend_snapshot(4);
@@ -80,7 +83,11 @@ fn clamp_drops_a_stale_height() {
     let _ = std::fs::remove_dir_all(&dir);
     let s = rbitcoin_store::Store::create_tiny(&dir).unwrap();
     s.confirmed
-        .set(rbitcoin_primitives::Height(0), rbitcoin_primitives::Fk(1))
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(0),
+            rbitcoin_primitives::Fk(1),
+        )
         .unwrap();
     SpendDurable::new(5, 0).store(s.path()).unwrap();
     s.clamp_spend_durable().unwrap();
@@ -109,6 +116,7 @@ fn stale_snapshot_note_after_disconnect_stays_at_the_tip() {
     for h in 0..=7u32 {
         s.confirmed
             .set(
+                &rbitcoin_store::ClassCWrite::for_test(),
                 rbitcoin_primitives::Height(h),
                 rbitcoin_primitives::Fk(u64::from(h) + 1),
             )
@@ -118,7 +126,10 @@ fn stale_snapshot_note_after_disconnect_stays_at_the_tip() {
     s.note_spend_snapshot(write_read_tip);
     for h in (5..=7u32).rev() {
         s.confirmed
-            .disconnect_tip(rbitcoin_primitives::Height(h))
+            .disconnect_tip(
+                &rbitcoin_store::ClassCWrite::for_test(),
+                rbitcoin_primitives::Height(h),
+            )
             .unwrap();
     }
     s.clamp_spend_durable().unwrap();
@@ -141,8 +152,11 @@ fn checkpoint_stops_below_a_pending_annotate() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     let s = rbitcoin_store::Store::create_tiny(&dir).unwrap();
+    let pairs: Vec<_> = (0..=7u32)
+        .map(|h| (rbitcoin_primitives::Height(h), rbitcoin_primitives::Fk(1)))
+        .collect();
     s.confirmed
-        .set(rbitcoin_primitives::Height(7), rbitcoin_primitives::Fk(1))
+        .set_many(&rbitcoin_store::ClassCWrite::for_test(), &pairs)
         .unwrap();
     s.note_spend_snapshot(7);
     s.note_spend_annotate_pending(5);

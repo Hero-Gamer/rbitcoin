@@ -2413,7 +2413,12 @@ fn uncover_parent_fence(hub: &rbitcoin_net::chain::ChainHub) {
     let header_fk = rbitcoin_primitives::Fk(first);
     store
         .header_txs
-        .put_range(header_fk, rbitcoin_primitives::Fk(first), 1)
+        .put_range(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            header_fk,
+            rbitcoin_primitives::Fk(first),
+            1,
+        )
         .unwrap();
     store
         .height_fence_extend(rbitcoin_primitives::Height(50), header_fk)

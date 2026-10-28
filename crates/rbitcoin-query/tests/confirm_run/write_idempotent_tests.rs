@@ -1589,8 +1589,14 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
         Vec::new(),
     );
     bp.set_spent_range_only(fks[0], loc[0].spent);
-    q.store().header_txs.put_range(Fk(100), fks[0], 1).unwrap();
-    q.store().confirmed.set(Height(0), Fk(100)).unwrap();
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(100), fks[0], 1)
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(100))
+        .unwrap();
     q.store().rebuild_height_fence().unwrap();
     let coinbase = Transaction {
         version: TxVersion::ONE,
@@ -3289,8 +3295,14 @@ fn structural_run_clears_reused_scratch_between_batches() {
         Vec::new(),
     );
     bp.set_spent_range_only(fks[0], loc[0].spent);
-    q.store().header_txs.put_range(Fk(100), fks[0], 1).unwrap();
-    q.store().confirmed.set(Height(0), Fk(100)).unwrap();
+    q.store()
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(100), fks[0], 1)
+        .unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), Fk(100))
+        .unwrap();
     q.store().rebuild_height_fence().unwrap();
 
     let coinbase = Transaction {
