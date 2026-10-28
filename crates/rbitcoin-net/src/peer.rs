@@ -3656,7 +3656,8 @@ pub enum GetBlockTxnServe {
 }
 
 /// Park one `getblocktxn` and serve it while the writer has room. A full
-/// queue keeps the request on [`PeerFollowState::getblocktxn_tail`].
+/// queue keeps the request on [`PeerFollowState::getblocktxn_tail`]. An
+/// empty request disconnects before the block is read, as in Core.
 pub async fn serve_getblocktxn(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -3664,6 +3665,14 @@ pub async fn serve_getblocktxn(
     session: Option<&crate::peers::LivePeer>,
     txs_request: BlockTransactionsRequest,
 ) -> Result<(), NetError> {
+    if txs_request.indexes.is_empty() {
+        let id = session.map(|s| s.id).unwrap_or(0);
+        rbitcoin_log::info!(
+            "p2p: getblocktxn received with no transaction indexes, disconnecting peer={id}"
+        );
+        punish_disconnect(&mut follow.ban_score, session);
+        return Ok(());
+    }
     follow.getblocktxn_tail.push_back(txs_request);
     serve_getblocktxn_tail(hub, out_tx, follow, session).await
 }

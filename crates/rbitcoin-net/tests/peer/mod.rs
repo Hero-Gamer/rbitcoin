@@ -2755,6 +2755,27 @@ fn getblocktxn_over_send_budget_waits_for_writer() {
             other => panic!("depth past 10 is a full block, got {other:?}"),
         }
 
+        // An empty getblocktxn asks for nothing. Core drops the peer before
+        // it reads the block (bitcoin/bitcoin#35832).
+        handle_peer_frame(
+            getblocktxn_frame(deep, vec![]),
+            &s.hub,
+            &out_tx,
+            &mut follow,
+            Some(s.sess.as_ref()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out_rx.try_recv().is_err(),
+            "an empty getblocktxn sends nothing back"
+        );
+        assert!(follow.getblocktxn_tail.is_empty());
+        assert!(
+            s.sess.stop.load(Ordering::SeqCst),
+            "an empty getblocktxn drops the peer"
+        );
+
         // The peer never reads. Further requests stop at the serve cap
         // instead of reconstructing without bound.
         let queued_before = s.sess.send_queued();
