@@ -57,6 +57,37 @@ fn get_racing_truncate_does_not_panic() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A disk-only append publishes the named slots, and a zero gap publishes
+/// zeros in the holes, before a reader can see the new length.
+#[test]
+fn fd_only_append_publishes_values_and_zero_gap() {
+    let dir = tmp_path();
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("slots.body");
+    let file = rbitcoin_store::file::TableFile::create(&path, TableKind::ArrayLink).unwrap();
+    file.write_at(ArrayTable::offset(0), &[0u8; 8]).unwrap();
+    drop(file);
+    let prev = std::env::var_os("RBITCOIN_CLASS_C_INRAM_MAX_MB");
+    std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", "0");
+    let t = ArrayTable::open(&path, TableKind::ArrayLink).unwrap();
+    match &prev {
+        Some(v) => std::env::set_var("RBITCOIN_CLASS_C_INRAM_MAX_MB", v),
+        None => std::env::remove_var("RBITCOIN_CLASS_C_INRAM_MAX_MB"),
+    }
+    assert_eq!(t.l2_resident_bytes(), 0, "disk-only table");
+    let write = rbitcoin_store::ClassCWrite::for_test();
+    t.set(&write, 0, 7).unwrap();
+    assert_eq!(t.get_sample(0).unwrap(), (7, 1));
+    t.set_zero_gap(&write, 3, 9).unwrap();
+    assert_eq!(t.get_sample(0).unwrap(), (7, 4));
+    assert_eq!(t.get_sample(1).unwrap(), (0, 4));
+    assert_eq!(t.get_sample(2).unwrap(), (0, 4));
+    assert_eq!(t.get_sample(3).unwrap(), (9, 4));
+    drop(t);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A disk-only table returns an empty slot after truncate, without a read.
 #[test]
 fn fd_only_truncate_then_get_is_absent() {

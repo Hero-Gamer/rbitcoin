@@ -5,8 +5,9 @@
 //! prefix. Stores update live slots. `flush` writes those
 //! slots in [`FLUSH_SCRATCH`] chunks and clears the unstored mark only after the
 //! persist succeeds. A clean table returns before new stores are excluded. Over
-//! the cap, tables stay fd write-through: an append pwrites the new slots, then
-//! the file length, then `len`. In-RAM gets take no reader-writer lock.
+//! the cap, tables stay fd write-through: an append pwrites the new slots
+//! (a zero gap fills that span first), then the file length, then `len`.
+//! In-RAM gets take no reader-writer lock.
 //! Counter order is the Class C paragraph of `docs/concurrency.md`.
 
 use crate::error::StoreError;
@@ -773,9 +774,8 @@ impl ArrayTable {
         self.store_ram(min_idx, max_idx, pairs, zero_gap)
     }
 
-    /// Bytes, then the file length, then `len`. `write_at` would publish the
-    /// file end during a zero fill. An index already inside `len` stays a
-    /// direct write.
+    /// An index already inside `len` is a direct write. An extension publishes
+    /// its length only after the new bytes.
     fn write_fd(
         &self,
         pairs: &[(u64, u64)],
@@ -792,11 +792,24 @@ impl ArrayTable {
         if max_idx < len {
             return Ok(());
         }
+        self.append_fd(len, max_idx, pairs, zero_gap)
+    }
+
+    /// Bytes, then the file length, then `len`. `write_at` would publish the
+    /// file end during a zero fill. A zero gap fills the new span first; the
+    /// named slots then overwrite their places in that span.
+    fn append_fd(
+        &self,
+        len: u64,
+        max_idx: u64,
+        pairs: &[(u64, u64)],
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
         let new_len = max_idx + 1;
         let end = Self::offset(new_len);
         self.file.ensure_capacity(end)?;
         if zero_gap {
-            self.pwrite_zero_holes(len, new_len, pairs)?;
+            self.pwrite_zeros(Self::offset(len), (new_len - len) * ELEM)?;
         }
         for &(index, value) in pairs {
             if index >= len {
@@ -810,33 +823,6 @@ impl ArrayTable {
         // so the model yields once `len` covers the new slots.
         #[cfg(loom)]
         loom::thread::yield_now();
-        Ok(())
-    }
-
-    /// Unnamed slots in `[from, to)` are the gap. Named slots are written after.
-    fn pwrite_zero_holes(
-        &self,
-        from: u64,
-        to: u64,
-        pairs: &[(u64, u64)],
-    ) -> Result<(), StoreError> {
-        let mut named: Vec<u64> = pairs
-            .iter()
-            .map(|(index, _)| *index)
-            .filter(|index| *index >= from && *index < to)
-            .collect();
-        named.sort_unstable();
-        named.dedup();
-        let mut cursor = from;
-        for index in named {
-            if cursor < index {
-                self.pwrite_zeros(Self::offset(cursor), (index - cursor) * ELEM)?;
-            }
-            cursor = index + 1;
-        }
-        if cursor < to {
-            self.pwrite_zeros(Self::offset(cursor), (to - cursor) * ELEM)?;
-        }
         Ok(())
     }
 
