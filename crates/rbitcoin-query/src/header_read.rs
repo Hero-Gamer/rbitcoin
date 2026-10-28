@@ -91,6 +91,34 @@ pub fn median_time_past(query: &Query, height: Height) -> Result<u32, ConfirmErr
     rbitcoin_consensus::block::median_or_bad_header(&times).map_err(ConfirmError::from)
 }
 
+/// Core `GetMinimumTime`: the earliest time a block on the header at `tip`
+/// may carry. It is above the tip median. A period's first block is at most
+/// 600 seconds before `tip` (BIP94), and a period's last block is not before
+/// the period's first block (BIP54). Core applies both floors on every
+/// network.
+pub fn next_block_mintime(
+    query: &Query,
+    params: &ChainParams,
+    tip: Height,
+) -> Result<u32, ConfirmError> {
+    const MAX_TIMEWARP: u32 = 600;
+    let mut mintime = median_time_past(query, tip)?.saturating_add(1);
+    let height = tip.0 + 1;
+    let interval = params.difficulty_adjustment_interval();
+    if height.is_multiple_of(interval) {
+        let (_fk, prev) =
+            rbitcoin_consensus::block::require_linked_parent(query.header_at_height(tip)?)?;
+        mintime = mintime.max(prev.timestamp.saturating_sub(MAX_TIMEWARP));
+    }
+    if interval > 1 && height % interval == interval - 1 {
+        let first = Height(height + 1 - interval);
+        let (_fk, first) =
+            rbitcoin_consensus::block::require_linked_parent(query.header_at_height(first)?)?;
+        mintime = mintime.max(first.timestamp);
+    }
+    Ok(mintime)
+}
+
 /// Timestamps ending at `height` for [`median_time_past`]. A missing plan above
 /// the confirmed tip stays a retryable load fault. A gap at or below the tip
 /// is `ConsensusError::BadPrev`.

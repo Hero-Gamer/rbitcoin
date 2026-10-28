@@ -10,7 +10,7 @@ use rbitcoin_consensus::{
 };
 use rbitcoin_net::{ChainHub, SelectBudget};
 use rbitcoin_primitives::Height;
-use rbitcoin_query::{expected_next_bits, median_time_past};
+use rbitcoin_query::{expected_next_bits, next_block_mintime};
 use std::io;
 use std::sync::Arc;
 use template_distribution_sv2::{NewTemplate, SetNewPrevHash};
@@ -105,10 +105,10 @@ pub fn build(
     if header.block_hash().to_byte_array() != prev {
         return Ok(None);
     }
-    let mtp = median_time_past(&chain.query, tip)
-        .map_err(|e| io::Error::other(format!("sv2: tip MTP: {e}")))?;
     let height = tip.0 + 1;
-    let header_timestamp = mtp.saturating_add(1).max(chain.clock.now_secs() as u32);
+    let header_timestamp = next_block_mintime(&chain.query, &chain.params, tip)
+        .map_err(|e| io::Error::other(format!("sv2: tip mintime: {e}")))?
+        .max(chain.clock.now_secs() as u32);
     let bits = expected_next_bits(
         &chain.query,
         &chain.params,

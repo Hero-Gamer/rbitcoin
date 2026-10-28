@@ -4789,6 +4789,55 @@ fn getblocktemplate_mintime_is_one_past_the_tip_median() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `GetMinimumTime` on every network: a period's last block is not
+/// before its first block, and a period's first block is at most 600 seconds
+/// before its parent. A node whose clock is behind still builds and mines
+/// both blocks.
+#[test]
+fn template_and_generate_hold_the_period_time_floors() {
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.btc.pow_target_timespan = 16 * params.btc.pow_target_spacing;
+    assert_eq!(params.difficulty_adjustment_interval(), 16);
+    let (ctx, dir, hub) = ctx_regtest_hub_on(params, 300_000_000);
+    let genesis = hub.tip_header().unwrap().time;
+    let ahead = genesis + 100_000;
+    let submit = |h: u32, time: u32| {
+        let prev = hub.tip_hash().unwrap();
+        let b = rbitcoin_consensus::mine_regtest_paying(prev, time, h, true_spk(), vec![]);
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b))]).unwrap();
+        assert!(r.is_null(), "height {h}: {r}");
+    };
+    let template = || dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]);
+    let generated_time = || {
+        let hashes = dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+        dispatch(&ctx, "getblockheader", vec![hashes[0].clone()]).unwrap()["time"]
+            .as_u64()
+            .unwrap()
+    };
+    for h in 1..=14 {
+        submit(h, genesis + 600 * h);
+    }
+    submit(15, ahead);
+    dispatch(&ctx, "setmocktime", vec![json!(ahead - 7_200)]).unwrap();
+
+    let first = template().unwrap();
+    assert_eq!(first["height"], 16, "{first}");
+    assert_eq!(first["mintime"], ahead - 600, "{first}");
+    assert_eq!(first["curtime"], ahead - 600, "{first}");
+    let first_time = generated_time();
+    assert_eq!(first_time, u64::from(ahead - 600));
+
+    for h in 17..=30 {
+        submit(h, genesis + 600 * h);
+    }
+    let last = template().unwrap();
+    assert_eq!(last["height"], 31, "{last}");
+    assert_eq!(last["mintime"], first_time, "{last}");
+    assert_eq!(last["curtime"], first_time, "{last}");
+    assert_eq!(generated_time(), first_time);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A sibling that spends the coin the current tip also spent is a competing
 /// block, not a permanent `duplicate-invalid`.
 #[test]

@@ -2236,13 +2236,14 @@ impl ChainHub {
         Ok(())
     }
 
-    /// Block time is `max(MTP+1, now)`.
+    /// Core `UpdateTime`: the clock, raised to
+    /// [`rbitcoin_query::next_block_mintime`].
     #[doc(hidden)]
-    pub fn generate_block_time(&self, tip_h: u32, tip_time: u32) -> u32 {
-        let now = self.clock.now_secs() as u32;
-        let mtp = rbitcoin_query::median_time_past(self.query.as_ref(), Height(tip_h))
-            .unwrap_or(tip_time);
-        now.max(mtp.saturating_add(1))
+    pub fn generate_block_time(&self, tip_h: u32) -> Result<u32, NetError> {
+        let mintime =
+            rbitcoin_query::next_block_mintime(self.query.as_ref(), &self.params, Height(tip_h))
+                .map_err(NetError::from_confirm)?;
+        Ok(mintime.max(self.clock.now_secs() as u32))
     }
 
     /// Mine one block paying `script_pubkey` without connecting it.
@@ -2260,8 +2261,7 @@ impl ChainHub {
         let prev = self
             .tip_hash()
             .ok_or(NetError::Protocol("generate: no tip hash"))?;
-        let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-        let time = self.generate_block_time(tip_h, tip_time);
+        let time = self.generate_block_time(tip_h)?;
         self.mine_paying_block(
             prev,
             time,
@@ -2456,8 +2456,7 @@ impl ChainHub {
             let prev = self
                 .tip_hash()
                 .ok_or(NetError::Protocol("generate: no tip hash"))?;
-            let tip_time = self.tip_header().map(|h| h.time).unwrap_or(0);
-            let time = self.generate_block_time(tip_h, tip_time);
+            let time = self.generate_block_time(tip_h)?;
             let block = self.mine_paying_block(
                 prev,
                 time,
