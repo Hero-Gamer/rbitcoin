@@ -43,7 +43,7 @@ VALID_REASONS = frozenset(
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_INVENTORY = HERE / "inventory.toml"
-DEFAULT_NAMES = HERE / "v31.1-tests.txt"
+DEFAULT_NAMES = HERE / "v32.1-tests.txt"
 ANALOG_RS = HERE.parents[1] / "crates/rbitcoin-test/tests/core_analogs.rs"
 
 

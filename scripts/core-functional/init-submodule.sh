@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Shallow, sparse checkout of bitcoin/bitcoin @ the inventory pin (v31.1).
+# Shallow, sparse checkout of bitcoin/bitcoin @ the inventory pin (v32.1).
 # cargo test stages script_tests.json / tx_*.json from src/test/data each run.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEST="${ROOT}/third_party/bitcoin"
-PIN_SHA="9be056a8a72b624dae9623b2f7bded92c2a21c91"
+PIN_SHA="f0de87f040621468b956f01f526a43a010310501"
 URL="https://github.com/bitcoin/bitcoin.git"
 
 # cargo test may stage fixtures from several processes at once.
@@ -16,11 +16,11 @@ flock 9
 if [[ ! -e "${DEST}/.git" && ! -f "${DEST}/.git" ]]; then
   mkdir -p "$(dirname "$DEST")"
   git clone --filter=blob:none --sparse --depth 1 --no-checkout "$URL" "$DEST"
-  git -C "$DEST" fetch --depth 1 origin tag v31.1
+  git -C "$DEST" fetch --depth 1 origin tag v32.1
   git -C "$DEST" sparse-checkout set src/test/data test
   git -C "$DEST" checkout "$PIN_SHA"
 else
-  git -C "$DEST" fetch --depth 1 origin tag v31.1
+  git -C "$DEST" fetch --depth 1 origin tag v32.1
   git -C "$DEST" sparse-checkout set src/test/data test 2>/dev/null || true
   git -C "$DEST" checkout "$PIN_SHA"
 fi
@@ -30,4 +30,4 @@ if [[ "$got" != "$PIN_SHA" ]]; then
   echo "init-submodule: expected $PIN_SHA got $got" >&2
   exit 1
 fi
-echo "init-submodule: ok $got (v31.1) at $DEST"
+echo "init-submodule: ok $got (v32.1) at $DEST"

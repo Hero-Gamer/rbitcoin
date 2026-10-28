@@ -604,7 +604,7 @@ fn core_script_tests_all_rows() {
 }
 
 /// Our script corpus, in addition to Core's JSON. Each `row` is Core
-/// `script_tests.json` form. The v31.1 oracle in `script-oracle/` runs the
+/// `script_tests.json` form. The v32.1 oracle in `script-oracle/` runs the
 /// same file.
 #[test]
 fn script_corpus_rows_match_our_interpreter() {

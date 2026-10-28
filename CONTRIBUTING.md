@@ -90,7 +90,7 @@ An editor with **rust-analyzer** at the repo root picks up `rust-toolchain.toml`
 
 ### Core JSON (consensus tests)
 
-`cargo test` for consensus Core vectors stages Bitcoin Core **v31.1**
+`cargo test` for consensus Core vectors stages Bitcoin Core **v32.1**
 `src/test/data/*.json` from `third_party/bitcoin`. If that tree is missing,
 tests run [`scripts/core-functional/init-submodule.sh`](./scripts/core-functional/init-submodule.sh)
 (sparse clone, ~16 MiB). The script needs **git**, **bash**, and **`flock`**:

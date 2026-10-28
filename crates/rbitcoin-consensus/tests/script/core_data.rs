@@ -1,4 +1,4 @@
-//! Stage Bitcoin Core `src/test/data` JSON from the v31.1 submodule.
+//! Stage Bitcoin Core `src/test/data` JSON from the v32.1 submodule.
 //!
 //! In-tree copies of Core `src/test/data/*.json` are not kept. Each corpus
 //! run hard-links (or copies) the pin into `$CARGO_TARGET_DIR/core-data/`.
@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, Once};
 
-const HINT: &str = "run ./scripts/core-functional/init-submodule.sh (sparse v31.1 pin)";
+const HINT: &str = "run ./scripts/core-functional/init-submodule.sh (sparse v32.1 pin)";
 
 /// Directory that holds Core JSON corpora (`RBITCOIN_CORE_DATA` or
 /// `third_party/bitcoin/src/test/data` walking up from this crate).

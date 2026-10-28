@@ -519,7 +519,7 @@ API.
 | `inv_getdata_wire` | `inv` / `getdata` payload parse (ASan, `inv.dict`) | none |
 | `electrum_json` | Electrum JSON-RPC line parse (ASan, `electrum.dict`) | none |
 | `asmap` | Core asmap bytecode `AsMap::from_bytes` then `interpret_ip16` on leftover 16 bytes (ASan, no Core). Junk must not panic or hang | none |
-| `v2_session` | BIP324 handshake + structured ping/pong vs a live v31.1 `bitcoind` v2 peer (ASan). Matching `pong` is a comparison. Garbage slice remains for encoder ASan. | official **v31.1** `bitcoind` tarball (`scripts/core-functional/fetch-bitcoind.sh`), `-listen=1` |
+| `v2_session` | BIP324 handshake + structured ping/pong vs a live v32.1 `bitcoind` v2 peer (ASan). Matching `pong` is a comparison. Garbage slice remains for encoder ASan. | official **v32.1** `bitcoind` tarball (`scripts/core-functional/fetch-bitcoind.sh`), `-listen=1` |
 | `cmpct_differential` | structured BIP152 recipe → `try_reconstruct` missing indexes vs Core `getblocktxn` (ASan). Fill-flag extras go to Core extra-txn first. Raw-wire arm is skip if decode fails. Full reconstruct (no `getblocktxn`) is a comparison, then `drain_pending_now` of a same-hash mutant and the honest body. Core is not invalidated first, and Core sees the honest body only. Hub accept with Core `submitblock` null agrees. `duplicate` agrees only when that block is active or a valid fork; invalid or not-connected is a reject. `duplicate-invalid` and `duplicate-inconclusive` are `reconsiderblock` then one more `submitblock`; a reason that remains is a reject. Both rejecting agrees. A tip that stays put is not treated as a Core accept. A disconnect-class error from the mutant drain is a disagreement. **Not** a second node process. Duplicate-txid fill (018) may request extra indexes Core extra-txn already placed; Core's request must be a subset of ours | same tarball, `-listen=1` |
 | `block_differential` | height-1 `ChainHub::accept_received_block` vs Core `submitblock`, **accept vs reject only**. An input longer than 16 bytes whose tail control byte is `0xFE` submits a same-hash merkle mutant first. The honest block is replayed only when both sides rejected that mutant, so an accept or a split is not replaced by the honest result. Duplicating the last tx keeps the computed merkle root only for an odd count of at least 3; shorter and even counts fail `check_merkle_root` | same tarball |
 | `block_spend_differential` | height-101 spend of a mature pad coinbase, same path and oracle, including the `0xFE` honest-twin replay. Weekdays are `--sanitizer none` and `-timeout=180`. Sunday (`FUZZ_WEEKDAY=7`) is `--sanitizer address` and `-timeout=90` so the maturity pad and Core spawn fit under ASan | same tarball |
@@ -639,7 +639,7 @@ HB `cmpctblock` announce.
 `testmempoolaccept`. Libre vs Core **policy** is skip (COMPAT), including
 `scriptpubkey` / `nonstandard` / non-mandatory script flags.
 `mandatory-script-verify-flag-failed` is consensus and is compared.
-RPC-only `bitcoind` is spawned with `-acceptnonstdtxn=1` (v31.1 regtest
+RPC-only `bitcoind` is spawned with `-acceptnonstdtxn=1` (v32.1 regtest
 requires standardness by default) so the OP_TRUE pad spend compares
 consensus instead of bouncing at `IsStandardTx`.
 
@@ -662,7 +662,7 @@ The official tarball is glibc; GitHub Actions `ubuntu-latest` runs it. A NixOS
 host cannot exec it without a foreign-glibc loader — that is CI-only, not a
 default-suite concern.
 
-Inventory for Bitcoin Core **v31.1** functional tests lives in
+Inventory for Bitcoin Core **v32.1** functional tests lives in
 [`scripts/core-functional/`](scripts/core-functional/)
 ([`docs/core-functional.md`](docs/core-functional.md)).
 `python3 scripts/core-functional/check_inventory.py` is the completeness

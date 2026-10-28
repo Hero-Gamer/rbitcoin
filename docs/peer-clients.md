@@ -54,7 +54,7 @@ accept, `submitblock` the same bytes to Core, compare **accept vs reject
 only** (not first-fault strings). Harness failures exit 2 so Docker flakes
 are not filed as consensus bugs.
 
-In-tree **Q-30** slices against official **v31.1** `bitcoind` (SHA256-pinned
+In-tree **Q-30** slices against official **v32.1** `bitcoind` (SHA256-pinned
 tarball, not Docker, not the sparse submodule):
 `fuzz/fuzz_targets/block_differential.rs` (height-1),
 `block_spend_differential.rs` (height-101 mature-pad spend), and
@@ -205,7 +205,7 @@ scheduling a slice.
 
 | Rank | Item | Source | Lands in |
 |-----:|------|--------|----------|
-| 1 | Height-1 + spend-pad + 2-block fork vs v31.1 `bitcoind`; BIP324 `v2_contents` ASan + live Core `v2_session` + compact reconstruct vs `getblocktxn` + script-mutating vs Core + compact reorg via `drain_pending` (**landed**; **Q-30** Completed) | satd `block_differential` | **Q-30** / [`TESTING.md`](../TESTING.md) |
+| 1 | Height-1 + spend-pad + 2-block fork vs v32.1 `bitcoind`; BIP324 `v2_contents` ASan + live Core `v2_session` + compact reconstruct vs `getblocktxn` + script-mutating vs Core + compact reorg via `drain_pending` (**landed**; **Q-30** Completed) | satd `block_differential` | **Q-30** / [`TESTING.md`](../TESTING.md) |
 | 2 | One cross-surface scenario: Esplora `POST /tx` → Electrum history + RPC mempool (**landed**; `esplora_broadcast_visible_in_rpc_and_electrum`) | satd E2E | `rbitcoin-test` `--test suite cross_surface::` |
 | — | ~~Hornet spec.html vs consensus-tests.md gap hunt~~ **done 2026-09-04** (table in this file; pins in `structure_rule_tests` / `header.rs` / `consensus_rules`) | Hornet | this file + [`consensus-tests.md`](./consensus-tests.md) |
 | 4 | `/healthz` + `/readyz` on the node listen; Prometheus as a flag (**landed**; `--health-listen`, `--metrics`) | satd | node / [`operations.md`](./operator/operations.md#health-probes-and-metrics) |

@@ -1,21 +1,21 @@
-# Generated first-pass classification for Bitcoin Core v31.1.
+# Classification for Bitcoin Core v32.1.
 # status=run only when an unmodified script is green against rbitcoin.
 # Do not use reason=unknown.
-pin = "v31.1"
-core_commit = "9be056a8a72b624dae9623b2f7bded92c2a21c91"
+pin = "v32.1"
+core_commit = "f0de87f040621468b956f01f526a43a010310501"
 
 [release]
-base_url = "https://bitcoincore.org/bin/bitcoin-core-31.1"
+base_url = "https://bitcoincore.org/bin/bitcoin-core-32.1"
 
 [[release.linux]]
 arch = "x86_64-linux-gnu"
-tarball = "bitcoin-31.1-x86_64-linux-gnu.tar.gz"
-sha256 = "b80d9c3e04da78fb6f0569685673418cf686fadba9042d926d13fb87ff503f9e"
+tarball = "bitcoin-32.1-x86_64-linux-gnu.tar.gz"
+sha256 = "61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963"
 
 [[release.linux]]
 arch = "aarch64-linux-gnu"
-tarball = "bitcoin-31.1-aarch64-linux-gnu.tar.gz"
-sha256 = "dcf1873f2208ba4f962f3398d47e154c39c0084be8f4553e05c940d0ace3d004"
+tarball = "bitcoin-32.1-aarch64-linux-gnu.tar.gz"
+sha256 = "7ed37c7373eb6aa3e3f72842596a1afeba1b223717033cade9842b25773e1922"
 
 [[test]]
 name = "combine_logs.py"
@@ -268,6 +268,12 @@ status = "skip"
 reason = "core-net-policy"
 
 [[test]]
+name = "feature_prune_stale_fork.py"
+status = "skip"
+reason = "no-prune"
+analog = "none"
+
+[[test]]
 name = "feature_pruning.py"
 status = "skip"
 reason = "no-prune"
@@ -333,6 +339,16 @@ reason = "rpc-missing"
 analog = "follow-up: taproot activation + generate"
 
 [[test]]
+name = "feature_torcontrol.py"
+status = "skip"
+reason = "core-net-policy"
+
+[[test]]
+name = "feature_txindex_compatibility.py"
+status = "skip"
+reason = "prev-release"
+
+[[test]]
 name = "feature_uacomment.py"
 status = "run"
 
@@ -341,6 +357,12 @@ name = "feature_unsupported_utxo_db.py"
 status = "skip"
 reason = "no-utxo-set"
 analog = "schema refuse / seqsigwit.reloc mismatch"
+
+[[test]]
+name = "feature_utxo_abort_on_error.py"
+status = "skip"
+reason = "no-utxo-set"
+analog = "none"
 
 [[test]]
 name = "feature_utxo_set_hash.py"
@@ -358,6 +380,11 @@ status = "skip"
 reason = "no-wallet"
 
 [[test]]
+name = "interface_gui.py"
+status = "skip"
+reason = "no-qt"
+
+[[test]]
 name = "interface_http.py"
 status = "skip"
 reason = "rpc-missing"
@@ -365,6 +392,11 @@ analog = "follow-up: HTTP REST-adjacent RPC"
 
 [[test]]
 name = "interface_ipc.py"
+status = "skip"
+reason = "no-ipc"
+
+[[test]]
+name = "interface_ipc_cli.py"
 status = "skip"
 reason = "no-ipc"
 
@@ -567,6 +599,12 @@ name = "p2p_addrv2_relay.py"
 status = "run"
 
 [[test]]
+name = "p2p_bip434_feature.py"
+status = "skip"
+reason = "core-net-policy"
+analog = "no BIP434 FEATURE negotiation"
+
+[[test]]
 name = "p2p_block_sync.py"
 status = "run"
 
@@ -590,6 +628,12 @@ status = "run"
 [[test]]
 name = "p2p_compactblocks_hb.py"
 status = "run"
+
+[[test]]
+name = "p2p_connection_limits.py"
+status = "skip"
+reason = "core-net-policy"
+analog = "fills the two inbound slots using BIP37 filterload peers"
 
 [[test]]
 name = "p2p_disconnect_ban.py"
@@ -745,6 +789,18 @@ status = "skip"
 reason = "core-log"
 
 [[test]]
+name = "p2p_private_broadcast_cap.py"
+status = "skip"
+reason = "core-net-policy"
+analog = "no -privatebroadcast queue"
+
+[[test]]
+name = "p2p_private_broadcast_completion.py"
+status = "skip"
+reason = "core-net-policy"
+analog = "no -privatebroadcast"
+
+[[test]]
 name = "p2p_private_broadcast_retry_v1.py"
 status = "skip"
 reason = "v1-only"
@@ -781,6 +837,12 @@ analog = "follow-up: tx download"
 [[test]]
 name = "p2p_tx_privacy.py"
 status = "run"
+
+[[test]]
+name = "p2p_tx_relay_rate_limit.py"
+status = "skip"
+reason = "rpc-missing"
+analog = "no -txsendrate and no getnetworkinfo.inv_buckets"
 
 [[test]]
 name = "p2p_unrequested_blocks.py"
@@ -840,6 +902,12 @@ name = "rpc_dumptxoutset.py"
 status = "skip"
 reason = "no-utxo-set"
 analog = "none"
+
+[[test]]
+name = "rpc_echo_payload.py"
+status = "skip"
+reason = "rpc-dialect"
+analog = "echo is shipped; the script requires Core -rpcworkqueue 503 text"
 
 [[test]]
 name = "rpc_estimatefee.py"
@@ -914,6 +982,12 @@ name = "rpc_net.py"
 status = "skip"
 reason = "core-net-policy"
 analog = "official: dual-connect getconnectioncount + last_block/last_transaction/minfeefilter/manual/help shipped; getpeerinfo before version: v1 magic mismatch (rpc_net.py:138 add_p2p_connection send_version=False); v2 wait_for_new_peer (pre-version session); addrman/setnetworkactive later"
+
+[[test]]
+name = "rpc_openrpc.py"
+status = "skip"
+reason = "rpc-missing"
+analog = "no getopenrpcinfo"
 
 [[test]]
 name = "rpc_orphans.py"
@@ -1058,6 +1132,11 @@ status = "skip"
 reason = "no-wallet"
 
 [[test]]
+name = "wallet_ancient_migration.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
 name = "wallet_assumeutxo.py"
 status = "skip"
 reason = "no-wallet"
@@ -1138,6 +1217,16 @@ status = "skip"
 reason = "no-wallet"
 
 [[test]]
+name = "wallet_deprecated_rbf.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+name = "wallet_derivehdkey.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
 name = "wallet_descriptor.py"
 status = "skip"
 reason = "no-wallet"
@@ -1149,6 +1238,11 @@ reason = "no-wallet"
 
 [[test]]
 name = "wallet_encryption.py"
+status = "skip"
+reason = "no-wallet"
+
+[[test]]
+name = "wallet_exported_watchonly.py"
 status = "skip"
 reason = "no-wallet"
 
