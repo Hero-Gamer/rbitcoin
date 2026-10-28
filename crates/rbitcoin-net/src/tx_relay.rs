@@ -3892,6 +3892,18 @@ impl MempoolHub {
         self.fee_deltas.lock().unwrap().clone()
     }
 
+    /// Core `GetSigOpsAdjustedWeight` for `tx` spending `prevouts`, at this
+    /// pool's `-bytespersigop`.
+    pub fn sigops_adjusted_weight(&self, tx: &Transaction, prevouts: &[TxOut]) -> u64 {
+        let spks: Vec<&[u8]> = prevouts
+            .iter()
+            .map(|o| o.script_pubkey.as_bytes())
+            .collect();
+        let sigops = rbitcoin_consensus::tx_sigop_cost(tx, &spks, true, true);
+        let bps = self.lock_read().graph.bytes_per_sigop();
+        rbitcoin_mempool::graph::sigops_adjusted_weight(tx.weight().to_wu(), sigops, bps)
+    }
+
     pub fn fee_delta(&self, txid: &Txid) -> i64 {
         self.fee_deltas
             .lock()

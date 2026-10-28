@@ -2458,19 +2458,22 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext, at: u32,
 }
 
 fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
+    // Core `AmountFromValue` is `-3`; only `ParseFeeRate`'s cap is `-8`.
     let too_high = "Fee rates larger than or equal to 1BTC/kvB are not accepted";
+    let (invalid, range) = ("Invalid amount", "Amount out of range");
     for (v, code, msg) in [
-        (json!(-1), ERR_INVALID_PARAMETER, "Amount out of range"),
-        (json!("-2"), ERR_INVALID_PARAMETER, "Amount out of range"),
+        (json!(-1), ERR_TYPE_ERROR, range),
+        (json!("-2"), ERR_TYPE_ERROR, range),
+        (json_num("-0.01"), ERR_TYPE_ERROR, range),
+        (json!(21_000_001), ERR_TYPE_ERROR, range),
         (json!(1), ERR_INVALID_PARAMETER, too_high),
         (json_num("1.5"), ERR_INVALID_PARAMETER, too_high),
         (json!("1.00000000"), ERR_INVALID_PARAMETER, too_high),
-        (json!("nope"), ERR_INVALID_PARAMETER, "Invalid amount"),
-        (
-            json!("0.000000001"),
-            ERR_INVALID_PARAMETER,
-            "Invalid amount",
-        ),
+        (json_num("1e0"), ERR_INVALID_PARAMETER, too_high),
+        (json!("nope"), ERR_TYPE_ERROR, invalid),
+        (json!("0.000000001"), ERR_TYPE_ERROR, invalid),
+        (json!("1e-9"), ERR_TYPE_ERROR, invalid),
+        (json!(" 0.1"), ERR_TYPE_ERROR, invalid),
         (
             json!({}),
             ERR_TYPE_ERROR,
@@ -2482,9 +2485,9 @@ fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
             "Amount is not a number or string",
         ),
     ] {
-        let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v]).unwrap_err();
-        assert_eq!(e["code"], code, "{e}");
-        assert_eq!(e["message"], msg, "{e}");
+        let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v.clone()]).unwrap_err();
+        assert_eq!(e["code"], code, "{v}: {e}");
+        assert_eq!(e["message"], msg, "{v}: {e}");
     }
 }
 
@@ -2592,7 +2595,7 @@ fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
         })),
     )
     .unwrap_err();
-    assert_eq!(neg["code"], ERR_INVALID_PARAMETER, "{neg}");
+    assert_eq!(neg["code"], ERR_TYPE_ERROR, "{neg}");
     assert_eq!(neg["message"], "Amount out of range", "{neg}");
     let typ = dispatch(
         ctx,
@@ -2617,7 +2620,7 @@ fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
             })),
         )
         .unwrap_err();
-        assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{e}");
+        assert_eq!(e["code"], ERR_TYPE_ERROR, "{e}");
         assert_eq!(e["message"], "Invalid amount", "{e}");
     }
 }

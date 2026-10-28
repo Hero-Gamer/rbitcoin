@@ -1,7 +1,7 @@
 use super::*;
 use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
-use bitcoin::{OutPoint, Transaction, Txid};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
@@ -383,57 +383,108 @@ pub const DEFAULT_MAX_RAW_TX_FEE_SAT_KVB: u64 = 10_000_000;
 #[doc(hidden)]
 pub const MAX_ALLOWED_FEERATE_SAT_KVB: u64 = 100_000_000;
 
+/// Core `ParseFixedPoint` bound: the largest 18-digit decimal.
+const FIXED_POINT_UPPER: i64 = 1_000_000_000_000_000_000 - 1;
+
+/// Core `ProcessMantissaDigit`: trailing zeros wait until a nonzero digit.
+fn push_mantissa_digit(ch: u8, mantissa: &mut i64, tzeros: &mut i64) -> Option<()> {
+    if ch == b'0' {
+        *tzeros += 1;
+        return Some(());
+    }
+    for _ in 0..=*tzeros {
+        if *mantissa > FIXED_POINT_UPPER / 10 {
+            return None;
+        }
+        *mantissa *= 10;
+    }
+    *mantissa += i64::from(ch - b'0');
+    *tzeros = 0;
+    Some(())
+}
+
+/// Core `ParseFixedPoint(val, 8)`: decimal or exponent text as satoshis.
+/// No whitespace, no leading zeros, no bare `.5` or `1.`.
+fn parse_fixed_point_sat(val: &str) -> Option<i64> {
+    let b = val.as_bytes();
+    let digit_at = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let negative = b.first() == Some(&b'-');
+    let mut p = usize::from(negative);
+    let (mut mantissa, mut tzeros, mut exponent) = (0i64, 0i64, 0i64);
+    match b.get(p) {
+        Some(b'0') => p += 1,
+        Some(b'1'..=b'9') => {
+            while digit_at(p) {
+                push_mantissa_digit(b[p], &mut mantissa, &mut tzeros)?;
+                p += 1;
+            }
+        }
+        _ => return None,
+    }
+    if b.get(p) == Some(&b'.') {
+        p += 1;
+        if !digit_at(p) {
+            return None;
+        }
+        while digit_at(p) {
+            push_mantissa_digit(b[p], &mut mantissa, &mut tzeros)?;
+            p += 1;
+            exponent -= 1;
+        }
+    }
+    if matches!(b.get(p), Some(b'e' | b'E')) {
+        p += 1;
+        let exp_negative = b.get(p) == Some(&b'-');
+        if matches!(b.get(p), Some(b'+' | b'-')) {
+            p += 1;
+        }
+        if !digit_at(p) {
+            return None;
+        }
+        let mut e = 0i64;
+        while digit_at(p) {
+            if e > FIXED_POINT_UPPER / 10 {
+                return None;
+            }
+            e = e * 10 + i64::from(b[p] - b'0');
+            p += 1;
+        }
+        exponent += if exp_negative { -e } else { e };
+    }
+    if p != b.len() {
+        return None;
+    }
+    let exponent = exponent + tzeros + 8;
+    if !(0..18).contains(&exponent) {
+        return None;
+    }
+    if negative {
+        mantissa = -mantissa;
+    }
+    for _ in 0..exponent {
+        if mantissa.abs() > FIXED_POINT_UPPER / 10 {
+            return None;
+        }
+        mantissa *= 10;
+    }
+    (mantissa.abs() <= FIXED_POINT_UPPER).then_some(mantissa)
+}
+
+/// Core `AmountFromValue`: BTC text as satoshis in `0..=MAX_MONEY`.
 #[doc(hidden)]
 pub fn parse_rpc_btc_to_sat(s: &str) -> Result<u64, Value> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"));
-    }
-    if s.starts_with('-') {
-        return Err(rpc_error(ERR_INVALID_PARAMETER, "Amount out of range"));
-    }
-    let (whole_s, frac_s) = match s.split_once('.') {
-        Some((w, f)) => (w, f),
-        None => (s, ""),
-    };
-    let whole: u64 = if whole_s.is_empty() {
-        0
-    } else {
-        whole_s
-            .parse()
-            .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"))?
-    };
-    if frac_s.len() > 8 {
-        return Err(rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"));
-    }
-    let mut frac = frac_s.to_string();
-    while frac.len() < 8 {
-        frac.push('0');
-    }
-    let frac_n: u64 = if frac.is_empty() {
-        0
-    } else {
-        frac.parse()
-            .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "Invalid amount"))?
-    };
-    Ok(whole.saturating_mul(100_000_000).saturating_add(frac_n))
+    let sat =
+        parse_fixed_point_sat(s).ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "Invalid amount"))?;
+    u64::try_from(sat)
+        .ok()
+        .filter(|&sat| sat <= Amount::MAX_MONEY.to_sat())
+        .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "Amount out of range"))
 }
 
 #[doc(hidden)]
 pub fn amount_sat_from_json(v: &Value) -> Result<u64, Value> {
     match v {
-        Value::Number(n) => {
-            if let Some(u) = n.as_u64() {
-                return Ok(u.saturating_mul(100_000_000));
-            }
-            if let Some(i) = n.as_i64() {
-                if i < 0 {
-                    return Err(rpc_error(ERR_INVALID_PARAMETER, "Amount out of range"));
-                }
-                return Ok((i as u64).saturating_mul(100_000_000));
-            }
-            parse_rpc_btc_to_sat(&n.to_string())
-        }
+        Value::Number(n) => parse_rpc_btc_to_sat(&n.to_string()),
         Value::String(s) => parse_rpc_btc_to_sat(s),
         _ => Err(rpc_error(
             ERR_TYPE_ERROR,
@@ -466,19 +517,19 @@ pub fn opt_maxfeerate_sat_kvb(params: &RpcParams, index: usize) -> Result<u64, V
 pub use rbitcoin_consensus::policy::{fee_exceeds_max, feerate_exceeds_max};
 
 #[doc(hidden)]
-pub fn prevout_value_sat(ctx: &RpcContext, op: &OutPoint) -> Option<u64> {
+pub fn prevout_txout(ctx: &RpcContext, op: &OutPoint) -> Option<TxOut> {
     if let Some(mp) = ctx.mempool.as_ref() {
         if let Some(parent) = mp.get_tx(&op.txid) {
-            return parent
-                .output
-                .get(op.vout as usize)
-                .map(|o| o.value.to_sat());
+            return parent.output.get(op.vout as usize).cloned();
         }
     }
     let want = op.txid.to_byte_array();
     let (fk, _) = ctx.query.get_tx_by_txid(&want).ok().flatten()?;
     let out = ctx.query.tx_output_at_fk(fk, op.vout).ok()?;
-    Some(out.value)
+    Some(TxOut {
+        value: Amount::from_sat(out.value),
+        script_pubkey: ScriptBuf::from_bytes(out.script),
+    })
 }
 
 #[derive(Debug)]
@@ -523,7 +574,7 @@ pub fn tx_fee_sat_from_prevouts(ctx: &RpcContext, tx: &Transaction) -> TxFeeLook
     fold_tx_fee_sat(
         tx.input
             .iter()
-            .map(|inp| prevout_value_sat(ctx, &inp.previous_output)),
+            .map(|inp| prevout_txout(ctx, &inp.previous_output).map(|o| o.value.to_sat())),
         tx_output_sum_sat(tx),
     )
 }
@@ -549,33 +600,46 @@ pub fn rpc_tx_fee_exceeds_max(ctx: &RpcContext, tx: &Transaction, max_sat_kvb: u
 }
 
 #[doc(hidden)]
-pub fn prevout_value_sat_in_package(
+pub fn prevout_txout_in_package(
     ctx: &RpcContext,
     op: &OutPoint,
     package: &[Transaction],
-) -> Option<u64> {
+) -> Option<TxOut> {
     for tx in package {
         if tx.compute_txid() == op.txid {
-            return tx.output.get(op.vout as usize).map(|o| o.value.to_sat());
+            return tx.output.get(op.vout as usize).cloned();
         }
     }
-    prevout_value_sat(ctx, op)
+    prevout_txout(ctx, op)
 }
 
+/// Core `submitpackage`: the member's modified fee over its sigop-adjusted
+/// vsize is above `max_sat_kvb`.
 #[doc(hidden)]
 pub fn package_tx_fee_exceeds_max(
     ctx: &RpcContext,
+    mp: &MempoolHub,
     tx: &Transaction,
     package: &[Transaction],
     max_sat_kvb: u64,
 ) -> bool {
+    let Some(prevouts) = tx
+        .input
+        .iter()
+        .map(|inp| prevout_txout_in_package(ctx, &inp.previous_output, package))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
     match fold_tx_fee_sat(
-        tx.input
-            .iter()
-            .map(|inp| prevout_value_sat_in_package(ctx, &inp.previous_output, package)),
+        prevouts.iter().map(|o| Some(o.value.to_sat())),
         tx_output_sum_sat(tx),
     ) {
-        TxFeeLook::Fee(fee) => feerate_exceeds_max(fee, tx.weight().to_wu(), max_sat_kvb),
+        TxFeeLook::Fee(fee) => feerate_exceeds_max(
+            fee.saturating_add_signed(mp.fee_delta(&tx.compute_txid())),
+            mp.sigops_adjusted_weight(tx, &prevouts),
+            max_sat_kvb,
+        ),
         TxFeeLook::Overflow => max_sat_kvb != 0,
         TxFeeLook::MissingPrevout => false,
     }
@@ -1406,7 +1470,7 @@ pub fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Valu
     if submitpackage_topology_disallowed(&txs, ctx.package_dialect) {
         return Err(rpc_error(ERR_VERIFY_ERROR, "package topology disallowed"));
     }
-    if let Some(failed) = submitpackage_fee_burn_precheck(ctx, &txs, max_feerate, max_burn)? {
+    if let Some(failed) = submitpackage_fee_burn_precheck(ctx, mp, &txs, max_feerate, max_burn)? {
         return Ok(failed);
     }
     Ok(submitpackage_admit(ctx, mp, &txs, max_feerate))
@@ -1434,6 +1498,7 @@ pub fn submitpackage_conflict_result(txs: &[Transaction]) -> Value {
 #[doc(hidden)]
 pub fn submitpackage_fee_burn_precheck(
     ctx: &RpcContext,
+    mp: &MempoolHub,
     txs: &[Transaction],
     max_feerate: u64,
     max_burn: u64,
@@ -1447,7 +1512,10 @@ pub fn submitpackage_fee_burn_precheck(
             return Err(rpc_error(ERR_VERIFY_ERROR, MAX_BURN_MSG));
         }
         // Chain and mempool prevouts only; in-package parents wait for admit.
-        if package_tx_fee_exceeds_max(ctx, tx, &[], max_feerate) {
+        // A member already in the pool is not re-checked (Core `AcceptPackage`).
+        if !mp.contains(&tx.compute_txid())
+            && package_tx_fee_exceeds_max(ctx, mp, tx, &[], max_feerate)
+        {
             pre_fail = true;
             tx_results.insert(
                 wtxid,
@@ -1531,7 +1599,7 @@ pub fn submitpackage_admit(
     let mut eval_txs = Vec::new();
     let mut over_max = Vec::new();
     for tx in to_admit {
-        if package_tx_fee_exceeds_max(ctx, &tx, txs, max_feerate) {
+        if package_tx_fee_exceeds_max(ctx, mp, &tx, txs, max_feerate) {
             over_max.push(tx);
         } else {
             eval_txs.push(tx);
