@@ -5,7 +5,8 @@
 //! prefix. Stores update live slots. `flush` writes those
 //! slots in [`FLUSH_SCRATCH`] chunks and clears the unstored mark only after the
 //! persist succeeds. A clean table returns before new stores are excluded. Over
-//! the cap, tables stay fd write-through. In-RAM gets take no reader-writer lock.
+//! the cap, tables stay fd write-through: an append pwrites the new slots, then
+//! the file length, then `len`. In-RAM gets take no reader-writer lock.
 //! Counter order is the Class C paragraph of `docs/concurrency.md`.
 
 use crate::error::StoreError;
@@ -744,29 +745,89 @@ impl ArrayTable {
         }
         let _odd = self.begin_store()?;
         if !self.in_ram {
-            let len = self.len.load(Ordering::Acquire);
-            if max_idx >= len {
-                let new_len = max_idx + 1;
-                let gap = new_len - len;
-                const CHUNK: usize = 1024 * 1024;
-                let mut offset = Self::offset(len);
-                let mut remaining = gap * ELEM;
-                let zeros = vec![0u8; CHUNK];
-                while remaining > 0 {
-                    let n = remaining.min(zeros.len() as u64) as usize;
-                    self.file.write_at(offset, &zeros[..n])?;
-                    offset += n as u64;
-                    remaining -= n as u64;
-                }
-                self.len.store(new_len, Ordering::Release);
-            }
-            for &(index, value) in pairs {
-                self.file
-                    .write_at(Self::offset(index), &value.to_le_bytes())?;
-            }
+            self.write_fd(pairs, max_idx, zero_gap)?;
             return Ok(());
         }
         self.store_ram(min_idx, max_idx, pairs, zero_gap)
+    }
+
+    /// Bytes, then the file length, then `len`. `write_at` would publish the
+    /// file end during a zero fill. An index already inside `len` stays a
+    /// direct write.
+    fn write_fd(
+        &self,
+        pairs: &[(u64, u64)],
+        max_idx: u64,
+        zero_gap: bool,
+    ) -> Result<(), StoreError> {
+        let len = self.len.load(Ordering::Acquire);
+        for &(index, value) in pairs {
+            if index < len {
+                self.file
+                    .write_at(Self::offset(index), &value.to_le_bytes())?;
+            }
+        }
+        if max_idx < len {
+            return Ok(());
+        }
+        let new_len = max_idx + 1;
+        let end = Self::offset(new_len);
+        self.file.ensure_capacity(end)?;
+        if zero_gap {
+            self.pwrite_zero_holes(len, new_len, pairs)?;
+        }
+        for &(index, value) in pairs {
+            if index >= len {
+                self.file
+                    .pwrite_all(Self::offset(index), &value.to_le_bytes())?;
+            }
+        }
+        self.file.set_logical_len(end)?;
+        self.len.store(new_len, Ordering::Release);
+        // Loom branches before the store. The pwrite is not a loom access,
+        // so the model yields once `len` covers the new slots.
+        #[cfg(loom)]
+        loom::thread::yield_now();
+        Ok(())
+    }
+
+    /// Unnamed slots in `[from, to)` are the gap. Named slots are written after.
+    fn pwrite_zero_holes(
+        &self,
+        from: u64,
+        to: u64,
+        pairs: &[(u64, u64)],
+    ) -> Result<(), StoreError> {
+        let mut named: Vec<u64> = pairs
+            .iter()
+            .map(|(index, _)| *index)
+            .filter(|index| *index >= from && *index < to)
+            .collect();
+        named.sort_unstable();
+        named.dedup();
+        let mut cursor = from;
+        for index in named {
+            if cursor < index {
+                self.pwrite_zeros(Self::offset(cursor), (index - cursor) * ELEM)?;
+            }
+            cursor = index + 1;
+        }
+        if cursor < to {
+            self.pwrite_zeros(Self::offset(cursor), (to - cursor) * ELEM)?;
+        }
+        Ok(())
+    }
+
+    fn pwrite_zeros(&self, mut offset: u64, mut remaining: u64) -> Result<(), StoreError> {
+        const CHUNK: usize = 1024 * 1024;
+        let zeros = vec![0u8; CHUNK.min(remaining as usize)];
+        while remaining > 0 {
+            let n = remaining.min(zeros.len() as u64) as usize;
+            self.file.pwrite_all(offset, &zeros[..n])?;
+            offset += n as u64;
+            remaining -= n as u64;
+        }
+        Ok(())
     }
 
     /// An append must name every index from `len` through `max`. Overwrites

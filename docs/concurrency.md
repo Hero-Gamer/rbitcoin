@@ -283,7 +283,10 @@ and the clean mark, which stay release stores. The flush does not bump the
 counter, so a get during the flush does not retry because of the flush. Readers stay up
 during IBD. Slot-table growth keeps the previous buffer until the table is dropped. `strong_tx` is one anonymous reservation of the 256 MiB cap: a grow commits the used prefix and does not keep a second image. A
 get retries when the length it sampled does not fit the buffer it loaded. A
-bulk bit scan rechecks the counter once at the end.
+bulk bit scan rechecks the counter once at the end. A table past the RAM cap
+is fd write-through and has no sequence counter. An append pwrites the new
+slots, then the file length, then `len`, so a get that sees the new length
+has those bytes.
 See **[io-modality.md](./io-modality.md)** for operator IO levers.
 
 ### Confirm load read pipeline

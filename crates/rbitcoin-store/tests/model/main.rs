@@ -4,6 +4,8 @@
 #[cfg(loom)]
 mod engine;
 #[cfg(loom)]
+mod fd_only;
+#[cfg(loom)]
 mod flush;
 #[cfg(loom)]
 mod seq;

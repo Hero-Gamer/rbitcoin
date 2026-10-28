@@ -32,6 +32,9 @@ Changed
 - **A script-pool claim release-publishes `next` after `in_wave`.**
   `is_complete` acquire-loads `next`, so it does not drop the wave under
   a claim that still applies.
+- **A disk-only Class C append publishes its length after the slot bytes.**
+  The file length follows those bytes. `len` follows the file length. A
+  reader that sees the new length does not read a zero fill.
 - **Loom and shuttle model the claim order, the idle turn, the UTXO view
   stamp, the Class C sequence counter, and Class C flush exclusion.**
   They are not required PR checks. The index-release order is not a model:
