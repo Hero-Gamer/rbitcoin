@@ -889,7 +889,7 @@ pub const NAMED_HELP: &[(&str, &str)] = &[
     (
         "sendrawtransaction",
         "sendrawtransaction hexstring (maxfeerate) (maxburnamount)\n\
-         RPC submit only. Default maxfeerate 10000 sat/vB (0 unlimited; >=100000 sat/vB is a parameter error). \
+         RPC submit only. Default maxfeerate 0.10 BTC/kvB (0 unlimited; >=1 BTC/kvB is a parameter error). \
          A pre-0.19 boolean allowhighfees there: true is unlimited, false the default. \
          Default maxburnamount 0. P2P relay is not capped.",
     ),

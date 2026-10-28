@@ -17,12 +17,10 @@ from rpc_proxy import (
     RpcProxy,
     authenticated_user,
     authorization_ok,
-    core_btc_kvb_to_sat_vb,
     esplora_port,
     node_authorization,
     node_rpc_port,
     peel_authproxy_args,
-    rewrite_core_maxfeerate,
     rewrite_testmempoolaccept_abort,
     rewrite_unspendable_spend,
     shim_miniwallet_scantxoutset,
@@ -218,31 +216,12 @@ send = {"result": [{"txid": "aa", "allowed": True}, {"txid": "bb", "allowed": Fa
 rewrite_testmempoolaccept_abort("sendrawtransaction", send)
 assert send["result"][0]["allowed"] is True, send
 
-assert core_btc_kvb_to_sat_vb(0) == 0
-assert core_btc_kvb_to_sat_vb(0.1) == 10_000
-assert core_btc_kvb_to_sat_vb("0.10") == 10_000
-assert core_btc_kvb_to_sat_vb(0.00099999) == 99
-try:
-    core_btc_kvb_to_sat_vb(1)
-    raise SystemExit("expected -8 for 1 BTC/kvB")
-except RpcError as e:
-    assert e.code == -8
-    assert "1BTC/kvB" in e.message
-item = {
-    "method": "sendrawtransaction",
-    "params": ["00", 0.1],
-}
-rewrite_core_maxfeerate(item)
-assert item["params"][1] == 10_000, item
-
 # AuthServiceProxy mixed: peel `args` into a positional list (echo keeps the object).
 mixed = {
     "method": "submitpackage",
     "params": {"args": [["aa", "bb"]], "maxfeerate": 0},
 }
 peel_authproxy_args(mixed)
-assert mixed["params"] == [["aa", "bb"], 0], mixed
-rewrite_core_maxfeerate(mixed)
 assert mixed["params"] == [["aa", "bb"], 0], mixed
 echo_mixed = {
     "method": "echo",
@@ -258,8 +237,7 @@ send_mixed = {
     "params": {"args": ["dead"], "maxfeerate": 0.1},
 }
 peel_authproxy_args(send_mixed)
-rewrite_core_maxfeerate(send_mixed)
-assert send_mixed["params"] == ["dead", 10_000], send_mixed
+assert send_mixed["params"] == ["dead", 0.1], send_mixed
 
 assert node_rpc_port(18443) == 28443
 assert esplora_port(18443) == 38443

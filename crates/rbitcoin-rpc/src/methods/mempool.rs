@@ -376,12 +376,12 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
     ))
 }
 
-/// Default RPC-submit cap: 10_000 sat/vB. `0` is unlimited.
+/// Default RPC-submit cap: Core 0.10 BTC/kvB, in sat/kvB. `0` is unlimited.
 #[doc(hidden)]
-pub const DEFAULT_MAX_RAW_TX_FEE_SAT_VB: u64 = 10_000;
-/// Sanity cap on the `maxfeerate` argument (sat/vB).
+pub const DEFAULT_MAX_RAW_TX_FEE_SAT_KVB: u64 = 10_000_000;
+/// Core `ParseFeeRate`: a `maxfeerate` of 1 BTC/kvB or more is refused.
 #[doc(hidden)]
-pub const MAX_ALLOWED_FEERATE_SAT_VB: u64 = 100_000;
+pub const MAX_ALLOWED_FEERATE_SAT_KVB: u64 = 100_000_000;
 
 #[doc(hidden)]
 pub fn parse_rpc_btc_to_sat(s: &str) -> Result<u64, Value> {
@@ -442,64 +442,28 @@ pub fn amount_sat_from_json(v: &Value) -> Result<u64, Value> {
     }
 }
 
-/// RPC-submit `maxfeerate` (sat/vB). Omitted → 10_000. `0` → unlimited.
-/// `>= 100_000` is a parameter error. P2P `accept_tx` does not read this cap.
+/// RPC-submit `maxfeerate` (Core BTC/kvB) as sat/kvB. Omitted → 0.10 BTC/kvB.
+/// `0` → unlimited. `>= 1` BTC/kvB is a parameter error. P2P `accept_tx` does
+/// not read this cap.
 #[doc(hidden)]
-pub fn opt_maxfeerate_sat_vb(params: &RpcParams, index: usize) -> Result<u64, Value> {
+pub fn opt_maxfeerate_sat_kvb(params: &RpcParams, index: usize) -> Result<u64, Value> {
     match params.get(index, "maxfeerate") {
-        None | Some(Value::Null) => Ok(DEFAULT_MAX_RAW_TX_FEE_SAT_VB),
+        None | Some(Value::Null) => Ok(DEFAULT_MAX_RAW_TX_FEE_SAT_KVB),
         Some(v) => {
-            let sat_vb = sat_vb_from_json(v)?;
-            if sat_vb >= MAX_ALLOWED_FEERATE_SAT_VB {
+            let sat_kvb = amount_sat_from_json(v)?;
+            if sat_kvb >= MAX_ALLOWED_FEERATE_SAT_KVB {
                 return Err(rpc_error(
                     ERR_INVALID_PARAMETER,
-                    "feerate >= 100000 sat/vB is not accepted",
+                    "Fee rates larger than or equal to 1BTC/kvB are not accepted",
                 ));
             }
-            Ok(sat_vb)
+            Ok(sat_kvb)
         }
     }
 }
 
 #[doc(hidden)]
-pub fn sat_vb_from_json(v: &Value) -> Result<u64, Value> {
-    match v {
-        Value::Number(n) => {
-            if let Some(u) = n.as_u64() {
-                return Ok(u);
-            }
-            if let Some(i) = n.as_i64() {
-                if i < 0 {
-                    return Err(rpc_error(ERR_INVALID_PARAMETER, "Amount out of range"));
-                }
-                return Ok(i as u64);
-            }
-            Err(rpc_error(
-                ERR_INVALID_PARAMETER,
-                "maxfeerate must be an integer sat/vB",
-            ))
-        }
-        Value::String(s) => {
-            let t = s.trim();
-            if t.starts_with('-') {
-                return Err(rpc_error(ERR_INVALID_PARAMETER, "Amount out of range"));
-            }
-            t.parse::<u64>().map_err(|_| {
-                rpc_error(
-                    ERR_INVALID_PARAMETER,
-                    "maxfeerate must be an integer sat/vB",
-                )
-            })
-        }
-        _ => Err(rpc_error(
-            ERR_TYPE_ERROR,
-            "maxfeerate is not a number or string",
-        )),
-    }
-}
-
-#[doc(hidden)]
-pub use rbitcoin_consensus::policy::fee_exceeds_max;
+pub use rbitcoin_consensus::policy::{fee_exceeds_max, feerate_exceeds_max};
 
 #[doc(hidden)]
 pub fn prevout_value_sat(ctx: &RpcContext, op: &OutPoint) -> Option<u64> {
@@ -576,10 +540,10 @@ pub fn rpc_tx_version_nonstandard(tx: &Transaction) -> bool {
 }
 
 #[doc(hidden)]
-pub fn rpc_tx_fee_exceeds_max(ctx: &RpcContext, tx: &Transaction, max_sat_vb: u64) -> bool {
+pub fn rpc_tx_fee_exceeds_max(ctx: &RpcContext, tx: &Transaction, max_sat_kvb: u64) -> bool {
     match tx_fee_sat_from_prevouts(ctx, tx) {
-        TxFeeLook::Fee(fee) => fee_exceeds_max(fee, tx.weight().to_wu(), max_sat_vb),
-        TxFeeLook::Overflow => max_sat_vb != 0,
+        TxFeeLook::Fee(fee) => fee_exceeds_max(fee, tx.weight().to_wu(), max_sat_kvb),
+        TxFeeLook::Overflow => max_sat_kvb != 0,
         TxFeeLook::MissingPrevout => false,
     }
 }
@@ -603,7 +567,7 @@ pub fn package_tx_fee_exceeds_max(
     ctx: &RpcContext,
     tx: &Transaction,
     package: &[Transaction],
-    max_sat_vb: u64,
+    max_sat_kvb: u64,
 ) -> bool {
     match fold_tx_fee_sat(
         tx.input
@@ -611,8 +575,8 @@ pub fn package_tx_fee_exceeds_max(
             .map(|inp| prevout_value_sat_in_package(ctx, &inp.previous_output, package)),
         tx_output_sum_sat(tx),
     ) {
-        TxFeeLook::Fee(fee) => fee_exceeds_max(fee, tx.weight().to_wu(), max_sat_vb),
-        TxFeeLook::Overflow => max_sat_vb != 0,
+        TxFeeLook::Fee(fee) => feerate_exceeds_max(fee, tx.weight().to_wu(), max_sat_kvb),
+        TxFeeLook::Overflow => max_sat_kvb != 0,
         TxFeeLook::MissingPrevout => false,
     }
 }
@@ -651,8 +615,8 @@ pub fn sendrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value,
     // because `/rbitcoin:` sorts below its `0.19.0` subversion check.
     let max_feerate = match params.get(1, "maxfeerate") {
         Some(Value::Bool(true)) => 0,
-        Some(Value::Bool(false)) => DEFAULT_MAX_RAW_TX_FEE_SAT_VB,
-        _ => opt_maxfeerate_sat_vb(params, 1)?,
+        Some(Value::Bool(false)) => DEFAULT_MAX_RAW_TX_FEE_SAT_KVB,
+        _ => opt_maxfeerate_sat_kvb(params, 1)?,
     };
     let max_burn = opt_maxburn_sat(params, 2)?;
     let tx = decode_tx_hex(hex)?;
@@ -781,7 +745,7 @@ pub fn accept_reject_details(e: &impl std::fmt::Display, tx: &Transaction) -> Op
 
 pub fn testmempoolaccept(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["rawtxs", "maxfeerate"])?;
-    let max_feerate = opt_maxfeerate_sat_vb(params, 1)?;
+    let max_feerate = opt_maxfeerate_sat_kvb(params, 1)?;
     let arr = params
         .get_array(0, "rawtxs")
         .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "rawtxs array required"))?;
@@ -1402,7 +1366,7 @@ pub fn getmempoolfeeratediagram(ctx: &RpcContext, params: &RpcParams) -> Result<
 
 pub fn submitpackage(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["package", "maxfeerate", "maxburnamount"])?;
-    let max_feerate = opt_maxfeerate_sat_vb(params, 1)?;
+    let max_feerate = opt_maxfeerate_sat_kvb(params, 1)?;
     let max_burn = opt_maxburn_sat(params, 2)?;
     let arr = params
         .get_array(0, "package")
@@ -1482,7 +1446,8 @@ pub fn submitpackage_fee_burn_precheck(
         if burn_exceeds_max(tx, max_burn) {
             return Err(rpc_error(ERR_VERIFY_ERROR, MAX_BURN_MSG));
         }
-        if rpc_tx_fee_exceeds_max(ctx, tx, max_feerate) {
+        // Chain and mempool prevouts only; in-package parents wait for admit.
+        if package_tx_fee_exceeds_max(ctx, tx, &[], max_feerate) {
             pre_fail = true;
             tx_results.insert(
                 wtxid,
