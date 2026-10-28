@@ -1009,39 +1009,32 @@ pub fn tx_confirmed_on_active_chain(ctx: &RpcContext, tx: &Transaction) -> Resul
     }
 }
 
-/// Core `ParseConfirmTarget`: integer in `1..=1008`.
-/// Core `ParseConfirmTarget`: integer in `1..=1008`.
+/// Core `ParseConfirmTarget`: an `int` (else `JSON integer out of range`) in `1..=1008`.
 pub fn parse_conf_target(v: &Value) -> Result<u32, Value> {
-    let conf_target = match v {
-        Value::Number(n) => n
-            .as_u64()
-            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok()))
-            .ok_or_else(|| {
-                rpc_error(
-                    ERR_TYPE_ERROR,
-                    "JSON value of type number is not of expected type number",
-                )
-            })? as u32,
-        other => {
-            return Err(rpc_error(
-                ERR_TYPE_ERROR,
-                format!(
-                    "JSON value of type {} is not of expected type number",
-                    json_type_name(other)
-                ),
-            ));
-        }
-    };
-    if !(1..=1008).contains(&conf_target) {
+    let Value::Number(n) = v else {
         return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "Invalid conf_target, must be between 1 and 1008",
+            ERR_TYPE_ERROR,
+            format!(
+                "JSON value of type {} is not of expected type number",
+                json_type_name(v)
+            ),
         ));
-    }
-    Ok(conf_target)
+    };
+    let conf_target = n
+        .as_i64()
+        .and_then(|t| i32::try_from(t).ok())
+        .ok_or_else(|| rpc_error(ERR_MISC, "JSON integer out of range"))?;
+    u32::try_from(conf_target)
+        .ok()
+        .filter(|t| (1..=1008).contains(t))
+        .ok_or_else(|| {
+            rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Invalid conf_target, must be between 1 and 1008",
+            )
+        })
 }
 
-/// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
 /// Map Core `estimatesmartfee` to this node's **10-minute inclusion** product.
 pub fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["conf_target", "estimate_mode"])?;
@@ -1079,8 +1072,9 @@ pub fn estimatesmartfee(ctx: &RpcContext, params: &RpcParams) -> Result<Value, V
     smart_fee_result(ctx, conf_target)
 }
 
-/// Core's `estimatesmartfee` result: `feerate` (at least `mempoolminfee`) and
-/// `blocks` with an estimate; `errors` and `blocks`, and no `feerate`, without one.
+/// Core's `estimatesmartfee` result: `feerate` and `blocks` with an estimate;
+/// `errors` and `blocks`, and no `feerate`, without one. The hub's published
+/// rates are already at least `mempoolminfee`.
 #[doc(hidden)]
 pub fn smart_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Value> {
     let blocks = conf_target.max(1);
@@ -1088,22 +1082,21 @@ pub fn smart_fee_result(ctx: &RpcContext, conf_target: u32) -> Result<Value, Val
         return Ok(json!({ "errors": ["mempool unavailable"], "blocks": blocks }));
     };
     let rate = mp.estimate_fee_btc_per_kb(conf_target);
-    Ok(smart_fee_json(blocks, rate, mp.mempool_min_fee_sat_kvb()))
+    Ok(smart_fee_json(blocks, rate))
 }
 
 /// Core's result for `rate` (BTC/kvB; negative = no estimate): `feerate` and
-/// `blocks`, or `errors` and `blocks`. An estimate is at least
-/// `mempoolminfee`, which includes `minrelaytxfee`.
+/// `blocks`, or `errors` and `blocks`.
 #[doc(hidden)]
-pub fn smart_fee_json(blocks: u32, rate: f64, mempool_min_fee_sat_kvb: u64) -> Value {
+pub fn smart_fee_json(blocks: u32, rate: f64) -> Value {
     if rate < 0.0 {
         return json!({
             "errors": ["Insufficient data or no feerate found"],
             "blocks": blocks,
         });
     }
-    let sat_kvb = ((rate * 100_000_000.0).round() as u64).max(mempool_min_fee_sat_kvb);
-    json!({ "feerate": sat_btc_json(sat_kvb as i64), "blocks": blocks })
+    let sat_kvb = (rate * 100_000_000.0).round() as i64;
+    json!({ "feerate": sat_btc_json(sat_kvb), "blocks": blocks })
 }
 
 /// Same 10-minute product as [`estimatesmartfee`] under the Core name.

@@ -173,7 +173,7 @@ pub fn persist_unbroadcast_file(dir: &Path, set: &HashSet<Txid>) {
 }
 
 /// Depths the refresh evaluates. Every other confirm target is
-/// [`fee_at_target_sat_kvb`] on this table (after 0–2 → default map).
+/// [`fee_at_target_sat_kvb`] on this table (after target 0 → default map).
 #[doc(hidden)]
 pub const FEE_SNAPSHOT_DEPTHS: &[u32] = &[1, 2, 3, 4, 5, 6, 10, 20, 144, 504, 1008];
 /// Txstat body bytes scanned and retained for historical fee estimates.
@@ -242,10 +242,11 @@ impl FeeSnapshot {
         }
     }
 
+    /// `target`'s rate, at least `floor_sat_kvb`, in BTC/kvB; `-1.0` without one.
     #[doc(hidden)]
-    pub fn rate_btc_per_kb(&self, target: u32) -> f64 {
+    pub fn rate_btc_per_kb(&self, target: u32, floor_sat_kvb: u64) -> f64 {
         match fee_at_target_sat_kvb(FEE_SNAPSHOT_DEPTHS, &self.depth_rates_sat_kvb, target) {
-            Some(sat) => sat as f64 / 100_000_000.0,
+            Some(sat) => sat.max(floor_sat_kvb) as f64 / 100_000_000.0,
             None => -1.0,
         }
     }
@@ -741,7 +742,7 @@ pub struct MempoolHub {
     pub recent_confirmed: Mutex<RecentConfirmed>,
     /// Core `m_lazy_recent_rejects` (wtxid). Forcerelay second-send skips ATMP.
     pub recent_rejects: Mutex<HashSet<Wtxid>>,
-    /// Recently confirmed package feerates (sat/kvB) for N=1 sanity clip.
+    /// Own feerates (sat/kvB) of the 64 newest confirmed entries, for the N=1 floor.
     pub confirm_feerate_memory: Mutex<std::collections::VecDeque<u64>>,
     /// Per-block vsize-weighted p10 hurdle, bounded by txstat body bytes.
     pub block_p10_history: Mutex<FeeHistory>,
@@ -3076,7 +3077,7 @@ impl MempoolHub {
             let projected = inflow
                 .as_ref()
                 .and_then(|inf| min_rate_for_capacity(|r| stock.above(r), inf, depth, &candidates));
-            let flow = flow_for_depth(projected, frontier, !chunks.is_empty(), depth, min_r);
+            let flow = flow_for_depth(projected, frontier, depth);
             let hist = history.get(&depth).copied().flatten();
             let rate = published_depth_rate(depth, alpha, flow, frontier, hist, confirm_floor);
             ordered.push((depth, rate.map(|r| r.max(min_r))));
@@ -4669,17 +4670,20 @@ impl MempoolHub {
 
     /// Standard / target-depth fee in BTC/kB (Engine v2 when flow meter warm).
     ///
-    /// **Default product answer is 10-minute inclusion** (`target_blocks` 0–2 →
+    /// **Default product answer is 10-minute inclusion** (`target_blocks` 0 →
     /// depth of [`Self::DEFAULT_HORIZON_BLOCKS`] blocks).
     ///
     /// **Non-blocking vs accept:** returns from a **published snapshot** (Arc).
     /// Graph linearize runs only on dirty/stale singleflight **refresh** (≤~1 s
     /// stale; one `mining_chunks` per refresh for all depths). Request path does
-    /// not hold the hub lock across multi-pass walks.
+    /// not hold the hub lock across multi-pass walks. The answer is at least
+    /// the live `mempoolminfee`, read under a short read lock.
     pub fn estimate_fee_btc_per_kb(&self, target_blocks: u32) -> f64 {
         self.maybe_refresh_fee_snapshot();
         let depth = Self::fee_depth(target_blocks);
-        self.fee_snapshot.load().rate_btc_per_kb(depth)
+        self.fee_snapshot
+            .load()
+            .rate_btc_per_kb(depth, self.mempool_min_fee_sat_kvb())
     }
 
     /// Esplora `/fee-estimates` targets in one Arc load (+ optional refresh):
@@ -4688,10 +4692,11 @@ impl MempoolHub {
     pub fn fee_estimates_btc_per_kb(&self) -> Vec<(u32, f64)> {
         self.maybe_refresh_fee_snapshot();
         let snap = self.fee_snapshot.load_full();
+        let floor = self.mempool_min_fee_sat_kvb();
         (1..=25)
             .chain([144, 504, 1008])
             .filter_map(|d| {
-                let rate = snap.rate_btc_per_kb(d);
+                let rate = snap.rate_btc_per_kb(d, floor);
                 (rate >= 0.0).then_some((d, rate))
             })
             .collect()
@@ -4708,8 +4713,9 @@ impl MempoolHub {
         rbitcoin_consensus::policy::MIN_RELAY_FEE_RATE_SAT_PER_KVB as f64 / 100_000_000.0
     }
 
-    /// Ring of recently confirmed package feerates (sat/kvB), newest last.
-    /// Filled from `remove_for_block` when live entries leave the pool.
+    /// p90 of the 64 newest confirmed entries' own feerates (sat/kvB), at
+    /// least min relay. Filled in block order from `remove_for_block` when
+    /// live entries leave the pool.
     #[doc(hidden)]
     pub fn confirm_memory_floor_sat_per_kvb(&self) -> Option<u64> {
         let mem = self.confirm_feerate_memory.lock().unwrap();

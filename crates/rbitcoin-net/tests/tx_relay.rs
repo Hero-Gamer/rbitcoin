@@ -4285,6 +4285,119 @@ fn far_horizon_follows_block_history_not_pool_tail() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Electrum `estimatefee` and Esplora `/fee-estimates` read these rates.
+/// They quote at least the floor this pool admits at, as soon as it rises.
+#[test]
+fn fee_estimates_follow_the_admission_floor() {
+    let store_dir = tmp();
+    let mp_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let hub = MempoolHub::open(&mp_dir, Arc::new(q)).unwrap();
+    hub.set_relay_enabled(true);
+    for height in 1..=2_100 {
+        record_fee_sample(&hub, height, 2_000);
+    }
+    hub.mark_fee_dirty();
+    let sat = |btc: f64| (btc * 100_000_000.0).round() as u64;
+    assert_eq!(sat(hub.estimate_fee_btc_per_kb(2)), 2_000);
+    // A refresh already in flight leaves other requests on the old table.
+    hub.fee_refreshing.store(true, Ordering::Release);
+    hub.set_min_relay_sat_kvb(5_000);
+    assert_eq!(hub.mempool_min_fee_sat_kvb(), 5_000);
+    assert_eq!(sat(hub.estimate_fee_btc_per_kb(2)), 5_000);
+    let bulk = hub.fee_estimates_btc_per_kb();
+    assert_eq!(bulk.len(), 28, "{bulk:?}");
+    assert!(bulk.iter().all(|&(_, btc)| sat(btc) == 5_000), "{bulk:?}");
+    hub.fee_refreshing.store(false, Ordering::Release);
+    hub.mark_fee_dirty();
+    assert_eq!(sat(hub.estimate_fee_btc_per_kb(2)), 5_000);
+    let _ = std::fs::remove_dir_all(&mp_dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// A package whose child fails after its parent replaced a conflict puts
+/// that conflict back, and the pool is near full again. Estimates quote the
+/// floor the restored pool enforces.
+#[test]
+fn fee_estimates_follow_the_floor_after_a_package_rollback() {
+    let (_store, q, cbs) = pad_cbs(3);
+    let dir = tmp();
+    let hub = MempoolHub::open_with_weight(&dir, q, 420_000).unwrap();
+    hub.set_relay_enabled(true);
+    for height in 1..=2_100 {
+        record_fee_sample(&hub, height, 150);
+    }
+    let victim = spend_true(cbs[0], 10_000, ScriptBuf::from_bytes(vec![0x51; 9_000]));
+    hub.accept_tx(&victim).expect("victim");
+    let near_full = hub.lock_read().mempool_min_fee_sat_kvb();
+    assert!(near_full > 150, "near-full floor {near_full}");
+    let replacement = spend_true(cbs[0], 20_000, ScriptBuf::from_bytes(vec![0x51]));
+    let overspend = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: replacement.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: replacement.output[0].value + Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    assert!(hub.accept_package(&[replacement, overspend]).is_err());
+    assert!(hub.contains(&victim.compute_txid()), "rollback restores it");
+    assert_eq!(hub.lock_read().mempool_min_fee_sat_kvb(), near_full);
+    hub.mark_fee_dirty();
+    let sat = |btc: f64| (btc * 100_000_000.0).round() as u64;
+    assert_eq!(sat(hub.estimate_fee_btc_per_kb(2)), near_full);
+    let bulk = hub.fee_estimates_btc_per_kb();
+    assert!(
+        !bulk.is_empty() && bulk.iter().all(|&(_, btc)| sat(btc) == near_full),
+        "{bulk:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Arrivals priced above the flow ladder fill the next blocks at every
+/// ladder rate, so flow has no price for the near targets. A pool thinner
+/// than one block then quotes block history, or nothing, never min relay
+/// and never the ladder top.
+#[test]
+fn arrivals_above_the_ladder_leave_near_targets_to_history() {
+    let (_store, q, cbs) = pad_cbs(3);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, q).unwrap();
+    hub.set_relay_enabled(true);
+    hub.accept_tx(&spend_true(
+        cbs[0],
+        1_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    ))
+    .expect("live stock");
+    let vsize = rbitcoin_mempool::BLOCK_WEIGHT_WU / 4;
+    for _ in 0..3 {
+        hub.note_fee_flow_admit(rbitcoin_mempool::BLOCK_WEIGHT_WU, 2_000 * vsize);
+    }
+    for target in [1, 2] {
+        let btc = hub.estimate_fee_btc_per_kb(target);
+        assert!(btc < 0.0, "target {target} without history: {btc}");
+    }
+    for height in 1..=2_100 {
+        record_fee_sample(&hub, height, 2_000);
+    }
+    hub.mark_fee_dirty();
+    for target in [1, 2] {
+        let sat = (hub.estimate_fee_btc_per_kb(target) * 100_000_000.0).round() as u64;
+        assert_eq!(sat, 2_000, "target {target}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Fee-snapshot refresh publishes live count/vsize/total_fee (GET /mempool).
 #[test]
 fn fee_snapshot_live_totals_match_list_live_meta() {
