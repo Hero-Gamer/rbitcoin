@@ -3999,15 +3999,17 @@ impl ChainHub {
         keep_height: u32,
     ) -> Result<Vec<Transaction>, NetError> {
         let mp = self.mempool().cloned();
-        // Every body is read before the first disconnect, so a read fault
-        // leaves the chain where it was and no tx is lost from the pool.
+        // Every body is read before the first disconnect, so a read fault or
+        // a missing block leaves the chain where it was and no tx is lost
+        // from the pool.
         let mut gone: Vec<Transaction> = Vec::new();
         if mp.is_some() {
             let tip = self.query.tip_height().map_or(0, |h| h.0);
             for height in keep_height.saturating_add(1)..=tip {
-                if let Some(b) = self.block_at_height(height)? {
-                    gone.extend(b.txdata.into_iter().skip(1));
-                }
+                let b = self.block_at_height(height)?.ok_or_else(|| {
+                    NetError::Store(format!("disconnect: no block at connected height {height}"))
+                })?;
+                gone.extend(b.txdata.into_iter().skip(1));
             }
         }
         while let Some(h) = self.query.tip_height() {

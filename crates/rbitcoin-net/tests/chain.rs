@@ -2030,6 +2030,30 @@ fn disconnect_fails_when_the_block_read_faults() {
     let _ = std::fs::remove_dir_all(pad.dir);
 }
 
+/// A connected height below the cached bodies whose header row is gone
+/// reads back as no block. That fails the disconnect too, before it moves
+/// the tip, and is not read as an empty block.
+#[test]
+fn disconnect_fails_when_a_connected_height_has_no_block() {
+    let pad = reorg_pad();
+    let tip = pad.hub.tip_height();
+    let tip_hash = pad.hub.tip_hash();
+    let hole = pad.fork - 20;
+    pad.hub
+        .query
+        .store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(hole), 0)
+        .unwrap();
+    assert!(pad.hub.block_at_height(hole).unwrap().is_none());
+    pad.hub
+        .rewind_to_height(hole - 1)
+        .expect_err("a connected height has no block");
+    assert_eq!(pad.hub.tip_height(), tip, "nothing was disconnected");
+    assert_eq!(pad.hub.tip_hash(), tip_hash);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
 /// The new branch double-spends the parent. Core drops the parent and its
 /// child. The child does not wait in the orphanage for a parent that cannot
 /// come back.
