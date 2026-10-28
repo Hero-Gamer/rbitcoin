@@ -1153,9 +1153,9 @@ pub fn read_confirmed_prevout(
     )))
 }
 
-/// Hard consensus rejects stick. Mutated bodies, missing parents, a block
-/// that is only too far in the future, and warn-and-apply faults stay
-/// retryable while `--trust-peer` is on.
+/// Hard consensus rejects stick. A mutated body, a missing parent, and a
+/// block that is only too far in the future stay retryable. A warn-and-apply
+/// fault stays retryable while `--trust-peer` is on.
 fn submit_reason_sticks(hub: &rbitcoin_net::ChainHub, block: &Block, reason: &str) -> bool {
     !submit_reason_is_mutated(block, reason)
         && reason != "high-hash"

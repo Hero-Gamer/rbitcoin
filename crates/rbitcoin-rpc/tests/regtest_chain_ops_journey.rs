@@ -1137,6 +1137,28 @@ fn chain_ops_mocktime(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, p2wpkh: &S
         assert_eq!(r, "time-too-new", "{attempt} submit of a future fork block");
     }
     assert_eq!(best_hash(ctx), json!(far.block_hash().to_string()));
+    // The sibling is still hours ahead of the wall clock. `setmocktime` is
+    // the node clock the next submit must use.
+    dispatch(ctx, "setmocktime", vec![json!(mock + 6 * 3600)]).unwrap();
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&sibling))]).unwrap();
+    assert_eq!(
+        r, "inconclusive",
+        "equal-work fork once the node clock reaches its time: {r}"
+    );
+    assert_eq!(best_hash(ctx), json!(far.block_hash().to_string()));
+    let child = rbitcoin_consensus::mine_regtest_paying(
+        sibling.block_hash(),
+        (mock + 6 * 3600 + 1) as u32,
+        4,
+        p2wpkh.clone(),
+        vec![],
+    );
+    let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&child))]).unwrap();
+    assert!(
+        r.is_null(),
+        "heavier fork connects once the node clock allows its parent: {r}"
+    );
+    assert_eq!(best_hash(ctx), json!(child.block_hash().to_string()));
     dispatch(ctx, "setmocktime", vec![json!(0)]).unwrap();
 }
 

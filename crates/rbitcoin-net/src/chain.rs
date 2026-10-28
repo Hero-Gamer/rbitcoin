@@ -1860,36 +1860,40 @@ impl ChainHub {
         #[cfg(debug_assertions)]
         self.header_contextual_checks
             .fetch_add(1, Ordering::Relaxed);
-        let parent_hash = header.prev_blockhash;
-        let parent_bytes = parent_hash.to_byte_array();
-        if let Some(ph) = self.query.height_of_hash(&parent_bytes).ok().flatten() {
-            return validate_header(
+        // Same node clock as `connect_at`. `current_now` is the wall clock
+        // unless this scope freezes it, so `setmocktime` would not apply.
+        self.clock.with_frozen(|| {
+            let parent_hash = header.prev_blockhash;
+            let parent_bytes = parent_hash.to_byte_array();
+            if let Some(ph) = self.query.height_of_hash(&parent_bytes).ok().flatten() {
+                return validate_header(
+                    self.query.as_ref(),
+                    &self.params,
+                    Height(ph.0.saturating_add(1)),
+                    header,
+                )
+                .map_err(|e| header_reject(header, &e));
+            }
+            let parent = self
+                .sync_parent_header(&parent_hash, in_batch)
+                .ok_or_else(|| {
+                    NetError::Consensus("header parent unknown — ensure parent before child".into())
+                })?;
+            let parent_height = self
+                .sync_parent_height(&parent_hash, in_batch)
+                .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
+            let mtp = self.mtp_off_tip(&parent, in_batch);
+            let expected = self.expected_bits_off_tip(header, &parent, parent_height, in_batch)?;
+            // `validate_header` opens the collector, and it only runs for a confirmed parent.
+            Self::apply_off_tip_header(
                 self.query.as_ref(),
                 &self.params,
-                Height(ph.0.saturating_add(1)),
                 header,
+                parent_height.saturating_add(1),
+                mtp,
+                expected,
             )
-            .map_err(|e| header_reject(header, &e));
-        }
-        let parent = self
-            .sync_parent_header(&parent_hash, in_batch)
-            .ok_or_else(|| {
-                NetError::Consensus("header parent unknown — ensure parent before child".into())
-            })?;
-        let parent_height = self
-            .sync_parent_height(&parent_hash, in_batch)
-            .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
-        let mtp = self.mtp_off_tip(&parent, in_batch);
-        let expected = self.expected_bits_off_tip(header, &parent, parent_height, in_batch)?;
-        // `validate_header` opens the collector, and it only runs for a confirmed parent.
-        Self::apply_off_tip_header(
-            self.query.as_ref(),
-            &self.params,
-            header,
-            parent_height.saturating_add(1),
-            mtp,
-            expected,
-        )
+        })
     }
 
     #[doc(hidden)]
@@ -2907,18 +2911,22 @@ impl ChainHub {
                 };
 
                 let new_height = parent_h.0.saturating_add(1);
-                // The tip path waives inside `connect_at`. This is the side
-                // block, and it uses the same session bit. Proof-of-work and
-                // bad nBits stay errors because they are not on the warn list.
-                rbitcoin_query::confirm_run::waive_batch(waive, || {
-                    validate_header(
-                        self.query.as_ref(),
-                        &self.params,
-                        Height(new_height),
-                        &block.header,
-                    )
-                })
-                .map_err(|e| header_reject(&block.header, &e))?;
+                // The tip path waives inside `connect_at`, which also freezes
+                // the node clock. This side block uses that same session bit
+                // and the same clock. Proof-of-work and bad nBits stay errors
+                // because they are not on the warn list.
+                self.clock
+                    .with_frozen(|| {
+                        rbitcoin_query::confirm_run::waive_batch(waive, || {
+                            validate_header(
+                                self.query.as_ref(),
+                                &self.params,
+                                Height(new_height),
+                                &block.header,
+                            )
+                        })
+                    })
+                    .map_err(|e| header_reject(&block.header, &e))?;
 
                 if new_height == tip_h {
                     // Park before the branch attempt so connect reads this
@@ -3128,56 +3136,61 @@ impl ChainHub {
         let Some(fork_h) = fork_height else {
             return Ok(());
         };
-        let mut batch = HashMap::with_capacity(blocks.len());
-        for (i, b) in blocks.iter().enumerate() {
-            let height = fork_h.saturating_add(1).saturating_add(i as u32);
-            let hash = b.block_hash();
-            let checked =
-                rbitcoin_query::confirm_run::waive_batch(self.waive_for_connect(&hash), || {
-                    if i == 0 {
-                        validate_header(
-                            self.query.as_ref(),
-                            &self.params,
-                            Height(height),
-                            &b.header,
-                        )
-                        .map_err(|e| header_reject(&b.header, &e))
-                    } else {
-                        let parent = &blocks[i - 1].header;
-                        let mtp = self.mtp_off_tip(parent, &batch);
-                        let expected = self.expected_bits_off_tip(
-                            &b.header,
-                            parent,
-                            height.saturating_sub(1),
-                            &batch,
-                        )?;
-                        soften_parent_header(self.query.as_ref(), &b.header, height, || {
-                            validate_header_on_parent(
+        // One sample of the node clock for the whole branch, as `connect_at`
+        // does for a tip block. Otherwise a heavier fork is judged on the
+        // wall clock after `setmocktime`.
+        self.clock.with_frozen(|| {
+            let mut batch = HashMap::with_capacity(blocks.len());
+            for (i, b) in blocks.iter().enumerate() {
+                let height = fork_h.saturating_add(1).saturating_add(i as u32);
+                let hash = b.block_hash();
+                let checked =
+                    rbitcoin_query::confirm_run::waive_batch(self.waive_for_connect(&hash), || {
+                        if i == 0 {
+                            validate_header(
+                                self.query.as_ref(),
                                 &self.params,
                                 Height(height),
                                 &b.header,
-                                mtp,
-                                expected,
                             )
-                        })
-                        .map_err(|e| {
-                            header_reject(&b.header, &rbitcoin_query::ConfirmError::from(e))
-                        })
-                    }
-                });
-            if let Err(e) = checked {
-                return Err(connect_failed_for_header(b.block_hash().to_byte_array(), e));
+                            .map_err(|e| header_reject(&b.header, &e))
+                        } else {
+                            let parent = &blocks[i - 1].header;
+                            let mtp = self.mtp_off_tip(parent, &batch);
+                            let expected = self.expected_bits_off_tip(
+                                &b.header,
+                                parent,
+                                height.saturating_sub(1),
+                                &batch,
+                            )?;
+                            soften_parent_header(self.query.as_ref(), &b.header, height, || {
+                                validate_header_on_parent(
+                                    &self.params,
+                                    Height(height),
+                                    &b.header,
+                                    mtp,
+                                    expected,
+                                )
+                            })
+                            .map_err(|e| {
+                                header_reject(&b.header, &rbitcoin_query::ConfirmError::from(e))
+                            })
+                        }
+                    });
+                if let Err(e) = checked {
+                    return Err(connect_failed_for_header(b.block_hash().to_byte_array(), e));
+                }
+                batch.insert(
+                    b.block_hash().to_byte_array(),
+                    HeaderSyncNode {
+                        fk: Fk(0),
+                        header: b.header,
+                        height: Some(height),
+                    },
+                );
             }
-            batch.insert(
-                b.block_hash().to_byte_array(),
-                HeaderSyncNode {
-                    fk: Fk(0),
-                    header: b.header,
-                    height: Some(height),
-                },
-            );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     #[doc(hidden)]
