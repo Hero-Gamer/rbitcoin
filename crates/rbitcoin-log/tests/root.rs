@@ -198,6 +198,16 @@ fn stderr_line_is_plain_when_not_a_terminal() {
     assert!(saved >= 0);
     assert_eq!(dup2(file.as_raw_fd(), 2), 2);
     log_at_style(Level::Error, Style::Bold, format_args!("operator-line"));
+    let controls: String = (0u8..=31).chain([127]).map(char::from).collect();
+    log_at(
+        Level::Error,
+        format_args!("peer={controls} 貓 € 😀 \\\" printable~\n"),
+    );
+    log_at_style(
+        Level::Error,
+        Style::Bold,
+        format_args!("peer={}\n", "remote\nERROR forged\r\x1b[31m"),
+    );
     log_at_style(Level::Info, Style::Plain, format_args!("hidden-info"));
     let _ = io::stderr().flush();
     assert_eq!(dup2(saved, 2), 2);
@@ -209,4 +219,23 @@ fn stderr_line_is_plain_when_not_a_terminal() {
     assert!(body.contains("operator-line"), "{body}");
     assert!(!body.contains('\u{1b}'), "{body}");
     assert!(!body.contains("hidden-info"), "{body}");
+    let messages: Vec<_> = body
+        .lines()
+        .map(|line| line.split_once(" ERROR ").unwrap().1)
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "operator-line",
+            concat!(
+                r"peer=\x00\x01\x02\x03\x04\x05\x06\x07",
+                r"\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f",
+                r"\x10\x11\x12\x13\x14\x15\x16\x17",
+                r"\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f",
+                " 貓 € 😀 \\\" printable~\\x0a",
+            ),
+            r"peer=remote\x0aERROR forged\x0d\x1b[31m\x0a",
+        ]
+    );
+    assert!(body.ends_with('\n'));
 }

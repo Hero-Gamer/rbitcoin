@@ -195,6 +195,23 @@ pub fn log_at(level: Level, args: fmt::Arguments<'_>) {
     log_at_style(level, Style::Plain, args);
 }
 
+struct EscapedMessage<'a>(&'a str);
+
+impl fmt::Display for EscapedMessage<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut start = 0;
+        for (i, byte) in self.0.bytes().enumerate() {
+            if !byte.is_ascii_control() {
+                continue;
+            }
+            f.write_str(&self.0[start..i])?;
+            write!(f, "\\x{byte:02x}")?;
+            start = i + 1;
+        }
+        f.write_str(&self.0[start..])
+    }
+}
+
 /// Write one log line with optional style. Bold is applied only when stderr is
 /// an interactive terminal so redirected logs stay clean ASCII.
 pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
@@ -204,13 +221,15 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     if !enabled(level) {
         return;
     }
+    let message = args.to_string();
+    let message = EscapedMessage(&message);
     let ts = format_timestamp(SystemTime::now());
     let mut stderr = io::stderr().lock();
     let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
     if bold {
-        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{args}\x1b[0m");
+        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{message}\x1b[0m");
     } else {
-        let _ = writeln!(stderr, "{ts} {level:<5} {args}");
+        let _ = writeln!(stderr, "{ts} {level:<5} {message}");
     }
     let _ = stderr.flush();
 }
