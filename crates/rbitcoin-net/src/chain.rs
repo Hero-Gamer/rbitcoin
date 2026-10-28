@@ -3371,6 +3371,7 @@ impl ChainHub {
             )));
         }
         // The prefix is gone, so its queued tip events are not announced.
+        let undone = reorg.tips.len();
         reorg.tips.clear();
         for (j, ob) in old_path.iter().enumerate() {
             // These blocks were our chain. Disconnect already dropped them
@@ -3388,11 +3389,21 @@ impl ChainHub {
             }
         }
         // Subscribers last saw this tip, so the restored blocks are not news.
-        // One event for it, with the restored length, has Electrum read every
-        // status again for the txs the prefix left in the pool.
-        if let Some(mut tip) = reorg.tips.pop() {
-            tip.reorg_branch_len = old_path.len() as u32;
-            reorg.tips = vec![tip];
+        // A prefix that came off may have left txs in the pool. One event for
+        // the tip, a reorg even when no old block came back, has Electrum
+        // read every status again.
+        reorg.tips.clear();
+        if undone > 0 {
+            if let (Some(height), Some(hash), Some(header)) =
+                (self.tip_height(), self.tip_hash(), self.tip_header())
+            {
+                reorg.tips.push(TipEvent {
+                    height,
+                    hash,
+                    header,
+                    reorg_branch_len: old_path.len().max(1) as u32,
+                });
+            }
         }
         Ok(())
     }

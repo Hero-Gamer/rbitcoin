@@ -2106,6 +2106,71 @@ fn branch_reorg_restore_puts_the_prefix_back() {
     let _ = std::fs::remove_dir_all(pad.dir);
 }
 
+/// A branch on the tip whose second block hits a store fault comes off
+/// with no old block to put back. Subscribers never saw its first block,
+/// but that block's tx is now in the pool, so one reorg event for the tip
+/// has Electrum read every status again.
+#[test]
+fn branch_on_the_tip_undone_by_a_fault_sends_one_reorg_event() {
+    let pad = reorg_pad();
+    let tip_h = pad.hub.tip_height().unwrap();
+    let tip = pad.hub.tip_hash().unwrap();
+    let time = pad.hub.tip_header().unwrap().time;
+    let side = mature_spend_tx(&pad.hub, 2);
+    let late = spend_out0(pad.child.compute_txid(), 49_9997_0000, LockTime::ZERO);
+    let b1 = mine_with_extra(tip, time + 1, tip_h + 1, vec![side.clone()]);
+    let b2 = mine_with_extra(b1.block_hash(), time + 2, tip_h + 2, vec![late]);
+    // Class A appends by height. Half the outputs keep the side's coin and
+    // drop the child's, so only the second block faults.
+    let txout = find_store_file(pad.dir.path(), "txout.body").expect("txout.body");
+    let len = std::fs::metadata(&txout).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&txout)
+        .unwrap()
+        .set_len(len / 2)
+        .unwrap();
+    let mut tips = pad.hub.subscribe_tips();
+    let err = pad
+        .hub
+        .accept_branch(&[b1, b2])
+        .expect_err("the second block faults");
+    assert!(err.is_local_fault(), "{err}");
+    assert_eq!(pad.hub.tip_hash(), Some(tip));
+    assert!(
+        pad.mp.contains(&side.compute_txid()),
+        "the first block's tx is back"
+    );
+    let mut events = Vec::new();
+    while let Ok(ev) = tips.try_recv() {
+        events.push((ev.height, ev.hash, ev.reorg_branch_len > 0));
+    }
+    assert_eq!(events, vec![(tip_h, tip, true)]);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A branch whose first block fails puts the old blocks back as they were,
+/// with the pool unchanged. No tip event is sent, as Core sends no
+/// `UpdatedBlockTip` when the tip ends where it started.
+#[test]
+fn branch_reorg_whose_first_block_fails_sends_no_tip_event() {
+    let pad = reorg_pad();
+    let old_tip = pad.hub.tip_hash().unwrap();
+    let mut tips = pad.hub.subscribe_tips();
+    let bad = spend_out0(
+        bitcoin::Txid::from_byte_array([0xee; 32]),
+        1,
+        LockTime::ZERO,
+    );
+    let branch = pad_branch(&pad, vec![vec![bad], vec![], vec![]]);
+    pad.hub
+        .accept_branch(&branch)
+        .expect_err("the first block spends a missing coin");
+    assert_eq!(pad.hub.tip_hash(), Some(old_tip));
+    assert!(tips.try_recv().is_err(), "no tip event");
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
 #[test]
 fn ensure_header_rejects_claimed_hard_bits_without_pow() {
     let (dir, hub) = tmp_hub();
