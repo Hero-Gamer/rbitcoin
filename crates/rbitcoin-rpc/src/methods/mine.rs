@@ -608,14 +608,14 @@ pub(crate) fn gbt_longpoll_wait(ctx: &RpcContext, want: &str) {
 /// Where a template may build. The stripped tip wins. The query tip is only
 /// a stand-in before any strip has been recorded.
 enum GbtTip {
-    /// `(height, display hash, time, bits)`.
-    Ready(u32, String, u32, u32),
+    /// `(height, display hash, bits)`.
+    Ready(u32, String, u32),
     /// `template_prev` names a block that is not the header at its height.
     Stale,
 }
 
-fn anchor_of(height: u32, hash: [u8; 32], time: u32, bits: u32) -> GbtTip {
-    GbtTip::Ready(height, hash_hex_display(&hash), time, bits)
+fn anchor_of(height: u32, hash: [u8; 32], bits: u32) -> GbtTip {
+    GbtTip::Ready(height, hash_hex_display(&hash), bits)
 }
 
 fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
@@ -637,7 +637,7 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
         if rec.hash != hash {
             return Ok(GbtTip::Stale);
         }
-        return Ok(anchor_of(height.0, rec.hash, rec.timestamp, rec.bits));
+        return Ok(anchor_of(height.0, rec.hash, rec.bits));
     }
     let Some(h) = ctx.query.tip_height() else {
         return Err(rpc_error(ERR_MISC, "no tip"));
@@ -647,7 +647,7 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
         .header_at_height(h)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         .ok_or_else(|| rpc_error(ERR_MISC, "tip header missing"))?;
-    Ok(anchor_of(h.0, rec.hash, rec.timestamp, rec.bits))
+    Ok(anchor_of(h.0, rec.hash, rec.bits))
 }
 
 pub fn gbt_longpoll_id(ctx: &RpcContext) -> String {
@@ -657,14 +657,14 @@ pub fn gbt_longpoll_id(ctx: &RpcContext) -> String {
         .map(|m| m.template_updates())
         .unwrap_or(0);
     match gbt_tip(ctx) {
-        Ok(GbtTip::Ready(_, hex, _, _)) => format!("{hex}{updates}"),
+        Ok(GbtTip::Ready(_, hex, _)) => format!("{hex}{updates}"),
         _ => format!("stale{updates}"),
     }
 }
 
 pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     refuse_unmaintained_template(ctx)?;
-    let GbtTip::Ready(tip_h, prev_hex, tip_time, tip_bits) = gbt_tip(ctx)? else {
+    let GbtTip::Ready(tip_h, prev_hex, tip_bits) = gbt_tip(ctx)? else {
         return Err(rpc_error(ERR_MISC, "template tip is not on the best chain"));
     };
     let updates = ctx
@@ -688,19 +688,13 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
                 .map(|d| d.as_secs() as u32)
                 .unwrap_or(0)
         });
-    let curtime = tip_time.saturating_add(1).max(now);
+    let mintime = rbitcoin_query::next_block_mintime(ctx.query.as_ref(), &params, Height(tip_h))
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
+    let curtime = mintime.max(now);
     let bits =
         rbitcoin_query::expected_next_bits(ctx.query.as_ref(), &params, Height(next_h), curtime)
             .map(|c| c.to_consensus())
             .unwrap_or(tip_bits);
-    // The next block must be above the tip median. Core's `GetMinimumTime`
-    // also raises this at retarget heights; that floor is not applied here.
-    let mintime = if tip_h == 0 {
-        tip_time
-    } else {
-        rbitcoin_query::median_time_past(ctx.query.as_ref(), Height(tip_h)).unwrap_or(tip_time)
-    }
-    .saturating_add(1);
     let selected = mempool_block_txs(ctx);
     let mut fees = 0u64;
     let mut tx_json = Vec::with_capacity(selected.len());

@@ -78,8 +78,8 @@ pub use confirm_error::ConfirmError;
 pub use connect_facade::*;
 pub use convert::header_to_record;
 pub use header_read::{
-    expected_next_bits, median_time_past, median_time_past_store, validate_header,
-    validate_header_hashed,
+    expected_next_bits, median_time_past, median_time_past_store, next_block_mintime,
+    validate_header, validate_header_hashed,
 };
 pub use index_writebehind::{
     build_indexes_released, index_tip_entry, prepare_live_indexes, spawn_index_writebehind,

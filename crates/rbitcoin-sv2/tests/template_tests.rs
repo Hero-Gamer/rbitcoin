@@ -1225,3 +1225,35 @@ fn template_builds_on_the_stripped_tip() {
     let best = tc.chain.query.wire_header_at_height(tip).unwrap();
     assert_ne!(built.prev_hash, best.block_hash().to_byte_array());
 }
+
+/// Core `GetMinimumTime`: on a clock behind a period's first block, the
+/// template for that period's last block is stamped at the first block's time.
+#[test]
+fn template_time_holds_the_last_of_period_floor() {
+    let mut params = ChainParams::regtest();
+    params.btc.pow_target_timespan = 16 * params.btc.pow_target_spacing;
+    assert_eq!(params.difficulty_adjustment_interval(), 16);
+    let tc = padded_chain_with("sv2-period-floor", 0, params);
+    let genesis = tc.tip_time - 600 * 100;
+    let first_time = genesis + 200_000;
+    let mut prev = tc.chain.tip_header().expect("tip").block_hash();
+    for h in 101..=126u32 {
+        let time = if h == 112 {
+            first_time
+        } else {
+            genesis + 600 * h
+        };
+        let block = mine_empty_regtest(prev, time, h);
+        prev = block.block_hash();
+        assert_eq!(
+            tc.chain.accept_block(block).unwrap(),
+            rbitcoin_net::AcceptOutcome::Accepted { height: h }
+        );
+    }
+    tc.chain.clock.set_mock(i64::from(first_time - 7_200));
+    let built = rbitcoin_sv2::template::build(&tc.chain, 0, 0)
+        .unwrap()
+        .expect("template");
+    assert_eq!(built.prev_hash, prev.to_byte_array());
+    assert_eq!(built.header_timestamp, first_time);
+}
