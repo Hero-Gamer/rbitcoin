@@ -74,6 +74,16 @@ pub struct TipEvent {
     pub reorg_branch_len: u32,
 }
 
+/// A branch reorg in progress (Core `ActivateBestChainStep`). It holds the
+/// template mark, collects the disconnected txs, and keeps the tip events
+/// until those txs are back in the pool.
+#[doc(hidden)]
+pub struct BranchReorg<'a> {
+    hold: Option<crate::tx_relay::TemplateHold<'a>>,
+    gone: Vec<Transaction>,
+    tips: Vec<TipEvent>,
+}
+
 #[doc(hidden)]
 pub struct HeaderSyncNode {
     pub fk: Fk,
@@ -1246,7 +1256,7 @@ impl ChainHub {
         if genesis.block_hash() != self.params.genesis_hash {
             return Err(NetError::Protocol("genesis hash mismatch with params"));
         }
-        self.connect_at(0, Arc::new(genesis), false)?;
+        self.connect_at(0, Arc::new(genesis), false, None)?;
         Ok(())
     }
 
@@ -2907,7 +2917,7 @@ impl ChainHub {
                 if prev.to_byte_array() != [0u8; 32] {
                     return Err(NetError::Protocol("non-genesis without tip"));
                 }
-                self.connect_at(0, block, waive)?;
+                self.connect_at(0, block, waive, None)?;
                 Ok(AcceptOutcome::Accepted { height: 0 })
             }
             Some(tip_h) => {
@@ -2920,7 +2930,7 @@ impl ChainHub {
                 if prev == tip_hash {
                     let height = tip_h.saturating_add(1);
                     self.remember_cmpct_prefill_from_block(block.as_ref());
-                    self.connect_at(height, block, waive)?;
+                    self.connect_at(height, block, waive, None)?;
                     return Ok(AcceptOutcome::Accepted { height });
                 }
 
@@ -3017,10 +3027,18 @@ impl ChainHub {
         }
         self.accept_branch_check_headers(blocks, fork_height)?;
         let old_path = self.accept_branch_collect_old(fork_height)?;
-        self.accept_branch_disconnect(fork_height)?;
+        let mp_hold = self.mempool().cloned();
+        let mut reorg = BranchReorg {
+            hold: mp_hold.as_ref().map(|mp| mp.template_hold()),
+            gone: Vec::new(),
+            tips: Vec::new(),
+        };
+        let was_ibd = self.in_ibd();
+        self.accept_branch_disconnect(fork_height, &mut reorg)?;
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
-        let (connected, failed) =
-            self.accept_branch_connect(blocks, fork_height, old_work, &old_path)?;
+        let res = self.accept_branch_connect(blocks, fork_height, old_work, &old_path, &mut reorg);
+        self.finish_branch_reorg(reorg, was_ibd);
+        let (connected, failed) = res?;
         self.announce_reorg_len.store(0, Ordering::Relaxed);
         let height = base + (connected.len() as u32) - 1;
         {
@@ -3218,15 +3236,19 @@ impl ChainHub {
         })
     }
 
+    /// Disconnect to the fork point into `reorg`. The reorg puts the
+    /// disconnected txs back after its connect.
     #[doc(hidden)]
-    pub fn accept_branch_disconnect(&self, fork_height: Option<u32>) -> Result<(), NetError> {
-        if let Some(fh) = fork_height {
-            self.disconnect_to(fh)?;
-        } else {
-            let _commit = self
-                .query
-                .lock_tip_commit()
-                .map_err(|e| NetError::Store(e.to_string()))?;
+    pub fn accept_branch_disconnect(
+        &self,
+        fork_height: Option<u32>,
+        reorg: &mut BranchReorg<'_>,
+    ) -> Result<(), NetError> {
+        let _commit = self
+            .query
+            .lock_tip_commit()
+            .map_err(|e| NetError::Store(e.to_string()))?;
+        let Some(fh) = fork_height else {
             while self.query.tip_height().is_some() {
                 if let Some(th) = self.tip_hash() {
                     self.confirmed.write().unwrap().remove(&th);
@@ -3237,8 +3259,35 @@ impl ChainHub {
             }
             self.cache.clear();
             self.confirmed.write().unwrap().clear();
+            return Ok(());
+        };
+        let gone = self.disconnect_harvest_in_commit(fh)?;
+        // The new branch connects at these heights before `gone` is back.
+        self.drop_above(fh);
+        reorg.gone.extend(gone);
+        if let Some(hold) = reorg.hold.as_mut() {
+            if let Ok(Some((_, rec))) = self.query.header_at_height(Height(fh)) {
+                hold.commit(rec.hash);
+            }
         }
         Ok(())
+    }
+
+    /// Put the disconnected txs back on the tip the reorg left, then send
+    /// its tip events, as Core signals after `MaybeUpdateMempoolForReorg`.
+    #[doc(hidden)]
+    pub fn finish_branch_reorg(&self, reorg: BranchReorg<'_>, was_ibd: bool) {
+        let BranchReorg { hold, gone, tips } = reorg;
+        self.reaccept_disconnected(&gone);
+        drop(hold);
+        self.maintain_pool_after_ibd(was_ibd);
+        if tips.is_empty() {
+            return;
+        }
+        for tip in tips {
+            let _ = self.tip_tx.send(tip);
+        }
+        self.notify.notify_waiters();
     }
 
     /// Connect `blocks` on the fork point and return the connected prefix,
@@ -3257,6 +3306,7 @@ impl ChainHub {
         fork_height: Option<u32>,
         old_work: Work,
         old_path: &[Block],
+        reorg: &mut BranchReorg<'_>,
     ) -> Result<(&'b [Block], Option<NetError>), NetError> {
         let base = fork_height.map(|h| h + 1).unwrap_or(0);
         for (i, b) in blocks.iter().enumerate() {
@@ -3266,12 +3316,13 @@ impl ChainHub {
                 base + i as u32,
                 Arc::new(b.clone()),
                 self.waive_for_connect(&b.block_hash()),
+                Some(&mut *reorg),
             ) else {
                 continue;
             };
             self.announce_reorg_len.store(0, Ordering::Relaxed);
             if e.is_local_fault() {
-                self.accept_branch_restore(fork_height, old_path, &e)?;
+                self.accept_branch_restore(fork_height, old_path, &e, reorg)?;
                 return Err(e);
             }
             // `ConnectFailed` displays its own "consensus: " prefix.
@@ -3294,7 +3345,7 @@ impl ChainHub {
                 self.remember_failed_accept(b.block_hash(), &failed);
                 return Ok((prefix, Some(failed)));
             }
-            self.accept_branch_restore(fork_height, old_path, &e)?;
+            self.accept_branch_restore(fork_height, old_path, &e, reorg)?;
             return Err(failed);
         }
         Ok((blocks, None))
@@ -3309,15 +3360,19 @@ impl ChainHub {
         fork_height: Option<u32>,
         old_path: &[Block],
         e: &NetError,
+        reorg: &mut BranchReorg<'_>,
     ) -> Result<(), NetError> {
         let Some(fh) = fork_height else {
             return Ok(());
         };
-        if let Err(disc) = self.disconnect_to(fh) {
+        if let Err(disc) = self.accept_branch_disconnect(fork_height, reorg) {
             return Err(NetError::Store(format!(
                 "reorg connect failed ({e}); disconnect for restore failed: {disc}"
             )));
         }
+        // The prefix is gone, so its queued tip events are not announced.
+        let undone = reorg.tips.len();
+        reorg.tips.clear();
         for (j, ob) in old_path.iter().enumerate() {
             // These blocks were our chain. Disconnect already dropped them
             // from `confirmed`, so the mode bit is the restore waive.
@@ -3326,10 +3381,28 @@ impl ChainHub {
                 fh + 1 + j as u32,
                 Arc::new(ob.clone()),
                 self.query.trust_peer(),
+                Some(&mut *reorg),
             ) {
                 return Err(NetError::Store(format!(
                     "reorg connect failed ({e}); tip restore failed: {re}"
                 )));
+            }
+        }
+        // Subscribers last saw this tip, so the restored blocks are not news.
+        // A prefix that came off may have left txs in the pool. One event for
+        // the tip, a reorg even when no old block came back, has Electrum
+        // read every status again.
+        reorg.tips.clear();
+        if undone > 0 {
+            if let (Some(height), Some(hash), Some(header)) =
+                (self.tip_height(), self.tip_hash(), self.tip_header())
+            {
+                reorg.tips.push(TipEvent {
+                    height,
+                    hash,
+                    header,
+                    reorg_branch_len: old_path.len().max(1) as u32,
+                });
             }
         }
         Ok(())
@@ -3768,8 +3841,17 @@ impl ChainHub {
         pres.iter().map(|p| Txid::from_byte_array(p.txid)).collect()
     }
 
+    /// Inside a branch `reorg`, the reorg owns the template mark and sends
+    /// the tip event once its disconnected txs are back. Without one, this
+    /// connect takes its own hold and sends the event itself.
     #[doc(hidden)]
-    pub fn connect_at(&self, height: u32, block: Arc<Block>, waive: bool) -> Result<(), NetError> {
+    pub fn connect_at(
+        &self,
+        height: u32,
+        block: Arc<Block>,
+        waive: bool,
+        mut reorg: Option<&mut BranchReorg<'_>>,
+    ) -> Result<(), NetError> {
         debug_assert!(
             crate::tip_accept::on_tip_accept_thread(),
             "connect_at must run on tip-accept"
@@ -3777,7 +3859,10 @@ impl ChainHub {
         // Held until this connect returns, so a template cannot observe the
         // new query tip before the pool strip is recorded.
         let mp_hold = self.mempool().cloned();
-        let mut template_hold = mp_hold.as_ref().map(|mp| mp.template_hold());
+        let mut own_hold = match reorg {
+            Some(_) => None,
+            None => mp_hold.as_ref().map(|mp| mp.template_hold()),
+        };
         // Sampled before the new tip. A later connect uses this only to
         // skip starting maintenance.
         let was_ibd = self.in_ibd();
@@ -3852,7 +3937,9 @@ impl ChainHub {
             rbitcoin_log::debug!("mempool: removed {n} confirmed tx(s) @ height {height}");
             if mp.pool_maintained() {
                 mp.note_block_fee_history(Height(height));
-                if let Some(hold) = template_hold.as_mut() {
+                if let Some(hold) = reorg.as_deref_mut().and_then(|r| r.hold.as_mut()) {
+                    hold.commit(hash.to_byte_array());
+                } else if let Some(hold) = own_hold.as_mut() {
                     hold.commit(hash.to_byte_array());
                 }
             }
@@ -3871,16 +3958,20 @@ impl ChainHub {
         // wakes on this event already sees the new mark. Maintenance starts
         // here, after that hold, so a template built on the event is not
         // refused for a catch-up pool. This call does not change peer relay.
-        drop(template_hold);
-        self.maintain_pool_after_ibd(was_ibd);
+        drop(own_hold);
         let event = TipEvent {
             height,
             hash,
             header,
             reorg_branch_len: self.announce_reorg_len.load(Ordering::Relaxed),
         };
-        let _ = self.tip_tx.send(event);
-        self.notify.notify_waiters();
+        if let Some(reorg) = reorg {
+            reorg.tips.push(event);
+        } else {
+            self.maintain_pool_after_ibd(was_ibd);
+            let _ = self.tip_tx.send(event);
+            self.notify.notify_waiters();
+        }
         self.query.release_index_writebehind(Height(height));
         self.trim_held_bodies(height);
         Ok(())
@@ -3909,19 +4000,39 @@ impl ChainHub {
 
     #[doc(hidden)]
     pub fn disconnect_to_in_commit(&self, keep_height: u32) -> Result<(), NetError> {
+        let gone = self.disconnect_harvest_in_commit(keep_height)?;
+        // Back in the pool before the RAM SH head drops them.
+        self.reaccept_disconnected(&gone);
+        self.drop_above(keep_height);
+        Ok(())
+    }
+
+    /// Disconnect down to `keep_height` and return the disconnected txs,
+    /// oldest block first, so a parent is ahead of its child (Core
+    /// `DisconnectedBlockTransactions`). The caller puts them back and
+    /// then calls [`Self::drop_above`].
+    #[doc(hidden)]
+    pub fn disconnect_harvest_in_commit(
+        &self,
+        keep_height: u32,
+    ) -> Result<Vec<Transaction>, NetError> {
         let mp = self.mempool().cloned();
-        let mut disconnected_txs: Vec<Transaction> = Vec::new();
-        while let Some(h) = self.query.tip_height() {
-            let tip = h.0;
-            if tip <= keep_height {
-                break;
+        // Every body is read before the first disconnect, so a read fault or
+        // a missing block leaves the chain where it was and no tx is lost
+        // from the pool.
+        let mut gone: Vec<Transaction> = Vec::new();
+        if mp.is_some() {
+            let tip = self.query.tip_height().map_or(0, |h| h.0);
+            for height in keep_height.saturating_add(1)..=tip {
+                let b = self.block_at_height(height)?.ok_or_else(|| {
+                    NetError::Store(format!("disconnect: no block at connected height {height}"))
+                })?;
+                gone.extend(b.txdata.into_iter().skip(1));
             }
-            if mp.is_some() {
-                if let Ok(Some(b)) = self.block_at_height(tip) {
-                    for tx in b.txdata.iter().skip(1) {
-                        disconnected_txs.push(tx.clone());
-                    }
-                }
+        }
+        while let Some(h) = self.query.tip_height() {
+            if h.0 <= keep_height {
+                break;
             }
             if let Some(th) = self.tip_hash() {
                 self.confirmed.write().unwrap().remove(&th);
@@ -3933,22 +4044,37 @@ impl ChainHub {
         self.cache.truncate_to_height(keep_height);
         if let Some(mp) = mp {
             mp.clear_recent_confirmed();
-            if !disconnected_txs.is_empty() {
-                let n = mp.reorg_reaccept(&disconnected_txs);
-                rbitcoin_log::debug!(
-                    "mempool: re-accepted {n}/{} tx(s) after reorg disconnect to {keep_height}",
-                    disconnected_txs.len()
-                );
-            }
-            mp.evict_after_reorg();
         }
+        Ok(gone)
+    }
+
+    /// Drop the RAM SH head and chain work above `keep_height`.
+    #[doc(hidden)]
+    pub fn drop_above(&self, keep_height: u32) {
         self.query
             .drop_sh_pending_from(Height(keep_height.saturating_add(1)));
         self.chain_work_prefix
             .write()
             .unwrap()
             .truncate(keep_height as usize + 1);
-        Ok(())
+    }
+
+    /// Put disconnected txs back on the current tip, then drop what is no
+    /// longer valid there (Core `MaybeUpdateMempoolForReorg`).
+    #[doc(hidden)]
+    pub fn reaccept_disconnected(&self, txs: &[Transaction]) {
+        let Some(mp) = self.mempool() else {
+            return;
+        };
+        if !txs.is_empty() {
+            let n = mp.reorg_reaccept(txs);
+            let tip = self.tip_height().unwrap_or(0);
+            rbitcoin_log::debug!(
+                "mempool: re-accepted {n}/{} tx(s) after reorg to {tip}",
+                txs.len()
+            );
+        }
+        mp.evict_after_reorg();
     }
 
     #[cfg(debug_assertions)]

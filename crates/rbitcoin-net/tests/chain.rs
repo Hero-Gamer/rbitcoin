@@ -1873,6 +1873,304 @@ fn disconnect_to_with_mempool_still_harvests() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Fork point `fork` (mature coinbases at 1 and 2), then the old branch:
+/// `parent` at `fork + 1` and `child` at `fork + 2`. The child's lock time is
+/// `fork + 1`, the height a Core wallet stamps after one block: final in its
+/// block and on any later tip, not on the fork point.
+struct ReorgPad {
+    dir: rbitcoin_query::testutil::TempDir,
+    hub: ChainHub,
+    mp: Arc<rbitcoin_net::tx_relay::MempoolHub>,
+    fork: u32,
+    fork_hash: BlockHash,
+    fork_time: u32,
+    parent: Transaction,
+    child: Transaction,
+}
+
+fn spend_out0(prev: bitcoin::Txid, sat: u64, lock_time: LockTime) -> Transaction {
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(sat),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
+fn reorg_pad() -> ReorgPad {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let gen = hub.tip_hash().unwrap();
+    hub.accept_block(mine(gen, hub.clock.now_secs() as u32, 1))
+        .unwrap();
+    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let fork = hub.tip_height().unwrap();
+    let fork_hash = hub.tip_hash().unwrap();
+    let fork_time = hub.tip_header().unwrap().time;
+    let parent = mature_spend_tx(&hub, 1);
+    let child = spend_out0(
+        parent.compute_txid(),
+        49_9998_0000,
+        LockTime::from_height(fork + 1).unwrap(),
+    );
+    let a1 = mine_with_extra(fork_hash, fork_time + 1, fork + 1, vec![parent.clone()]);
+    let a2 = mine_with_extra(
+        a1.block_hash(),
+        fork_time + 2,
+        fork + 2,
+        vec![child.clone()],
+    );
+    hub.accept_block(a1).unwrap();
+    hub.accept_block(a2).unwrap();
+    ReorgPad {
+        dir,
+        hub,
+        mp,
+        fork,
+        fork_hash,
+        fork_time,
+        parent,
+        child,
+    }
+}
+
+/// Mine `txs.len()` blocks on the fork point, block `i` holding `txs[i]`.
+fn pad_branch(pad: &ReorgPad, txs: Vec<Vec<Transaction>>) -> Vec<Block> {
+    let mut branch = Vec::new();
+    let mut prev = pad.fork_hash;
+    for (i, extra) in txs.into_iter().enumerate() {
+        let i = i as u32 + 1;
+        let b = mine_with_extra(prev, pad.fork_time + 10 + i, pad.fork + i, extra);
+        prev = b.block_hash();
+        branch.push(b);
+    }
+    branch
+}
+
+/// Core re-adds disconnected txs after the new branch connects
+/// (`MaybeUpdateMempoolForReorg`), so the child is final there (issue #1236).
+/// Parents go first, so the child comes back from its block, not the orphanage.
+#[test]
+fn branch_reorg_reaccepts_on_the_new_tip() {
+    let pad = reorg_pad();
+    let branch = pad_branch(&pad, vec![vec![], vec![], vec![]]);
+    assert_eq!(
+        pad.hub.accept_branch(&branch).unwrap(),
+        AcceptOutcome::Accepted {
+            height: pad.fork + 3
+        }
+    );
+    assert!(
+        pad.mp.contains(&pad.parent.compute_txid()),
+        "parent is back"
+    );
+    assert!(
+        pad.mp.contains(&pad.child.compute_txid()),
+        "the child is final on the new tip"
+    );
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// Core signals `BlockConnected` after `MaybeUpdateMempoolForReorg`. The
+/// branch's first tip event already finds the child back, so an Electrum
+/// restatus on that event does not go stale.
+#[test]
+fn branch_reorg_tip_events_follow_the_reaccept() {
+    let pad = reorg_pad();
+    let mut tips = pad.hub.subscribe_tips();
+    let mp = Arc::clone(&pad.mp);
+    let child = pad.child.compute_txid();
+    let seen = std::thread::spawn(move || {
+        let ev = tips.blocking_recv().expect("tip event");
+        (ev.height, mp.contains(&child))
+    });
+    let branch = pad_branch(&pad, vec![vec![], vec![], vec![]]);
+    pad.hub.accept_branch(&branch).unwrap();
+    let (height, back) = seen.join().unwrap();
+    assert_eq!(height, pad.fork + 1);
+    assert!(back, "the child is back before the first tip event");
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A disconnect whose blocks cannot all be read back fails before it moves
+/// the tip. The 16 cached tip bodies read fine, and the next one down
+/// faults, so a disconnect that read as it went would stop halfway.
+#[test]
+fn disconnect_fails_when_the_block_read_faults() {
+    let pad = reorg_pad();
+    let tip = pad.hub.tip_height();
+    let tip_hash = pad.hub.tip_hash();
+    let inputs = find_store_file(pad.dir.path(), "input.body").expect("input.body");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&inputs)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    pad.hub
+        .rewind_to_height(pad.fork - 20)
+        .expect_err("a block below the cache cannot be read back");
+    assert_eq!(pad.hub.tip_height(), tip, "nothing was disconnected");
+    assert_eq!(pad.hub.tip_hash(), tip_hash);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A connected height below the cached bodies whose header row is gone
+/// reads back as no block. That fails the disconnect too, before it moves
+/// the tip, and is not read as an empty block.
+#[test]
+fn disconnect_fails_when_a_connected_height_has_no_block() {
+    let pad = reorg_pad();
+    let tip = pad.hub.tip_height();
+    let tip_hash = pad.hub.tip_hash();
+    let hole = pad.fork - 20;
+    pad.hub
+        .query
+        .store()
+        .confirmed
+        .set_raw_for_test(&rbitcoin_store::ClassCWrite::for_test(), Height(hole), 0)
+        .unwrap();
+    assert!(pad.hub.block_at_height(hole).unwrap().is_none());
+    pad.hub
+        .rewind_to_height(hole - 1)
+        .expect_err("a connected height has no block");
+    assert_eq!(pad.hub.tip_height(), tip, "nothing was disconnected");
+    assert_eq!(pad.hub.tip_hash(), tip_hash);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// The new branch double-spends the parent. Core drops the parent and its
+/// child. The child does not wait in the orphanage for a parent that cannot
+/// come back.
+#[test]
+fn branch_reorg_drops_the_child_of_a_double_spent_parent() {
+    let pad = reorg_pad();
+    let mut rival = mature_spend_tx(&pad.hub, 1);
+    rival.output[0].value = Amount::from_sat(49_9998_0000);
+    let branch = pad_branch(&pad, vec![vec![rival], vec![], vec![]]);
+    pad.hub.accept_branch(&branch).unwrap();
+    assert!(!pad.mp.contains(&pad.parent.compute_txid()));
+    assert!(!pad.mp.contains(&pad.child.compute_txid()));
+    assert_eq!(pad.mp.orphan_count(), 0);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A failed connect restores the old branch under the same template hold.
+/// A tx only in the dropped prefix goes back in the pool. Subscribers last
+/// saw the old tip, so the one tip event is that tip, with the restored
+/// length, as a reorg Electrum reads every status again for.
+#[test]
+fn branch_reorg_restore_puts_the_prefix_back() {
+    let pad = reorg_pad();
+    let old_tip = pad.hub.tip_hash().unwrap();
+    let old_height = pad.hub.tip_height().unwrap();
+    let mut tips = pad.hub.subscribe_tips();
+    let side = mature_spend_tx(&pad.hub, 2);
+    let bad = spend_out0(
+        bitcoin::Txid::from_byte_array([0xee; 32]),
+        1,
+        LockTime::ZERO,
+    );
+    let branch = pad_branch(&pad, vec![vec![side.clone()], vec![bad], vec![]]);
+    pad.hub
+        .accept_branch(&branch)
+        .expect_err("the second block spends a missing coin");
+    assert_eq!(pad.hub.tip_hash(), Some(old_tip));
+    let mut events = Vec::new();
+    while let Ok(tip) = tips.try_recv() {
+        events.push((tip.height, tip.hash, tip.reorg_branch_len));
+    }
+    assert!(
+        events.iter().all(|&(height, _, _)| height >= old_height),
+        "no event below the old tip: {events:?}"
+    );
+    assert_eq!(events, vec![(old_height, old_tip, 2)]);
+    assert!(pad.mp.contains(&side.compute_txid()), "prefix tx is back");
+    assert!(!pad.mp.contains(&pad.parent.compute_txid()));
+    assert!(!pad.mp.contains(&pad.child.compute_txid()));
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A branch on the tip whose second block hits a store fault comes off
+/// with no old block to put back. Subscribers never saw its first block,
+/// but that block's tx is now in the pool, so one reorg event for the tip
+/// has Electrum read every status again.
+#[test]
+fn branch_on_the_tip_undone_by_a_fault_sends_one_reorg_event() {
+    let pad = reorg_pad();
+    let tip_h = pad.hub.tip_height().unwrap();
+    let tip = pad.hub.tip_hash().unwrap();
+    let time = pad.hub.tip_header().unwrap().time;
+    let side = mature_spend_tx(&pad.hub, 2);
+    let late = spend_out0(pad.child.compute_txid(), 49_9997_0000, LockTime::ZERO);
+    let b1 = mine_with_extra(tip, time + 1, tip_h + 1, vec![side.clone()]);
+    let b2 = mine_with_extra(b1.block_hash(), time + 2, tip_h + 2, vec![late]);
+    // Class A appends by height. Half the outputs keep the side's coin and
+    // drop the child's, so only the second block faults.
+    let txout = find_store_file(pad.dir.path(), "txout.body").expect("txout.body");
+    let len = std::fs::metadata(&txout).unwrap().len();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&txout)
+        .unwrap()
+        .set_len(len / 2)
+        .unwrap();
+    let mut tips = pad.hub.subscribe_tips();
+    let err = pad
+        .hub
+        .accept_branch(&[b1, b2])
+        .expect_err("the second block faults");
+    assert!(err.is_local_fault(), "{err}");
+    assert_eq!(pad.hub.tip_hash(), Some(tip));
+    assert!(
+        pad.mp.contains(&side.compute_txid()),
+        "the first block's tx is back"
+    );
+    let mut events = Vec::new();
+    while let Ok(ev) = tips.try_recv() {
+        events.push((ev.height, ev.hash, ev.reorg_branch_len > 0));
+    }
+    assert_eq!(events, vec![(tip_h, tip, true)]);
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
+/// A branch whose first block fails puts the old blocks back as they were,
+/// with the pool unchanged. No tip event is sent, as Core sends no
+/// `UpdatedBlockTip` when the tip ends where it started.
+#[test]
+fn branch_reorg_whose_first_block_fails_sends_no_tip_event() {
+    let pad = reorg_pad();
+    let old_tip = pad.hub.tip_hash().unwrap();
+    let mut tips = pad.hub.subscribe_tips();
+    let bad = spend_out0(
+        bitcoin::Txid::from_byte_array([0xee; 32]),
+        1,
+        LockTime::ZERO,
+    );
+    let branch = pad_branch(&pad, vec![vec![bad], vec![], vec![]]);
+    pad.hub
+        .accept_branch(&branch)
+        .expect_err("the first block spends a missing coin");
+    assert_eq!(pad.hub.tip_hash(), Some(old_tip));
+    assert!(tips.try_recv().is_err(), "no tip event");
+    let _ = std::fs::remove_dir_all(pad.dir);
+}
+
 #[test]
 fn ensure_header_rejects_claimed_hard_bits_without_pow() {
     let (dir, hub) = tmp_hub();

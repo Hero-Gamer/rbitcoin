@@ -813,6 +813,8 @@ pub struct MempoolHub {
     /// Tip whose mempool strip has finished. Block templates build on this.
     /// The query tip is visible earlier, before `remove_for_block_spent`.
     template_prev: Mutex<Option<[u8; 32]>>,
+    /// Odd while a [`TemplateHold`] is out, so the pool may not match the tip.
+    pool_settle: AtomicU64,
     /// INV immediately instead of waiting on mocktime.
     pub immediate_relay: AtomicBool,
     /// Last `setmocktime` (0 = wall). Used to age mempool txs for delayed INV.
@@ -898,6 +900,7 @@ pub struct CommitOutcome {
 #[doc(hidden)]
 pub struct TemplateHold<'a> {
     updates: &'a AtomicU64,
+    settle: &'a AtomicU64,
     slot: std::sync::MutexGuard<'a, Option<[u8; 32]>>,
     commit: Option<[u8; 32]>,
 }
@@ -910,11 +913,11 @@ impl TemplateHold<'_> {
 
 impl Drop for TemplateHold<'_> {
     fn drop(&mut self) {
-        let Some(hash) = self.commit else {
-            return;
-        };
-        *self.slot = Some(hash);
-        self.updates.fetch_add(1, Ordering::Relaxed);
+        if let Some(hash) = self.commit {
+            *self.slot = Some(hash);
+            self.updates.fetch_add(1, Ordering::Relaxed);
+        }
+        self.settle.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -1064,6 +1067,7 @@ impl MempoolHub {
             fee_deltas: Mutex::new(HashMap::new()),
             template_updates: AtomicU64::new(0),
             template_prev: Mutex::new(None),
+            pool_settle: AtomicU64::new(0),
             age_inv: Mutex::new(BTreeMap::new()),
             min_live_accept_at: AtomicU64::new(u64::MAX),
             tip_ctx: Mutex::new(None),
@@ -3658,7 +3662,7 @@ impl MempoolHub {
         })
     }
 
-    /// Re-admit txs after reorg disconnect (best-effort).
+    /// Re-admit txs after reorg disconnect (best-effort), parents first.
     pub fn reorg_reaccept(&self, txs: &[Transaction]) -> usize {
         let utxo = self.utxo_provider();
         let mut admitted: Vec<(&Transaction, Vec<TxOut>)> = Vec::new();
@@ -3686,21 +3690,16 @@ impl MempoolHub {
         utxo.note_spender(tx);
         let mut stages = rbitcoin_mempool::AcceptStageUs::default();
         let mut lock_us = 0u64;
+        // Parents come first, so a missing input is a parent that did not
+        // come back or a coin the new chain spent. Core drops the tx.
         let spec = AdmitSpec {
-            report_orphans: true,
+            report_orphans: false,
             fee_delta: 0,
             time_prepare_lock: false,
             min_relay: None,
             waive: false,
         };
-        let prep = match self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us) {
-            Ok(p) => p,
-            Err(AcceptError::Orphaned { missing, .. }) => {
-                let mut g = self.lock_write();
-                return Err(g.park_orphan(tx, missing));
-            }
-            Err(e) => return Err(e),
-        };
+        let prep = self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us)?;
         let sample = self.sample_chain_coins(tx, utxo);
         let committed = {
             let mut g = self.lock_write();
@@ -3871,11 +3870,21 @@ impl MempoolHub {
     /// mutex, so callers must record the hash through [`TemplateHold::commit`].
     #[doc(hidden)]
     pub fn template_hold(&self) -> TemplateHold<'_> {
+        let slot = self.template_prev.lock().unwrap();
+        self.pool_settle.fetch_add(1, Ordering::SeqCst);
         TemplateHold {
             updates: &self.template_updates,
-            slot: self.template_prev.lock().unwrap(),
+            settle: &self.pool_settle,
+            slot,
             commit: None,
         }
+    }
+
+    /// Odd while a connect, disconnect, or reorg holds the template mark. A
+    /// reader that sees one even value before and after its reads saw a
+    /// pool that matches the tip.
+    pub fn pool_settle_gen(&self) -> u64 {
+        self.pool_settle.load(Ordering::SeqCst)
     }
 
     pub fn template_prev(&self) -> Option<[u8; 32]> {
