@@ -586,6 +586,9 @@ fn getorphantxs_is_hidden_and_lists_parked() {
     let v1 = dispatch(&ctx, "getorphantxs", vec![json!(1)]).unwrap();
     assert_eq!(v1[0]["txid"], json!(txid));
     assert_eq!(v1[0]["from"], json!([3]));
+    assert_eq!(v1[0]["vsize"], tx.vsize());
+    assert_eq!(v1[0]["vsize_bip141"], tx.vsize());
+    assert!(v1[0].get("vsize_adjusted").is_none());
     assert!(v1[0].get("hex").is_none());
     let v2 = dispatch(&ctx, "getorphantxs", vec![json!(2)]).unwrap();
     assert!(v2[0]["hex"].as_str().unwrap().len() > 20);

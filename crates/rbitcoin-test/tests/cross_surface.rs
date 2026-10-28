@@ -1668,6 +1668,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_eq!(sent_min["result"], at_min_txid, "{sent_min}");
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[rpc_hex.clone()]])).await;
     assert_eq!(tma["result"][0]["allowed"], true, "{tma}");
+    for field in ["vsize", "vsize_bip141", "vsize_adjusted"] {
+        assert_eq!(tma["result"][0][field], rpc_spend.vsize(), "{tma}");
+    }
     let sent = jsonrpc(rpc_addr, "sendrawtransaction", json!([rpc_hex])).await;
     assert_eq!(sent["result"], rpc_txid, "{sent}");
     let mem_utxo = jsonrpc(rpc_addr, "gettxout", json!([rpc_txid.clone(), 0])).await;
@@ -1701,6 +1704,9 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     let tma = jsonrpc(rpc_addr, "testmempoolaccept", json!([[miss_hex]])).await;
     assert_eq!(tma["result"][0]["allowed"], false, "{tma}");
     assert_eq!(tma["result"][0]["reject-reason"], "missing-inputs", "{tma}");
+    for field in ["vsize", "vsize_bip141", "vsize_adjusted"] {
+        assert!(tma["result"][0].get(field).is_none(), "{tma}");
+    }
 
     let spk = ScriptBuf::from_bytes(vec![0x52]);
     let spend = acs_spend(coinbase_txid, 50_0000_0000, 1_000, spk.clone());

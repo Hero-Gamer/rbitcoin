@@ -1904,7 +1904,36 @@ fn chain_ops_mine_pool_empty(ctx: &RpcContext) {
 fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     let tx = sigop_heavy_spend(ctx, cbs.take(), 2_000);
     let tid = tx.compute_txid();
-    dispatch(ctx, "sendrawtransaction", vec![json!(tx_hex(&tx))]).unwrap();
+    let tid_hex = tid.to_string();
+    let tma = dispatch(ctx, "testmempoolaccept", vec![json!([tx_hex(&tx)])]).unwrap();
+    assert_eq!(tma[0]["allowed"], true, "{tma}");
+    assert_rpc_vsizes(&tma[0], &tx, 4_000);
+    let height = cbs.take();
+    let ordinary = spend_generated_coinbase(
+        ctx,
+        height,
+        generated_coinbase_value(ctx, height) - 1_000,
+        ScriptBuf::new(),
+    )
+    .1;
+    let tma = dispatch(
+        ctx,
+        "testmempoolaccept",
+        vec![json!([tx_hex(&tx), tx_hex(&ordinary)])],
+    )
+    .unwrap();
+    assert_rpc_vsizes(&tma[0], &tx, 4_000);
+    assert_rpc_vsizes(&tma[1], &ordinary, ordinary.vsize() as u64);
+    assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
+    for _ in 0..2 {
+        let submitted = dispatch(ctx, "submitpackage", vec![json!([tx_hex(&tx)])]).unwrap();
+        assert_eq!(submitted["package_msg"], "success", "{submitted}");
+        assert_rpc_vsizes(
+            &submitted["tx-results"][tx.compute_wtxid().to_string()],
+            &tx,
+            4_000,
+        );
+    }
     let raw_w = tx.weight().to_wu();
     assert!(raw_w < 16_000);
     let e = dispatch(
@@ -1913,9 +1942,22 @@ fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCo
         vec![json!(hash_hex_display(&tid.to_byte_array()))],
     )
     .unwrap();
-    assert_eq!(e["vsize"], 4_000);
+    assert_rpc_vsizes(&e, &tx, 4_000);
     assert_eq!(e["weight"], raw_w);
     assert_eq!(e["ancestorsize"], 4_000);
+    let verbose = dispatch(ctx, "getrawmempool", vec![json!(true)]).unwrap();
+    assert_rpc_vsizes(&verbose[&tid_hex], &tx, 4_000);
+    let raw = dispatch(ctx, "getrawtransaction", vec![json!(tid_hex), json!(2)]).unwrap();
+    assert_eq!(raw["vsize"], tx.vsize());
+    assert_eq!(raw["vsize_adjusted"], 4_000);
+    assert!(raw.get("vsize_bip141").is_none());
+    assert_eq!(
+        dispatch(ctx, "getrawtransaction", vec![json!(tid_hex)]).unwrap(),
+        tx_hex(&tx),
+    );
+    let decoded = dispatch(ctx, "decoderawtransaction", vec![json!(tx_hex(&tx))]).unwrap();
+    assert_eq!(decoded["vsize"], tx.vsize());
+    assert!(decoded.get("vsize_adjusted").is_none());
     let info = dispatch(ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(
         (info["size"].clone(), info["bytes"].clone()),
@@ -1950,9 +1992,21 @@ fn chain_ops_sigop_adjusted_entry_and_min_fee(ctx: &RpcContext, cbs: &mut TrueCo
     assert_eq!(keep(500), vec![tx.clone()]);
     assert_eq!(keep(501), Vec::<Transaction>::new());
     ctx.mempool.as_ref().unwrap().set_bytes_per_sigop(0);
+    let unadjusted = dispatch(ctx, "getmempoolentry", vec![json!(tid_hex)]).unwrap();
+    assert_rpc_vsizes(&unadjusted, &tx, tx.vsize() as u64);
     assert_eq!(keep(501), vec![tx]);
     chain_ops_restore_sigop_mining_knobs(ctx);
     chain_ops_mine_pool_empty(ctx);
+    let confirmed = dispatch(ctx, "getrawtransaction", vec![json!(tid_hex), json!(true)]).unwrap();
+    assert_eq!(confirmed["vsize"], raw_vb);
+    assert!(confirmed["confirmations"].as_u64().unwrap() > 0);
+    assert!(confirmed.get("vsize_adjusted").is_none());
+}
+
+fn assert_rpc_vsizes(row: &Value, tx: &Transaction, adjusted: u64) {
+    assert_eq!(row["vsize"], adjusted, "{row}");
+    assert_eq!(row["vsize_adjusted"], adjusted, "{row}");
+    assert_eq!(row["vsize_bip141"], tx.vsize(), "{row}");
 }
 
 /// Package-retry `vsize` is sigop-adjusted. The zero-fee parent fails min
@@ -1994,8 +2048,8 @@ fn chain_ops_submitpackage_sigop_vsize(ctx: &RpcContext, cbs: &mut TrueCoinbases
         r["tx-results"][hash_hex_display(&t.compute_wtxid().to_byte_array())].clone()
     };
     assert!(parent.weight().to_wu() < 16_000);
-    assert_eq!(row(&parent)["vsize"], 4_000, "{r}");
-    assert_eq!(row(&child)["vsize"], child.vsize(), "{r}");
+    assert_rpc_vsizes(&row(&parent), &parent, 4_000);
+    assert_rpc_vsizes(&row(&child), &child, child.vsize() as u64);
     chain_ops_mine_pool_empty(ctx);
 }
 
