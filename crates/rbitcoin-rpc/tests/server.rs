@@ -1,4 +1,4 @@
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use rbitcoin_net::MempoolHub;
@@ -25,6 +25,30 @@ fn auth_header(auth: &RpcAuth) -> String {
 
 fn tcp_addr(handle: &RpcHandle) -> SocketAddr {
     handle.local_addr.expect("tcp listen")
+}
+
+async fn read_keepalive_reply<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+    let mut len = None;
+    loop {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            len = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut body = vec![0; len.expect("content-length")];
+    reader.read_exact(&mut body).await.unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reply["result"], 0, "{reply}");
+    assert!(reply["error"].is_null(), "{reply}");
 }
 
 async fn post_rpc(
@@ -676,13 +700,61 @@ async fn long_poll_deadline_returns_the_tip() {
         elapsed < std::time::Duration::from_secs(2),
         "waitforblock slept past a short deadline: {elapsed:?}"
     );
+    let addr = tcp_addr(&handle);
+    let auth = handle.auth.clone();
+    let waiter = tokio::spawn(async move {
+        post_rpc(
+            addr,
+            &auth,
+            "waitforblock",
+            serde_json::json!([missing, 60_000]),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let info = post_rpc(addr, &handle.auth, "getrpcinfo", serde_json::json!([]))
+                .await
+                .unwrap();
+            if info["result"]["active_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cmd| cmd["method"] == "waitforblock")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("long-poll starts");
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::time::resume();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !waiter.is_finished(),
+        "read timeout interrupted a complete RPC request"
+    );
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    tokio::time::resume();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("long-poll deadline returns")
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply["result"]["height"], 0, "{reply}");
+    assert!(reply["error"].is_null(), "{reply}");
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
-async fn extra_rpc_accept_is_dropped() {
-    use tokio::io::AsyncReadExt;
+async fn stalled_rpc_connections_expire_and_free_capacity() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-accept-cap").expect("dir");
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
     let hub = rbitcoin_net::ChainHub::new(
@@ -692,9 +764,10 @@ async fn extra_rpc_accept_is_dropped() {
     );
     hub.ensure_genesis().unwrap();
     let query = Arc::clone(&hub.query);
+    let socket_path = cfg!(unix).then(|| dir.join("rpc.sock"));
     let cfg = RpcConfig {
         listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
+        socket_path: socket_path.clone(),
         socket_shared: false,
         datadir: dir.path().to_path_buf(),
         network: Network::Regtest,
@@ -703,7 +776,7 @@ async fn extra_rpc_accept_is_dropped() {
         cookie_perms: RpcCookiePerms::Owner,
         subversion: None,
         work_queue: None,
-        rest: false,
+        rest: true,
         alert_notify: None,
 
         blocksonly: false,
@@ -714,9 +787,29 @@ async fn extra_rpc_accept_is_dropped() {
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     let addr = tcp_addr(&handle);
+    let request = br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#;
+    let keepalive = format!(
+        "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        auth_header(&handle.auth), request.len(), std::str::from_utf8(request).unwrap()
+    );
     let mut held = Vec::with_capacity(RPC_MAX_CONNECTIONS);
-    for _ in 0..RPC_MAX_CONNECTIONS {
-        held.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+    for i in 0..RPC_MAX_CONNECTIONS {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let prefix = match i % 4 {
+            0 => String::new(),
+            1 => "POST / HTTP/1.1\r\nHost:".into(),
+            2 => format!(
+                "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{",
+                auth_header(&handle.auth)
+            ),
+            _ => "POST /rest/getutxos.json HTTP/1.1\r\nHost: rpc\r\nContent-Length: 100\r\n\r\n{".into(),
+        };
+        stream.write_all(prefix.as_bytes()).await.unwrap();
+        if i == 0 {
+            stream.write_all(keepalive.as_bytes()).await.unwrap();
+            read_keepalive_reply(&mut stream).await;
+        }
+        held.push(stream);
     }
     let mut extra = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut buf = [0u8; 8];
@@ -725,9 +818,21 @@ async fn extra_rpc_accept_is_dropped() {
         matches!(read, Ok(Ok(0)) | Ok(Err(_))),
         "an accept past the cap must be dropped, got {read:?}"
     );
-    drop(held);
     drop(extra);
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(31)).await;
+    tokio::time::resume();
+    for (i, stream) in held.iter_mut().enumerate() {
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .unwrap_or_else(|_| panic!("stalled connection {i} did not expire"))
+            .expect("expired connection closes cleanly");
+        if i % 4 >= 2 {
+            assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 408"));
+        }
+    }
     let (st, body) = post_raw(
         addr,
         &handle.auth,
@@ -735,6 +840,26 @@ async fn extra_rpc_accept_is_dropped() {
     )
     .await;
     assert_eq!(st, 200, "{body:?}");
+    #[cfg(unix)]
+    {
+        let mut socket = tokio::net::UnixStream::connect(socket_path.unwrap())
+            .await
+            .unwrap();
+        socket.write_all(format!(
+            "POST / HTTP/1.1\r\nHost: rpc\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            request.len()
+        ).as_bytes()).await.unwrap();
+        socket.write_all(request).await.unwrap();
+        read_keepalive_reply(&mut socket).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::time::resume();
+        let read = tokio::time::timeout(Duration::from_secs(2), socket.read(&mut buf))
+            .await
+            .expect("unix keep-alive expires")
+            .unwrap();
+        assert_eq!(read, 0);
+    }
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -822,6 +947,7 @@ fn waitfor_does_not_hold_the_blocking_pool() {
 
 #[tokio::test]
 async fn long_poll_does_not_hold_the_work_queue() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-wait-queue").expect("dir");
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
     let hub = rbitcoin_net::ChainHub::new(
@@ -862,8 +988,14 @@ async fn long_poll_does_not_hold_the_work_queue() {
             "params": [5_000]
         })
         .to_string();
-        let _ = post_raw(addr, &auth, body.as_bytes()).await;
+        post_raw(addr, &auth, body.as_bytes()).await
     });
+    let mut idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stalled.write_all(format!(
+        "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: {}\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{{",
+        auth_header(&handle.auth)
+    ).as_bytes()).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     let (st, body) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
@@ -881,8 +1013,39 @@ async fn long_poll_does_not_hold_the_work_queue() {
         !waiter.is_finished(),
         "waitfornewblock returned before the queue probe"
     );
-    waiter.abort();
-    handle.shutdown().await;
+    tokio::time::timeout(std::time::Duration::from_millis(500), handle.shutdown())
+        .await
+        .expect("closing the listener must not await the long-poll deadline");
+    assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+    let mut buf = [0; 1];
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), idle.read(&mut buf))
+            .await
+            .expect("idle connection closes during shutdown")
+            .unwrap(),
+        0
+    );
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(6)).await;
+    tokio::time::resume();
+    let (st, body) = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("in-flight reply finishes after listener shutdown")
+        .expect("client receives a complete HTTP response");
+    assert_eq!(st, 200, "{body:?}");
+    assert_eq!(body.expect("long-poll tip")["result"]["height"], 0);
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(25)).await;
+    tokio::time::resume();
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stalled.read_to_string(&mut response),
+    )
+    .await
+    .expect("stalled body still expires during shutdown")
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -962,7 +1125,9 @@ async fn empty_work_queue_is_http_503() {
     };
     let response = rpc_post(
         State(state),
-        Bytes::from_static(br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#),
+        axum::extract::Request::new(Body::from(
+            br#"{"jsonrpc":"1.0","id":1,"method":"getblockcount"}"#.as_slice(),
+        )),
     )
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
