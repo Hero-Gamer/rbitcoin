@@ -3271,13 +3271,22 @@ fn mine_versioned(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, version: i32, 
 
 /// Core's `testdummy` BIP9 states as a template reports them: DEFINED,
 /// STARTED, LOCKED_IN, ACTIVE, and back to STARTED when a reorg takes away
-/// the signal that locked it in. Regtest's 144-block period is checked
-/// against Core; a 4-block period with a threshold of 3 walks the same states.
+/// the signal that locked it in. A 4-block period with a threshold of 3 walks
+/// the same states as regtest's 144 and 108.
 #[test]
 fn template_versionbits_follow_regtest_testdummy() {
     const TOP: i64 = 0x2000_0000;
     const DUMMY: i64 = 1 << 28;
     let mut params = rbitcoin_consensus::ChainParams::regtest();
+    assert_eq!(
+        params.testdummy,
+        Some(rbitcoin_consensus::Bip9Deployment {
+            bit: 28,
+            period: 144,
+            threshold: 108,
+        }),
+        "Core regtest DEPLOYMENT_TESTDUMMY"
+    );
     params.testdummy = Some(rbitcoin_consensus::Bip9Deployment {
         bit: 28,
         period: 4,
@@ -3393,5 +3402,24 @@ fn proposal_of_a_known_block_is_a_duplicate() {
         "duplicate",
         "a block connected and then reorged off stays scripts-valid"
     );
+    let reorged_off = best_hash(&ctx);
+
+    let mut prev = connected.block_hash();
+    let mut time = connected.header.time;
+    for height in 3..=4 {
+        time += 1;
+        let block = rbitcoin_consensus::mine_regtest_paying(prev, time, height, true_spk(), vec![]);
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert!(r.is_null() || r == "inconclusive", "{r}");
+        prev = block.block_hash();
+    }
+    assert_eq!(best_hash(&ctx), json!(prev.to_string()), "the first branch is back");
+    let back = connected.block_hash().to_byte_array();
+    assert!(
+        !ctx.query.was_disconnected(&back),
+        "a reconnected block is no longer remembered as reorged off"
+    );
+    let off = parse_hash32_display(reorged_off.as_str().unwrap()).unwrap();
+    assert!(ctx.query.was_disconnected(&off));
     let _ = std::fs::remove_dir_all(&dir);
 }

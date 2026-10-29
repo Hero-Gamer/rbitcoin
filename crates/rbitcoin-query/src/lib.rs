@@ -418,7 +418,7 @@ pub struct Query {
     /// Regtest `testdummy` state per period-end hash.
     pub versionbits: versionbits::VersionBitsCache,
     /// Blocks this process connected and then disconnected (Core keeps
-    /// `BLOCK_VALID_SCRIPTS` on them). Grows by one per disconnect.
+    /// `BLOCK_VALID_SCRIPTS` on them). A reconnect drops the hash.
     pub disconnected: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// In-RAM body rows. `has_hash` is a map lookup on this mutex, not a scan.
     ///
