@@ -7,6 +7,7 @@ use bitcoin::script::Builder;
 use bitcoin::{Address, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
 use rbitcoin_net::Selected;
 use rbitcoin_primitives::{Height, Network};
+use rbitcoin_query::{ThresholdState, TESTDUMMY_BIT};
 
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -527,63 +528,75 @@ pub fn mocktime_i64(v: &Value) -> Result<i64, Value> {
     Ok(i)
 }
 
-/// Core `VERSIONBITS_TOP_BITS`. No testdummy bit.
-#[doc(hidden)]
-pub const GBT_VERSION: i32 = 0x2000_0000;
+const SEGWIT_RULE_REQUIRED: &str =
+    r#"getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})"#;
+const SIGNET_RULE_REQUIRED: &str = r#"getblocktemplate must be called with the signet rule set (call with {"rules": ["segwit", "signet"]})"#;
 
-pub fn gbt_rules(req: Option<&Value>) -> Result<Vec<String>, Value> {
-    let Some(obj) = req.and_then(Value::as_object) else {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        ));
+/// Core `setClientRules`: a `rules` array of strings. Anything else is no rules.
+fn gbt_client_rules(req: Option<&serde_json::Map<String, Value>>) -> Result<Vec<&str>, Value> {
+    let Some(rules) = req.and_then(|o| o.get("rules")).and_then(Value::as_array) else {
+        return Ok(Vec::new());
     };
-    let rules = obj.get("rules").and_then(Value::as_array).ok_or_else(|| {
-        rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        )
-    })?;
-    let names: Vec<String> = rules
+    rules
         .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    if !names.iter().any(|r| r == "segwit") {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        ));
-    }
-    Ok(names)
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                rpc_error(
+                    ERR_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        json_type_name(v)
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     refuse_unmaintained_template(ctx)?;
     params.reject_unknown(&["template_request"])?;
-    let req = params.get(0, "template_request");
-    let _rules = gbt_rules(req)?;
-    let mode = req
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("mode"))
-        .and_then(Value::as_str)
-        .unwrap_or("template");
-    match mode {
-        "template" | "" => {
-            if let Some(lp) = req
-                .and_then(Value::as_object)
-                .and_then(|o| o.get("longpollid"))
-                .and_then(Value::as_str)
-            {
-                gbt_longpoll_wait(ctx, lp);
-            }
-            gbt_template(ctx)
-        }
-        "proposal" => gbt_proposal(ctx, req),
-        other => Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            format!("Invalid mode: {other}"),
-        )),
+    let req = params.get(0, "template_request").and_then(Value::as_object);
+    let invalid_mode = || rpc_error(ERR_INVALID_PARAMETER, "Invalid mode");
+    let mode = match req.and_then(|o| o.get("mode")) {
+        None | Some(Value::Null) => "template",
+        Some(Value::String(m)) => m.as_str(),
+        Some(_) => return Err(invalid_mode()),
+    };
+    if mode == "proposal" {
+        return gbt_proposal(ctx, req);
     }
+    let rules = gbt_client_rules(req)?;
+    if mode != "template" {
+        return Err(invalid_mode());
+    }
+    if matches!(ctx.network, Network::Mainnet) {
+        if super::net::connection_count(ctx) == 0 {
+            return Err(rpc_error(
+                ERR_CLIENT_NOT_CONNECTED,
+                "Bitcoin Core is not connected!",
+            ));
+        }
+        if super::chain::in_ibd(ctx) {
+            return Err(rpc_error(
+                ERR_CLIENT_IN_INITIAL_DOWNLOAD,
+                "Bitcoin Core is in initial sync and waiting for blocks...",
+            ));
+        }
+    }
+    if let Some(lp) = req
+        .and_then(|o| o.get("longpollid"))
+        .and_then(Value::as_str)
+    {
+        gbt_longpoll_wait(ctx, lp);
+    }
+    if gbt_params(ctx).signet_challenge.is_some() && !rules.contains(&"signet") {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, SIGNET_RULE_REQUIRED));
+    }
+    if !rules.contains(&"segwit") {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, SEGWIT_RULE_REQUIRED));
+    }
+    gbt_template(ctx)
 }
 
 /// Core GBT longpoll: block while `longpollid` still matches the live tip +
@@ -662,6 +675,13 @@ pub fn gbt_longpoll_id(ctx: &RpcContext) -> String {
     }
 }
 
+fn gbt_params(ctx: &RpcContext) -> rbitcoin_consensus::ChainParams {
+    ctx.chain
+        .as_ref()
+        .map(|c| c.params.clone())
+        .unwrap_or_else(|| rbitcoin_consensus::ChainParams::for_network(ctx.network))
+}
+
 pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     refuse_unmaintained_template(ctx)?;
     let GbtTip::Ready(tip_h, prev_hex, tip_bits) = gbt_tip(ctx)? else {
@@ -673,11 +693,13 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         .map(|m| m.template_updates())
         .unwrap_or(0);
     let next_h = tip_h.saturating_add(1);
-    let params = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.params.clone())
-        .unwrap_or_else(|| rbitcoin_consensus::ChainParams::for_network(ctx.network));
+    let params = gbt_params(ctx);
+    let pre_segwit = next_h < params.segwit_height();
+    let legacy_scale = if pre_segwit { 4 } else { 1 };
+    let testdummy = ctx
+        .query
+        .testdummy_state(&params, Height(tip_h))
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let now = ctx
         .chain
         .as_ref()
@@ -713,7 +735,7 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
             "hash": tx.compute_wtxid().to_string(),
             "depends": depends,
             "fee": sel.fee_sat,
-            "sigops": sel.sigop_cost,
+            "sigops": sel.sigop_cost / legacy_scale,
             "weight": tx.weight().to_wu(),
         }));
     }
@@ -723,36 +745,62 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     if let Some(c) = ctx.chain.as_ref() {
         c.note_gbt_assembled();
     }
-    let wtxids: Vec<[u8; 32]> = selected
+    let wtxids = selected
         .iter()
-        .map(|(tx, _)| tx.compute_wtxid().to_byte_array())
-        .collect();
+        .map(|(tx, _)| tx.compute_wtxid().to_byte_array());
     let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
+    let mut rules = vec!["csv"];
+    if !pre_segwit {
+        rules.extend(["!segwit", "taproot"]);
+    }
+    if params.signet_challenge.is_some() {
+        rules.push("!signet");
+    }
+    let mut vbavailable = serde_json::Map::new();
+    let mut version = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.gbt_block_version(testdummy))
+        .unwrap_or_else(|| testdummy.block_version());
+    match testdummy {
+        ThresholdState::Started => {
+            vbavailable.insert("testdummy".into(), json!(TESTDUMMY_BIT));
+        }
+        ThresholdState::LockedIn => {
+            version |= 1 << TESTDUMMY_BIT;
+            vbavailable.insert("testdummy".into(), json!(TESTDUMMY_BIT));
+        }
+        ThresholdState::Active => rules.push("testdummy"),
+        ThresholdState::Defined | ThresholdState::Failed => {}
+    }
     let mut template = json!({
         "capabilities": ["proposal"],
-        "version": ctx
-            .chain
-            .as_ref()
-            .map(|c| c.gbt_block_version())
-            .unwrap_or(GBT_VERSION | (1 << 28)),
+        "version": version,
+        "rules": rules,
+        "vbavailable": vbavailable,
+        "vbrequired": 0,
         "previousblockhash": prev_hex,
         "transactions": tx_json,
-        "coinbaseaux": { "flags": "" },
+        "coinbaseaux": {},
         "coinbasevalue": subsidy.saturating_add(fees),
         "longpollid": longpollid,
         "target": format!("{target:064x}"),
         "mintime": mintime,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
-        "sigoplimit": rbitcoin_consensus::block::MAX_BLOCK_SIGOPS_COST,
-        "sizelimit": 4_000_000,
-        "weightlimit": 4_000_000,
+        "sigoplimit": rbitcoin_consensus::block::MAX_BLOCK_SIGOPS_COST / legacy_scale,
+        "sizelimit": 4_000_000 / legacy_scale,
         "curtime": curtime,
         "bits": format!("{bits:08x}"),
         "height": next_h,
-        "rules": ["segwit"],
-        "default_witness_commitment": rbitcoin_primitives::hex_encode(&(witness_commit)),
+        "default_witness_commitment": rbitcoin_primitives::hex_encode(&witness_commit),
     });
+    if !pre_segwit {
+        template["weightlimit"] = json!(4_000_000);
+    }
+    if let Some(challenge) = &params.signet_challenge {
+        template["signet_challenge"] = json!(rbitcoin_primitives::hex_encode(challenge.as_bytes()));
+    }
     let warnings = rpc_warnings(ctx);
     if !warnings.is_empty() {
         template["warnings"] = json!(warnings);
@@ -760,12 +808,14 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     Ok(template)
 }
 
-pub fn gbt_proposal(ctx: &RpcContext, req: Option<&Value>) -> Result<Value, Value> {
+pub fn gbt_proposal(
+    ctx: &RpcContext,
+    req: Option<&serde_json::Map<String, Value>>,
+) -> Result<Value, Value> {
     let data = req
-        .and_then(Value::as_object)
         .and_then(|o| o.get("data"))
         .and_then(Value::as_str)
-        .ok_or_else(|| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
+        .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "Missing data String key for proposal"))?;
     let raw = rbitcoin_primitives::hex_decode(data)
         .map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
     let block: Block =
