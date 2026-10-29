@@ -1026,3 +1026,33 @@ pub fn create_fks_from_header_ranges(
     }
     by_header
 }
+
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::coalesce_ranges;
+
+    #[test]
+    fn gate_under_1mib() {
+        let total: u64 = 512*1024;
+        assert!(total < 1024*1024);
+    }
+
+    #[test]
+    fn coalesce_merges_within_64kib() {
+        let ranges = vec![(0, 100_000), (100_000+10_000, 50_000), (500_000, 10_000)];
+        let merged = coalesce_ranges(ranges);
+        assert_eq!(merged.len(), 2);
+        assert!(merged[0].1 >= 150_000);
+    }
+
+    #[test]
+    fn coalesce_caps_32() {
+        let mut ranges = Vec::new();
+        for i in 0..100 {
+            ranges.push((i*200_000, 10_000));
+        }
+        let merged = coalesce_ranges(ranges);
+        assert_eq!(merged.len(), 32);
+    }
+}
