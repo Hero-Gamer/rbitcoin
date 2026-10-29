@@ -16,7 +16,6 @@ pub use chain::{tip_hash_height, wait_timeout_ms};
 
 /// Cap for `waitfor*` and `getblocktemplate` long-poll. Not a knob.
 pub const RPC_WAIT_TIMEOUT_MS: u64 = 120_000;
-pub use mine::gbt_longpoll_id;
 pub use mine::{gbt_template, submit_received_block};
 pub use rest::{dispatch_rest, RestReply};
 thread_local! {

@@ -1001,7 +1001,7 @@ async fn waitforblock_positional_hash_returns_current_tip() {
         "jsonrpc": "1.0",
         "id": 5,
         "method": "getblocktemplate",
-        "params": [{"rules": ["segwit"], "longpollid": "00"}]
+        "params": [{"rules": ["segwit"], "longpollid": "0000000000000000000000000000000000000000000000000000000000000000"}]
     });
     let t3 = std::time::Instant::now();
     let (st, body) = tokio::time::timeout(
@@ -2079,7 +2079,19 @@ async fn http_wait_is_an_active_command_while_it_waits() {
 #[tokio::test]
 async fn http_longpoll_logs_the_request_once_before_it_waits() {
     let (ctx, _dir) = http_wait_ctx();
-    let current = rbitcoin_rpc::methods::gbt_longpoll_id(&ctx);
+    let malformed = serde_json::json!({
+        "method": "getblocktemplate",
+        "params": [{ "rules": ["segwit"], "longpollid": "x" }],
+        "id": 1
+    });
+    assert!(
+        !satisfy_http_wait(&ctx, &malformed).await,
+        "a longpollid Core cannot parse is the request's error, not a wait"
+    );
+    let current = format!(
+        "{}0",
+        rbitcoin_rpc::methods::tip_hash_height(&ctx).unwrap().0
+    );
     let req = serde_json::json!({
         "method": "getblocktemplate",
         "params": [{ "rules": ["segwit"], "longpollid": current }],

@@ -440,7 +440,8 @@ pub async fn satisfy_http_wait(
     ctx: &Arc<crate::methods::RpcContext>,
     parsed: &serde_json::Value,
 ) -> bool {
-    use crate::methods::{gbt_longpoll_id, tip_hash_height, wait_timeout_ms, RpcParams};
+    use crate::methods::mine::{gbt_request, GbtRequest};
+    use crate::methods::{tip_hash_height, wait_timeout_ms, RpcParams};
     let Some(method) = parsed.get("method").and_then(|m| m.as_str()) else {
         return false;
     };
@@ -456,13 +457,18 @@ pub async fn satisfy_http_wait(
     };
     let mut tips = ctx.chain.as_ref().map(|c| c.subscribe_tips());
     if method == "getblocktemplate" {
-        let Some(want) = params
-            .get(0, "template_request")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|o| o.get("longpollid"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-        else {
+        let want = {
+            let ctx = Arc::clone(ctx);
+            let params = params.clone();
+            tokio::task::spawn_blocking(move || match gbt_request(&ctx, &params) {
+                Ok(GbtRequest::Template { longpoll, .. }) => longpoll,
+                _ => None,
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        let Some(want) = want else {
             return false;
         };
         rbitcoin_log::info!("ThreadRPCServer method=getblocktemplate");
@@ -478,7 +484,7 @@ pub async fn satisfy_http_wait(
                 let ctx = Arc::clone(&ctx);
                 let want = want.clone();
                 tokio::task::spawn_blocking(move || {
-                    ctx.stop.load(Ordering::SeqCst) || gbt_longpoll_id(&ctx) != want
+                    ctx.stop.load(Ordering::SeqCst) || want.changed(&ctx)
                 })
                 .await
                 .unwrap_or(true)

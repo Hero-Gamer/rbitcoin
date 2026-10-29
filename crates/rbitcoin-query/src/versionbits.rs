@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use rbitcoin_consensus::ChainParams;
 use rbitcoin_primitives::Height;
-use rbitcoin_store::StoreError;
+use rbitcoin_store::{HeaderRecord, StoreError};
 
 use crate::{Query, QueryError};
 
@@ -55,27 +55,37 @@ impl Query {
             return Ok(ThresholdState::Failed);
         }
         let next = tip.0.saturating_add(1);
+        let period_start = next - next % REGTEST_PERIOD;
+        if period_start == 0 {
+            return Ok(ThresholdState::Defined);
+        }
+        let (_, mut end) = self
+            .header_at_height(Height(period_start - 1))?
+            .ok_or(StoreError::NotFound)?;
+        let mut end_height = period_start - 1;
         let mut cache = self.versionbits.0.lock().expect("versionbits cache");
         let mut state = ThresholdState::Defined;
         let mut uncached = Vec::new();
-        let mut period_start = next - next % REGTEST_PERIOD;
-        while period_start >= REGTEST_PERIOD {
-            let end = Height(period_start - 1);
-            let hash = self.confirmed_hash_at(end)?;
-            if let Some(known) = cache.get(&hash) {
+        loop {
+            if let Some(known) = cache.get(&end.hash) {
                 state = *known;
                 break;
             }
-            uncached.push((end, hash));
-            period_start -= REGTEST_PERIOD;
+            let (signals, prev_end) = self.testdummy_period(&end, end_height)?;
+            uncached.push((end.hash, signals));
+            match prev_end {
+                Some(prev) => {
+                    end = prev;
+                    end_height -= REGTEST_PERIOD;
+                }
+                None => break,
+            }
         }
-        for (end, hash) in uncached.into_iter().rev() {
+        for (hash, signals) in uncached.into_iter().rev() {
             state = match state {
                 // Start time 0: every median time past is at or after it.
                 ThresholdState::Defined => ThresholdState::Started,
-                ThresholdState::Started if self.testdummy_signals(end)? >= REGTEST_THRESHOLD => {
-                    ThresholdState::LockedIn
-                }
+                ThresholdState::Started if signals >= REGTEST_THRESHOLD => ThresholdState::LockedIn,
                 ThresholdState::LockedIn => ThresholdState::Active,
                 other => other,
             };
@@ -84,27 +94,29 @@ impl Query {
         Ok(state)
     }
 
-    fn confirmed_hash_at(&self, height: Height) -> Result<[u8; 32], QueryError> {
-        Ok(self
-            .header_at_height(height)?
-            .ok_or(StoreError::NotFound)?
-            .1
-            .hash)
-    }
-
-    /// Core `VersionBitsConditionChecker::Condition` over the period ending at `end`.
-    fn testdummy_signals(&self, end: Height) -> Result<usize, QueryError> {
-        let mut n = 0;
-        for h in end.0 + 1 - REGTEST_PERIOD..=end.0 {
-            let (_, rec) = self
-                .header_at_height(Height(h))?
-                .ok_or(StoreError::NotFound)?;
-            if rec.version & VERSIONBITS_TOP_MASK == VERSIONBITS_TOP_BITS
+    /// Core `VersionBitsConditionChecker::Condition` count over the period
+    /// ending at `end`, read through `prev_fk` so a reorg cannot mix chains.
+    /// Also returns the previous period's last header, `None` before genesis.
+    fn testdummy_period(
+        &self,
+        end: &HeaderRecord,
+        end_height: u32,
+    ) -> Result<(usize, Option<HeaderRecord>), QueryError> {
+        let signals = |rec: &HeaderRecord| {
+            rec.version & VERSIONBITS_TOP_MASK == VERSIONBITS_TOP_BITS
                 && rec.version & TESTDUMMY_MASK != 0
-            {
-                n += 1;
-            }
+        };
+        let mut rec = end.clone();
+        let mut n = usize::from(signals(&rec));
+        for _ in 1..REGTEST_PERIOD {
+            rec = self.store.get_header(rec.prev_fk)?;
+            n += usize::from(signals(&rec));
         }
-        Ok(n)
+        let prev_end = if end_height < REGTEST_PERIOD {
+            None
+        } else {
+            Some(self.store.get_header(rec.prev_fk)?)
+        };
+        Ok((n, prev_end))
     }
 }

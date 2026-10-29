@@ -553,7 +553,17 @@ fn gbt_client_rules(req: Option<&serde_json::Map<String, Value>>) -> Result<Vec<
         .collect()
 }
 
-pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+/// A `getblocktemplate` request after Core's checks that come before the
+/// longpoll wait.
+pub enum GbtRequest<'a> {
+    Proposal(Option<&'a serde_json::Map<String, Value>>),
+    Template {
+        rules: Vec<&'a str>,
+        longpoll: Option<LongpollWant>,
+    },
+}
+
+pub fn gbt_request<'a>(ctx: &RpcContext, params: &'a RpcParams) -> Result<GbtRequest<'a>, Value> {
     refuse_unmaintained_template(ctx)?;
     params.reject_unknown(&["template_request"])?;
     let req = params.get(0, "template_request").and_then(Value::as_object);
@@ -564,7 +574,7 @@ pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<V
         Some(_) => return Err(invalid_mode()),
     };
     if mode == "proposal" {
-        return gbt_proposal(ctx, req);
+        return Ok(GbtRequest::Proposal(req));
     }
     let rules = gbt_client_rules(req)?;
     if mode != "template" {
@@ -584,11 +594,25 @@ pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<V
             ));
         }
     }
-    if let Some(lp) = req
-        .and_then(|o| o.get("longpollid"))
-        .and_then(Value::as_str)
-    {
-        gbt_longpoll_wait(ctx, lp);
+    let longpoll = match req.and_then(|o| o.get("longpollid")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(LongpollWant::parse(id)?),
+        // Core: a non-string id waits on the current tip and counter.
+        Some(_) => Some(LongpollWant::current(ctx)),
+    };
+    Ok(GbtRequest::Template { rules, longpoll })
+}
+
+pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
+    let (rules, longpoll) = match gbt_request(ctx, params)? {
+        GbtRequest::Proposal(req) => return gbt_proposal(ctx, req),
+        GbtRequest::Template { rules, longpoll } => (rules, longpoll),
+    };
+    if let Some(want) = longpoll {
+        gbt_longpoll_wait(ctx, &want);
+        if ctx.stop.load(Ordering::Relaxed) {
+            return Err(rpc_error(ERR_CLIENT_NOT_CONNECTED, "Shutting down"));
+        }
     }
     if gbt_params(ctx).signet_challenge.is_some() && !rules.contains(&"signet") {
         return Err(rpc_error(ERR_INVALID_PARAMETER, SIGNET_RULE_REQUIRED));
@@ -599,21 +623,103 @@ pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<V
     gbt_template(ctx)
 }
 
-/// Core GBT longpoll: block while `longpollid` still matches the live tip +
-/// mempool update counter. Tip change (P2P / generate) wakes within one poll
-/// tick. A new mempool tx or `prioritisetransaction` does too.
-pub(crate) fn gbt_longpoll_wait(ctx: &RpcContext, want: &str) {
+/// Core BIP22 `longpollid`: the watched tip and mempool update counter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LongpollWant {
+    /// Lowercase display hex. `None` while the template tip is stale.
+    tip: Option<String>,
+    updates: u32,
+}
+
+impl LongpollWant {
+    /// Core `ParseHashV` on the first 64 bytes, `LocaleIndependentAtoi` on the rest.
+    fn parse(id: &str) -> Result<Self, Value> {
+        let bytes = id.as_bytes();
+        let (head, rest) = bytes.split_at(bytes.len().min(64));
+        let head_text = String::from_utf8_lossy(head);
+        if head.len() != 64 {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                format!(
+                    "longpollid must be of length 64 (not {}, for '{head_text}')",
+                    head.len()
+                ),
+            ));
+        }
+        if !head.iter().all(u8::is_ascii_hexdigit) {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                format!("longpollid must be hexadecimal string (not '{head_text}')"),
+            ));
+        }
+        Ok(Self {
+            tip: Some(head_text.to_ascii_lowercase()),
+            updates: locale_independent_atoi(rest) as u32,
+        })
+    }
+
+    pub fn current(ctx: &RpcContext) -> Self {
+        let updates = ctx
+            .mempool
+            .as_ref()
+            .map(|m| m.template_updates() as u32)
+            .unwrap_or(0);
+        let tip = match gbt_tip(ctx) {
+            Ok(GbtTip::Ready(_, hex, _)) => Some(hex),
+            _ => None,
+        };
+        Self { tip, updates }
+    }
+
+    pub fn changed(&self, ctx: &RpcContext) -> bool {
+        Self::current(ctx) != *self
+    }
+}
+
+/// Core `LocaleIndependentAtoi<int64_t>`: leading whitespace, one `+` or
+/// `-`, then digits up to the first non-digit. Saturates; no digits is 0.
+fn locale_independent_atoi(s: &[u8]) -> i64 {
+    let s = &s[s
+        .iter()
+        .take_while(|c| b" \x0c\n\r\t\x0b".contains(c))
+        .count()..];
+    let s = match s {
+        [b'+', b'-', ..] => return 0,
+        [b'+', rest @ ..] => rest,
+        _ => s,
+    };
+    let (negative, digits) = match s {
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, s),
+    };
+    let mut v: i64 = 0;
+    for d in digits.iter().take_while(|c| c.is_ascii_digit()) {
+        let d = i64::from(d - b'0');
+        let next = v.checked_mul(10).and_then(|v| {
+            if negative {
+                v.checked_sub(d)
+            } else {
+                v.checked_add(d)
+            }
+        });
+        v = match next {
+            Some(v) => v,
+            None if negative => return i64::MIN,
+            None => return i64::MAX,
+        };
+    }
+    v
+}
+
+/// Core GBT longpoll: block while the watched tip and mempool update counter
+/// still hold. Tip change (P2P / generate) wakes within one poll tick. A new
+/// mempool tx or `prioritisetransaction` does too.
+fn gbt_longpoll_wait(ctx: &RpcContext, want: &LongpollWant) {
     const TICK: std::time::Duration = std::time::Duration::from_millis(50);
     if super::http_wait_satisfied() {
         return;
     }
-    loop {
-        if ctx.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        if gbt_longpoll_id(ctx) != want {
-            return;
-        }
+    while !ctx.stop.load(Ordering::Relaxed) && !want.changed(ctx) {
         std::thread::sleep(TICK);
     }
 }
@@ -663,18 +769,6 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
     Ok(anchor_of(h.0, rec.hash, rec.bits))
 }
 
-pub fn gbt_longpoll_id(ctx: &RpcContext) -> String {
-    let updates = ctx
-        .mempool
-        .as_ref()
-        .map(|m| m.template_updates())
-        .unwrap_or(0);
-    match gbt_tip(ctx) {
-        Ok(GbtTip::Ready(_, hex, _)) => format!("{hex}{updates}"),
-        _ => format!("stale{updates}"),
-    }
-}
-
 fn gbt_params(ctx: &RpcContext) -> rbitcoin_consensus::ChainParams {
     ctx.chain
         .as_ref()
@@ -690,7 +784,7 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     let updates = ctx
         .mempool
         .as_ref()
-        .map(|m| m.template_updates())
+        .map(|m| m.template_updates() as u32)
         .unwrap_or(0);
     let next_h = tip_h.saturating_add(1);
     let params = gbt_params(ctx);
@@ -820,10 +914,36 @@ pub fn gbt_proposal(
         .map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
     let block: Block =
         deserialize(&raw).map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
+    if let Some(known) = proposal_duplicate(ctx, &block.block_hash())? {
+        return Ok(json!(known));
+    }
     match gbt_check_proposal(ctx, &block) {
         Ok(()) => Ok(Value::Null),
         Err(s) => Ok(json!(s)),
     }
+}
+
+/// Core's block-index lookup before a proposal is checked. Connected is
+/// `duplicate`; this node keeps no scripts-valid mark for a block off the
+/// active chain, so any other known header is `duplicate-inconclusive`.
+fn proposal_duplicate(ctx: &RpcContext, hash: &BlockHash) -> Result<Option<&'static str>, Value> {
+    let bytes = hash.to_byte_array();
+    let connected = ctx
+        .query
+        .height_of_hash(&bytes)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .is_some();
+    if connected {
+        return Ok(Some("duplicate"));
+    }
+    let Some(chain) = ctx.chain.as_ref() else {
+        return Ok(None);
+    };
+    if chain.is_block_invalid(hash) {
+        return Ok(Some("duplicate-invalid"));
+    }
+    let known = chain.stored_header_height(hash).is_some() || chain.held_body(hash).is_some();
+    Ok(known.then_some("duplicate-inconclusive"))
 }
 
 /// Core `TestBlockValidity` for GBT proposal: no PoW, no UTXO write.

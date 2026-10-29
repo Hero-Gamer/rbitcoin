@@ -10,5 +10,8 @@ Fixed
   `weightlimit`. Signet requires the `signet` rule and returns
   `signet_challenge`. Request errors match Core: a proposal needs no rules,
   a missing `data` is `-3`, a non-string rule is `-3`, and a mode that is not
-  `template` or `proposal` is `-8` `Invalid mode`. Esplora
+  `template` or `proposal` is `-8` `Invalid mode`. A malformed `longpollid` is
+  `-8`, and a proposal of a block the node already has is `duplicate`,
+  `duplicate-invalid`, or `duplicate-inconclusive`. On mainnet a template
+  needs a peer and a node out of IBD. Esplora
   `GET /block-template` and the SV2 template version follow.

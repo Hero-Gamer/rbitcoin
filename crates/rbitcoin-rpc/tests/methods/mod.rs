@@ -5681,6 +5681,43 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         (ERR_DESERIALIZATION, "Block decode failed".to_owned()),
         "a proposal needs no rules"
     );
+    assert_eq!(
+        gbt_err(&ctx, json!({"rules": ["segwit"], "longpollid": "x"})),
+        (
+            ERR_INVALID_PARAMETER,
+            "longpollid must be of length 64 (not 1, for 'x')".to_owned()
+        )
+    );
+    let not_hex = "z".repeat(64);
+    assert_eq!(
+        gbt_err(
+            &ctx,
+            json!({"rules": ["segwit"], "longpollid": format!("{not_hex}7")})
+        ),
+        (
+            ERR_INVALID_PARAMETER,
+            format!("longpollid must be hexadecimal string (not '{not_hex}')")
+        )
+    );
+    assert_eq!(
+        gbt_err(&ctx, json!({"rules": [1], "longpollid": "x"})).0,
+        ERR_TYPE_ERROR,
+        "rules are read before the longpoll"
+    );
+    let other_tip = dispatch(
+        &ctx,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit"], "longpollid": format!("{}0", "AB".repeat(32))})],
+    )
+    .unwrap();
+    assert_eq!(other_tip["previousblockhash"], gbt["previousblockhash"]);
+    let mut stopping = ctx_without_chain(&ctx);
+    stopping.stop = Arc::new(AtomicBool::new(true));
+    assert_eq!(
+        gbt_err(&stopping, json!({"rules": ["segwit"], "longpollid": 5})),
+        (ERR_CLIENT_NOT_CONNECTED, "Shutting down".to_owned()),
+        "a non-string longpollid waits on the current tip"
+    );
     let mut signet = ctx_without_chain(&ctx);
     signet.network = Network::Signet;
     assert_eq!(

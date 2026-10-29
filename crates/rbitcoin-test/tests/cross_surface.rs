@@ -482,7 +482,7 @@ async fn spawn_wait_and_gbt_longpoll(rpc_addr: SocketAddr, want_height: u64) -> 
     let stale = jsonrpc(
         rpc_addr,
         "getblocktemplate",
-        json!([{"rules": ["segwit"], "longpollid": "not-this-id"}]),
+        json!([{"rules": ["segwit"], "longpollid": "0000000000000000000000000000000000000000000000000000000000000000"}]),
     )
     .await;
     assert!(

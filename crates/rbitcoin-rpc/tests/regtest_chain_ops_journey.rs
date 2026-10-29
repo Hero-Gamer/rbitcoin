@@ -1866,7 +1866,7 @@ fn chain_ops_template_sigops_and_script_reject(ctx: &RpcContext, cbs: &mut TrueC
     let stale = dispatch(
         ctx,
         "getblocktemplate",
-        vec![json!({"rules": ["segwit"], "longpollid": "not-this-id"})],
+        vec![json!({"rules": ["segwit"], "longpollid": "0000000000000000000000000000000000000000000000000000000000000000"})],
     )
     .unwrap();
     assert_eq!(stale["longpollid"], lp);
@@ -3349,5 +3349,28 @@ fn template_before_segwit_uses_legacy_limits() {
     assert_eq!(t["rules"], json!(["csv", "!segwit", "taproot"]), "{t}");
     assert_eq!(t["sigoplimit"], 80_000);
     assert_eq!(t["weightlimit"], 4_000_000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core looks a proposal up in its block index before checking it.
+#[test]
+fn proposal_of_a_known_block_is_a_duplicate() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
+    let tip = best_hash(&ctx);
+    let raw = dispatch(&ctx, "getblock", vec![tip.clone(), json!(0)]).unwrap();
+    let connected: Block =
+        deserialize(&rbitcoin_primitives::hex_decode(raw.as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(propose(&ctx, &connected), "duplicate");
+
+    let mut header_only = proposal_on_tip(&ctx, vec![]);
+    regrind(&mut header_only);
+    let header_hex =
+        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&header_only.header));
+    dispatch(&ctx, "submitheader", vec![json!(header_hex)]).unwrap();
+    assert_eq!(propose(&ctx, &header_only), "duplicate-inconclusive");
+
+    dispatch(&ctx, "invalidateblock", vec![tip]).unwrap();
+    assert_eq!(propose(&ctx, &connected), "duplicate-invalid");
     let _ = std::fs::remove_dir_all(&dir);
 }
