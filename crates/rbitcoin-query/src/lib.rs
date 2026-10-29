@@ -101,7 +101,9 @@ pub use soft_densify::{
 };
 pub use sp_read::{tweaks_at_height, tweaks_for_height, tweaks_from_thin_and_body};
 pub use sp_tweaks::{BlockSpOutpoints, ThinTweakRangeLimits, ThinTweakRow};
-pub use versionbits::{ThresholdState, TESTDUMMY_BIT, VERSIONBITS_TOP_BITS};
+pub use versionbits::{
+    compute_block_version, DeploymentState, ThresholdState, VERSIONBITS_TOP_BITS,
+};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header as BlockHeader, Version as BlockVersion};
@@ -415,6 +417,9 @@ pub struct Query {
     pub bip34_ancestor: std::sync::Mutex<Option<crate::chain_view::Bip34AncestorNote>>,
     /// Regtest `testdummy` state per period-end hash.
     pub versionbits: versionbits::VersionBitsCache,
+    /// Blocks this process connected and then disconnected (Core keeps
+    /// `BLOCK_VALID_SCRIPTS` on them). Grows by one per disconnect.
+    pub disconnected: std::sync::Mutex<std::collections::HashSet<[u8; 32]>>,
     /// In-RAM body rows. `has_hash` is a map lookup on this mutex, not a scan.
     ///
     /// RAM-only by design: avoids double-writing every block (queue + Class A).
@@ -634,6 +639,7 @@ impl Query {
             confirm_parents: confirm_parent_cache::ConfirmParentCache::new(),
             bip34_ancestor: std::sync::Mutex::new(None),
             versionbits: versionbits::VersionBitsCache::default(),
+            disconnected: std::sync::Mutex::new(std::collections::HashSet::new()),
             block_queue: Mutex::new(rbitcoin_store::BlockQueue::open_or_create(&store_path)?),
             bq_resolved: Mutex::new(HashMap::new()),
             block_queue_pressure: AtomicBool::new(false),

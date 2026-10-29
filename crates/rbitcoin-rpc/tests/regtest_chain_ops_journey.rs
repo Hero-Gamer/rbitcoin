@@ -3269,14 +3269,21 @@ fn mine_versioned(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, version: i32, 
     }
 }
 
-/// Core regtest `testdummy` (bit 28, 144-block periods, 108 to lock in) as a
-/// BIP9 template reports it: DEFINED, STARTED, LOCKED_IN, ACTIVE, and back to
-/// STARTED when a reorg takes away the signal that locked it in.
+/// Core's `testdummy` BIP9 states as a template reports them: DEFINED,
+/// STARTED, LOCKED_IN, ACTIVE, and back to STARTED when a reorg takes away
+/// the signal that locked it in. Regtest's 144-block period is checked
+/// against Core; a 4-block period with a threshold of 3 walks the same states.
 #[test]
 fn template_versionbits_follow_regtest_testdummy() {
     const TOP: i64 = 0x2000_0000;
     const DUMMY: i64 = 1 << 28;
-    let (ctx, dir, hub) = ctx_regtest_hub();
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.testdummy = Some(rbitcoin_consensus::Bip9Deployment {
+        bit: 28,
+        period: 4,
+        threshold: 3,
+    });
+    let (ctx, dir, hub) = ctx_regtest_hub_on(params, 300_000_000);
     let defined = bip9_template(&ctx);
     assert_eq!(defined["version"], TOP, "{defined}");
     assert_eq!(defined["rules"], json!(["csv", "!segwit", "taproot"]));
@@ -3284,23 +3291,23 @@ fn template_versionbits_follow_regtest_testdummy() {
     assert_eq!(defined["vbrequired"], 0);
     assert_eq!(defined["coinbaseaux"], json!({}));
 
-    dispatch(&ctx, "generate", vec![json!(143)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(3)]).unwrap();
     let started = bip9_template(&ctx);
     assert_eq!(started["version"], TOP | DUMMY, "{started}");
     assert_eq!(started["vbavailable"], json!({"testdummy": 28}));
     assert_eq!(started["rules"], json!(["csv", "!segwit", "taproot"]));
 
-    mine_versioned(&ctx, &hub, (TOP | DUMMY) as i32, 107);
-    dispatch(&ctx, "generate", vec![json!(37)]).unwrap();
+    mine_versioned(&ctx, &hub, (TOP | DUMMY) as i32, 2);
+    dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
     hub.set_block_version(1337);
-    assert_eq!(bip9_template(&ctx)["version"], 1337, "107 signals stay STARTED");
+    assert_eq!(bip9_template(&ctx)["version"], 1337, "2 of 3 signals stay STARTED");
     hub.set_block_version(0);
 
-    dispatch(&ctx, "generate", vec![json!(36)]).unwrap();
-    mine_versioned(&ctx, &hub, (TOP | DUMMY) as i32, 108);
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    mine_versioned(&ctx, &hub, (TOP | DUMMY) as i32, 3);
     let last_signal = best_hash(&ctx);
     let locked = bip9_template(&ctx);
-    assert_eq!(locked["height"], 432);
+    assert_eq!(locked["height"], 12);
     assert_eq!(locked["version"], TOP | DUMMY, "{locked}");
     assert_eq!(locked["vbavailable"], json!({"testdummy": 28}));
     assert_eq!(locked["rules"], json!(["csv", "!segwit", "taproot"]));
@@ -3308,17 +3315,17 @@ fn template_versionbits_follow_regtest_testdummy() {
     assert_eq!(bip9_template(&ctx)["version"], 1337 | DUMMY, "LOCKED_IN sets the bit");
     hub.set_block_version(0);
 
-    dispatch(&ctx, "generate", vec![json!(144)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(4)]).unwrap();
     let active = bip9_template(&ctx);
-    assert_eq!(active["height"], 576);
+    assert_eq!(active["height"], 16);
     assert_eq!(active["version"], TOP, "{active}");
     assert_eq!(active["vbavailable"], json!({}));
     assert_eq!(active["rules"], json!(["csv", "!segwit", "taproot", "testdummy"]));
 
     dispatch(&ctx, "invalidateblock", vec![last_signal]).unwrap();
-    dispatch(&ctx, "generate", vec![json!(145)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(5)]).unwrap();
     let reorged = bip9_template(&ctx);
-    assert_eq!(reorged["height"], 576);
+    assert_eq!(reorged["height"], 16);
     assert_eq!(reorged["version"], TOP | DUMMY, "{reorged}");
     assert_eq!(reorged["vbavailable"], json!({"testdummy": 28}));
     assert_eq!(reorged["rules"], json!(["csv", "!segwit", "taproot"]));
@@ -3327,13 +3334,13 @@ fn template_versionbits_follow_regtest_testdummy() {
 
 /// Core `fPreSegWit`: before segwit the template drops `!segwit`/`taproot`
 /// and the weight limit, and counts legacy sigops. Core 32 keeps the witness
-/// commitment.
+/// commitment. The mature pad is read with segwit at height 103.
 #[test]
 fn template_before_segwit_uses_legacy_limits() {
     let mut params = rbitcoin_consensus::ChainParams::regtest();
-    params.segwit_height_overlay = Some(120);
-    let (ctx, dir, _hub) = ctx_regtest_hub_on(params, 300_000_000);
-    dispatch(&ctx, "generate", vec![json!(101)]).unwrap();
+    params.segwit_height_overlay = Some(103);
+    let (ctx, dir, hub) = ctx_from_mature_pad_on(params, 300_000_000);
+    assert_eq!(hub.tip_height(), Some(101));
     let cb = generated_coinbase_value(&ctx, 1);
     let checksig = spend_generated_coinbase(&ctx, 1, cb - 1_000, ScriptBuf::from_bytes(vec![0xac])).1;
     dispatch(&ctx, "sendrawtransaction", vec![json!(tx_hex(&checksig))]).unwrap();
@@ -3344,7 +3351,7 @@ fn template_before_segwit_uses_legacy_limits() {
     assert!(t.get("weightlimit").is_none(), "{t}");
     assert!(t.get("default_witness_commitment").is_some(), "{t}");
     assert_eq!(t["transactions"][0]["sigops"], 1, "{t}");
-    dispatch(&ctx, "generate", vec![json!(18)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
     let t = bip9_template(&ctx);
     assert_eq!(t["rules"], json!(["csv", "!segwit", "taproot"]), "{t}");
     assert_eq!(t["sigoplimit"], 80_000);
@@ -3370,7 +3377,21 @@ fn proposal_of_a_known_block_is_a_duplicate() {
     dispatch(&ctx, "submitheader", vec![json!(header_hex)]).unwrap();
     assert_eq!(propose(&ctx, &header_only), "duplicate-inconclusive");
 
-    dispatch(&ctx, "invalidateblock", vec![tip]).unwrap();
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
     assert_eq!(propose(&ctx, &connected), "duplicate-invalid");
+
+    dispatch(
+        &ctx,
+        "generatetodescriptor",
+        vec![json!(2), json!("raw(52)#qu92mhx7")],
+    )
+    .unwrap();
+    dispatch(&ctx, "reconsiderblock", vec![tip.clone()]).unwrap();
+    assert_ne!(best_hash(&ctx), tip, "the heavier branch stays the tip");
+    assert_eq!(
+        propose(&ctx, &connected),
+        "duplicate",
+        "a block connected and then reorged off stays scripts-valid"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

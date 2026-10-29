@@ -879,12 +879,12 @@ impl ChainHub {
     }
 
     /// Core `BlockAssembler` version: `--block-version`, else `ComputeBlockVersion`.
-    pub fn gbt_block_version(&self, testdummy: rbitcoin_query::ThresholdState) -> i32 {
+    pub fn gbt_block_version(&self, testdummy: Option<rbitcoin_query::DeploymentState>) -> i32 {
         let v = self.mining.block_version.load(Ordering::Relaxed);
         if v != 0 {
             v
         } else {
-            testdummy.block_version()
+            rbitcoin_query::compute_block_version(testdummy)
         }
     }
 

@@ -1268,7 +1268,21 @@ impl Query {
         }
         self.truncate_sp_tweaks_through_tip(self.tip_height())?;
         self.truncate_basic_filters_to_tip()?;
+        if disconnected.is_some() {
+            self.disconnected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(hash);
+        }
         Ok(())
+    }
+
+    /// This process connected `hash` and later disconnected it.
+    pub fn was_disconnected(&self, hash: &[u8; 32]) -> bool {
+        self.disconnected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(hash)
     }
 }
 

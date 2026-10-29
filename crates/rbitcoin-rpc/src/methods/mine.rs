@@ -7,7 +7,7 @@ use bitcoin::script::Builder;
 use bitcoin::{Address, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
 use rbitcoin_net::Selected;
 use rbitcoin_primitives::{Height, Network};
-use rbitcoin_query::{ThresholdState, TESTDUMMY_BIT};
+use rbitcoin_query::ThresholdState;
 
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -857,17 +857,19 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         .chain
         .as_ref()
         .map(|c| c.gbt_block_version(testdummy))
-        .unwrap_or_else(|| testdummy.block_version());
-    match testdummy {
-        ThresholdState::Started => {
-            vbavailable.insert("testdummy".into(), json!(TESTDUMMY_BIT));
+        .unwrap_or_else(|| rbitcoin_query::compute_block_version(testdummy));
+    if let Some(d) = testdummy {
+        match d.state {
+            ThresholdState::Started => {
+                vbavailable.insert("testdummy".into(), json!(d.bit));
+            }
+            ThresholdState::LockedIn => {
+                version |= 1 << d.bit;
+                vbavailable.insert("testdummy".into(), json!(d.bit));
+            }
+            ThresholdState::Active => rules.push("testdummy"),
+            ThresholdState::Defined => {}
         }
-        ThresholdState::LockedIn => {
-            version |= 1 << TESTDUMMY_BIT;
-            vbavailable.insert("testdummy".into(), json!(TESTDUMMY_BIT));
-        }
-        ThresholdState::Active => rules.push("testdummy"),
-        ThresholdState::Defined | ThresholdState::Failed => {}
     }
     let mut template = json!({
         "capabilities": ["proposal"],
@@ -925,9 +927,10 @@ pub fn gbt_proposal(
     }
 }
 
-/// Core's block-index lookup before a proposal is checked. Connected is
-/// `duplicate`; this node keeps no scripts-valid mark for a block off the
-/// active chain, so any other known header is `duplicate-inconclusive`.
+/// Core's block-index lookup before a proposal is checked. A block connected
+/// now, or connected and then reorged off by this process, is `duplicate`
+/// (Core `BLOCK_VALID_SCRIPTS`). The mark is not kept across a restart, so
+/// such a block is then `duplicate-inconclusive`, like any other known header.
 fn proposal_duplicate(ctx: &RpcContext, hash: &BlockHash) -> Result<Option<&'static str>, Value> {
     let bytes = hash.to_byte_array();
     let connected = ctx
@@ -943,6 +946,9 @@ fn proposal_duplicate(ctx: &RpcContext, hash: &BlockHash) -> Result<Option<&'sta
     };
     if chain.is_block_invalid(hash) {
         return Ok(Some("duplicate-invalid"));
+    }
+    if ctx.query.was_disconnected(&bytes) {
+        return Ok(Some("duplicate"));
     }
     let known = chain.stored_header_height(hash).is_some() || chain.held_body(hash).is_some();
     Ok(known.then_some("duplicate-inconclusive"))

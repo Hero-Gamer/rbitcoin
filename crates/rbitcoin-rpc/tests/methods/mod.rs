@@ -1757,10 +1757,25 @@ fn ctx_from_mature_pad_relay(
     max_wu: u64,
     relay: bool,
 ) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    ctx_from_mature_pad_with(rbitcoin_consensus::ChainParams::regtest(), max_wu, relay)
+}
+
+fn ctx_from_mature_pad_on(
+    params: rbitcoin_consensus::ChainParams,
+    max_wu: u64,
+) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    ctx_from_mature_pad_with(params, max_wu, true)
+}
+
+fn ctx_from_mature_pad_with(
+    params: rbitcoin_consensus::ChainParams,
+    max_wu: u64,
+    relay: bool,
+) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     let dir = TempDir::labeled("rpc-gen").expect("temp dir");
     let dest = dir.path().join("store");
     copy_store_tree(&mature_regtest_pad().store, &dest);
-    let hub = open_regtest_hub(&dest, rbitcoin_consensus::ChainParams::regtest());
+    let hub = open_regtest_hub(&dest, params);
     hub.ensure_genesis().unwrap();
     regtest_ctx(dir, hub, max_wu, relay)
 }
