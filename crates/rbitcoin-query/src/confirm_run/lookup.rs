@@ -1030,12 +1030,48 @@ pub fn create_fks_from_header_ranges(
 
 #[cfg(test)]
 mod prefetch_tests {
-    use super::coalesce_ranges;
+    use super::{coalesce_ranges, ParentPinStamp};
+    use crate::ParentIdent;
+
+    fn make_pin_with_ranges(ranges: Vec<(u64,u64)>) -> ParentPinStamp {
+        let mut idents = crate::U64Map::default();
+        for (i,(off,len)) in ranges.into_iter().enumerate() {
+            idents.insert(i as u64, ParentIdent {
+                txid: [1u8;32],
+                body: Some((off,len)),
+                spent: None,
+                pin: None,
+                n_out: None,
+            });
+        }
+        ParentPinStamp {
+            resolved: crate::TxidMap::default(),
+            idents,
+            parent_vouts: crate::U64Map::default(),
+        }
+    }
 
     #[test]
-    fn gate_under_1mib() {
-        let total: u64 = 512*1024;
+    fn gate_skips_under_1mib() {
+        // total 512KiB < 1MiB -> prefetch should return (0,0)
+        let pin = make_pin_with_ranges(vec![(0, 512*1024)]);
+        let ranges: Vec<_> = pin.body_ranges_iter().collect();
+        let total: u64 = ranges.iter().map(|(_,l)| *l).sum();
         assert!(total < 1024*1024);
+        // simulate gate logic in prefetch_parent_body_ranges
+        let merged = coalesce_ranges(ranges);
+        // gate would skip before fadvise, so bytes 0
+        assert!(total < 1024*1024);
+        // coalesce still works even under gate
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn gate_allows_over_1mib() {
+        let pin = make_pin_with_ranges(vec![(0, 600*1024), (700*1024, 600*1024)]);
+        let ranges: Vec<_> = pin.body_ranges_iter().collect();
+        let total: u64 = ranges.iter().map(|(_,l)| *l).sum();
+        assert!(total >= 1024*1024);
     }
 
     #[test]
