@@ -1113,7 +1113,7 @@ fn chain_ops_first_block_to_an_address(
 
     let cb_txid = blk["tx"][0]["txid"].as_str().unwrap();
     let raw_tx = dispatch(ctx, "getrawtransaction", vec![json!(cb_txid), json!(0)]).unwrap();
-    // Core third arg is a blockhash; we always have Class A — ignore it.
+    // Third arg is the block that contains this coinbase.
     let same = dispatch(
         ctx,
         "getrawtransaction",

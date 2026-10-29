@@ -3,6 +3,7 @@ use bitcoin::consensus::encode::serialize_hex;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use rbitcoin_net::MempoolHub;
+use rbitcoin_primitives::Fk;
 use rbitcoin_primitives::Height;
 use serde_json::{json, Value};
 
@@ -275,6 +276,232 @@ pub fn getmempoolentry(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Va
     ))
 }
 
+const RAW_TX_NOT_FOUND: &str =
+    "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
+const RAW_TX_NOT_IN_BLOCK: &str =
+    "No such transaction found in the provided block. Use gettransaction for wallet transactions.";
+const RAW_TX_PRUNED: &str = "Transaction not available (pruned data)";
+
+fn raw_tx_verbosity(params: &RpcParams) -> Result<u32, Value> {
+    match params
+        .get(1, "verbose")
+        .or_else(|| params.get(1, "verbosity"))
+    {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Bool(b)) => Ok(u32::from(*b)),
+        Some(v) => json_u64(v)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+            .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "not of expected type number")),
+    }
+}
+
+/// `None` is "no block filter". A present non-string fails the call.
+fn raw_tx_blockhash(params: &RpcParams) -> Result<Option<[u8; 32]>, Value> {
+    match params.get(2, "blockhash") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(parse_hash32_display(s)?)),
+        Some(_) => Err(rpc_error(
+            ERR_TYPE_ERROR,
+            "blockhash must be of type string",
+        )),
+    }
+}
+
+struct RawTxBlock {
+    active: bool,
+    height: Option<u32>,
+    timestamp: u32,
+    hash: [u8; 32],
+    fks: Vec<Fk>,
+}
+
+fn raw_tx_block(ctx: &RpcContext, hash: [u8; 32]) -> Result<RawTxBlock, Value> {
+    let q = ctx.query.as_ref();
+    let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
+    let missing = || rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block hash not found");
+    // Membership is this header's tx span. Prune does not remove that span, so
+    // a pruned block that does not hold the tx is "not in this block", not
+    // "this tx is pruned". The tx body is read only after membership.
+    let Some((header_fk, header)) = q.get_header_by_hash(&hash).map_err(misc)? else {
+        return Err(missing());
+    };
+    if header.hash != hash {
+        return Err(missing());
+    }
+    let Some(fks) = q.header_tx_fks(header_fk, Some(&hash)).map_err(misc)? else {
+        return Err(missing());
+    };
+    if fks.is_empty() {
+        return Err(missing());
+    }
+    // height_of_hash is the active chain. Confirm and disconnect do not move
+    // together, so the header now at that height may not be this one. Active
+    // only when the confirmed slot still points at this header.
+    let located = q.height_of_hash(&hash).map_err(misc)?;
+    let active = match located {
+        Some(height) => q.store().confirmed.get(height).map_err(misc)? == Some(header_fk),
+        None => false,
+    };
+    Ok(RawTxBlock {
+        active,
+        height: located.filter(|_| active).map(|h| h.0),
+        timestamp: header.timestamp,
+        hash,
+        fks,
+    })
+}
+
+fn fk_in_block(ctx: &RpcContext, fks: &[Fk], want: &[u8; 32]) -> Result<Option<Fk>, Value> {
+    let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
+    if let Some((fk, _)) = ctx.query.get_tx_by_txid(want).map_err(misc)? {
+        if fks.contains(&fk) {
+            return Ok(Some(fk));
+        }
+    }
+    for fk in fks {
+        if ctx.query.store().txs.body_txid(*fk).map_err(misc)? == *want {
+            return Ok(Some(*fk));
+        }
+    }
+    Ok(None)
+}
+
+/// Undo for verbosity >= 2. `None` means the inputs are not a confirmed spend
+/// (coinbase, or a parent height the connected fence does not know).
+fn raw_tx_prevouts(
+    ctx: &RpcContext,
+    tx: &Transaction,
+    fk: Fk,
+) -> Result<Option<(i64, Vec<Value>)>, Value> {
+    if tx.is_coinbase() {
+        return Ok(None);
+    }
+    let (_, edges) = match ctx.query.store().get_tx_meta_and_prevouts(fk) {
+        Ok(v) => v,
+        Err(rbitcoin_store::StoreError::NotFound) => return Ok(None),
+        Err(e) => return Err(map_query(e, RAW_TX_PRUNED)),
+    };
+    if edges.len() != tx.input.len() {
+        return Ok(None);
+    }
+    let net = rpc_btc_network(ctx.network);
+    let mut in_sum = 0u64;
+    let mut rows = Vec::with_capacity(edges.len());
+    for (create_fk, vout) in edges {
+        if create_fk.is_null() {
+            return Ok(None);
+        }
+        let Some(height) = ctx
+            .query
+            .store()
+            .tx_height_get(create_fk)
+            .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let generated = match ctx.query.store().get_tx_meta_and_prevouts(create_fk) {
+            Ok((_, prevs)) => prevs.len() == 1 && prevs[0].0.is_null(),
+            Err(rbitcoin_store::StoreError::NotFound) => return Ok(None),
+            Err(e) => return Err(map_query(e, RAW_TX_PRUNED)),
+        };
+        let out = match ctx.query.tx_output_at_fk(create_fk, vout) {
+            Ok(out) => out,
+            Err(rbitcoin_store::StoreError::NotFound) => return Ok(None),
+            Err(e) => return Err(map_query(e, RAW_TX_PRUNED)),
+        };
+        let Some(value) = i64::try_from(out.value).ok() else {
+            return Ok(None);
+        };
+        in_sum = match in_sum.checked_add(out.value) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        rows.push(json!({
+            "generated": generated,
+            "height": height,
+            "value": sat_btc_json(value),
+            "scriptPubKey": script_pubkey_json(&ScriptBuf::from_bytes(out.script), net),
+        }));
+    }
+    let Some(out_sum) = tx_output_sum_sat(tx) else {
+        return Ok(None);
+    };
+    let Some(fee) = in_sum.checked_sub(out_sum) else {
+        return Ok(None);
+    };
+    let Some(fee) = i64::try_from(fee).ok() else {
+        return Ok(None);
+    };
+    Ok(Some((fee, rows)))
+}
+
+fn insert_vin_prevouts(obj: &mut Value, prevouts: &[Value]) {
+    let Some(vins) = obj.get_mut("vin").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (vin, prev) in vins.iter_mut().zip(prevouts) {
+        if let Some(row) = vin.as_object_mut() {
+            row.insert("prevout".into(), prev.clone());
+        }
+    }
+}
+
+fn finish_verbose_tx(
+    ctx: &RpcContext,
+    tx: &Transaction,
+    fk: Fk,
+    verbosity: u32,
+    mut extra: serde_json::Map<String, Value>,
+) -> Result<Value, Value> {
+    let net = rpc_btc_network(ctx.network);
+    if verbosity >= 2 {
+        if let Some((fee, prevouts)) = raw_tx_prevouts(ctx, tx, fk)? {
+            extra.insert("fee".into(), sat_btc_json(fee));
+            let mut obj = tx_to_json(tx, Some(Value::Object(extra)), net);
+            insert_vin_prevouts(&mut obj, &prevouts);
+            return Ok(obj);
+        }
+    }
+    Ok(tx_to_json(tx, Some(Value::Object(extra)), net))
+}
+
+fn getrawtransaction_in_block(
+    ctx: &RpcContext,
+    want: [u8; 32],
+    verbosity: u32,
+    hash: [u8; 32],
+) -> Result<Value, Value> {
+    let block = raw_tx_block(ctx, hash)?;
+    let Some(fk) = fk_in_block(ctx, &block.fks, &want)? else {
+        return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_IN_BLOCK));
+    };
+    let tx = ctx
+        .query
+        .reconstruct_tx(fk)
+        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
+    if verbosity == 0 {
+        return Ok(json!(serialize_hex(&tx)));
+    }
+    let mut extra = serde_json::Map::new();
+    extra.insert("in_mempool".into(), json!(false));
+    extra.insert("in_active_chain".into(), json!(block.active));
+    extra.insert("blockhash".into(), json!(hash_hex_display(&block.hash)));
+    // Off the active chain Core reports confirmations 0 and omits both
+    // timestamps. getblock uses -1 for that same block.
+    if block.active {
+        let confirmations = match (block.height, ctx.query.tip_height()) {
+            (Some(h), Some(tip)) => i64::from(tip.0.saturating_sub(h).saturating_add(1)),
+            _ => 0,
+        };
+        extra.insert("confirmations".into(), json!(confirmations));
+        extra.insert("blocktime".into(), json!(block.timestamp));
+        extra.insert("time".into(), json!(block.timestamp));
+    } else {
+        extra.insert("confirmations".into(), json!(0));
+    }
+    finish_verbose_tx(ctx, &tx, fk, verbosity, extra)
+}
+
 pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["txid", "verbose", "verbosity", "blockhash"])?;
     let hex = params.req_str(0, "txid")?;
@@ -285,21 +512,17 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
             "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
         ));
     }
-    let verbose = match params
-        .get(1, "verbose")
-        .or_else(|| params.get(1, "verbosity"))
-    {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(v) => json_u64(v)
-            .map(|n| n != 0)
-            .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "not of expected type number"))?,
-    };
+    let verbosity = raw_tx_verbosity(params)?;
+    let blockhash = raw_tx_blockhash(params)?;
+    // A blockhash selects that block only. A mempool hit must not answer it.
+    if let Some(hash) = blockhash {
+        return getrawtransaction_in_block(ctx, want, verbosity, hash);
+    }
 
     if let Some(mp) = ctx.mempool.as_ref() {
         let tid = Txid::from_byte_array(want);
         if let Some(tx) = mp.get_tx(&tid) {
-            if !verbose {
+            if verbosity == 0 {
                 return Ok(json!(serialize_hex(&tx)));
             }
             let mut extra = json!({ "in_mempool": true });
@@ -314,32 +537,39 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
         .query
         .get_tx_by_txid(&want)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| {
-            rpc_error(
-                ERR_INVALID_ADDRESS_OR_KEY,
-                "No such mempool or blockchain transaction",
-            )
-        })?;
+        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND))?;
     let tx = ctx
         .query
         .reconstruct_tx(fk)
-        .map_err(|e| map_query(e, "Transaction not available (pruned data)"))?;
-    if !verbose {
+        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
+    if verbosity == 0 {
         return Ok(json!(serialize_hex(&tx)));
     }
+    let mut extra = serde_json::Map::new();
+    extra.insert("in_mempool".into(), json!(false));
     // The resolver falls back to an unconnected Class A row (reorg orphan,
     // invalidateblock, never-connected archive). It has no active-chain block,
     // so it gets the plain object, without confirmations or block fields.
-    let unconnected = || {
-        Ok(tx_to_json(
-            &tx,
-            Some(json!({ "in_mempool": false })),
-            rpc_btc_network(ctx.network),
-        ))
-    };
+    if let Some((header, height, tip)) = confirmed_tx_header(ctx, fk)? {
+        extra.insert(
+            "confirmations".into(),
+            json!(tip.saturating_sub(height).saturating_add(1)),
+        );
+        extra.insert("blockhash".into(), json!(hash_hex_display(&header.hash)));
+        extra.insert("blocktime".into(), json!(header.timestamp));
+        extra.insert("time".into(), json!(header.timestamp));
+    }
+    finish_verbose_tx(ctx, &tx, fk, verbosity, extra)
+}
+
+/// Header of the active block that still holds `fk`, plus that height and the tip.
+fn confirmed_tx_header(
+    ctx: &RpcContext,
+    fk: Fk,
+) -> Result<Option<(rbitcoin_store::HeaderRecord, u32, u32)>, Value> {
     let store_err = |e: rbitcoin_store::StoreError| rpc_error(ERR_MISC, e.to_string());
     let Some(height) = ctx.query.store().tx_height_get(fk).map_err(store_err)? else {
-        return unconnected();
+        return Ok(None);
     };
     // The fence and confirmed[] do not move together (connect extends the
     // fence before setting confirmed[h]; disconnect clears confirmed[h] before
@@ -350,7 +580,7 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
         .header_at_height(Height(height))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
     else {
-        return unconnected();
+        return Ok(None);
     };
     let holds_fk = ctx
         .query
@@ -359,21 +589,10 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
         .get_range(header_fk)
         .map_err(store_err)?
         .is_some_and(|(first, n)| (first.0..first.0.saturating_add(u64::from(n))).contains(&fk.0));
-    let tip = ctx.query.tip_height();
-    let Some(tip) = tip.filter(|t| holds_fk && t.0 >= height) else {
-        return unconnected();
+    let Some(tip) = ctx.query.tip_height().filter(|t| holds_fk && t.0 >= height) else {
+        return Ok(None);
     };
-    Ok(tx_to_json(
-        &tx,
-        Some(json!({
-            "in_mempool": false,
-            "confirmations": tip.0.saturating_sub(height).saturating_add(1),
-            "blockhash": hash_hex_display(&header.hash),
-            "blocktime": header.timestamp,
-            "time": header.timestamp,
-        })),
-        rpc_btc_network(ctx.network),
-    ))
+    Ok(Some((header, height, tip.0)))
 }
 
 /// Default RPC-submit cap: Core 0.10 BTC/kvB, in sat/kvB. `0` is unlimited.

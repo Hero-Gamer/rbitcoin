@@ -1499,7 +1499,7 @@ fn mempool_txid_lookups_do_not_list_live() {
     let miss_raw = dispatch(&ctx, "getrawtransaction", vec![json!("11".repeat(32))]).unwrap_err();
     assert_eq!(
         miss_raw["message"],
-        "No such mempool or blockchain transaction"
+        "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
     );
     assert_eq!(miss_raw["code"], ERR_INVALID_ADDRESS_OR_KEY);
     let _ = std::fs::remove_dir_all(&dir);
@@ -2208,6 +2208,291 @@ fn getrawtransaction_verbose_mid_disconnect_has_no_block_fields() {
     for field in ["confirmations", "blockhash", "blocktime", "time"] {
         assert!(replaced.get(field).is_none(), "{field}: {replaced}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const TX_NOT_FOUND: &str =
+    "No such mempool or blockchain transaction. Use gettransaction for wallet transactions.";
+const TX_NOT_IN_BLOCK: &str =
+    "No such transaction found in the provided block. Use gettransaction for wallet transactions.";
+
+fn assert_raw_tx_error(err: &Value, code: i64, message: &str) {
+    assert_eq!(err["code"], code, "{err}");
+    assert_eq!(err["message"], message, "{err}");
+    assert!(err.get("txid").is_none(), "{err}");
+    assert!(err.get("hex").is_none(), "{err}");
+}
+
+fn assert_raw_tx_not_in_block(ctx: &RpcContext, txid: &str, verbose: Value, block: &str) {
+    let err = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), verbose, json!(block)],
+    )
+    .unwrap_err();
+    assert_raw_tx_error(&err, ERR_INVALID_ADDRESS_OR_KEY, TX_NOT_IN_BLOCK);
+}
+
+fn assert_no_fee_or_prevout(tx: &Value) {
+    assert!(tx.get("fee").is_none(), "{tx}");
+    assert!(tx["vin"][0].get("prevout").is_none(), "{tx}");
+}
+
+fn assert_btc_amount(amount: &Value, expect: f64) {
+    let text = serde_json::to_string(amount).unwrap();
+    assert!(text.contains('.'), "amount must be BTC, not sats: {text}");
+    assert!(amount.as_u64().is_none(), "{amount}");
+    let got = amount.as_f64().expect("btc amount");
+    assert!(
+        (got - expect).abs() < 1e-8,
+        "got={got} expect={expect} {amount}"
+    );
+}
+
+fn assert_blockhash_misses(ctx: &RpcContext, txid: &str, block_x: &str, block_y: &str) -> String {
+    assert_raw_tx_not_in_block(ctx, txid, json!(true), block_y);
+    let parent2 = generated_coinbase_value(ctx, 2);
+    let (hex2, spend2) =
+        spend_generated_coinbase(ctx, 2, parent2 - 2_000, ScriptBuf::from_bytes(vec![0x51]));
+    let mem_txid = hash_hex_display(&spend2.compute_txid().to_byte_array());
+    dispatch(ctx, "sendrawtransaction", vec![json!(hex2)]).unwrap();
+    assert_raw_tx_not_in_block(ctx, &mem_txid, json!(true), block_x);
+    assert_raw_tx_not_in_block(ctx, &mem_txid, json!(0), block_y);
+    let unknown = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(true), json!("00".repeat(32))],
+    )
+    .unwrap_err();
+    assert_raw_tx_error(&unknown, ERR_INVALID_ADDRESS_OR_KEY, "Block hash not found");
+    assert_bad_blockhash_rejected(ctx, txid);
+    mem_txid
+}
+
+fn assert_bad_blockhash_rejected(ctx: &RpcContext, txid: &str) {
+    for bad in [json!(true), json!("foobar")] {
+        let err = dispatch(
+            ctx,
+            "getrawtransaction",
+            vec![json!(txid), json!(true), bad],
+        )
+        .unwrap_err();
+        assert!(err["code"].as_i64().unwrap() < 0, "{err}");
+        assert!(err.get("txid").is_none(), "{err}");
+    }
+}
+
+fn assert_active_block_verbosity(
+    ctx: &RpcContext,
+    txid: &str,
+    hex: &str,
+    block_x: &str,
+    parent: &Value,
+) {
+    let raw0 = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(0), json!(block_x)],
+    )
+    .unwrap();
+    assert_eq!(raw0.as_str().unwrap(), hex);
+    let raw_false = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(false), json!(block_x)],
+    )
+    .unwrap();
+    assert_eq!(raw_false.as_str().unwrap(), hex);
+    let verbose = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(true), json!(block_x)],
+    )
+    .unwrap();
+    assert_eq!(verbose["txid"], json!(txid), "{verbose}");
+    assert_eq!(verbose["hex"], json!(hex), "{verbose}");
+    assert_eq!(verbose["in_active_chain"], json!(true), "{verbose}");
+    assert_eq!(verbose["blockhash"], json!(block_x), "{verbose}");
+    assert!(verbose["confirmations"].as_i64().unwrap() > 0, "{verbose}");
+    assert!(verbose.get("time").is_some(), "{verbose}");
+    assert!(verbose.get("blocktime").is_some(), "{verbose}");
+    assert_no_fee_or_prevout(&verbose);
+    let v1 = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(1), json!(block_x)],
+    )
+    .unwrap();
+    assert_eq!(v1["in_active_chain"], json!(true), "{v1}");
+    assert_no_fee_or_prevout(&v1);
+    assert_verbosity_2_prevout(ctx, txid, block_x, parent);
+}
+
+fn assert_confirmed_spend_v2(obj: &Value, parent: &Value) {
+    assert_btc_amount(&obj["fee"], 1_000.0 / 1e8);
+    let prevout = &obj["vin"][0]["prevout"];
+    let parent_cb = &parent["tx"][0];
+    assert_eq!(prevout["generated"], json!(true), "{prevout}");
+    assert_eq!(prevout["height"], parent["height"], "{prevout}");
+    assert_btc_amount(
+        &prevout["value"],
+        parent_cb["vout"][0]["value"].as_f64().unwrap(),
+    );
+    for key in ["asm", "hex", "type"] {
+        assert_eq!(
+            prevout["scriptPubKey"][key], parent_cb["vout"][0]["scriptPubKey"][key],
+            "{key} {prevout}"
+        );
+        assert!(!prevout["scriptPubKey"][key].as_str().unwrap().is_empty());
+    }
+}
+
+fn assert_verbosity_2_prevout(ctx: &RpcContext, txid: &str, block_x: &str, parent: &Value) {
+    let mut named = serde_json::Map::new();
+    named.insert("txid".into(), json!(txid));
+    named.insert("verbosity".into(), json!(2));
+    named.insert("blockhash".into(), json!(block_x));
+    let v2 = dispatch(ctx, "getrawtransaction", RpcParams::named(named)).unwrap();
+    assert_eq!(v2["in_active_chain"], json!(true), "{v2}");
+    assert_confirmed_spend_v2(&v2, parent);
+}
+
+fn assert_unscoped_and_mempool(
+    ctx: &RpcContext,
+    txid: &str,
+    mem_txid: &str,
+    block_x: &str,
+    parent: &Value,
+) {
+    let no_hash = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)]).unwrap();
+    assert!(no_hash.get("in_active_chain").is_none(), "{no_hash}");
+    assert_eq!(no_hash["txid"], json!(txid), "{no_hash}");
+    let no_hash_v2 = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(2)]).unwrap();
+    assert!(no_hash_v2.get("in_active_chain").is_none(), "{no_hash_v2}");
+    assert_confirmed_spend_v2(&no_hash_v2, parent);
+    let mem_v2 = dispatch(ctx, "getrawtransaction", vec![json!(mem_txid), json!(2)]).unwrap();
+    assert!(mem_v2.get("in_active_chain").is_none(), "{mem_v2}");
+    assert_eq!(mem_v2["in_mempool"], json!(true), "{mem_v2}");
+    assert_no_fee_or_prevout(&mem_v2);
+    let cb_txid = dispatch(ctx, "getblock", vec![json!(block_x), json!(1)]).unwrap()["tx"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let cb = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(cb_txid), json!(2), json!(block_x)],
+    )
+    .unwrap();
+    assert_no_fee_or_prevout(&cb);
+    assert!(cb["vin"][0].get("txid").is_none(), "{cb}");
+    assert!(cb["vin"][0].get("coinbase").is_some(), "{cb}");
+}
+
+fn assert_missing_txid_and_rest(ctx: &RpcContext, txid: &str) -> String {
+    for missing in ["00".repeat(32), "11".repeat(32)] {
+        let err = dispatch(ctx, "getrawtransaction", vec![json!(missing.clone())]).unwrap_err();
+        assert_raw_tx_error(&err, ERR_INVALID_ADDRESS_OR_KEY, TX_NOT_FOUND);
+        let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.json"), "");
+        assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("not found"), "{body}");
+    }
+    let (status, body) = rest_text(ctx, &format!("/rest/tx/{txid}.json"), "");
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let genesis_hash = dispatch(ctx, "getblockhash", vec![json!(0)]).unwrap();
+    let genesis_tx = dispatch(ctx, "getblock", vec![genesis_hash, json!(1)]).unwrap()["tx"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let genesis_err =
+        dispatch(ctx, "getrawtransaction", vec![json!(genesis_tx.clone())]).unwrap_err();
+    assert_raw_tx_error(
+        &genesis_err,
+        ERR_INVALID_ADDRESS_OR_KEY,
+        "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+    );
+    genesis_tx
+}
+
+fn assert_inactive_block_and_pruned(
+    ctx: &RpcContext,
+    txid: &str,
+    hex: &str,
+    block_x: &str,
+    block_y: String,
+    genesis_tx: &str,
+) {
+    let h1_early = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
+    ctx.query.set_pruneheight(Some(Height(1))).unwrap();
+    assert_raw_tx_not_in_block(ctx, txid, json!(true), h1_early.as_str().unwrap());
+    let above_prune = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)])
+        .unwrap_or_else(|e| panic!("unscoped lookup of an unpruned tx must succeed: {e}"));
+    assert!(
+        above_prune.get("in_active_chain").is_none(),
+        "{above_prune}"
+    );
+    ctx.query.set_pruneheight(None).unwrap();
+    dispatch(ctx, "invalidateblock", vec![json!(block_x)]).unwrap();
+    let inactive = dispatch(
+        ctx,
+        "getrawtransaction",
+        vec![json!(txid), json!(true), json!(block_x)],
+    )
+    .unwrap_or_else(|e| panic!("inactive block must still return the tx: {e}"));
+    assert_eq!(inactive["txid"], json!(txid), "{inactive}");
+    assert_eq!(inactive["hex"], json!(hex), "{inactive}");
+    assert_eq!(inactive["in_active_chain"], json!(false), "{inactive}");
+    assert_eq!(inactive["blockhash"], json!(block_x), "{inactive}");
+    assert_eq!(inactive["confirmations"], json!(0), "{inactive}");
+    assert!(inactive.get("time").is_none(), "{inactive}");
+    assert!(inactive.get("blocktime").is_none(), "{inactive}");
+    assert_raw_tx_not_in_block(ctx, txid, json!(1), &block_y);
+    let unscoped = dispatch(ctx, "getrawtransaction", vec![json!(txid), json!(true)])
+        .unwrap_or_else(|e| panic!("lookup without blockhash must still succeed: {e}"));
+    assert!(unscoped.get("in_active_chain").is_none(), "{unscoped}");
+    let h1 = dispatch(ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let h1_cb = dispatch(ctx, "getblock", vec![h1, json!(1)]).unwrap()["tx"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ctx.query.set_pruneheight(Some(Height(1))).unwrap();
+    let pruned = dispatch(ctx, "getrawtransaction", vec![json!(h1_cb)]).unwrap_err();
+    assert_raw_tx_error(
+        &pruned,
+        ERR_INVALID_PARAMETER,
+        "Transaction not available (pruned data)",
+    );
+    let genesis_still = dispatch(ctx, "getrawtransaction", vec![json!(genesis_tx)]).unwrap_err();
+    assert_raw_tx_error(
+        &genesis_still,
+        ERR_INVALID_ADDRESS_OR_KEY,
+        "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+    );
+}
+
+/// `getrawtransaction` reads `blockhash` and integer verbosity. A txid in a
+/// different block, only in the mempool, or under an unknown hash is an error.
+/// Verbosity 2 on a confirmed spend carries a BTC fee and `vin[].prevout`.
+#[test]
+fn getrawtransaction_blockhash_and_verbosity_2() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let parent_sat = generated_coinbase_value(&ctx, 1);
+    let (hex, spend) =
+        mature_coinbase_spend(&ctx, parent_sat - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    let txid = hash_hex_display(&spend.compute_txid().to_byte_array());
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap();
+    let mined = dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let block_x = mined[0].as_str().unwrap().to_string();
+    let next = dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let block_y = next[0].as_str().unwrap().to_string();
+    let parent_hash = dispatch(&ctx, "getblockhash", vec![json!(1)]).unwrap();
+    let parent = dispatch(&ctx, "getblock", vec![parent_hash, json!(2)]).unwrap();
+
+    let mem_txid = assert_blockhash_misses(&ctx, &txid, &block_x, &block_y);
+    assert_active_block_verbosity(&ctx, &txid, &hex, &block_x, &parent);
+    assert_unscoped_and_mempool(&ctx, &txid, &mem_txid, &block_x, &parent);
+    let genesis_tx = assert_missing_txid_and_rest(&ctx, &txid);
+    assert_inactive_block_and_pruned(&ctx, &txid, &hex, &block_x, block_y, &genesis_tx);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
