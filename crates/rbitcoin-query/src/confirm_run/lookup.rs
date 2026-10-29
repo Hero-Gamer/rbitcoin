@@ -62,6 +62,52 @@ impl ParentPinStamp {
     }
 }
 
+fn coalesce_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    ranges.sort_by_key(|(off, _)| *off);
+    let mut out = Vec::with_capacity(ranges.len().min(32));
+    let mut cur_off = ranges[0].0;
+    let mut cur_end = ranges[0].0 + ranges[0].1;
+    for (off, len) in ranges.into_iter().skip(1) {
+        let end = off + len;
+        if off <= cur_end + 64 * 1024 {
+            if end > cur_end {
+                cur_end = end;
+            }
+        } else {
+            out.push((cur_off, cur_end - cur_off));
+            if out.len() >= 32 {
+                break;
+            }
+            cur_off = off;
+            cur_end = end;
+        }
+    }
+    if out.len() < 32 {
+        out.push((cur_off, cur_end - cur_off));
+    }
+    out
+}
+pub fn prefetch_parent_body_ranges(
+    query: &crate::Query,
+    parent_pin: &ParentPinStamp,
+) -> (u64, u64) {
+    let ranges: Vec<_> = parent_pin.body_ranges_iter().collect();
+    let total: u64 = ranges.iter().map(|(_, l)| *l).sum();
+    if total < 1024 * 1024 {
+        return (0, 0);
+    }
+    let merged = coalesce_ranges(ranges);
+    let start = std::time::Instant::now();
+    let mut bytes = 0u64;
+    for (off, len) in &merged {
+        query.store().advise_tx_body_will_need(*off, *len);
+        bytes += *len;
+    }
+    (bytes, start.elapsed().as_nanos() as u64)
+}
 pub type WireBlockIn = (Height, Arc<Block>, Option<Arc<[crate::TxPrecompute]>>);
 #[doc(hidden)]
 pub type LookupPhaseOut = (
@@ -179,6 +225,11 @@ fn lookup_stamp_work(
             (pin, pairs)
         }
     };
+    let (pref_bytes, pref_ns) = prefetch_parent_body_ranges(query, &parent_pin);
+    if pref_bytes > 0 {
+        crate::note_confirm(&query.confirm_stats().prefetch_bytes, pref_bytes);
+        crate::note_confirm(&query.confirm_stats().prefetch_ns, pref_ns);
+    }
     crate::note_confirm(&query.confirm_stats().lookup_blocks, blocks.len() as u64);
     crate::note_confirm(&query.confirm_stats().lookup_head_ns, plan_ns);
     let work_ns = t0.elapsed().as_nanos() as u64;
