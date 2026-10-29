@@ -1,7 +1,10 @@
 //! Post-catch-up outbound full-relay refill up to `--max-outbound`.
 //!
-//! Drives `run_p2p` against local listeners. Routable addresses are required
-//! in the address book, so the body runs in its own network namespace.
+//! Drives `run_p2p` against one local listener. Routable addresses are required
+//! in the address book, so the body runs in its own process, and in a network
+//! namespace when the machine allows one. That listener binds `0.0.0.0` and
+//! the book lists each `45.x.0.1` on its port. One store reserves a 256 MiB
+//! map; a store per address does not fit the suite runner's 6 GiB hard cap.
 
 use bitcoin::Block;
 use rbitcoin_consensus::{ChainParams, Milestone};
@@ -118,23 +121,30 @@ fn two_blocks() -> Vec<Block> {
     vec![first, second]
 }
 
-async fn listen_with_chain(dir: &Path, ip: Ipv4Addr, blocks: &[Block]) -> P2PNode {
-    let query =
-        Query::open_or_create_tiny(dir.join(format!("listener-{ip}"))).expect("listener store");
+/// One store, one `0.0.0.0` socket. Each routable local uses that port.
+/// A socket bound to one `45.x` address would not accept the others.
+async fn listen_shared(
+    dir: &Path,
+    ips: &[Ipv4Addr],
+    blocks: &[Block],
+) -> (P2PNode, Vec<SocketAddr>) {
+    let query = Query::open_or_create_tiny(dir.join("listener")).expect("listener store");
     let node = P2PNode::start(
-        SocketAddr::from((ip, 0)),
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         query,
         ChainParams::regtest(),
         Milestone::NONE,
         rbitcoin_net::REDIAL_INTERVAL_TEST,
     )
     .await
-    .unwrap_or_else(|e| panic!("listen {ip}: {e}"));
+    .unwrap_or_else(|e| panic!("listen: {e}"));
     for (h, block) in blocks.iter().enumerate() {
         node.ingest_block(block.clone())
-            .unwrap_or_else(|e| panic!("ingest {ip} block {}: {e}", h + 1));
+            .unwrap_or_else(|e| panic!("ingest block {}: {e}", h + 1));
     }
-    node
+    let port = node.local_addr.port();
+    let addrs = ips.iter().map(|ip| SocketAddr::from((*ip, port))).collect();
+    (node, addrs)
 }
 
 fn write_book(dir: &Path, addrs: &[SocketAddr]) {
@@ -180,10 +190,25 @@ fn published(dir: &Path, name: &str) -> PathBuf {
     dir.join("run").join(format!("{name}.addr"))
 }
 
-async fn published_listener(dir: &Path, name: &str, wait: Duration) -> SocketAddr {
+async fn published_listener(
+    dir: &Path,
+    name: &str,
+    wait: Duration,
+    join: &mut JoinHandle<Result<(), NodeError>>,
+) -> SocketAddr {
     let path = published(dir, name);
     let deadline = Instant::now() + wait;
     loop {
+        if join.is_finished() {
+            match join.await {
+                Ok(Ok(())) => panic!("{name} exited before publishing {}", path.display()),
+                Ok(Err(e)) => panic!("{name} exited before publishing {}: {e}", path.display()),
+                Err(e) => panic!(
+                    "{name} task ended before publishing {}: {e}",
+                    path.display()
+                ),
+            }
+        }
         if let Some(addr) = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| text.trim().parse().ok())
@@ -274,13 +299,12 @@ async fn stop_node(rpc: SocketAddr, join: JoinHandle<Result<(), NodeError>>) {
     }
 }
 
-async fn book_refill(root: &Path, listeners: &[P2PNode]) {
+async fn book_refill(root: &Path, addrs: &[SocketAddr]) {
     let dir = root.join("book");
-    let addrs: Vec<SocketAddr> = listeners.iter().map(|n| n.local_addr).collect();
-    write_book(&dir, &addrs);
+    write_book(&dir, addrs);
     let cfg = base_cfg(&dir);
-    let join = spawn_run(cfg);
-    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40)).await;
+    let mut join = spawn_run(cfg);
+    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40), &mut join).await;
     let rows = wait_full_relay(rpc, MAX_OUT as usize, MAX_OUT as usize).await;
     let before = ids_of(&full_relay(&rows));
     assert!(
@@ -318,7 +342,7 @@ async fn book_refill(root: &Path, listeners: &[P2PNode]) {
     stop_node(rpc, join).await;
 }
 
-async fn learned_book(root: &Path, seed: &P2PNode, others: &[SocketAddr]) {
+async fn learned_book(root: &Path, seed: &P2PNode, seed_addr: SocketAddr, others: &[SocketAddr]) {
     let mut book = AddrMan::new();
     for addr in others {
         book.add(*addr);
@@ -337,9 +361,9 @@ async fn learned_book(root: &Path, seed: &P2PNode, others: &[SocketAddr]) {
         .set_addrman(std::sync::Arc::new(std::sync::Mutex::new(book)));
     let dir = root.join("fetch");
     let mut cfg = base_cfg(&dir);
-    cfg.listen.seednodes = vec![seed.local_addr.to_string()];
-    let join = spawn_run(cfg);
-    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40)).await;
+    cfg.listen.seednodes = vec![seed_addr.to_string()];
+    let mut join = spawn_run(cfg);
+    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40), &mut join).await;
     // getaddr returns 23% of the book. Every returned row is dialed as
     // outbound-full-relay; the seed session itself stays addr-fetch.
     let rows = wait_learned_relay(rpc, others, MAX_OUT as usize, expect).await;
@@ -403,17 +427,16 @@ async fn wait_learned_relay(
 
 /// At `--max-outbound`, a short stale-tip wait rotates one outbound
 /// full-relay peer when seeds are on, and does not rotate when they are off.
-async fn stale_rotation(root: &Path, listeners: &[P2PNode], seeds: bool) {
+async fn stale_rotation(root: &Path, addrs: &[SocketAddr], seeds: bool) {
     let dir = root.join(if seeds { "stale-on" } else { "stale-off" });
-    let addrs: Vec<SocketAddr> = listeners.iter().take(6).map(|n| n.local_addr).collect();
     assert_eq!(addrs.len(), 6, "one spare address past --max-outbound");
-    write_book(&dir, &addrs);
+    write_book(&dir, addrs);
     let mut cfg = base_cfg(&dir);
     cfg.listen.use_seeds = seeds;
     cfg.stale_tip = Duration::from_secs(1);
     cfg.stale_poll = Duration::from_millis(200);
-    let join = spawn_run(cfg);
-    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40)).await;
+    let mut join = spawn_run(cfg);
+    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40), &mut join).await;
     let rows = wait_full_relay(rpc, MAX_OUT as usize, MAX_OUT as usize).await;
     let before = ids_of(&full_relay(&rows));
     let deadline = Instant::now() + Duration::from_secs(if seeds { 8 } else { 4 });
@@ -493,8 +516,8 @@ async fn pinned_connect(root: &Path, pinned: SocketAddr, book: &[SocketAddr]) {
     write_book(&dir, book);
     let mut cfg = base_cfg(&dir);
     cfg.listen.connect = vec![NetAddr::Ip(pinned)];
-    let join = spawn_run(cfg);
-    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40)).await;
+    let mut join = spawn_run(cfg);
+    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40), &mut join).await;
     assert_no_book_peers(rpc, book, "--connect").await;
     stop_node(rpc, join).await;
 }
@@ -508,8 +531,8 @@ async fn pinned_trust(root: &Path, pinned: SocketAddr, book: &[SocketAddr]) {
     cfg.connect_redial = rbitcoin_net::REDIAL_INTERVAL_TEST;
     cfg.rpc.listen = Some("127.0.0.1:0".parse().expect("rpc"));
     cfg.max_tip_age_secs = Some(u64::MAX);
-    let join = spawn_run(cfg);
-    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40)).await;
+    let mut join = spawn_run(cfg);
+    let rpc = published_listener(&dir, "rpc", Duration::from_secs(40), &mut join).await;
     assert_no_book_peers(rpc, book, "--trust-peer").await;
     stop_node(rpc, join).await;
 }
@@ -518,7 +541,15 @@ fn output_tail(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let lines: Vec<_> = text.lines().collect();
     let start = lines.len().saturating_sub(40);
-    lines[start..].join("\n")
+    let tail = lines[start..].join("\n");
+    let Some(i) = lines.iter().position(|line| line.contains("panicked at")) else {
+        return tail;
+    };
+    if i >= start {
+        return tail;
+    }
+    let end = (i + 3).min(lines.len());
+    format!("{}\n...\n{tail}", lines[i..end].join("\n"))
 }
 
 async fn journey() {
@@ -526,33 +557,18 @@ async fn journey() {
     let home = TestDatadir::new().expect("temp");
     let root = home.path();
     let blocks = two_blocks();
-    let mut listeners = Vec::new();
-    for ip in ips {
-        listeners.push(listen_with_chain(&root, ip, &blocks).await);
-    }
-    book_refill(&root, &listeners[..MAX_OUT as usize]).await;
-    let others: Vec<SocketAddr> = listeners.iter().skip(1).map(|n| n.local_addr).collect();
+    let (listener, addrs) = listen_shared(&root, &ips, &blocks).await;
+    book_refill(&root, &addrs[..MAX_OUT as usize]).await;
+    let others = &addrs[1..];
     assert_eq!(others.len(), LEARNED_PEERS);
-    learned_book(&root, &listeners[0], &others).await;
-    // Later phases dial at most 6 of these. Each listener store reserves a
-    // 256 MiB strong-bit map, and the test runner caps address space at 6 GiB.
-    for node in listeners.drain(6..) {
-        node.shutdown().await;
-    }
-    let pinned = listeners[0].local_addr;
-    let book: Vec<SocketAddr> = listeners
-        .iter()
-        .skip(1)
-        .take(4)
-        .map(|n| n.local_addr)
-        .collect();
-    pinned_connect(&root, pinned, &book).await;
-    pinned_trust(&root, pinned, &book).await;
-    stale_rotation(&root, &listeners, true).await;
-    stale_rotation(&root, &listeners, false).await;
-    for node in listeners {
-        node.shutdown().await;
-    }
+    learned_book(&root, &listener, addrs[0], others).await;
+    let pinned = addrs[0];
+    let book = &addrs[1..5];
+    pinned_connect(&root, pinned, book).await;
+    pinned_trust(&root, pinned, book).await;
+    stale_rotation(&root, &addrs[..6], true).await;
+    stale_rotation(&root, &addrs[..6], false).await;
+    listener.shutdown().await;
 }
 
 fn spawn_journey(netns: bool) -> Output {
@@ -564,8 +580,8 @@ fn spawn_journey(netns: bool) -> Output {
             .arg(&exe)
             .env("RBITCOIN_REFILL_NS", "1")
     } else {
-        // Own process: the suite shares one address space, and each listener
-        // store reserves a 256 MiB strong-bit map. GitHub's test runner caps
+        // Own process: the suite shares one address space, and a listener
+        // store reserves a 256 MiB strong-bit map. GitHub's test runner hard-caps
         // that space at 6 GiB.
         cmd = Command::new(&exe);
         cmd.env("RBITCOIN_REFILL_CHILD", "1")
