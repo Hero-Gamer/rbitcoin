@@ -324,9 +324,10 @@ fn wait_all_idle(n: usize) {
 }
 
 /// Publish while every worker is parked, and require that publish to unpark
-/// `k` of them. A worker that left `park` in the gap claims the chunk and
-/// leaves the unpark count at 0. Finish that attempt and try again. A publish
-/// that wakes nobody stays at `entered == 0` and the wait fails.
+/// `k` of them. A worker that left `park` in the gap claims one or more
+/// chunks before this unpark, so the count is short of `k` (zero when it
+/// claimed them all). Finish that attempt and try again. A publish that
+/// wakes nobody stays at `entered == 0` and the wait fails.
 fn publish_waking(n: usize, k: usize, items: Vec<u32>) -> HeldWave {
     let start = Instant::now();
     loop {
@@ -348,15 +349,12 @@ fn publish_waking(n: usize, k: usize, items: Vec<u32>) -> HeldWave {
         loop {
             let entered = HOLD_ENTERED.load(Ordering::SeqCst);
             let unparks = STEAL_UNPARKS.load(Ordering::Relaxed);
-            if entered >= k && unparks == k {
-                return wave;
-            }
-            if entered >= k && unparks == 0 {
+            if entered >= k {
+                if unparks == k {
+                    return wave;
+                }
                 wave.finish().expect("retry wave");
                 break;
-            }
-            if entered >= k {
-                assert_eq!(unparks, k, "publish must unpark {k} workers");
             }
             assert!(
                 spin.elapsed() < Duration::from_secs(2),
