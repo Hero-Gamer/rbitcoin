@@ -580,7 +580,9 @@ pub fn gbt_request<'a>(ctx: &RpcContext, params: &'a RpcParams) -> Result<GbtReq
     if mode != "template" {
         return Err(invalid_mode());
     }
-    if matches!(ctx.network, Network::Mainnet) {
+    // An HTTP longpoll passed these before its wait. Core does not check
+    // them again after the wait.
+    if matches!(ctx.network, Network::Mainnet) && !super::http_wait_satisfied() {
         if super::net::connection_count(ctx) == 0 {
             return Err(rpc_error(
                 ERR_CLIENT_NOT_CONNECTED,

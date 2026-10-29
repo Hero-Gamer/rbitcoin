@@ -5762,6 +5762,17 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         (ERR_DESERIALIZATION, "Block decode failed".to_owned()),
         "a proposal does not need a peer"
     );
+    set_http_wait_satisfied(true);
+    let after_wait = dispatch(
+        &mainnet,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit"], "longpollid": format!("{}0", "ab".repeat(32))})],
+    );
+    set_http_wait_satisfied(false);
+    assert!(
+        after_wait.is_ok(),
+        "Core checks peers before the longpoll wait, not after: {after_wait:?}"
+    );
     mainnet.connections = Arc::new(AtomicU64::new(1));
     mainnet.initial_block_download = Arc::new(AtomicBool::new(true));
     assert_eq!(
