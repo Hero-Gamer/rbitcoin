@@ -131,6 +131,34 @@ pub fn archived_create_pairs(
 /// (plan=None). Wire blocks are `Arc` so IBD resolve can decode once and hand
 /// off without cloning full `Block` payloads into stamp. `pres` is lookup
 /// `TxPrecompute` when the caller already hashed (loadq); `None` hashes here.
+/// Prefetch next-batch parent body ranges while current batch is in scripts/write.
+///
+/// Gate: only when total bytes > 1MiB (skip small batches, avoid fadvise overhead).
+/// Records bytes and ns into ConfirmStats prefetch_* counters.
+/// Linux-only (WILLNEED), no-op elsewhere.
+#[inline]
+fn prefetch_parent_body_ranges(query: &crate::Query, parent_pin: &ParentPinStamp) {
+    let mut total_bytes: u64 = 0;
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    for (off, len) in parent_pin.body_ranges_iter() {
+        if len == 0 {
+            continue;
+        }
+        total_bytes = total_bytes.saturating_add(len);
+        ranges.push((off, len));
+    }
+    if total_bytes < 1024 * 1024 {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    for (off, len) in ranges {
+        query.store().advise_tx_body_will_need(off, len);
+    }
+    let ns = t0.elapsed().as_nanos() as u64;
+    crate::note_confirm(&query.confirm_stats().prefetch_bytes, total_bytes);
+    crate::note_confirm(&query.confirm_stats().prefetch_ns, ns);
+}
+
 pub fn confirm_wire_lookup_stamp(
     query: &Query,
     params: &ChainParams,
@@ -179,6 +207,8 @@ fn lookup_stamp_work(
             (pin, pairs)
         }
     };
+    // Prefetch parent body ranges for load stage (WILLNEED, >1MiB gate)
+    prefetch_parent_body_ranges(query, &parent_pin);
     crate::note_confirm(&query.confirm_stats().lookup_blocks, blocks.len() as u64);
     crate::note_confirm(&query.confirm_stats().lookup_head_ns, plan_ns);
     let work_ns = t0.elapsed().as_nanos() as u64;
