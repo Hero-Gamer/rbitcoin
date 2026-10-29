@@ -42,6 +42,10 @@ impl ParentPinStamp {
         self.idents.get(&create_fk_id).and_then(|p| p.body)
     }
 
+    pub fn body_ranges_iter(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.idents.values().filter_map(|p| p.body)
+    }
+
     #[inline]
     pub fn spent_range(&self, create_fk_id: u64) -> Option<(u64, u64)> {
         self.idents.get(&create_fk_id).and_then(|p| p.spent)
