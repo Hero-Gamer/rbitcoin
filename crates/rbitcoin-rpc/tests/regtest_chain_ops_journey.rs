@@ -2783,7 +2783,7 @@ fn chain_ops_submit_overweight(
 }
 
 fn chain_ops_maxfeerate(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
-    let heights: Vec<u32> = (0..6).map(|_| cbs.take()).collect();
+    let heights: Vec<u32> = (0..8).map(|_| cbs.take()).collect();
     pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx, heights[0], heights[1]);
     let (hex, spend) = spend_generated_coinbase(ctx, heights[2], 1_000, true_spk());
     let e = dispatch(ctx, "sendrawtransaction", vec![json!(hex.clone())]).unwrap_err();
@@ -2807,20 +2807,31 @@ fn chain_ops_maxfeerate(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         .expect("P2P/admit path is not capped by RPC maxfeerate");
     let ok = dispatch(ctx, "sendrawtransaction", vec![json!(hex.clone()), json!(0)]).unwrap();
     assert!(ok.as_str().is_some(), "{ok}");
-    let over = dispatch(ctx, "sendrawtransaction", vec![json!(hex), json!(100_000)]).unwrap_err();
+    let over = dispatch(ctx, "sendrawtransaction", vec![json!(hex), json!(1)]).unwrap_err();
     assert_eq!(over["code"], ERR_INVALID_PARAMETER, "{over}");
-    assert_eq!(over["message"], "feerate >= 100000 sat/vB is not accepted");
+    assert_eq!(
+        over["message"],
+        "Fee rates larger than or equal to 1BTC/kvB are not accepted"
+    );
 
     let modest_at = |h: u32| {
         spend_generated_coinbase(ctx, h, generated_coinbase_value(ctx, h) - 1_000, true_spk())
     };
     let (modest_hex, modest) = modest_at(heights[3]);
-    let ok99 = dispatch(ctx, "sendrawtransaction", vec![json!(modest_hex), json!(99_999)]).unwrap();
+    let ok99 = dispatch(
+        ctx,
+        "sendrawtransaction",
+        vec![json!(modest_hex), json_num("0.99999999")],
+    )
+    .unwrap();
     assert_eq!(ok99, json!(modest.compute_txid().to_string()));
     pin_maxfeerate_json_shapes(ctx);
     let (str_hex, str_tx) = modest_at(heights[4]);
-    let ok_str = dispatch(ctx, "sendrawtransaction", vec![json!(str_hex), json!("99999")]).unwrap();
+    let ok_str =
+        dispatch(ctx, "sendrawtransaction", vec![json!(str_hex), json!("0.99999999")]).unwrap();
     assert_eq!(ok_str, json!(str_tx.compute_txid().to_string()));
+    pin_maxfeerate_core_rounding(ctx, heights[6]);
+    pin_maxfeerate_size_and_fee_basis(ctx, heights[7]);
 
     let (huge_hex, _) = spend_generated_coinbase(ctx, heights[5], 1_000, true_spk());
     let pkg = dispatch(ctx, "submitpackage", vec![json!([huge_hex])]).unwrap();
@@ -2835,6 +2846,112 @@ fn chain_ops_maxfeerate(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     assert!(row.get("vsize").is_some() && row["fees"].get("base").is_some(), "{again}");
     dispatch(ctx, "generate", vec![json!(1)]).unwrap();
     assert_eq!(dispatch(ctx, "getrawmempool", vec![]).unwrap(), json!([]));
+}
+
+/// `maxfeerate` is BTC/kvB, carried at Core's 1 sat/kvB resolution. Core
+/// rounds its two checks differently: `sendrawtransaction` and
+/// `testmempoolaccept` cap the fee at `GetFee(vsize)`, rounded up to a whole
+/// sat; `submitpackage` compares each member's feerate unrounded.
+fn pin_maxfeerate_core_rounding(ctx: &RpcContext, height: u32) {
+    let cb = generated_coinbase_value(ctx, height);
+    let probe = spend_generated_coinbase(ctx, height, cb - 1, true_spk()).1;
+    let vsize = bitcoin::Weight::from_wu(probe.weight().to_wu()).to_vbytes_ceil();
+    // At 1001 sat/kvB the `GetFee` cap is ceil(1.001 * vsize) = vsize + 1.
+    assert!(vsize < 1000, "{vsize}");
+    let (hex, tx) = spend_generated_coinbase(ctx, height, cb - (vsize + 1), true_spk());
+    let tma = |rate: Value| {
+        dispatch(ctx, "testmempoolaccept", vec![json!([hex.clone()]), rate]).unwrap()[0].clone()
+    };
+    // 1 sat/kvB is the smallest cap, not unlimited. Python and Go write
+    // small floats in exponent form; Core `ParseFixedPoint` reads it.
+    for tight in [
+        json_num("0.00000001"),
+        json_num("1e-08"),
+        json!("1E-8"),
+        json!("0.00001000"),
+        json_num("1e-05"),
+    ] {
+        let row = tma(tight.clone());
+        assert_eq!(row["reject-reason"], "max-fee-exceeded", "{tight}: {row}");
+    }
+    for exact in [json_num("0.00001001"), json_num("1.001e-05")] {
+        let row = tma(exact.clone());
+        assert_eq!(row["allowed"], true, "{exact}: {row}");
+    }
+    // The parent fails that unrounded check before admit, so its child is
+    // missing inputs, as in Core `rpc_packages.py`.
+    let child = child_of(&tx, 1_000);
+    let pkg = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([hex.clone(), tx_hex(&child)]), json!("0.00001001")],
+    )
+    .unwrap();
+    let rows = &pkg["tx-results"];
+    let w = |t: &Transaction| t.compute_wtxid().to_string();
+    assert_eq!(rows[w(&tx)]["error"], "max feerate exceeded", "{pkg}");
+    assert_eq!(rows[w(&child)]["error"], "bad-txns-inputs-missingorspent", "{pkg}");
+    let ok = dispatch(
+        ctx,
+        "sendrawtransaction",
+        vec![json!(hex), json_num("0.00001001")],
+    )
+    .unwrap();
+    assert_eq!(ok, json!(tx.compute_txid().to_string()));
+}
+
+/// Core sizes the cap three ways. `sendrawtransaction` takes the base fee
+/// over BIP141 vsize, `testmempoolaccept` the base fee over sigop-adjusted
+/// vsize, and `submitpackage` the modified fee over sigop-adjusted vsize.
+fn pin_maxfeerate_size_and_fee_basis(ctx: &RpcContext, height: u32) {
+    use bitcoin::TxOut;
+    let cb = generated_coinbase_value(ctx, height);
+    let mut tx = spend_generated_coinbase(ctx, height, 0, true_spk()).1;
+    // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops each,
+    // so 10 of them are an 800 sigop cost and a 4_000 vB adjusted size.
+    tx.output = vec![
+        TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+        };
+        11
+    ];
+    // 1 sat/vB over the adjusted size.
+    let fee = 4_000;
+    tx.output[0] = TxOut {
+        value: Amount::from_sat(cb - 10_000 - fee),
+        script_pubkey: true_spk(),
+    };
+    assert!(tx.vsize() * 10 < 4_000, "{}", tx.vsize());
+    let hex = tx_hex(&tx);
+    let txid = tx.compute_txid().to_string();
+    let rate = json!("0.00001");
+    let e = dispatch(ctx, "sendrawtransaction", vec![json!(hex), rate.clone()]).unwrap_err();
+    assert_eq!(e["code"], ERR_VERIFY_ERROR, "BIP141 vsize: {e}");
+    let tma = dispatch(ctx, "testmempoolaccept", vec![json!([hex]), rate.clone()]).unwrap();
+    assert_eq!(tma[0]["allowed"], true, "adjusted vsize: {tma}");
+    let package = |delta: i64| {
+        dispatch(ctx, "prioritisetransaction", vec![json!(txid), json!(0), json!(delta)]).unwrap();
+        dispatch(ctx, "submitpackage", vec![json!([hex]), rate.clone()]).unwrap()
+    };
+    let over = package(1);
+    let row = over["tx-results"].as_object().unwrap().values().next().unwrap();
+    assert_eq!(row["error"], "max feerate exceeded", "modified fee: {over}");
+    let ok = package(-1);
+    assert_eq!(ok["package_msg"], "success", "{ok}");
+    // A member already in the pool is not re-checked, so a delta that puts
+    // it over the cap does not block its new child (Core `AcceptPackage`).
+    let child_vb = child_of(&tx, 0).vsize() as u64;
+    let child = child_of(&tx, child_vb);
+    dispatch(ctx, "prioritisetransaction", vec![json!(txid), json!(0), json!(1)]).unwrap();
+    let pkg = dispatch(
+        ctx,
+        "submitpackage",
+        vec![json!([hex, tx_hex(&child)]), rate],
+    )
+    .unwrap();
+    assert_eq!(pkg["package_msg"], "success", "{pkg}");
+    assert!(ctx.mempool.as_ref().unwrap().contains(&child.compute_txid()), "{pkg}");
 }
 
 fn chain_ops_invalidate_and_precious(

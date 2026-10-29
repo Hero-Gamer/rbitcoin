@@ -2166,11 +2166,12 @@ pub struct MaxFeeQuery {
     pub maxfeerate: Option<String>,
 }
 
+/// BTC/kvB → sat/kvB, rounded up to a whole sat/vB (at least 1).
 #[allow(clippy::result_large_err)] // public error enum
 #[doc(hidden)]
 pub fn parse_maxfeerate_btc_kvb(q: MaxFeeQuery) -> Result<u64, Response> {
     let Some(s) = q.maxfeerate.filter(|s| !s.is_empty()) else {
-        return Ok(10_000);
+        return Ok(10_000_000);
     };
     let v: f64 = s
         .parse()
@@ -2181,8 +2182,8 @@ pub fn parse_maxfeerate_btc_kvb(q: MaxFeeQuery) -> Result<u64, Response> {
     if v == 0.0 {
         return Ok(0);
     }
-    let sat = (v * 100_000.0).ceil() as u64;
-    Ok(sat.max(1))
+    let sat_vb = (v * 100_000.0).ceil() as u64;
+    Ok(sat_vb.max(1).saturating_mul(1000))
 }
 
 pub async fn post_txs_test(
@@ -2190,7 +2191,7 @@ pub async fn post_txs_test(
     AxumQuery(q): AxumQuery<MaxFeeQuery>,
     body: Bytes,
 ) -> Response {
-    let max_sat_vb = match parse_maxfeerate_btc_kvb(q) {
+    let max_sat_kvb = match parse_maxfeerate_btc_kvb(q) {
         Ok(v) => v,
         Err(r) => return r,
     };
@@ -2252,7 +2253,7 @@ pub async fn post_txs_test(
             let wtxid = format!("{}", tx.compute_wtxid());
             match mp.test_accept(&tx) {
                 Ok(r) => {
-                    if rbitcoin_consensus::policy::fee_exceeds_max(r.fee_sat, r.weight, max_sat_vb)
+                    if rbitcoin_consensus::policy::fee_exceeds_max(r.fee_sat, r.weight, max_sat_kvb)
                     {
                         out.push(json!({
                             "txid": txid,

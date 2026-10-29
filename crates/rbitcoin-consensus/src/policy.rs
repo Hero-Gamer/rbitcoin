@@ -49,13 +49,22 @@ pub fn vbytes_ceil(weight: u64) -> u64 {
     Weight::from_wu(weight).to_vbytes_ceil()
 }
 
-/// Zero `max_sat_vb` is unlimited. Otherwise the fee is over
-/// `max_sat_vb * vbytes_ceil(weight)`.
-pub fn fee_exceeds_max(fee_sat: u64, weight: u64, max_sat_vb: u64) -> bool {
-    if max_sat_vb == 0 {
+/// Core `CFeeRate::GetFee` cap (`sendrawtransaction`, `testmempoolaccept`).
+/// Zero `max_sat_kvb` is unlimited. Otherwise the fee is over
+/// `max_sat_kvb * vbytes_ceil(weight) / 1000`, rounded up to a whole sat.
+pub fn fee_exceeds_max(fee_sat: u64, weight: u64, max_sat_kvb: u64) -> bool {
+    if max_sat_kvb == 0 {
         return false;
     }
-    fee_sat > max_sat_vb.saturating_mul(vbytes_ceil(weight))
+    let cap = (u128::from(max_sat_kvb) * u128::from(vbytes_ceil(weight))).div_ceil(1000);
+    u128::from(fee_sat) > cap
+}
+
+/// Core `submitpackage` member check: the feerate is over `max_sat_kvb`,
+/// unrounded. Zero `max_sat_kvb` is unlimited.
+pub fn feerate_exceeds_max(fee_sat: u64, weight: u64, max_sat_kvb: u64) -> bool {
+    max_sat_kvb != 0
+        && u128::from(fee_sat) * 1000 > u128::from(max_sat_kvb) * u128::from(vbytes_ceil(weight))
 }
 
 /// True if `fee_sat` meets the minimum relay feerate for `weight` (WU).

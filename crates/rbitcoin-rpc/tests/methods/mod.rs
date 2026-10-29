@@ -2392,6 +2392,21 @@ fn generated_coinbase_value(ctx: &RpcContext, height: u32) -> u64 {
     (blk["tx"][0]["vout"][0]["value"].as_f64().unwrap() * 100_000_000.0).round() as u64
 }
 
+/// A JSON number as a client writes it (`0.00001001`). `json!` on an `f64`
+/// prints exponent form for small values.
+fn json_num(text: &str) -> Value {
+    serde_json::from_str(text).expect("JSON number")
+}
+
+/// sat/kvB as the BTC/kvB string a Core client sends.
+fn btc_kvb(sat_kvb: u64) -> Value {
+    json!(format!(
+        "{}.{:08}",
+        sat_kvb / 100_000_000,
+        sat_kvb % 100_000_000
+    ))
+}
+
 fn default_max_raw_fee_sat(weight: u64) -> u64 {
     let vsize = bitcoin::Weight::from_wu(weight).to_vbytes_ceil();
     10_000u64.saturating_mul(vsize)
@@ -2407,7 +2422,7 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext, at: u32,
     let ok = dispatch(ctx, "sendrawtransaction", vec![json!(at_hex)]).unwrap();
     assert!(
         ok.as_str().is_some(),
-        "exact default 10000 sat/vB must accept: {ok}"
+        "exact default 0.10 BTC/kvB must accept: {ok}"
     );
     let (over_hex, _) = spend_generated_coinbase(
         ctx,
@@ -2416,8 +2431,13 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext, at: u32,
         ScriptBuf::from_bytes(vec![0x51]),
     );
     // Pre-0.19 `allowhighfees`, which btcd rpcclient sends for a `/rbitcoin:`
-    // subversion: `false` keeps the default cap, `true` lifts it.
-    for params in [vec![json!(over_hex)], vec![json!(over_hex), json!(false)]] {
+    // subversion: `false` keeps the default cap, `true` lifts it. LND on a
+    // modern subversion sends the default as `0.1` BTC/kvB.
+    for params in [
+        vec![json!(over_hex)],
+        vec![json!(over_hex), json!(false)],
+        vec![json!(over_hex), json_num("0.1")],
+    ] {
         let e = dispatch(ctx, "sendrawtransaction", params).unwrap_err();
         assert_eq!(e["code"], ERR_VERIFY_ERROR, "{e}");
         assert_eq!(
@@ -2438,33 +2458,36 @@ fn pin_sendraw_maxfeerate_at_default_and_one_sat_over(ctx: &RpcContext, at: u32,
 }
 
 fn pin_maxfeerate_json_shapes(ctx: &RpcContext) {
+    // Core `AmountFromValue` is `-3`; only `ParseFeeRate`'s cap is `-8`.
+    let too_high = "Fee rates larger than or equal to 1BTC/kvB are not accepted";
+    let (invalid, range) = ("Invalid amount", "Amount out of range");
     for (v, code, msg) in [
-        (json!(-1), ERR_INVALID_PARAMETER, "Amount out of range"),
-        (json!("-2"), ERR_INVALID_PARAMETER, "Amount out of range"),
-        (
-            json!(1.5),
-            ERR_INVALID_PARAMETER,
-            "maxfeerate must be an integer sat/vB",
-        ),
-        (
-            json!("nope"),
-            ERR_INVALID_PARAMETER,
-            "maxfeerate must be an integer sat/vB",
-        ),
+        (json!(-1), ERR_TYPE_ERROR, range),
+        (json!("-2"), ERR_TYPE_ERROR, range),
+        (json_num("-0.01"), ERR_TYPE_ERROR, range),
+        (json!(21_000_001), ERR_TYPE_ERROR, range),
+        (json!(1), ERR_INVALID_PARAMETER, too_high),
+        (json_num("1.5"), ERR_INVALID_PARAMETER, too_high),
+        (json!("1.00000000"), ERR_INVALID_PARAMETER, too_high),
+        (json_num("1e0"), ERR_INVALID_PARAMETER, too_high),
+        (json!("nope"), ERR_TYPE_ERROR, invalid),
+        (json!("0.000000001"), ERR_TYPE_ERROR, invalid),
+        (json!("1e-9"), ERR_TYPE_ERROR, invalid),
+        (json!(" 0.1"), ERR_TYPE_ERROR, invalid),
         (
             json!({}),
             ERR_TYPE_ERROR,
-            "maxfeerate is not a number or string",
+            "Amount is not a number or string",
         ),
         (
             json!([]),
             ERR_TYPE_ERROR,
-            "maxfeerate is not a number or string",
+            "Amount is not a number or string",
         ),
     ] {
-        let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v]).unwrap_err();
-        assert_eq!(e["code"], code, "{e}");
-        assert_eq!(e["message"], msg, "{e}");
+        let e = dispatch(ctx, "sendrawtransaction", vec![json!("00"), v.clone()]).unwrap_err();
+        assert_eq!(e["code"], code, "{v}: {e}");
+        assert_eq!(e["message"], msg, "{v}: {e}");
     }
 }
 
@@ -2572,7 +2595,7 @@ fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
         })),
     )
     .unwrap_err();
-    assert_eq!(neg["code"], ERR_INVALID_PARAMETER, "{neg}");
+    assert_eq!(neg["code"], ERR_TYPE_ERROR, "{neg}");
     assert_eq!(neg["message"], "Amount out of range", "{neg}");
     let typ = dispatch(
         ctx,
@@ -2597,7 +2620,7 @@ fn pin_maxburn_json_shapes(ctx: &RpcContext, hex: &str) {
             })),
         )
         .unwrap_err();
-        assert_eq!(e["code"], ERR_INVALID_PARAMETER, "{e}");
+        assert_eq!(e["code"], ERR_TYPE_ERROR, "{e}");
         assert_eq!(e["message"], "Invalid amount", "{e}");
     }
 }
@@ -2754,14 +2777,14 @@ fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
     let child_vb = bitcoin::Weight::from_wu(child.weight().to_wu()).to_vbytes_ceil();
     let parent_fee = 2_000u64;
     let child_fee = 10_000u64;
-    let max_feerate = parent_fee.div_ceil(parent_vb.max(1));
+    let max_feerate = (parent_fee * 1000).div_ceil(parent_vb.max(1));
     assert!(
-        parent_fee <= max_feerate.saturating_mul(parent_vb),
-        "parent fee must stay within maxfeerate {max_feerate}"
+        parent_fee * 1000 <= max_feerate * parent_vb,
+        "parent fee must stay within maxfeerate {max_feerate} sat/kvB"
     );
     assert!(
-        child_fee > max_feerate.saturating_mul(child_vb),
-        "child fee must exceed maxfeerate {max_feerate} vsize {child_vb}"
+        child_fee * 1000 > max_feerate * child_vb,
+        "child fee must exceed maxfeerate {max_feerate} sat/kvB vsize {child_vb}"
     );
     let pkg = dispatch(
         &ctx,
@@ -2771,7 +2794,7 @@ fn submitpackage_maxfeerate_skips_package_eval_and_reports_replacements() {
                 rbitcoin_primitives::hex_encode(serialize(&parent)),
                 rbitcoin_primitives::hex_encode(serialize(&child))
             ]),
-            json!(max_feerate),
+            btc_kvb(max_feerate),
         ],
     )
     .unwrap();
@@ -3205,7 +3228,7 @@ fn pressure_tiny_weight() {
     let vsize = bitcoin::Weight::from_wu(probe.weight().to_wu()).to_vbytes_ceil();
     let minrelay_fee = vsize.div_ceil(10);
     let (low_hex, low) = spend_generated_coinbase(&fee_ctx, 1, cb - minrelay_fee, spk.clone());
-    // Child fee stays under the default 10_000 sat/vB `maxfeerate`. A 1 sat
+    // Child fee stays under the default 0.10 BTC/kvB `maxfeerate`. A 1 sat
     // output would burn almost the whole coinbase and skip package eval.
     let child_fee = 1_000u64;
     let low_child = Transaction {
@@ -5592,7 +5615,10 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     let priced = dispatch(
         &ctx,
         "testmempoolaccept",
-        vec![json!([serialize_hex(&fat), serialize_hex(&v3a)]), json!(1)],
+        vec![
+            json!([serialize_hex(&fat), serialize_hex(&v3a)]),
+            json!("0.00001"),
+        ],
     )
     .unwrap();
     assert_eq!(priced[0]["reject-reason"], "max-fee-exceeded", "{priced}");

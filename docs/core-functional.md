@@ -136,8 +136,8 @@ the asserts then hit `sendrawtransaction` / `generate*` / P2P. Do **not**
 `Bound to` lines, vendored `rpcauth.py`, or Core decode/`validateaddress`
 dialect the node does not ship. Named Core-functional shim dialect is allowed
 when documented: child env (`RBITCOIN_RPC_WAIT_TIP_IDLE`,
-`RBITCOIN_RPC_PACKAGE_DIALECT`) and proxy JSON (`maxfeerate` BTC/kvB,
-abort-class `testmempoolaccept` blanking). Do not `run` a silent Core-clone
+`RBITCOIN_RPC_PACKAGE_DIALECT`) and proxy JSON (abort-class
+`testmempoolaccept` blanking). Do not `run` a silent Core-clone
 of production RPC.
 
 First production-green pair (historical): `feature_uacomment.py`

@@ -445,8 +445,8 @@ fn wait_bitcoind_rpc(cookie: PathBuf, rpcport: u16) -> Result<CoreRpc, String> {
 
 /// `testmempoolaccept` params: hex array + `maxfeerate=0`.
 ///
-/// Core v31 docs: set to 0 to accept any fee rate. Node `maxfeerate` is
-/// sat/vB (`>= 100000` is a param error); fuzz still passes `0`.
+/// Core v31 docs: set to 0 to accept any fee rate. The node reads
+/// `maxfeerate` as Core BTC/kvB too.
 pub fn testmempoolaccept_params(hexs: &[&str]) -> String {
     let inner = hexs
         .iter()
@@ -660,8 +660,7 @@ mod tests {
 
     #[test]
     fn testmempoolaccept_params_disable_maxfeerate() {
-        // maxfeerate=0 means accept any fee rate (node sat/vB; Core BTC/kvB
-        // is the functional-harness proxy).
+        // maxfeerate=0 means accept any fee rate on both nodes.
         assert_eq!(testmempoolaccept_params(&["ab"]), r#"[["ab"], 0]"#);
         assert_eq!(
             testmempoolaccept_params(&["aa", "bb"]),
