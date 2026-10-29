@@ -7,6 +7,7 @@ use bitcoin::script::Builder;
 use bitcoin::{Address, Block, BlockHash, Network as BtcNetwork, ScriptBuf, Transaction, Txid};
 use rbitcoin_net::Selected;
 use rbitcoin_primitives::{Height, Network};
+use rbitcoin_query::ThresholdState;
 
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -527,80 +528,200 @@ pub fn mocktime_i64(v: &Value) -> Result<i64, Value> {
     Ok(i)
 }
 
-/// Core `VERSIONBITS_TOP_BITS`. No testdummy bit.
-#[doc(hidden)]
-pub const GBT_VERSION: i32 = 0x2000_0000;
+const SEGWIT_RULE_REQUIRED: &str =
+    r#"getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})"#;
+const SIGNET_RULE_REQUIRED: &str = r#"getblocktemplate must be called with the signet rule set (call with {"rules": ["segwit", "signet"]})"#;
 
-pub fn gbt_rules(req: Option<&Value>) -> Result<Vec<String>, Value> {
-    let Some(obj) = req.and_then(Value::as_object) else {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        ));
+/// Core `setClientRules`: a `rules` array of strings. Anything else is no rules.
+fn gbt_client_rules(req: Option<&serde_json::Map<String, Value>>) -> Result<Vec<&str>, Value> {
+    let Some(rules) = req.and_then(|o| o.get("rules")).and_then(Value::as_array) else {
+        return Ok(Vec::new());
     };
-    let rules = obj.get("rules").and_then(Value::as_array).ok_or_else(|| {
-        rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        )
-    })?;
-    let names: Vec<String> = rules
+    rules
         .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
-    if !names.iter().any(|r| r == "segwit") {
-        return Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            "getblocktemplate must be called with the segwit rule set",
-        ));
+        .map(|v| {
+            v.as_str().ok_or_else(|| {
+                rpc_error(
+                    ERR_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} is not of expected type string",
+                        json_type_name(v)
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+/// A `getblocktemplate` request after Core's checks that come before the
+/// longpoll wait.
+pub enum GbtRequest<'a> {
+    Proposal(Option<&'a serde_json::Map<String, Value>>),
+    Template {
+        rules: Vec<&'a str>,
+        longpoll: Option<LongpollWant>,
+    },
+}
+
+pub fn gbt_request<'a>(ctx: &RpcContext, params: &'a RpcParams) -> Result<GbtRequest<'a>, Value> {
+    refuse_unmaintained_template(ctx)?;
+    params.reject_unknown(&["template_request"])?;
+    let req = params.get(0, "template_request").and_then(Value::as_object);
+    let invalid_mode = || rpc_error(ERR_INVALID_PARAMETER, "Invalid mode");
+    let mode = match req.and_then(|o| o.get("mode")) {
+        None | Some(Value::Null) => "template",
+        Some(Value::String(m)) => m.as_str(),
+        Some(_) => return Err(invalid_mode()),
+    };
+    if mode == "proposal" {
+        return Ok(GbtRequest::Proposal(req));
     }
-    Ok(names)
+    let rules = gbt_client_rules(req)?;
+    if mode != "template" {
+        return Err(invalid_mode());
+    }
+    // An HTTP longpoll passed these before its wait. Core does not check
+    // them again after the wait.
+    if matches!(ctx.network, Network::Mainnet) && !super::http_wait_satisfied() {
+        if super::net::connection_count(ctx) == 0 {
+            return Err(rpc_error(
+                ERR_CLIENT_NOT_CONNECTED,
+                "Bitcoin Core is not connected!",
+            ));
+        }
+        if super::chain::in_ibd(ctx) {
+            return Err(rpc_error(
+                ERR_CLIENT_IN_INITIAL_DOWNLOAD,
+                "Bitcoin Core is in initial sync and waiting for blocks...",
+            ));
+        }
+    }
+    let longpoll = match req.and_then(|o| o.get("longpollid")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(LongpollWant::parse(id)?),
+        // Core: a non-string id waits on the current tip and counter.
+        Some(_) => Some(LongpollWant::current(ctx)),
+    };
+    Ok(GbtRequest::Template { rules, longpoll })
 }
 
 pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
-    refuse_unmaintained_template(ctx)?;
-    params.reject_unknown(&["template_request"])?;
-    let req = params.get(0, "template_request");
-    let _rules = gbt_rules(req)?;
-    let mode = req
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("mode"))
-        .and_then(Value::as_str)
-        .unwrap_or("template");
-    match mode {
-        "template" | "" => {
-            if let Some(lp) = req
-                .and_then(Value::as_object)
-                .and_then(|o| o.get("longpollid"))
-                .and_then(Value::as_str)
-            {
-                gbt_longpoll_wait(ctx, lp);
-            }
-            gbt_template(ctx)
+    let (rules, longpoll) = match gbt_request(ctx, params)? {
+        GbtRequest::Proposal(req) => return gbt_proposal(ctx, req),
+        GbtRequest::Template { rules, longpoll } => (rules, longpoll),
+    };
+    if let Some(want) = longpoll {
+        gbt_longpoll_wait(ctx, &want);
+        if ctx.stop.load(Ordering::Relaxed) {
+            return Err(rpc_error(ERR_CLIENT_NOT_CONNECTED, "Shutting down"));
         }
-        "proposal" => gbt_proposal(ctx, req),
-        other => Err(rpc_error(
-            ERR_INVALID_PARAMETER,
-            format!("Invalid mode: {other}"),
-        )),
+    }
+    if gbt_params(ctx).signet_challenge.is_some() && !rules.contains(&"signet") {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, SIGNET_RULE_REQUIRED));
+    }
+    if !rules.contains(&"segwit") {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, SEGWIT_RULE_REQUIRED));
+    }
+    gbt_template(ctx)
+}
+
+/// Core BIP22 `longpollid`: the watched tip and mempool update counter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LongpollWant {
+    /// Lowercase display hex. `None` while the template tip is stale.
+    tip: Option<String>,
+    updates: u32,
+}
+
+impl LongpollWant {
+    /// Core `ParseHashV` on the first 64 bytes, `LocaleIndependentAtoi` on the rest.
+    fn parse(id: &str) -> Result<Self, Value> {
+        let bytes = id.as_bytes();
+        let (head, rest) = bytes.split_at(bytes.len().min(64));
+        let head_text = String::from_utf8_lossy(head);
+        if head.len() != 64 {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                format!(
+                    "longpollid must be of length 64 (not {}, for '{head_text}')",
+                    head.len()
+                ),
+            ));
+        }
+        if !head.iter().all(u8::is_ascii_hexdigit) {
+            return Err(rpc_error(
+                ERR_INVALID_PARAMETER,
+                format!("longpollid must be hexadecimal string (not '{head_text}')"),
+            ));
+        }
+        Ok(Self {
+            tip: Some(head_text.to_ascii_lowercase()),
+            updates: locale_independent_atoi(rest) as u32,
+        })
+    }
+
+    pub fn current(ctx: &RpcContext) -> Self {
+        let updates = ctx
+            .mempool
+            .as_ref()
+            .map(|m| m.template_updates() as u32)
+            .unwrap_or(0);
+        let tip = match gbt_tip(ctx) {
+            Ok(GbtTip::Ready(_, hex, _)) => Some(hex),
+            _ => None,
+        };
+        Self { tip, updates }
+    }
+
+    pub fn changed(&self, ctx: &RpcContext) -> bool {
+        Self::current(ctx) != *self
     }
 }
 
-/// Core GBT longpoll: block while `longpollid` still matches the live tip +
-/// mempool update counter. Tip change (P2P / generate) wakes within one poll
-/// tick. A new mempool tx or `prioritisetransaction` does too.
-pub(crate) fn gbt_longpoll_wait(ctx: &RpcContext, want: &str) {
+/// Core `LocaleIndependentAtoi<int64_t>`: leading whitespace, one `+` or
+/// `-`, then digits up to the first non-digit. Saturates; no digits is 0.
+fn locale_independent_atoi(s: &[u8]) -> i64 {
+    let s = &s[s
+        .iter()
+        .take_while(|c| b" \x0c\n\r\t\x0b".contains(c))
+        .count()..];
+    let s = match s {
+        [b'+', b'-', ..] => return 0,
+        [b'+', rest @ ..] => rest,
+        _ => s,
+    };
+    let (negative, digits) = match s {
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, s),
+    };
+    let mut v: i64 = 0;
+    for d in digits.iter().take_while(|c| c.is_ascii_digit()) {
+        let d = i64::from(d - b'0');
+        let next = v.checked_mul(10).and_then(|v| {
+            if negative {
+                v.checked_sub(d)
+            } else {
+                v.checked_add(d)
+            }
+        });
+        v = match next {
+            Some(v) => v,
+            None if negative => return i64::MIN,
+            None => return i64::MAX,
+        };
+    }
+    v
+}
+
+/// Core GBT longpoll: block while the watched tip and mempool update counter
+/// still hold. Tip change (P2P / generate) wakes within one poll tick. A new
+/// mempool tx or `prioritisetransaction` does too.
+fn gbt_longpoll_wait(ctx: &RpcContext, want: &LongpollWant) {
     const TICK: std::time::Duration = std::time::Duration::from_millis(50);
     if super::http_wait_satisfied() {
         return;
     }
-    loop {
-        if ctx.stop.load(Ordering::Relaxed) {
-            return;
-        }
-        if gbt_longpoll_id(ctx) != want {
-            return;
-        }
+    while !ctx.stop.load(Ordering::Relaxed) && !want.changed(ctx) {
         std::thread::sleep(TICK);
     }
 }
@@ -650,16 +771,11 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
     Ok(anchor_of(h.0, rec.hash, rec.bits))
 }
 
-pub fn gbt_longpoll_id(ctx: &RpcContext) -> String {
-    let updates = ctx
-        .mempool
+fn gbt_params(ctx: &RpcContext) -> rbitcoin_consensus::ChainParams {
+    ctx.chain
         .as_ref()
-        .map(|m| m.template_updates())
-        .unwrap_or(0);
-    match gbt_tip(ctx) {
-        Ok(GbtTip::Ready(_, hex, _)) => format!("{hex}{updates}"),
-        _ => format!("stale{updates}"),
-    }
+        .map(|c| c.params.clone())
+        .unwrap_or_else(|| rbitcoin_consensus::ChainParams::for_network(ctx.network))
 }
 
 pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
@@ -670,14 +786,16 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     let updates = ctx
         .mempool
         .as_ref()
-        .map(|m| m.template_updates())
+        .map(|m| m.template_updates() as u32)
         .unwrap_or(0);
     let next_h = tip_h.saturating_add(1);
-    let params = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.params.clone())
-        .unwrap_or_else(|| rbitcoin_consensus::ChainParams::for_network(ctx.network));
+    let params = gbt_params(ctx);
+    let pre_segwit = next_h < params.segwit_height();
+    let legacy_scale = if pre_segwit { 4 } else { 1 };
+    let testdummy = ctx
+        .query
+        .testdummy_state(&params, Height(tip_h))
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
     let now = ctx
         .chain
         .as_ref()
@@ -713,7 +831,7 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
             "hash": tx.compute_wtxid().to_string(),
             "depends": depends,
             "fee": sel.fee_sat,
-            "sigops": sel.sigop_cost,
+            "sigops": sel.sigop_cost / legacy_scale,
             "weight": tx.weight().to_wu(),
         }));
     }
@@ -723,36 +841,64 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     if let Some(c) = ctx.chain.as_ref() {
         c.note_gbt_assembled();
     }
-    let wtxids: Vec<[u8; 32]> = selected
+    let wtxids = selected
         .iter()
-        .map(|(tx, _)| tx.compute_wtxid().to_byte_array())
-        .collect();
+        .map(|(tx, _)| tx.compute_wtxid().to_byte_array());
     let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
+    let mut rules = vec!["csv"];
+    if !pre_segwit {
+        rules.extend(["!segwit", "taproot"]);
+    }
+    if params.signet_challenge.is_some() {
+        rules.push("!signet");
+    }
+    let mut vbavailable = serde_json::Map::new();
+    let mut version = ctx
+        .chain
+        .as_ref()
+        .map(|c| c.gbt_block_version(testdummy))
+        .unwrap_or_else(|| rbitcoin_query::compute_block_version(testdummy));
+    if let Some(d) = testdummy {
+        match d.state {
+            ThresholdState::Started => {
+                vbavailable.insert("testdummy".into(), json!(d.bit));
+            }
+            ThresholdState::LockedIn => {
+                version |= 1 << d.bit;
+                vbavailable.insert("testdummy".into(), json!(d.bit));
+            }
+            ThresholdState::Active => rules.push("testdummy"),
+            ThresholdState::Defined => {}
+        }
+    }
     let mut template = json!({
         "capabilities": ["proposal"],
-        "version": ctx
-            .chain
-            .as_ref()
-            .map(|c| c.gbt_block_version())
-            .unwrap_or(GBT_VERSION | (1 << 28)),
+        "version": version,
+        "rules": rules,
+        "vbavailable": vbavailable,
+        "vbrequired": 0,
         "previousblockhash": prev_hex,
         "transactions": tx_json,
-        "coinbaseaux": { "flags": "" },
+        "coinbaseaux": {},
         "coinbasevalue": subsidy.saturating_add(fees),
         "longpollid": longpollid,
         "target": format!("{target:064x}"),
         "mintime": mintime,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
-        "sigoplimit": rbitcoin_consensus::block::MAX_BLOCK_SIGOPS_COST,
-        "sizelimit": 4_000_000,
-        "weightlimit": 4_000_000,
+        "sigoplimit": rbitcoin_consensus::block::MAX_BLOCK_SIGOPS_COST / legacy_scale,
+        "sizelimit": 4_000_000 / legacy_scale,
         "curtime": curtime,
         "bits": format!("{bits:08x}"),
         "height": next_h,
-        "rules": ["segwit"],
-        "default_witness_commitment": rbitcoin_primitives::hex_encode(&(witness_commit)),
+        "default_witness_commitment": rbitcoin_primitives::hex_encode(&witness_commit),
     });
+    if !pre_segwit {
+        template["weightlimit"] = json!(4_000_000);
+    }
+    if let Some(challenge) = &params.signet_challenge {
+        template["signet_challenge"] = json!(rbitcoin_primitives::hex_encode(challenge.as_bytes()));
+    }
     let warnings = rpc_warnings(ctx);
     if !warnings.is_empty() {
         template["warnings"] = json!(warnings);
@@ -760,20 +906,52 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
     Ok(template)
 }
 
-pub fn gbt_proposal(ctx: &RpcContext, req: Option<&Value>) -> Result<Value, Value> {
+pub fn gbt_proposal(
+    ctx: &RpcContext,
+    req: Option<&serde_json::Map<String, Value>>,
+) -> Result<Value, Value> {
     let data = req
-        .and_then(Value::as_object)
         .and_then(|o| o.get("data"))
         .and_then(Value::as_str)
-        .ok_or_else(|| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
+        .ok_or_else(|| rpc_error(ERR_TYPE_ERROR, "Missing data String key for proposal"))?;
     let raw = rbitcoin_primitives::hex_decode(data)
         .map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
     let block: Block =
         deserialize(&raw).map_err(|_| rpc_error(ERR_DESERIALIZATION, "Block decode failed"))?;
+    if let Some(known) = proposal_duplicate(ctx, &block.block_hash())? {
+        return Ok(json!(known));
+    }
     match gbt_check_proposal(ctx, &block) {
         Ok(()) => Ok(Value::Null),
         Err(s) => Ok(json!(s)),
     }
+}
+
+/// Core's block-index lookup before a proposal is checked. A block connected
+/// now, or connected and then reorged off by this process, is `duplicate`
+/// (Core `BLOCK_VALID_SCRIPTS`). The mark is not kept across a restart, so
+/// such a block is then `duplicate-inconclusive`, like any other known header.
+fn proposal_duplicate(ctx: &RpcContext, hash: &BlockHash) -> Result<Option<&'static str>, Value> {
+    let bytes = hash.to_byte_array();
+    let connected = ctx
+        .query
+        .height_of_hash(&bytes)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+        .is_some();
+    if connected {
+        return Ok(Some("duplicate"));
+    }
+    let Some(chain) = ctx.chain.as_ref() else {
+        return Ok(None);
+    };
+    if chain.is_block_invalid(hash) {
+        return Ok(Some("duplicate-invalid"));
+    }
+    if ctx.query.was_disconnected(&bytes) {
+        return Ok(Some("duplicate"));
+    }
+    let known = chain.stored_header_height(hash).is_some() || chain.held_body(hash).is_some();
+    Ok(known.then_some("duplicate-inconclusive"))
 }
 
 /// Core `TestBlockValidity` for GBT proposal: no PoW, no UTXO write.

@@ -650,6 +650,7 @@ impl Query {
                 .map(|item| (item.hash, item.height.0))
                 .collect();
             self.publish_confirmed_rows(&rows);
+            self.forget_reconnected(items.iter().map(|item| &item.hash));
         }
         // Do not forget pending here: drain may still be inserting tx.head
         // (67438). Write forgets after drain.join() *and* this extend.
@@ -1268,7 +1269,31 @@ impl Query {
         }
         self.truncate_sp_tweaks_through_tip(self.tip_height())?;
         self.truncate_basic_filters_to_tip()?;
+        if disconnected.is_some() {
+            self.disconnected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(hash);
+        }
         Ok(())
+    }
+
+    fn forget_reconnected<'a>(&self, hashes: impl Iterator<Item = &'a [u8; 32]>) {
+        let mut disconnected = self.disconnected.lock().unwrap_or_else(|e| e.into_inner());
+        if disconnected.is_empty() {
+            return;
+        }
+        for hash in hashes {
+            disconnected.remove(hash);
+        }
+    }
+
+    /// This process connected `hash` and later disconnected it.
+    pub fn was_disconnected(&self, hash: &[u8; 32]) -> bool {
+        self.disconnected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(hash)
     }
 }
 

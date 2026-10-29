@@ -1335,7 +1335,7 @@ fn chain_ops_empty_template_and_proposals(ctx: &RpcContext) {
     let tip_h = tip_count(ctx);
     let tmpl = dispatch(ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
     assert_eq!(tmpl["height"], tip_h + 1);
-    assert_eq!(tmpl["version"], 0x2000_0000 | (1 << 28));
+    assert_eq!(tmpl["version"], 0x2000_0000, "testdummy is DEFINED below height 144");
     assert!(tmpl["transactions"].as_array().unwrap().is_empty());
     let info = dispatch(ctx, "getmininginfo", vec![]).unwrap();
     assert_eq!(info["blocks"], tip_h);
@@ -1866,7 +1866,7 @@ fn chain_ops_template_sigops_and_script_reject(ctx: &RpcContext, cbs: &mut TrueC
     let stale = dispatch(
         ctx,
         "getblocktemplate",
-        vec![json!({"rules": ["segwit"], "longpollid": "not-this-id"})],
+        vec![json!({"rules": ["segwit"], "longpollid": "0000000000000000000000000000000000000000000000000000000000000000"})],
     )
     .unwrap();
     assert_eq!(stale["longpollid"], lp);
@@ -3244,4 +3244,182 @@ fn walk_for(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+fn bip9_template(ctx: &RpcContext) -> Value {
+    dispatch(ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap()
+}
+
+/// Mine `n` blocks whose header version is `version` (a miner following the
+/// template, or not).
+fn mine_versioned(ctx: &RpcContext, hub: &rbitcoin_net::ChainHub, version: i32, n: u32) {
+    for _ in 0..n {
+        let tip = hub.tip_header().unwrap();
+        let mut block = rbitcoin_consensus::mine_regtest_paying(
+            hub.tip_hash().unwrap(),
+            tip.time + 1,
+            tip_count(ctx) as u32 + 1,
+            true_spk(),
+            vec![],
+        );
+        block.header.version = bitcoin::block::Version::from_consensus(version);
+        rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+        let r = dispatch(ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert!(r.is_null(), "{r}");
+    }
+}
+
+/// Core's `testdummy` BIP9 states as a template reports them: DEFINED,
+/// STARTED, LOCKED_IN, ACTIVE, and back to STARTED when a reorg takes away
+/// the signal that locked it in. A 4-block period with a threshold of 3 walks
+/// the same states as regtest's 144 and 108.
+#[test]
+fn template_versionbits_follow_regtest_testdummy() {
+    const TOP: i64 = 0x2000_0000;
+    const DUMMY: i64 = 1 << 28;
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    assert_eq!(
+        params.testdummy,
+        Some(rbitcoin_consensus::Bip9Deployment {
+            bit: 28,
+            period: 144,
+            threshold: 108,
+        }),
+        "Core regtest DEPLOYMENT_TESTDUMMY"
+    );
+    params.testdummy = Some(rbitcoin_consensus::Bip9Deployment {
+        bit: 28,
+        period: 4,
+        threshold: 3,
+    });
+    let (ctx, dir, hub) = ctx_regtest_hub_on(params, 300_000_000);
+    let defined = bip9_template(&ctx);
+    assert_eq!(defined["version"], TOP, "{defined}");
+    assert_eq!(defined["rules"], json!(["csv", "!segwit", "taproot"]));
+    assert_eq!(defined["vbavailable"], json!({}));
+    assert_eq!(defined["vbrequired"], 0);
+    assert_eq!(defined["coinbaseaux"], json!({}));
+
+    dispatch(&ctx, "generate", vec![json!(3)]).unwrap();
+    let started = bip9_template(&ctx);
+    assert_eq!(started["version"], TOP | DUMMY, "{started}");
+    assert_eq!(started["vbavailable"], json!({"testdummy": 28}));
+    assert_eq!(started["rules"], json!(["csv", "!segwit", "taproot"]));
+
+    mine_versioned(&ctx, &hub, (TOP | DUMMY) as i32, 2);
+    dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
+    hub.set_block_version(1337);
+    assert_eq!(bip9_template(&ctx)["version"], 1337, "2 of 3 signals stay STARTED");
+    hub.set_block_version(0);
+
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    mine_versioned(&ctx, &hub, (TOP | DUMMY) as i32, 3);
+    let last_signal = best_hash(&ctx);
+    let locked = bip9_template(&ctx);
+    assert_eq!(locked["height"], 12);
+    assert_eq!(locked["version"], TOP | DUMMY, "{locked}");
+    assert_eq!(locked["vbavailable"], json!({"testdummy": 28}));
+    assert_eq!(locked["rules"], json!(["csv", "!segwit", "taproot"]));
+    hub.set_block_version(1337);
+    assert_eq!(bip9_template(&ctx)["version"], 1337 | DUMMY, "LOCKED_IN sets the bit");
+    hub.set_block_version(0);
+
+    dispatch(&ctx, "generate", vec![json!(4)]).unwrap();
+    let active = bip9_template(&ctx);
+    assert_eq!(active["height"], 16);
+    assert_eq!(active["version"], TOP, "{active}");
+    assert_eq!(active["vbavailable"], json!({}));
+    assert_eq!(active["rules"], json!(["csv", "!segwit", "taproot", "testdummy"]));
+
+    dispatch(&ctx, "invalidateblock", vec![last_signal]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(5)]).unwrap();
+    let reorged = bip9_template(&ctx);
+    assert_eq!(reorged["height"], 16);
+    assert_eq!(reorged["version"], TOP | DUMMY, "{reorged}");
+    assert_eq!(reorged["vbavailable"], json!({"testdummy": 28}));
+    assert_eq!(reorged["rules"], json!(["csv", "!segwit", "taproot"]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `fPreSegWit`: before segwit the template drops `!segwit`/`taproot`
+/// and the weight limit, and counts legacy sigops. Core 32 keeps the witness
+/// commitment. The mature pad is read with segwit at height 103.
+#[test]
+fn template_before_segwit_uses_legacy_limits() {
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.segwit_height_overlay = Some(103);
+    let (ctx, dir, hub) = ctx_from_mature_pad_on(params, 300_000_000);
+    assert_eq!(hub.tip_height(), Some(101));
+    let cb = generated_coinbase_value(&ctx, 1);
+    let checksig = spend_generated_coinbase(&ctx, 1, cb - 1_000, ScriptBuf::from_bytes(vec![0xac])).1;
+    dispatch(&ctx, "sendrawtransaction", vec![json!(tx_hex(&checksig))]).unwrap();
+    let t = bip9_template(&ctx);
+    assert_eq!(t["rules"], json!(["csv"]), "{t}");
+    assert_eq!(t["sigoplimit"], 20_000);
+    assert_eq!(t["sizelimit"], 1_000_000);
+    assert!(t.get("weightlimit").is_none(), "{t}");
+    assert!(t.get("default_witness_commitment").is_some(), "{t}");
+    assert_eq!(t["transactions"][0]["sigops"], 1, "{t}");
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+    let t = bip9_template(&ctx);
+    assert_eq!(t["rules"], json!(["csv", "!segwit", "taproot"]), "{t}");
+    assert_eq!(t["sigoplimit"], 80_000);
+    assert_eq!(t["weightlimit"], 4_000_000);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core looks a proposal up in its block index before checking it.
+#[test]
+fn proposal_of_a_known_block_is_a_duplicate() {
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "generate", vec![json!(2)]).unwrap();
+    let tip = best_hash(&ctx);
+    let raw = dispatch(&ctx, "getblock", vec![tip.clone(), json!(0)]).unwrap();
+    let connected: Block =
+        deserialize(&rbitcoin_primitives::hex_decode(raw.as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(propose(&ctx, &connected), "duplicate");
+
+    let mut header_only = proposal_on_tip(&ctx, vec![]);
+    regrind(&mut header_only);
+    let header_hex =
+        rbitcoin_primitives::hex_encode(bitcoin::consensus::encode::serialize(&header_only.header));
+    dispatch(&ctx, "submitheader", vec![json!(header_hex)]).unwrap();
+    assert_eq!(propose(&ctx, &header_only), "duplicate-inconclusive");
+
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    assert_eq!(propose(&ctx, &connected), "duplicate-invalid");
+
+    dispatch(
+        &ctx,
+        "generatetodescriptor",
+        vec![json!(2), json!("raw(52)#qu92mhx7")],
+    )
+    .unwrap();
+    dispatch(&ctx, "reconsiderblock", vec![tip.clone()]).unwrap();
+    assert_ne!(best_hash(&ctx), tip, "the heavier branch stays the tip");
+    assert_eq!(
+        propose(&ctx, &connected),
+        "duplicate",
+        "a block connected and then reorged off stays scripts-valid"
+    );
+    let reorged_off = best_hash(&ctx);
+
+    let mut prev = connected.block_hash();
+    let mut time = connected.header.time;
+    for height in 3..=4 {
+        time += 1;
+        let block = rbitcoin_consensus::mine_regtest_paying(prev, time, height, true_spk(), vec![]);
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&block))]).unwrap();
+        assert!(r.is_null() || r == "inconclusive", "{r}");
+        prev = block.block_hash();
+    }
+    assert_eq!(best_hash(&ctx), json!(prev.to_string()), "the first branch is back");
+    let back = connected.block_hash().to_byte_array();
+    assert!(
+        !ctx.query.was_disconnected(&back),
+        "a reconnected block is no longer remembered as reorged off"
+    );
+    let off = parse_hash32_display(reorged_off.as_str().unwrap()).unwrap();
+    assert!(ctx.query.was_disconnected(&off));
+    let _ = std::fs::remove_dir_all(&dir);
 }

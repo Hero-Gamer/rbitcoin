@@ -103,7 +103,7 @@ pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher, TxidMap, TxidSe
 pub use milestone::{Milestone, MilestoneAnchor};
 pub use params::{
     default_milestone_anchor, default_milestone_height, default_min_chain_work_be, genesis_block,
-    ChainParams, MAINNET_MILESTONE_HASH, TESTNET_MILESTONE_HASH,
+    Bip9Deployment, ChainParams, MAINNET_MILESTONE_HASH, TESTNET_MILESTONE_HASH,
 };
 pub use policy::PolicyResult;
 pub use regtest_pad::{

@@ -106,6 +106,10 @@ pub fn build(
         return Ok(None);
     }
     let height = tip.0 + 1;
+    let testdummy = chain
+        .query
+        .testdummy_state(&chain.params, tip)
+        .map_err(|e| io::Error::other(format!("sv2: versionbits: {e}")))?;
     let header_timestamp = next_block_mintime(&chain.query, &chain.params, tip)
         .map_err(|e| io::Error::other(format!("sv2: tip mintime: {e}")))?
         .max(chain.clock.now_secs() as u32);
@@ -140,7 +144,7 @@ pub fn build(
     let mut leaves = vec![[0u8; 32]];
     leaves.extend(selected.iter().map(|(_, s)| s.txid.to_byte_array()));
     Ok(Some(Template {
-        version: chain.gbt_block_version() as u32,
+        version: chain.gbt_block_version(testdummy) as u32,
         coinbase_prefix: bip34_height_script(height),
         value_remaining: (block_subsidy(height, &chain.params) as u64).saturating_add(fees),
         coinbase_outputs: serialize(&commitment),

@@ -878,13 +878,13 @@ impl ChainHub {
         self.mining.block_version.store(v, Ordering::Relaxed);
     }
 
-    /// GBT `version`: override, or versionbits top bits with testdummy (`0x30000000`).
-    pub fn gbt_block_version(&self) -> i32 {
+    /// Core `BlockAssembler` version: `--block-version`, else `ComputeBlockVersion`.
+    pub fn gbt_block_version(&self, testdummy: Option<rbitcoin_query::DeploymentState>) -> i32 {
         let v = self.mining.block_version.load(Ordering::Relaxed);
         if v != 0 {
             v
         } else {
-            0x3000_0000
+            rbitcoin_query::compute_block_version(testdummy)
         }
     }
 

@@ -1757,10 +1757,25 @@ fn ctx_from_mature_pad_relay(
     max_wu: u64,
     relay: bool,
 ) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    ctx_from_mature_pad_with(rbitcoin_consensus::ChainParams::regtest(), max_wu, relay)
+}
+
+fn ctx_from_mature_pad_on(
+    params: rbitcoin_consensus::ChainParams,
+    max_wu: u64,
+) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
+    ctx_from_mature_pad_with(params, max_wu, true)
+}
+
+fn ctx_from_mature_pad_with(
+    params: rbitcoin_consensus::ChainParams,
+    max_wu: u64,
+    relay: bool,
+) -> (RpcContext, TempDir, Arc<rbitcoin_net::ChainHub>) {
     let dir = TempDir::labeled("rpc-gen").expect("temp dir");
     let dest = dir.path().join("store");
     copy_store_tree(&mature_regtest_pad().store, &dest);
-    let hub = open_regtest_hub(&dest, rbitcoin_consensus::ChainParams::regtest());
+    let hub = open_regtest_hub(&dest, params);
     hub.ensure_genesis().unwrap();
     regtest_ctx(dir, hub, max_wu, relay)
 }
@@ -5631,22 +5646,156 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         64,
         "{gbt}"
     );
-    assert_eq!(gbt["rules"][0], "segwit", "{gbt}");
-    let no_segwit =
-        dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["csv"]})]).unwrap_err();
-    assert!(
-        rpc_message(&no_segwit).contains("segwit rule set"),
-        "{no_segwit}"
+    assert_eq!(gbt["rules"], json!(["csv", "!segwit", "taproot"]), "{gbt}");
+    let gbt_err = |ctx: &RpcContext, req: Value| {
+        let e = dispatch(ctx, "getblocktemplate", vec![req]).unwrap_err();
+        (e["code"].as_i64().unwrap(), rpc_message(&e).to_owned())
+    };
+    let segwit = (
+        ERR_INVALID_PARAMETER,
+        r#"getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})"#
+            .to_owned(),
     );
-    let bad_mode = dispatch(
+    assert_eq!(gbt_err(&ctx, json!({"rules": ["csv"]})), segwit);
+    assert_eq!(gbt_err(&ctx, json!({"rules": "segwit"})), segwit);
+    assert_eq!(
+        gbt_err(&ctx, json!({"rules": ["segwit", 1]})),
+        (
+            ERR_TYPE_ERROR,
+            "JSON value of type number is not of expected type string".to_owned()
+        )
+    );
+    let invalid_mode = (ERR_INVALID_PARAMETER, "Invalid mode".to_owned());
+    for mode in [json!("future"), json!(""), json!(5)] {
+        assert_eq!(
+            gbt_err(&ctx, json!({"rules": ["segwit"], "mode": mode})),
+            invalid_mode
+        );
+    }
+    let null_mode = dispatch(
         &ctx,
         "getblocktemplate",
-        vec![json!({"rules": ["segwit"], "mode": "future"})],
+        vec![json!({"rules": ["segwit"], "mode": null})],
     )
-    .unwrap_err();
+    .unwrap();
+    assert_eq!(null_mode["previousblockhash"], gbt["previousblockhash"]);
+    for data in [
+        json!({"mode": "proposal"}),
+        json!({"mode": "proposal", "data": 5}),
+    ] {
+        assert_eq!(
+            gbt_err(&ctx, data),
+            (
+                ERR_TYPE_ERROR,
+                "Missing data String key for proposal".to_owned()
+            )
+        );
+    }
+    assert_eq!(
+        gbt_err(&ctx, json!({"mode": "proposal", "data": "zz"})),
+        (ERR_DESERIALIZATION, "Block decode failed".to_owned()),
+        "a proposal needs no rules"
+    );
+    assert_eq!(
+        gbt_err(&ctx, json!({"rules": ["segwit"], "longpollid": "x"})),
+        (
+            ERR_INVALID_PARAMETER,
+            "longpollid must be of length 64 (not 1, for 'x')".to_owned()
+        )
+    );
+    let not_hex = "z".repeat(64);
+    assert_eq!(
+        gbt_err(
+            &ctx,
+            json!({"rules": ["segwit"], "longpollid": format!("{not_hex}7")})
+        ),
+        (
+            ERR_INVALID_PARAMETER,
+            format!("longpollid must be hexadecimal string (not '{not_hex}')")
+        )
+    );
+    assert_eq!(
+        gbt_err(&ctx, json!({"rules": [1], "longpollid": "x"})).0,
+        ERR_TYPE_ERROR,
+        "rules are read before the longpoll"
+    );
+    let other_tip = dispatch(
+        &ctx,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit"], "longpollid": format!("{}0", "AB".repeat(32))})],
+    )
+    .unwrap();
+    assert_eq!(other_tip["previousblockhash"], gbt["previousblockhash"]);
+    let mut stopping = ctx_without_chain(&ctx);
+    stopping.stop = Arc::new(AtomicBool::new(true));
+    assert_eq!(
+        gbt_err(&stopping, json!({"rules": ["segwit"], "longpollid": 5})),
+        (ERR_CLIENT_NOT_CONNECTED, "Shutting down".to_owned()),
+        "a non-string longpollid waits on the current tip"
+    );
+    let mut signet = ctx_without_chain(&ctx);
+    signet.network = Network::Signet;
+    assert_eq!(
+        gbt_err(&signet, json!({"rules": ["segwit"]})),
+        (
+            ERR_INVALID_PARAMETER,
+            r#"getblocktemplate must be called with the signet rule set (call with {"rules": ["segwit", "signet"]})"#
+                .to_owned()
+        )
+    );
+    let on_signet = dispatch(
+        &signet,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit", "signet"]})],
+    )
+    .unwrap();
+    assert_eq!(
+        on_signet["rules"],
+        json!(["csv", "!segwit", "taproot", "!signet"]),
+        "{on_signet}"
+    );
+    assert_eq!(
+        on_signet["signet_challenge"],
+        rbitcoin_primitives::hex_encode(
+            rbitcoin_consensus::signet::default_signet_challenge().as_bytes()
+        ),
+        "{on_signet}"
+    );
+    assert!(gbt.get("signet_challenge").is_none(), "{gbt}");
+    let mut mainnet = ctx_without_chain(&ctx);
+    mainnet.network = Network::Mainnet;
+    mainnet.connections = Arc::new(AtomicU64::new(0));
+    assert_eq!(
+        gbt_err(&mainnet, json!({"rules": ["segwit"]})),
+        (
+            ERR_CLIENT_NOT_CONNECTED,
+            "Bitcoin Core is not connected!".to_owned()
+        )
+    );
+    assert_eq!(
+        gbt_err(&mainnet, json!({"mode": "proposal", "data": "zz"})),
+        (ERR_DESERIALIZATION, "Block decode failed".to_owned()),
+        "a proposal does not need a peer"
+    );
+    set_http_wait_satisfied(true);
+    let after_wait = dispatch(
+        &mainnet,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit"], "longpollid": format!("{}0", "ab".repeat(32))})],
+    );
+    set_http_wait_satisfied(false);
     assert!(
-        rpc_message(&bad_mode).contains("Invalid mode"),
-        "{bad_mode}"
+        after_wait.is_ok(),
+        "Core checks peers before the longpoll wait, not after: {after_wait:?}"
+    );
+    mainnet.connections = Arc::new(AtomicU64::new(1));
+    mainnet.initial_block_download = Arc::new(AtomicBool::new(true));
+    assert_eq!(
+        gbt_err(&mainnet, json!({"rules": ["segwit"]})),
+        (
+            ERR_CLIENT_IN_INITIAL_DOWNLOAD,
+            "Bitcoin Core is in initial sync and waiting for blocks...".to_owned()
+        )
     );
     let (empty, empty_dir) = ctx_empty();
     let no_tip = dispatch(

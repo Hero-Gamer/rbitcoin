@@ -13,6 +13,17 @@ pub fn bip34_block_hash(display_hex: &str) -> BlockHash {
     BlockHash::from_str(display_hex).expect("BIP34 block hash")
 }
 
+/// Core `Consensus::BIP9Deployment` that starts at time 0, never times
+/// out, and activates as soon as it locks in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bip9Deployment {
+    pub bit: u8,
+    /// Blocks per signalling period (Core `period`).
+    pub period: u32,
+    /// Signalling blocks in one period that lock it in (Core `threshold`).
+    pub threshold: u32,
+}
+
 /// Static chain parameters for validation.
 #[derive(Debug, Clone)]
 pub struct ChainParams {
@@ -35,6 +46,8 @@ pub struct ChainParams {
     /// Header hash at BIP34 height that turns BIP30 off. `None` on signet and
     /// regtest (Core's null hash), so BIP30 stays on at every height.
     pub bip34_hash: Option<BlockHash>,
+    /// Core `DEPLOYMENT_TESTDUMMY`. `None` is Core's `NEVER_ACTIVE`.
+    pub testdummy: Option<Bip9Deployment>,
 }
 
 impl ChainParams {
@@ -67,6 +80,11 @@ impl ChainParams {
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
             bip34_hash: None,
+            testdummy: Some(Bip9Deployment {
+                bit: 28,
+                period: 144,
+                threshold: 108,
+            }),
         }
     }
 
@@ -86,6 +104,7 @@ impl ChainParams {
                 // Core `consensus.BIP34Hash`: mainnet block 227931.
                 "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8",
             )),
+            testdummy: None,
         }
     }
 
@@ -104,6 +123,7 @@ impl ChainParams {
             bip34_hash: Some(bip34_block_hash(
                 "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8",
             )),
+            testdummy: None,
         }
     }
 
@@ -134,6 +154,7 @@ impl ChainParams {
             segwit_height_overlay: None,
             subsidy_halving_overlay: None,
             bip34_hash: None,
+            testdummy: None,
         })
     }
 

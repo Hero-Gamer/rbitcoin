@@ -45,6 +45,15 @@ pub fn getblockhash(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
     Ok(json!(hash_hex_display(&rec.hash)))
 }
 
+/// Live hub latch, not the tip-follow copy: `feature_maxtipage` asserts
+/// immediately after `sync_all`, before the 50ms RPC tick may store.
+pub(crate) fn in_ibd(ctx: &RpcContext) -> bool {
+    ctx.chain
+        .as_ref()
+        .map(|c| c.in_ibd())
+        .unwrap_or_else(|| ctx.initial_block_download.load(Ordering::Relaxed))
+}
+
 pub fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
     let tip = ctx.query.tip_height().map(|h| h.0).unwrap_or(0);
     let best = if let Some(h) = ctx.query.tip_height() {
@@ -57,13 +66,7 @@ pub fn getblockchaininfo(ctx: &RpcContext) -> Result<Value, Value> {
     } else {
         String::new()
     };
-    // Live hub latch, not the tip-follow copy: `feature_maxtipage` asserts
-    // immediately after `sync_all`, before the 50ms RPC tick may store.
-    let ibd = ctx
-        .chain
-        .as_ref()
-        .map(|c| c.in_ibd())
-        .unwrap_or_else(|| ctx.initial_block_download.load(Ordering::Relaxed));
+    let ibd = in_ibd(ctx);
     let headers = ctx
         .chain
         .as_ref()

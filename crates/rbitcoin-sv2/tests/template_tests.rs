@@ -98,7 +98,10 @@ async fn check_template(
         .sum();
 
     assert_eq!(t.future_template, future);
-    assert_eq!(t.version, tc.chain.gbt_block_version() as u32);
+    assert_eq!(
+        t.version, 0x2000_0000,
+        "testdummy is DEFINED below height 144"
+    );
     assert_eq!(
         (
             t.coinbase_tx_version,
