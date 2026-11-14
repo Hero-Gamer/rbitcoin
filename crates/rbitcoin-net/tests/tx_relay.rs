@@ -2485,6 +2485,212 @@ fn purge_fault_unindexes_txs_that_already_left() {
     let _ = std::fs::remove_dir_all(&store);
 }
 
+/// A txid lookup miss is not proof that a parent is gone. A child admitted
+/// while its parent was pooled has no cached create, so once the parent has
+/// confirmed and left the pool, tip-mode entry looks it up by txid. While the `tx.head` drain is behind the
+/// fence the purge is a store fault and maintenance stays off for the next
+/// call. After a power loss drops the head's unsynced slot pages, the parent
+/// is still on the connected chain in `txid.body`, and the child stays.
+#[test]
+fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
+    use rbitcoin_consensus::{mine_regtest_paying, ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    let (store, q, cbs) = copy_maturity_pad(12);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = spend_true(cbs[0], 1_000, spk.clone());
+    let child = spend_vout(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        parent.output[0].value.to_sat() - 2_000,
+    );
+    let dir = tmp();
+    {
+        let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+        hub.accept_tx(&parent).expect("admit the parent");
+        hub.accept_tx(&child)
+            .expect("admit the child of a pooled parent");
+        // The parent's block strips it from the pool. The child stays.
+        let mut g = hub.lock_write();
+        g.remove_live_txids(&[parent.compute_txid()])
+            .expect("strip the confirmed parent");
+        g.flush().expect("persist the pool");
+    }
+    let tip_h = q.tip_height().unwrap().0;
+    let rec = q.get_header(q.tip_header_fk().unwrap().unwrap()).unwrap();
+    let block = mine_regtest_paying(
+        bitcoin::BlockHash::from_byte_array(rec.hash),
+        rec.timestamp + 600,
+        tip_h + 1,
+        spk,
+        vec![parent.clone()],
+    );
+    accept_and_connect_block(
+        &q,
+        &ChainParams::regtest(),
+        Height(tip_h + 1),
+        &block,
+        Milestone::NONE,
+    )
+    .expect("confirm the parent");
+    {
+        // Every lookup hits, so a lagging drain is no fault. The catch-up
+        // cancel is still set at tip-mode entry and must not stop the purge.
+        let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+        let drained = q.head_drain_fk();
+        q.head_drain_fk.store(0, Ordering::Release);
+        let g = hub.lock_write();
+        assert_eq!(
+            hub.dead_chain_prevouts(&g, &[child.compute_txid()], &Default::default()),
+            Ok(Vec::new()),
+            "the child's confirmed parent is found and unspent"
+        );
+        drop(g);
+        q.head_drain_fk.store(drained, Ordering::Release);
+    }
+    q.flush().unwrap();
+    drop(Arc::into_inner(q).expect("the test holds the only query"));
+    rbitcoin_store::testutil::drop_unsynced_tx_head_pages(&store);
+    let q = Arc::new(Query::open_or_create_tiny(&store).expect("reopen after the power loss"));
+    assert!(
+        q.store()
+            .get_fk_by_txid_batch(&[parent.compute_txid().to_byte_array()])
+            .unwrap()[0]
+            .1
+            .is_none(),
+        "the head lost the confirmed parent"
+    );
+
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    let drained = q.head_drain_fk();
+    q.head_drain_fk.store(0, Ordering::Release);
+    assert!(
+        !hub.begin_pool_maintenance(),
+        "a miss while the head drain is behind the fence is a store fault"
+    );
+    assert!(hub.contains(&child.compute_txid()) && !hub.pool_maintained());
+    q.head_drain_fk.store(drained, Ordering::Release);
+    q.request_confirm_cancel();
+    assert!(hub.begin_pool_maintenance());
+    assert!(
+        hub.contains(&child.compute_txid()),
+        "a parent on the connected chain is not missing because the head lost its row"
+    );
+    drop(hub);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// A reorg resurrects a parent whose child was admitted while the parent was
+/// confirmed, and an unclean stop loses the parent's re-admit. The reloaded
+/// child spends an output that is neither on chain nor in the pool. Tip-mode
+/// entry must drop it and its descendants (Core's reload re-accepts and
+/// rejects it as `missing-inputs`), or every template it builds is invalid.
+/// A child of a still-confirmed parent, of a parent the new branch mined
+/// again, and of a pooled parent stay.
+#[test]
+fn maintenance_drops_reloaded_txs_whose_parent_is_gone() {
+    use rbitcoin_consensus::{mine_regtest_paying, ChainParams, Milestone};
+    use rbitcoin_query::accept_and_connect_block;
+
+    let (store, q, cbs) = copy_maturity_pad(12);
+    let params = ChainParams::regtest();
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let connect = |txs: Vec<Transaction>| {
+        let tip_h = q.tip_height().unwrap().0;
+        let rec = q.get_header(q.tip_header_fk().unwrap().unwrap()).unwrap();
+        let block = mine_regtest_paying(
+            bitcoin::BlockHash::from_byte_array(rec.hash),
+            rec.timestamp + 600,
+            tip_h + 1,
+            spk.clone(),
+            txs,
+        );
+        accept_and_connect_block(&q, &params, Height(tip_h + 1), &block, Milestone::NONE)
+    };
+    let child_of = |parent: &Transaction| {
+        spend_vout(
+            OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            parent.output[0].value.to_sat() - 2_000,
+        )
+    };
+    let kept_parent = spend_true(cbs[0], 1_000, spk.clone());
+    let reorged_parent = spend_true(cbs[1], 1_000, spk.clone());
+    let remined_parent = spend_true(cbs[3], 1_000, spk.clone());
+    connect(vec![kept_parent.clone()]).expect("connect the parent that stays");
+    connect(vec![reorged_parent.clone(), remined_parent.clone()])
+        .expect("connect the parents that reorg out");
+    let pooled_parent = spend_true(cbs[2], 1_000, spk.clone());
+    let pooled_child = child_of(&pooled_parent);
+    let lost_parent = child_of(&pooled_child);
+    let kept_child = child_of(&kept_parent);
+    let reorged_child = child_of(&reorged_parent);
+    let remined_child = child_of(&remined_parent);
+    let reorged_grandchild = child_of(&reorged_child);
+    let lost_child = child_of(&lost_parent);
+    let dir = tmp();
+    {
+        let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+        for tx in [
+            &kept_child,
+            &reorged_child,
+            &reorged_grandchild,
+            &remined_child,
+            &pooled_parent,
+            &pooled_child,
+            &lost_parent,
+            &lost_child,
+        ] {
+            hub.accept_tx(tx).expect("admit");
+        }
+        // The lost admit: the parent leaves the sidecar, its child stays.
+        let mut g = hub.lock_write();
+        g.remove_live_txids(&[lost_parent.compute_txid()])
+            .expect("drop the parent alone");
+        assert!(g.graph.contains(&lost_child.compute_txid()));
+        g.flush().expect("persist the pool");
+    }
+    // The reorg: the parents' block leaves the active chain and the new
+    // branch mines one of them again.
+    q.disconnect_tip().expect("disconnect the parents' block");
+    connect(vec![remined_parent.clone()]).expect("mine one parent again");
+
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    assert!(hub.contains(&reorged_child.compute_txid()), "reloaded");
+    assert!(hub.contains(&lost_child.compute_txid()), "reloaded");
+    assert!(hub.begin_pool_maintenance());
+    for gone in [&reorged_child, &reorged_grandchild, &lost_child] {
+        assert!(
+            !hub.contains(&gone.compute_txid()),
+            "a tx with no chain or pool parent must leave at tip-mode entry"
+        );
+    }
+    for kept in [&kept_child, &remined_child, &pooled_parent, &pooled_child] {
+        assert!(hub.contains(&kept.compute_txid()));
+    }
+    let picked: Vec<Transaction> = hub
+        .select_block_template(hub.template_budget(0))
+        .into_iter()
+        .map(|(tx, _)| (*tx).clone())
+        .collect();
+    assert_eq!(picked.len(), 4, "the txs whose inputs exist");
+    connect(picked).expect("a block built from the template connects");
+    drop(hub);
+    let reopened = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    assert!(
+        !reopened.contains(&reorged_child.compute_txid()),
+        "the drop is durable"
+    );
+    drop(reopened);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
 /// An update that lands while a hold is out, and the hold never commits,
 /// still has to reach `template_watch`. A failed connect drops its hold
 /// with no commit. Swallowing the update leaves a longpoll asleep.
