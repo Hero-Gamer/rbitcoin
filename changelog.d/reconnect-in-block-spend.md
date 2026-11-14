@@ -13,4 +13,5 @@ Fixed
   that already connected such a block again keeps those wrong spends after
   the upgrade, until `store/spend_durable` is deleted and the node
   restarted. Open then revalidates the whole chain and replays every
-  height's spends.
+  height's spends
+  ([116](docs/external_findings/116-reconnected-in-block-spend.md)).
