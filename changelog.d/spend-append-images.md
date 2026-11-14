@@ -8,4 +8,5 @@ Changed
   open-edge wait is released. A failed commit directory sync leaves a
   generation file the previous commit still names. A fold before the next
   durable commit leaves that file in place. Each published image is
-  composed once.
+  composed once and written before the next page is composed. A return
+  before the commit rename removes that file.

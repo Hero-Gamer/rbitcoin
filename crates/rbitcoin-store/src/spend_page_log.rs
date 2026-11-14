@@ -242,6 +242,41 @@ enum PublishHold {
     Clear,
 }
 
+/// Deletes a generation file unless the commit rename has already happened.
+struct UncommittedGen {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl Drop for UncommittedGen {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Images written into `spend.pages.{generation}` before the commit rename.
+struct ComposedFile {
+    recs: Vec<PageRec>,
+    discard: Option<UncommittedGen>,
+}
+
+impl ComposedFile {
+    fn empty() -> Self {
+        Self {
+            recs: Vec::new(),
+            discard: None,
+        }
+    }
+
+    fn disarm(&mut self) {
+        if let Some(file) = &mut self.discard {
+            file.armed = false;
+        }
+    }
+}
+
 /// What install does with the previous directory after the commit is renamed.
 struct PublishPlan {
     hold: PublishHold,
@@ -930,7 +965,7 @@ impl SpendPageLog {
         let (mut kept, mut rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
         clears.extend(more);
         let composed = self.pages_that_compose(&mut read_page, published, &kept, &clears)?;
-        let composed_set: HashSet<u64> = composed.iter().map(|(off, _)| *off).collect();
+        let composed_set: HashSet<u64> = composed.recs.iter().map(|rec| rec.0).collect();
         let unpublished: Vec<u64> = kept
             .iter()
             .map(|(off, _)| *off)
@@ -938,7 +973,7 @@ impl SpendPageLog {
             .collect();
         kept.retain(|(off, _)| composed_set.contains(off));
         rejected.extend(unpublished);
-        if composed.is_empty() {
+        if composed.recs.is_empty() {
             self.drop_frozen_pages(&rejected);
             return Ok(());
         }
@@ -959,7 +994,7 @@ impl SpendPageLog {
         let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
         self.store_pending(
             height,
-            &composed,
+            composed,
             &kept,
             rejected,
             &carried,
@@ -997,7 +1032,7 @@ impl SpendPageLog {
         S: FnOnce(&Self) -> Result<u32, StoreError>,
     {
         let composed = self.pages_that_compose(read_page, published, kept, clears)?;
-        let fresh: HashSet<u64> = composed.iter().map(|(off, _)| *off).collect();
+        let fresh: HashSet<u64> = composed.recs.iter().map(|rec| rec.0).collect();
         let cleared: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
         let mut carried = if deferred {
             self.carry_untouched(&fresh, &cleared)
@@ -1005,7 +1040,7 @@ impl SpendPageLog {
             Vec::new()
         };
         carried.retain(|(off, _)| *off < published);
-        if composed.is_empty() && carried.is_empty() {
+        if composed.recs.is_empty() && carried.is_empty() {
             if deferred {
                 self.drop_rejected_generation();
             }
@@ -1015,7 +1050,7 @@ impl SpendPageLog {
         let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
         self.store_pending(
             height,
-            &composed,
+            composed,
             kept,
             Vec::new(),
             &carried,
@@ -1419,18 +1454,19 @@ impl SpendPageLog {
     fn store_pending(
         &self,
         height: u32,
-        composed: &[(u64, Vec<u8>)],
+        composed: ComposedFile,
         kept: &[(u64, OpenPage)],
         mut rejected: Vec<u64>,
         carried: &[(u64, CommittedPage)],
         plan: PublishPlan,
     ) -> Result<(), StoreError> {
+        let composed_offs: Vec<u64> = composed.recs.iter().map(|rec| rec.0).collect();
         let (generation, file, pages) =
             self.publish_generation(height, composed, carried, plan.hold, plan.hold_ticks)?;
         let written: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
-        for (off, _) in composed {
-            if !written.contains(off) {
-                rejected.push(*off);
+        for off in composed_offs {
+            if !written.contains(&off) {
+                rejected.push(off);
             }
         }
         let kept_slots: Vec<KeptPage> = kept
@@ -1478,17 +1514,19 @@ impl SpendPageLog {
     /// next checkpoint writes the next generation instead of replacing the
     /// file the commit already names. A failed pages rename leaves that file
     /// in place. Parked files stay until nothing names them. Each new image
-    /// was composed once before this write. `commit_io` covers the hold
-    /// sample through the commit write.
+    /// was composed once and written before this commit. This does not
+    /// compose it again. A return before the commit rename deletes that
+    /// file. An empty compose still creates the file so the commit length
+    /// is zero. `commit_io` covers the hold sample through the commit write.
     fn publish_generation(
         &self,
         height: u32,
-        composed: &[(u64, Vec<u8>)],
+        mut composed: ComposedFile,
         carried: &[(u64, CommittedPage)],
         hold: PublishHold,
         sampled_ticks: u64,
     ) -> Result<(u32, Arc<File>, Vec<PageRec>), StoreError> {
-        let fresh: HashSet<u64> = composed.iter().map(|(off, _)| *off).collect();
+        let fresh: HashSet<u64> = composed.recs.iter().map(|rec| rec.0).collect();
         let mut carried_rows: Vec<(u64, PageLoc)> = carried
             .iter()
             .filter(|(off, _)| !fresh.contains(off))
@@ -1498,7 +1536,26 @@ impl SpendPageLog {
         let old_generation = self.lock().generation;
         self.park_published_pages(old_generation)?;
         let generation = old_generation.wrapping_add(1);
-        let gen_path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+        let gen_path = match composed.discard.take() {
+            Some(mut existing) => {
+                existing.armed = false;
+                existing.path.clone()
+            }
+            None => {
+                let path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+                if let Err(err) = write_synced_tmp_file(&path, |_f| Ok(())) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(err);
+                }
+                path
+            }
+        };
+        // The prewritten file is armed again so a commit-rename failure
+        // still removes it. `take` disarmed the previous guard.
+        composed.discard = Some(UncommittedGen {
+            path: gen_path.clone(),
+            armed: true,
+        });
         let pages_path = self.dir.join(SPEND_PAGES_NAME);
         let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
         let mut disk: Vec<(u64, u64, u32, u32)> = Vec::new();
@@ -1510,20 +1567,12 @@ impl SpendPageLog {
             };
             disk.push((*page_off, loc.log_off, loc.image_len, rec_gen));
         }
-        let mut fresh_recs: Vec<PageRec> = Vec::new();
+        let fresh_recs = std::mem::take(&mut composed.recs);
         let mut committed_len = 0u64;
-        write_synced_tmp_file(&gen_path, |f| {
-            use std::io::Write;
-            for (page_off, buf) in composed {
-                let log_off = committed_len;
-                f.write_all(buf).map_err(|e| StoreError::io(&gen_path, e))?;
-                committed_len = committed_len.saturating_add(buf.len() as u64);
-                let image_len = buf.len() as u32;
-                fresh_recs.push((*page_off, log_off, image_len));
-                disk.push((*page_off, log_off, image_len, generation));
-            }
-            Ok(())
-        })?;
+        for &(page_off, log_off, image_len) in &fresh_recs {
+            committed_len = committed_len.saturating_add(u64::from(image_len));
+            disk.push((page_off, log_off, image_len, generation));
+        }
         let file = Arc::new(File::open(&gen_path).map_err(|e| StoreError::io(&gen_path, e))?);
         // Sample the hold and write the commit under one lock. A hold that
         // lands during the image stream bumps `hold_ticks`. Clear still
@@ -1540,6 +1589,7 @@ impl SpendPageLog {
         };
         let commit = encode_commit(height, generation, committed_len, &disk, held, sealed_tip);
         let dir_synced = write_commit_file(&commit_path, &commit)?;
+        composed.disarm();
         {
             let mut g = self.lock();
             g.log_bytes = disk.iter().map(|rec| u64::from(rec.2)).sum();
@@ -2150,6 +2200,36 @@ fn clears_by_page(clears: &[BodyClear]) -> HashMap<u64, Vec<(u16, [u8; SLOT])>> 
     clear_at
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static COMPOSED_HOLD_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Forget the high-water mark of composed images held at once.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_composed_hold_peak() {
+    COMPOSED_HOLD_PEAK.with(|peak| peak.set(0));
+}
+
+/// Most composed page images [`SpendPageLog`] held at once since the reset.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn composed_hold_peak() -> usize {
+    COMPOSED_HOLD_PEAK.with(|peak| peak.get())
+}
+
+fn note_composed_hold(held: usize) {
+    #[cfg(debug_assertions)]
+    COMPOSED_HOLD_PEAK.with(|peak| {
+        if held > peak.get() {
+            peak.set(held);
+        }
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = held;
+}
+
 fn compose_offs(kept: &[(u64, OpenPage)], clears: &[BodyClear]) -> Vec<u64> {
     let mut offs: Vec<u64> = kept.iter().map(|(off, _)| *off).collect();
     offs.extend(clears.iter().map(|clear| clear.page_off));
@@ -2163,13 +2243,46 @@ fn compose_base(kept: Option<&OpenPage>, stored: Option<PageLoc>) -> Option<Page
 }
 
 impl SpendPageLog {
+    fn compose_at<F>(
+        &self,
+        read_page: &mut F,
+        published: u64,
+        page_off: u64,
+        kept_at: &HashMap<u64, &OpenPage>,
+        stored: &HashMap<u64, PageLoc>,
+        clear_at: &HashMap<u64, Vec<(u16, [u8; SLOT])>>,
+    ) -> Result<Option<Vec<u8>>, StoreError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+    {
+        let loc = compose_base(
+            kept_at.get(&page_off).copied(),
+            stored.get(&page_off).copied(),
+        );
+        let image = loc.map(|loc| self.read_loc(loc));
+        compose_one_page(
+            read_page,
+            published,
+            page_off,
+            kept_at.get(&page_off).copied(),
+            clear_at.get(&page_off),
+            image.as_deref(),
+        )
+    }
+
+    /// Compose each page and write it into `spend.pages.{generation}`.
+    ///
+    /// The buffer is dropped after that write. A later page is not composed
+    /// while an earlier image is still held. No file is created when every
+    /// page is skipped. The returned guard deletes the file if the commit
+    /// rename does not happen.
     fn pages_that_compose<F>(
         &self,
         read_page: &mut F,
         published: u64,
         kept: &[(u64, OpenPage)],
         clears: &[BodyClear],
-    ) -> Result<Vec<(u64, Vec<u8>)>, StoreError>
+    ) -> Result<ComposedFile, StoreError>
     where
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
     {
@@ -2177,25 +2290,60 @@ impl SpendPageLog {
         let clear_at = clears_by_page(clears);
         let kept_at: HashMap<u64, &OpenPage> =
             kept.iter().map(|(off, page)| (*off, page)).collect();
-        let mut out = Vec::new();
-        for page_off in compose_offs(kept, clears) {
-            let loc = compose_base(
-                kept_at.get(&page_off).copied(),
-                stored.get(&page_off).copied(),
-            );
-            let image = loc.map(|loc| self.read_loc(loc));
-            if let Some(buf) = compose_one_page(
-                read_page,
-                published,
-                page_off,
-                kept_at.get(&page_off).copied(),
-                clear_at.get(&page_off),
-                image.as_deref(),
-            )? {
-                out.push((page_off, buf));
+        let mut offs = compose_offs(kept, clears).into_iter();
+        let mut first: Option<(u64, Vec<u8>)> = None;
+        for page_off in offs.by_ref() {
+            if let Some(buf) =
+                self.compose_at(read_page, published, page_off, &kept_at, &stored, &clear_at)?
+            {
+                first = Some((page_off, buf));
+                break;
             }
         }
-        Ok(out)
+        let Some((first_off, first_buf)) = first else {
+            return Ok(ComposedFile::empty());
+        };
+        let pending_offs: Vec<u64> = offs.collect();
+        let generation = self.lock().generation.wrapping_add(1);
+        let gen_path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+        let mut recs: Vec<PageRec> = Vec::new();
+        let mut committed_len = 0u64;
+        let mut held = 0usize;
+        let write = write_synced_tmp_file(&gen_path, |f| {
+            use std::io::Write;
+            let mut write_image =
+                |f: &mut File, page_off: u64, buf: Vec<u8>| -> Result<(), StoreError> {
+                    held += 1;
+                    note_composed_hold(held);
+                    f.write_all(&buf)
+                        .map_err(|e| StoreError::io(&gen_path, e))?;
+                    let image_len = buf.len() as u32;
+                    recs.push((page_off, committed_len, image_len));
+                    committed_len = committed_len.saturating_add(u64::from(image_len));
+                    held -= 1;
+                    Ok(())
+                };
+            write_image(f, first_off, first_buf)?;
+            for page_off in &pending_offs {
+                if let Some(buf) = self.compose_at(
+                    read_page, published, *page_off, &kept_at, &stored, &clear_at,
+                )? {
+                    write_image(f, *page_off, buf)?;
+                }
+            }
+            Ok(())
+        });
+        if let Err(err) = write {
+            let _ = std::fs::remove_file(&gen_path);
+            return Err(err);
+        }
+        Ok(ComposedFile {
+            recs,
+            discard: Some(UncommittedGen {
+                path: gen_path,
+                armed: true,
+            }),
+        })
     }
 }
 

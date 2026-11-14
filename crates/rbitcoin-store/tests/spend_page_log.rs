@@ -265,6 +265,27 @@ fn fold_order_copies_the_oldest_generation_first() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// One checkpoint writes each composed image before it composes the next.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_holds_one_composed_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[
+        (16, [1u8, 1, 2, 3, 4, 5, 6, 7]),
+        (4096, [2u8, 1, 2, 3, 4, 5, 6, 7]),
+    ])
+    .unwrap();
+    rbitcoin_store::spend_page_log::reset_composed_hold_peak();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(
+        rbitcoin_store::spend_page_log::composed_hold_peak(),
+        1,
+        "a checkpoint writes each image before composing the next"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// One checkpoint composes a newly touched page once. A quiet page is not composed.
 #[test]
 fn checkpoint_composes_a_published_page_once() {
@@ -2953,6 +2974,32 @@ fn directory_sync_failure_keeps_a_generation_the_old_commit_names() {
         "a failed commit directory sync must keep the file the previous commit names"
     );
     assert_eq!(loaded.slot(16), Some(kept));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn directory_sync_failure_before_the_commit_removes_the_new_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, [3u8, 1, 2, 3, 4, 5, 6, 7])])
+        .unwrap();
+    let _reset = ResetDirSync;
+    // The new image's directory sync succeeds. Park's sync is next and
+    // fails before the commit rename, so generation 2 must not stay.
+    rbitcoin_store::file::arm_fail_dir_sync_after(1, 1);
+    assert!(log.commit_open(3, 8192, zeros, |_| Ok(true)).is_err());
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    assert!(
+        !d.join(format!("{SPEND_PAGES_NAME}.2")).exists(),
+        "a return before the commit rename must remove the new image"
+    );
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
     let _ = std::fs::remove_dir_all(&d);
 }
 
