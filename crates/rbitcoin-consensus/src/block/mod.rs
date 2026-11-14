@@ -279,21 +279,7 @@ pub fn validate_block_structure_with_pres(
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
-    let bip54 = ctx.enforce_height_gates && ctx.params.enforce_bip54;
-    if bip54 {
-        for p in pres.iter() {
-            reject_bip54_tx_size(p.base_size)?;
-        }
-    }
-
-    // BIP34 only after the network's buried height (mainnet 227931). From
-    // height 1 this rejects mainnet block 1.
-    if ctx.enforce_height_gates && ctx.params.bip34_active_at(ctx.height.0) {
-        check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
-    }
-    if bip54 {
-        reject_bip54_coinbase(&block.txdata[0], ctx.height.0)?;
-    }
+    check_height_gated_rules(block, ctx, &pres)?;
 
     {
         let mut cost = 0u64;
@@ -313,6 +299,33 @@ pub fn validate_block_structure_with_pres(
     // BIP325 signet solution is not checked here — tip confirm only.
 
     Ok(pres)
+}
+
+/// Core `ContextualCheckBlock` rules that read the block's height, in Core's
+/// order: the BIP 54 transaction size, the BIP34 coinbase height, then the
+/// BIP 54 coinbase timelock.
+fn check_height_gated_rules(
+    block: &Block,
+    ctx: &ValidationContext<'_>,
+    pres: &[TxPrecompute],
+) -> Result<(), ConsensusError> {
+    if !ctx.enforce_height_gates {
+        return Ok(());
+    }
+    if ctx.params.enforce_bip54 {
+        for p in pres {
+            reject_bip54_tx_size(p.base_size)?;
+        }
+    }
+    // BIP34 only after the network's buried height (mainnet 227931). From
+    // height 1 this rejects mainnet block 1.
+    if ctx.params.bip34_active_at(ctx.height.0) {
+        check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
+    }
+    if ctx.params.enforce_bip54 {
+        reject_bip54_coinbase(&block.txdata[0], ctx.height.0)?;
+    }
+    Ok(())
 }
 
 /// Witness commitment before weight. Padding is not the block hash's fault.
