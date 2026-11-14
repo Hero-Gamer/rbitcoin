@@ -12,4 +12,5 @@ Fixed
   body is already archived now writes them, as open replay does. A node
   that already connected such a block again keeps those wrong spends after
   the upgrade, until `store/spend_durable` is deleted and the node
-  restarted, which replays every height's spends.
+  restarted. Open then revalidates the whole chain and replays every
+  height's spends.

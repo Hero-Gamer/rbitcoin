@@ -387,13 +387,13 @@ fn write_phase_inner(
                 &mut reuse.borrow_mut(),
             )
         })?;
+        let structural_ns = t_struct.elapsed().as_nanos() as u64;
         push_same_block_spends_of_archived_bodies(
             query,
             &batch.prepared,
             &class_a_wave,
             &mut slots,
         )?;
-        let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
         let n_blocks = batch.prepared.len();
         let pending_token = batch
@@ -882,6 +882,13 @@ fn push_same_block_spends_of_archived_bodies(
         if body_appended {
             continue;
         }
+        if !p
+            .spends
+            .iter()
+            .any(|&(_, _, _, create_fk, _)| create_fk.is_null())
+        {
+            continue;
+        }
         let tx_at: crate::TxidMap<usize> =
             p.txids.iter().enumerate().map(|(i, t)| (*t, i)).collect();
         for &(parent_txid, vout, spend_fk, create_fk, vin) in &p.spends {
@@ -901,13 +908,14 @@ fn push_same_block_spends_of_archived_bodies(
     if edges.is_empty() {
         return Ok(());
     }
+    let t_meta = Instant::now();
     let parents: Vec<rbitcoin_primitives::Fk> = edges.iter().map(|e| e.0).collect();
     let ranges = query
         .store()
         .tx_spent_range_batch(&parents)
         .map_err(ConfirmError::from)?;
-    let mut abs_slots = Vec::with_capacity(edges.len());
-    for (&(parent, vout, spend_fk, vin), range) in edges.iter().zip(ranges) {
+    let mut offs = Vec::with_capacity(edges.len());
+    for (&(_, vout, _, _), range) in edges.iter().zip(ranges) {
         let (off, len) = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
             "invariant: same-block spend parent without spent range",
         )))?;
@@ -919,16 +927,18 @@ fn push_same_block_spends_of_archived_bodies(
                 "invariant: same-block spent slot OOB",
             )));
         }
-        abs_slots.push((parent, vout, spend_fk, vin, abs));
+        offs.push(abs);
     }
-    let offs: Vec<u64> = abs_slots.iter().map(|&(_, _, _, _, abs)| abs).collect();
     let metas = query
         .store()
         .get_spender_meta_at_abs_batch(&offs)
         .map_err(ConfirmError::from)?;
-    for ((parent, vout, spend_fk, vin, abs), meta) in abs_slots.into_iter().zip(metas) {
+    let meta_ns = t_meta.elapsed().as_nanos() as u64;
+    crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+    crate::note_confirm(&query.confirm_stats().spend_meta_n, offs.len() as u64);
+    for (((parent, vout, spend_fk, vin), abs), meta) in edges.into_iter().zip(offs).zip(metas) {
         let known = meta.ok_or(ConfirmError::Store(StoreError::Corrupt(
-            "invariant: same-block spent slot past the published body",
+            "invariant: same-block spent slot short, undecodable, or past the published body",
         )))?;
         slots.push((abs, parent, vout, spend_fk, vin), known);
     }
@@ -937,7 +947,7 @@ fn push_same_block_spends_of_archived_bodies(
 
 /// After Class A commit, stamp spend creates from append RAM loc
 /// (this pack + just-written packs still in the write loc window).
-/// Write never preads `create.loc`.
+/// This fill never preads `create.loc`.
 pub fn fill_planned_create_layout_after_commit(
     query: &Query,
     batch_parents: &mut crate::BatchParents,
