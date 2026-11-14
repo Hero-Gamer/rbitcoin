@@ -107,9 +107,15 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
+/// **29:** `spend.pages.commit` records name the generation file that holds
+///         each page image. An unchanged page stays in the older file. A
+///         schema-28 binary reads every offset as the newest file and would
+///         delete the parked files, so it refuses 29 `meta`. This binary
+///         rewrites 22–28 `meta` to 29. A record generation of 0 still means
+///         the header generation, so a schema-28 commit loads.
 /// **28:** `meta` only. A schema-27 binary does not read `spend.pages` and
 ///         would hide spends it wrote into `spent.body` under a live log, so
-///         it refuses 28 `meta`. This binary rewrites 22–27 `meta` to 28.
+///         it refuses 28 `meta`. A 28 binary rewrote 22–27 `meta` to 28.
 /// **27:** `meta` only. Historical spend slots, including the short tail
 ///         page, live in `spend.pages` until fold. `--prune-seqsigwit` can
 ///         leave `seqsigwit` at a header while creates remain. A 26 binary
@@ -134,15 +140,16 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 ///         this binary opens.
 /// **21 and older:** not opened. Meta below 22 is one wipe-and-IBD refuse.
 ///         Those layouts are archaeology in `SCHEMA_HISTORY.md`.
-pub const SCHEMA_VERSION: u16 = 28;
+pub const SCHEMA_VERSION: u16 = 29;
 
 /// True if `ver` may appear in store `meta` / table headers this binary can open.
 ///
-/// Schema **28** is current. Meta **22** through **28** opens. Occupied **22**
+/// Schema **29** is current. Meta **22** through **29** opens. Occupied **22**
 /// rewrites `create.loc.ovf` 12 B rows to 16 B. Occupied **24/25** strips
-/// trailing size/weight from 96 B `header.body` rows. Any meta below **28**
-/// is rewritten to 28; a short `txstat.body` is aligned to the loc count.
-/// Table bytes do not change for 26. A 27 binary refuses 28 `meta`.
+/// trailing size/weight from 96 B `header.body` rows. Any meta below **29**
+/// is rewritten to 29; a short `txstat.body` is aligned to the loc count.
+/// Table bytes do not change for 26. A 27 binary refuses 28 `meta`. A 28
+/// binary refuses 29 `meta`.
 /// Meta older than **22** is not
 /// openable: those Class A bodies (`tx.body`, `txout.body`, `inwit.body` /
 /// `seqsigwit.body`) were wiped, not rewritten.

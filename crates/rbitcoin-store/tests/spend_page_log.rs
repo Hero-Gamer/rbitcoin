@@ -210,15 +210,101 @@ fn second_generation_keeps_the_first_image_bytes() {
     let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
     log.note_slots(&[(16, slot)]).unwrap();
     log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let commit = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let generation = u32::from_le_bytes(commit[12..16].try_into().unwrap());
     let first = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
     log.note_slots(&[(4096, slot)]).unwrap();
     log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let parked = d.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+    let kept = std::fs::read(&parked).expect("the first generation file stays on disk");
+    assert_eq!(
+        kept, first,
+        "an unchanged page stays in the generation file that already holds it"
+    );
     let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
-    assert_eq!(&file[..first.len()], first.as_slice());
-    assert_eq!(&file[16..24], &slot);
+    assert_eq!(file.len(), first.len(), "the new file is only the new page");
+    assert!(
+        !file
+            .windows(first.len())
+            .any(|window| window == first.as_slice()),
+        "the new generation blob does not copy the carried page"
+    );
+    assert_eq!(&file[..8], &slot);
     let loaded = SpendPageLog::load(&d).unwrap();
     assert_eq!(loaded.slot(16), Some(slot));
     assert_eq!(loaded.slot(4096), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Quiet pages fold oldest generation file first. Page offset is the tie break.
+#[test]
+fn fold_order_copies_the_oldest_generation_first() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(4096, older)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(16, newer)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    log.widen_cool_through();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        wrote,
+        vec![4096, 16],
+        "fold copies the older generation file before the newer page"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// One checkpoint composes a newly touched page once. A quiet page is not composed.
+#[test]
+fn checkpoint_composes_a_published_page_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let quiet = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, quiet)]).unwrap();
+    log.commit_open(3, 100, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, fresh)]).unwrap();
+    let fresh_reads = AtomicUsize::new(0);
+    let quiet_reads = AtomicUsize::new(0);
+    log.commit_open(
+        4,
+        8192,
+        |off, len| {
+            if off == 4096 {
+                fresh_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            if off == 0 {
+                quiet_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(vec![0u8; len])
+        },
+        |_| Ok(true),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh_reads.load(Ordering::SeqCst),
+        1,
+        "the newly touched page is composed once"
+    );
+    assert_eq!(
+        quiet_reads.load(Ordering::SeqCst),
+        0,
+        "a quiet carried page is not composed"
+    );
+    assert_eq!(log.slot(16), Some(quiet));
+    assert_eq!(log.slot(4096), Some(fresh));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -1928,7 +2014,7 @@ fn hold_during_the_clearing_image_keeps_the_commit_bit() {
         4,
         8192,
         |off, len| {
-            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
                 log.hold_fold_above(1)?;
             }
             read(off, len)
@@ -3208,6 +3294,46 @@ fn review_1501_fold_probe() {
 }
 
 #[cfg(debug_assertions)]
+struct StoredImageProbe {
+    store: std::sync::Arc<rbitcoin_store::Store>,
+    pages: PathBuf,
+    body: PathBuf,
+    image: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static STORED_IMAGE_PROBE: std::cell::RefCell<Option<StoredImageProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The edge count has already dropped. The body still has the pre-fold byte.
+#[cfg(debug_assertions)]
+fn stored_image_fold_probe() {
+    let probe = STORED_IMAGE_PROBE.with(|slot| slot.borrow_mut().take());
+    let Some(probe) = probe else {
+        return;
+    };
+    assert!(
+        probe.store.open_spend_edge_count() < OPEN_EDGE_CAP,
+        "the open-edge count drops before the cooled copy"
+    );
+    assert_eq!(
+        probe.store.spend_directory_slot(24),
+        Some([0u8; 8]),
+        "an explicit zero stays in the log until the copy is durable"
+    );
+    let body = std::fs::read(&probe.body).unwrap();
+    assert_eq!(
+        &body[24..32],
+        &[0xabu8; 8],
+        "the cooled copy has not written the stored image yet"
+    );
+    *probe.image.lock().unwrap_or_else(|e| e.into_inner()) = std::fs::read(&probe.pages).unwrap();
+    review_1501_fold_probe();
+}
+
+#[cfg(debug_assertions)]
 struct ClearFoldProbe;
 
 #[cfg(debug_assertions)]
@@ -3422,7 +3548,7 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     use std::time::Duration;
 
     let d = dir();
-    let store = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let store = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&d).unwrap());
     let nbytes = 4096usize;
     let prep = store
         .txs
@@ -3438,11 +3564,20 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
         .write_body_blob_bulk(prep.start, &prep.body_blob)
         .unwrap();
     store.txs.spent.finish_prepared(prep).unwrap();
+    store.txs.spent.write_body_pwrite(24, &[0xabu8; 8]).unwrap();
     let slot =
         rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
     store.note_open_spend_slots(&[(16, slot)]).unwrap();
     store.checkpoint_spend_through(0).unwrap();
     assert_eq!(store.spend_directory_slot(16), Some(slot));
+    let zero = [0u8; 8];
+    store.note_open_spend_slots(&[(24, zero)]).unwrap();
+    store.checkpoint_spend_through(0).unwrap();
+    assert_eq!(
+        store.spend_directory_slot(24),
+        Some(zero),
+        "the explicit zero is served from the log"
+    );
 
     let mut batch = Vec::with_capacity(4096);
     let mut n = 0u64;
@@ -3461,6 +3596,7 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     }
     let wake = Arc::new((Mutex::new(false), Condvar::new()));
     store.bind_spend_sync_wake(Arc::clone(&wake));
+    let folded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (lock, cv) = &*wake;
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let released = AtomicBool::new(false);
@@ -3487,7 +3623,15 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
                     release: release_rx,
                 });
             });
-            rbitcoin_store::Store::arm_spend_fold_probe(review_1501_fold_probe);
+            STORED_IMAGE_PROBE.with(|slot| {
+                *slot.borrow_mut() = Some(StoredImageProbe {
+                    store: std::sync::Arc::clone(&store),
+                    pages: d.join(SPEND_PAGES_NAME),
+                    body: d.join("spent.body"),
+                    image: std::sync::Arc::clone(&folded),
+                });
+            });
+            rbitcoin_store::Store::arm_spend_fold_probe(stored_image_fold_probe);
             store.checkpoint_spend_through(0)
         });
         entered_rx
@@ -3508,6 +3652,16 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
         None,
         "the cooled page is copied from the generation file before the next one is assembled"
     );
+    assert_eq!(store.spend_directory_slot(24), None);
+    let image = folded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(image.len() > 32, "the probe saved the stored page image");
+    let body = std::fs::read(d.join("spent.body")).unwrap();
+    assert_eq!(
+        &body[16..image.len()],
+        &image[16..],
+        "the cooled copy writes the stored image, including an explicit zero"
+    );
+    assert_eq!(&body[24..32], &[0u8; 8]);
     let _ = std::fs::remove_dir_all(&d);
 }
 

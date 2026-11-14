@@ -2682,6 +2682,11 @@ impl TxTable {
     }
 
     #[doc(hidden)]
+    pub fn open_spend_edge_count(&self) -> u64 {
+        self.spend_pages.open_edge_count()
+    }
+
+    #[doc(hidden)]
     pub fn spend_log_slot(&self, abs: u64) -> Option<[u8; 8]> {
         self.spend_pages.slot(abs)
     }

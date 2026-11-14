@@ -1,7 +1,7 @@
 # Schema history
 
 Historic on-disk layouts for the rbitcoin chain store.  
-**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 28`).
+**Current layout:** [`SCHEMA.md`](./SCHEMA.md) (`SCHEMA_VERSION = 29`).
 
 Until 1.0 there is **no in-place migration**: a new major layout generally means wipe the store and redo IBD. This file is for archaeology, code archaeology, and understanding why the current design looks the way it does.
 
@@ -13,7 +13,8 @@ Versions below are listed **newest → oldest** after the summary table.
 
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
-| **28** | `meta` only. A 27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. Open rewrites 22–27 `meta` to 28. | **Current** |
+| **29** | Each `spend.pages` record names the generation file that holds that image. An unchanged page stays in the older file. A 28 binary would read every offset as the newest file, so it refuses 29 `meta`. Open rewrites 22–28 `meta` to 29. | **Current** |
+| **28** | `meta` only. A 27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. A 28 binary rewrote 22–27 `meta` to 28. | Prior |
 | **27** | `meta` only. A pruned witness stem can be a header while creates remain. A 26 binary would truncate that chain, so it refuses 27 `meta`. Open rewrites 22–26 `meta` to 27, pruned or not. | Prior |
 | **26** | `header.body` 88 B. Occupied 24/25 strips trailing `size`/`weight`. Block size and weight come from `txstat`. | Prior |
 | **25** | `txstat.body` three ULEBs (`fee_sat`/`base`/`wit_extra`); `n_in` and parent edges on `input.*`. `seqsigwit` is the old `inwit` stem. Occupied 24 zero-extends `txstat`; no `txout` rewrite. | Prior |
@@ -41,6 +42,10 @@ Versions below are listed **newest → oldest** after the summary table.
 | **≤3** | Early mmap store; fat heads; mixed prev encoding | Mostly gone |
 
 ---
+
+## v29 (page image stays in its generation file)
+
+A `spend.pages.commit` record is 24 bytes. Bytes 20..24 are the generation file for that page. Zero means the header generation, which is how a schema-28 commit still loads. The header committed length is the newest file. A checkpoint appends images only for pages touched since the last publish and parks the previous `spend.pages` at `spend.pages.{generation}` before the new file takes that name. Fold copies the stored image, oldest file first. A 28 binary refuses 29 `meta`.
 
 ## v28 (`spend.pages` until fold)
 

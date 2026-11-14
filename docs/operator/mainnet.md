@@ -43,8 +43,8 @@ BIP 54 from block 1, no minimum-difficulty blocks, peer port 18353, RPC port
 18352. It has no seeds yet, so name a peer with `--connect`.
 
 A 0.7 directory (schema 24) or a 0.8 directory (schema 26) opens in place.
-Schema 22 through 27 rewrite `meta` to 28 on open. That includes a datadir
-that never pruned witnesses. A schema-27 binary refuses 28 `meta`, and a 0.9.0 binary does too. A directory
+Schema 22 through 28 rewrite `meta` to 29 on open. That includes a datadir
+that never pruned witnesses. A schema-28 binary refuses 29 `meta`, and a 0.9.0 binary does too. A directory
 from 0.6 or earlier is refused: wipe that datadir and sync again. Do not
 point an older binary at a directory this release has opened.
 
