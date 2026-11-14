@@ -12,8 +12,9 @@ Security
   header that needed room in a full pending map. Each message now scores
   every parked header at most once, so its cost is its items plus the parked
   headers. Parked leaves above headers the store already holds also share
-  one walk of those while a pass has cached fewer than 10,001 entries for
-  stored headers; past that, and above a stored trunk longer than the walk
-  limit, each leaf walks them again as before. A header that does not connect no longer reads the header
+  one walk of those on the work pass and one on the proof-of-work failure
+  pass. Each pass keeps its own 10,001 stored headers. Past that, and above
+  a stored trunk longer than the walk limit, each leaf walks them again as
+  before. A header that does not connect no longer reads the header
   store once per parked ancestor. Best-known blocks and block requests are
   unchanged.

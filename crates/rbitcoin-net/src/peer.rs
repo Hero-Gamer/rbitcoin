@@ -7572,14 +7572,17 @@ enum WorkStep {
 /// map changes.
 ///
 /// Each map holds at most one entry per parked header, which the pending
-/// cap bounds. A stored header is outside that cap, so the three maps
-/// together keep at most `stored_cap` of them and walk the rest again.
+/// cap bounds. A stored header is outside that cap. `header_path` and
+/// `fails_pow` each keep at most `stored_cap` of them and walk the rest
+/// again. They do not share that count: the failure walk must not spend
+/// the slots the work walk caches.
 #[doc(hidden)]
 pub struct PathWorkMemo {
     pending_path: HashMap<BlockHash, Option<(bitcoin::Work, usize)>>,
     header_path: HashMap<BlockHash, Option<(bitcoin::Work, usize)>>,
     fails_pow: HashMap<BlockHash, bool>,
-    stored_kept: usize,
+    header_stored: usize,
+    fails_stored: usize,
     stored_cap: usize,
 }
 
@@ -7613,7 +7616,8 @@ impl PathWorkMemo {
             pending_path: HashMap::new(),
             header_path: HashMap::new(),
             fails_pow: HashMap::new(),
-            stored_kept: 0,
+            header_stored: 0,
+            fails_stored: 0,
             stored_cap,
         }
     }
@@ -7667,7 +7671,7 @@ impl PathWorkMemo {
     ) -> Option<bitcoin::Work> {
         let Self {
             header_path,
-            stored_kept,
+            header_stored,
             stored_cap,
             ..
         } = self;
@@ -7692,7 +7696,7 @@ impl PathWorkMemo {
             }
         };
         memo_path_work(header_path, hub, tip, step, |h| {
-            memo_keeps(pending, stored_kept, *stored_cap, h)
+            memo_keeps(pending, header_stored, *stored_cap, h)
         })
     }
 
@@ -7729,7 +7733,8 @@ impl PathWorkMemo {
 
     /// A header on `tip`'s path fails its claimed proof of work before the
     /// path reaches a connected block or a header we do not have.
-    fn path_fails_claimed_pow(
+    #[doc(hidden)]
+    pub fn path_fails_claimed_pow(
         &mut self,
         hub: &ChainHub,
         pending: &HashMap<BlockHash, bitcoin::block::Header>,
@@ -7764,7 +7769,7 @@ impl PathWorkMemo {
         // Stored headers passed proof of work, so a failing header is a
         // pending one and lies within the walk limit of every hash above it.
         for h in path {
-            if memo_keeps(pending, &mut self.stored_kept, self.stored_cap, &h) {
+            if memo_keeps(pending, &mut self.fails_stored, self.stored_cap, &h) {
                 self.fails_pow.insert(h, fails);
             }
         }

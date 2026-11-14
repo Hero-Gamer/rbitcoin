@@ -3356,6 +3356,68 @@ async fn path_work_memo_keeps_a_bounded_number_of_stored_headers() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Eviction asks one memo whether a tip fails claimed proof of work and then
+/// for that tip's work. The failure walk must not spend the stored-header
+/// slots the work walk needs, or every later leaf re-walks the fork.
+#[tokio::test]
+async fn failure_walk_does_not_spend_the_work_walk_cache() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-split-cap");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18625, 65, true);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let stored_n = 20u32;
+    let stored = regtest_headers_after(&tip, stored_n);
+    let top = stored[stored.len() - 1];
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(stored),
+    )
+    .await;
+    assert!(hub.header_of(&top.block_hash()).is_some());
+    assert!(!hub.is_connected(&top.block_hash()));
+    let mut pending = std::collections::HashMap::new();
+    let mut leaves = Vec::new();
+    for n in 0..30u32 {
+        let mut leaf = regtest_headers_after(&top, 1)[0];
+        let mut merkle = [0x61u8; 32];
+        merkle[..4].copy_from_slice(&n.to_le_bytes());
+        leaf.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+        leaf.nonce = 0;
+        rbitcoin_consensus::grind_regtest_pow(&mut leaf);
+        pending.insert(leaf.block_hash(), leaf);
+        leaves.push(leaf.block_hash());
+    }
+    let mut expect = rbitcoin_net::peer::PathWorkMemo::default();
+    let mut want = Vec::with_capacity(leaves.len());
+    for leaf in &leaves {
+        want.push(expect.work_of_header_path(&hub, &pending, *leaf));
+    }
+    let cap = 22;
+    let mut memo = rbitcoin_net::peer::PathWorkMemo::with_stored_cap(cap);
+    let _ = hub.take_path_work_steps();
+    for (leaf, work) in leaves.iter().zip(&want) {
+        assert!(
+            !memo.path_fails_claimed_pow(&hub, &pending, *leaf),
+            "stored headers already passed claimed proof of work"
+        );
+        assert_eq!(memo.work_of_header_path(&hub, &pending, *leaf), *work);
+    }
+    let steps = hub.take_path_work_steps();
+    let bound = 4 * (leaves.len() as u64 + u64::from(stored_n));
+    assert!(
+        steps <= bound,
+        "a stored fork that fits in the cap is scored once per walk: {steps} steps, bound {bound}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A connecting batch that needs room in a full pending map scores each
 /// parked fork once, however many leaves share its trunk.
 #[tokio::test]
