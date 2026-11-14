@@ -76,6 +76,10 @@ pub struct ChainParams {
     /// Core `enforce_BIP94`: a retarget multiplies the period's first `nBits`,
     /// and a period's first header is at most 600 seconds before its parent.
     pub enforce_bip94: bool,
+    /// BIP 95 Testnet 5. rust-bitcoin 0.32 has no such network, so `network`
+    /// is `Testnet4`, which has the same address encodings and buried
+    /// heights. This selects the genesis block and the message start.
+    pub testnet5: bool,
 }
 
 impl ChainParams {
@@ -85,6 +89,7 @@ impl ChainParams {
             rbitcoin_primitives::Network::Testnet => Self::testnet(),
             rbitcoin_primitives::Network::Signet => Self::signet(),
             rbitcoin_primitives::Network::Testnet4 => Self::testnet4(),
+            rbitcoin_primitives::Network::Testnet5 => Self::testnet5(),
             rbitcoin_primitives::Network::Regtest => Self::regtest(),
         }
     }
@@ -117,6 +122,7 @@ impl ChainParams {
                 threshold: 108,
             }),
             enforce_bip94: false,
+            testnet5: false,
         }
     }
 
@@ -140,6 +146,7 @@ impl ChainParams {
             )),
             testdummy: None,
             enforce_bip94: false,
+            testnet5: false,
         }
     }
 
@@ -162,6 +169,7 @@ impl ChainParams {
             )),
             testdummy: None,
             enforce_bip94: false,
+            testnet5: false,
         }
     }
 
@@ -184,6 +192,26 @@ impl ChainParams {
             bip34_hash: None,
             testdummy: None,
             enforce_bip94: true,
+            testnet5: false,
+        }
+    }
+
+    /// BIP 95 and Core `CTestNet5Params`. The pow limit is the genesis
+    /// block's `nBits`, and no block may fall back to it after a slow parent.
+    pub fn testnet5() -> Self {
+        let genesis = testnet5_genesis_block();
+        let pow_limit = Target::from_compact(genesis.header.bits);
+        let mut btc = BtcParams::new(Network::Testnet4);
+        btc.allow_min_difficulty_blocks = false;
+        btc.max_attainable_target = pow_limit;
+        Self {
+            genesis_hash: genesis.block_hash(),
+            genesis_coinbase_txid: genesis.txdata[0].compute_txid().to_byte_array(),
+            pow_limit,
+            btc,
+            enforce_bip94: false,
+            testnet5: true,
+            ..Self::testnet4()
         }
     }
 
@@ -218,6 +246,7 @@ impl ChainParams {
             bip34_hash: None,
             testdummy: None,
             enforce_bip94: false,
+            testnet5: false,
         })
     }
 
@@ -574,6 +603,7 @@ pub fn default_milestone_height(network: rbitcoin_primitives::Network) -> u32 {
         rbitcoin_primitives::Network::Testnet => 5_128_859,
         rbitcoin_primitives::Network::Signet
         | rbitcoin_primitives::Network::Testnet4
+        | rbitcoin_primitives::Network::Testnet5
         | rbitcoin_primitives::Network::Regtest => 0,
     }
 }
@@ -588,6 +618,7 @@ pub fn default_milestone_anchor(
         rbitcoin_primitives::Network::Testnet => TESTNET_MILESTONE_HASH,
         rbitcoin_primitives::Network::Signet
         | rbitcoin_primitives::Network::Testnet4
+        | rbitcoin_primitives::Network::Testnet5
         | rbitcoin_primitives::Network::Regtest => return None,
     };
     Some(crate::milestone::MilestoneAnchor {
@@ -608,7 +639,9 @@ pub fn default_min_chain_work_be(network: rbitcoin_primitives::Network) -> Optio
         rbitcoin_primitives::Network::Testnet4 => {
             Some(min_work_from_display_hex(TESTNET4_MIN_CHAIN_WORK))
         }
-        rbitcoin_primitives::Network::Signet | rbitcoin_primitives::Network::Regtest => None,
+        rbitcoin_primitives::Network::Signet
+        | rbitcoin_primitives::Network::Testnet5
+        | rbitcoin_primitives::Network::Regtest => None,
     }
 }
 
@@ -626,7 +659,24 @@ pub fn check_genesis_hash(params: &ChainParams, hash: BlockHash) -> bool {
 }
 
 pub fn genesis_block(params: &ChainParams) -> bitcoin::block::Block {
+    if params.testnet5 {
+        return testnet5_genesis_block();
+    }
     constants::genesis_block(params.network)
+}
+
+/// BIP 95 genesis block, mined at mainnet height 975,744.
+const TESTNET5_GENESIS_HEX: &str = "\
+    00c0302200000000000000000000000000000000000000000000000000000000000000008de2a6b556ecb5\
+    6779c34481ede767f09b2ae214f37ab1ad34085b5cb699588c91ebf76affff0f1a31913d65010100000001\
+    0000000000000000000000000000000000000000000000000000000000000000ffffffff5b04ffff001d01\
+    044c52323032362d31312d313420393735373434203030303030303030303030303030303030303031323365\
+    3236383165326638326163646362393433306131356565633234636338356234303036393164343739ffff\
+    ffff0100f2052a010000000a6a0895ebf76a0200000000000000";
+
+fn testnet5_genesis_block() -> bitcoin::block::Block {
+    bitcoin::consensus::encode::deserialize_hex(TESTNET5_GENESIS_HEX)
+        .expect("testnet5 genesis block hex")
 }
 
 /// Largest target `t` with `t * 4 * timespan` at most `2^256 - 1`: that

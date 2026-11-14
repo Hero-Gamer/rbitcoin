@@ -880,6 +880,9 @@ pub async fn run_outbound_session_with_abort(
 
 /// Resolve P2P message magic, including BIP325 custom-Signet derivation.
 pub fn magic_for_params(params: &ChainParams) -> Magic {
+    if params.testnet5 {
+        return Magic::from_bytes(*b"FIVE");
+    }
     match params.signet_challenge.as_ref() {
         Some(challenge) => Magic::from_bytes(signet_magic(challenge.as_script())),
         None => Magic::from(params.network),

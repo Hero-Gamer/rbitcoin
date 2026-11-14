@@ -375,7 +375,7 @@ pub fn operator_usage() -> String {
     [--block-version N] [--block-min-tx-fee BTC] [--bytes-per-sigop N] [--block-reserved-sigops N] [--alert-notify CMD] [--startup-notify CMD] \\\n\
     [--max-run-secs N] [--log-level LEVEL] [--api-log PATH] [--asmap PATH] \\\n\
     [--no-seeds] [--no-listen] [--no-discover] [--discover-from-peers] [--listen-onion] [--cjdns-reachable] [--smoke] [--inhibit-suspend]\n\n\
-Networks: mainnet|testnet|testnet4|signet|regtest.\n\
+Networks: mainnet|testnet|testnet4|testnet5|signet|regtest.\n\
 Custom Signet: --signet-challenge HEX [--signet-block-time SECS].\n\
 Log level: error|warn|info|debug|trace|off (CLI > conf log_level > RBITCOIN_LOG / RUST_LOG).\n\
 API log: --api-log PATH writes one JSON line per Electrum/Esplora/RPC call (also TRACE `api:`).\n\
@@ -384,7 +384,7 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
   Defaults: mainnet {main_height} anchored to block {MAINNET_MILESTONE_HASH},\n\
   testnet {testnet_height} anchored to block {TESTNET_MILESTONE_HASH}\n\
   (skip only on that header path; chain work is not the script gate),\n\
-  signet 0, testnet4 0 (testnet4 still ships Core's min chain work), regtest 0.\n\
+  signet 0, testnet4 0 (testnet4 still ships Core's min chain work), testnet5 0, regtest 0.\n\
   Explicit HEIGHT is height-only. Use 0 for full scripts.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default 300 → 300e6 WU; N × 1_000_000 weight, not MiB).\n\

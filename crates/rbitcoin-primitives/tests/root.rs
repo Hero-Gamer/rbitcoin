@@ -40,6 +40,11 @@ fn network_parse_display_and_error() {
     assert_eq!(t4.as_str(), "testnet4");
     assert_eq!(t4.default_p2p_port(), 48333);
     assert_eq!(t4.default_rpc_port(), 48332);
+    let t5 = Network::parse("testnet5").unwrap();
+    assert_eq!(t5, Network::Testnet5);
+    assert_eq!(t5.as_str(), "testnet5");
+    assert_eq!(t5.default_p2p_port(), 18353);
+    assert_eq!(t5.default_rpc_port(), 18352);
     assert_eq!(DEFAULT_ELECTRUM_PORT, 50001);
     assert_eq!(DEFAULT_ESPLORA_PORT, 3000);
 }

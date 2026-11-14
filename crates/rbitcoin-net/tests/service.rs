@@ -45,6 +45,15 @@ fn magic_for_all_networks() {
         Magic::from(bitcoin::Network::Signet)
     );
     assert_eq!(magic_for_params(&ChainParams::regtest()), Magic::REGTEST);
+    assert_eq!(
+        magic_for_params(&ChainParams::testnet4()),
+        Magic::from(bitcoin::Network::Testnet4)
+    );
+    assert_eq!(
+        magic_for_params(&ChainParams::testnet5()),
+        Magic::from_bytes(*b"FIVE"),
+        "BIP 95 message start"
+    );
 }
 
 #[test]

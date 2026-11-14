@@ -67,6 +67,12 @@ fn genesis_coinbase_txid_reads_the_query_once_set() {
     let ctx = open_ctx(&dir);
     let network = rbitcoin_consensus::ChainParams::regtest().genesis_coinbase_txid;
     assert_eq!(genesis_coinbase_txid(&ctx), network);
+    let mut testnet5 = ctx_without_chain(&ctx);
+    testnet5.network = Network::Testnet5;
+    assert_eq!(
+        genesis_coinbase_txid(&testnet5),
+        rbitcoin_consensus::ChainParams::testnet5().genesis_coinbase_txid
+    );
     let marked = [0x11; 32];
     ctx.query.set_genesis_coinbase_txid(marked);
     assert_eq!(genesis_coinbase_txid(&ctx), marked);
@@ -8610,6 +8616,7 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         (Network::Testnet, "test"),
         (Network::Signet, "signet"),
         (Network::Testnet4, "testnet4"),
+        (Network::Testnet5, "testnet5"),
     ] {
         let mut labeled = ctx_without_chain(&ctx);
         labeled.network = net;
@@ -8625,6 +8632,15 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     )
     .unwrap();
     assert_eq!(tb["isvalid"], true, "testnet4 addresses are tb: {tb}");
+    let mut testnet5 = ctx_without_chain(&ctx);
+    testnet5.network = Network::Testnet5;
+    let tb = dispatch(
+        &testnet5,
+        "validateaddress",
+        vec![json!("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")],
+    )
+    .unwrap();
+    assert_eq!(tb["isvalid"], true, "testnet5 addresses are tb: {tb}");
 
     let gbt = dispatch(
         &bare,

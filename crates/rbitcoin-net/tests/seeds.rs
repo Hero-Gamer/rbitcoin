@@ -551,6 +551,7 @@ fn seed_lookup_names_x_filter_before_unfiltered() {
         }
     }
     assert!(seed_lookup_names(Network::Regtest).is_empty());
+    assert!(seed_lookup_names(Network::Testnet5).is_empty());
 }
 
 #[test]
@@ -1140,6 +1141,8 @@ fn fixed_seeds_are_core_v32_tables() {
         );
     }
     assert_eq!(fixed_seeds(Network::Regtest).count(), 0);
+    assert!(dns_seeds(Network::Testnet5).is_empty());
+    assert_eq!(fixed_seeds(Network::Testnet5).count(), 0);
 }
 
 #[test]
