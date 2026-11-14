@@ -299,7 +299,10 @@ is no plaintext mode.
 base58check form (`9b…`); configure it as the TP authority public key in the
 client. No templates are sent while the node is in IBD.
 The template time is `next_block_mintime`: above the tip median, with the
-BIP94 and BIP54 floors applied on every network. On testnet3 and testnet4,
+BIP94 and BIP54 floors applied on every network. On testnet5 `NewTemplate`
+carries the coinbase BIP 54 requires: `coinbase_tx_locktime` is the height
+before the block's and `coinbase_tx_input_sequence` is `0xfffffffe`. Every
+other network sends locktime 0 and a final sequence. On testnet3 and testnet4,
 `SetNewPrevHash` carries nBits for that previous hash and `NewTemplate` has
 no bits field. A solution whose time rolls past the previous block by two
 target spacings needs the minimum-difficulty bits. Those bits are inside

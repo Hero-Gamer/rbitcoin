@@ -22,8 +22,8 @@ consensus/script** path.
 > Script and signature checks skip only when that hash and the block being
 > connected are the header-path occupants at their heights. Stored minimum
 > chain work is not that gate. `--milestone 0` checks every script. An
-> explicit height skips by height alone. Signet and testnet4 check every
-> script by default.
+> explicit height skips by height alone. Signet, testnet4, and testnet5 check
+> every script by default.
 >
 > Occupied **0.6.x** stores refuse: wipe the datadir and sync again.
 > Schema **24 and 25** open in place. A published **0.8** directory is schema

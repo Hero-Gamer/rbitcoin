@@ -42,6 +42,7 @@ refreshing; do not check copies into `tests/fixtures/`.
 | `bip341_wallet_vectors.json` | same | `script::core_bip341::core_bip341_wallet_vectors_all_rows` | key-path fully-signed + per-input spends accept; unknown-leaf script-path accepts |
 | `script_corpus/script_tests.json` | `tests/fixtures/script_corpus/` (ours, Core row form) | `script::core_vectors::script_corpus_rows_match_our_interpreter` and `script-oracle` | every row accept/reject matches the file; the oracle is the pinned Core `VerifyScript` |
 | mainnet 866342 + prevouts | `tests/fixtures/block_866342/` (Floresta zstd) | `block::block_866342::block_866342_structure_scripts_and_overweight` | structure at height + every non-coinbase `verify_job_all_inputs`; extra-NOP clone is 4_000_001 WU |
+| BIP 54 vectors (`timestamps`, `coinbases`, `txsize`, `sigops`) | `tests/fixtures/bip54/` (bitcoin/bips `bip-0054/test_vectors`; the two large files under zstd) | `block::bip54_vectors::*` | every case accepts or rejects as its `valid` says, with mainnet parameters and `enforce_bip54` set; a reject carries the BIP 54 reason |
 
 ### How the harness works
 
