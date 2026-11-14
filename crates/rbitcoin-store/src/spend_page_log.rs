@@ -1822,52 +1822,7 @@ impl SpendPageLog {
         let buf = std::fs::read(&commit_path).map_err(|e| StoreError::io(&commit_path, e))?;
         let parsed = parse_commit(&buf)?;
         let header_gen = parsed.generation;
-        let gen_path = self.dir.join(format!("{SPEND_PAGES_NAME}.{header_gen}"));
-        let pages_path = if gen_path.exists() {
-            gen_path
-        } else {
-            self.dir.join(SPEND_PAGES_NAME)
-        };
-        let opened =
-            open_committed_pages(&pages_path, parsed.committed_len, parsed.recs.is_empty())?;
-        let limit = parsed.committed_len;
-        for rec in &parsed.recs {
-            if resolved_generation(rec.generation, header_gen) != header_gen {
-                continue;
-            }
-            let end = rec.log_off.saturating_add(u64::from(rec.image_len));
-            if rec.log_off > limit || end > limit {
-                return Err(StoreError::Corrupt(
-                    "spend page commit names bytes past the committed length",
-                ));
-            }
-        }
-        let mut files: HashMap<u32, File> = HashMap::new();
-        if let Some(file) = opened {
-            files.insert(header_gen, file);
-        }
-        let mut other_gens = HashSet::new();
-        for rec in &parsed.recs {
-            let generation = resolved_generation(rec.generation, header_gen);
-            if generation != header_gen {
-                other_gens.insert(generation);
-            }
-        }
-        for generation in other_gens {
-            let path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
-            let file = open_named_image(&path)?;
-            let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
-            for rec in &parsed.recs {
-                if resolved_generation(rec.generation, header_gen) != generation {
-                    continue;
-                }
-                let end = rec.log_off.saturating_add(u64::from(rec.image_len));
-                if rec.log_off > file_len || end > file_len {
-                    return Err(StoreError::Corrupt("spend.pages short"));
-                }
-            }
-            files.insert(generation, file);
-        }
+        let files = open_commit_images(&self.dir, &parsed)?;
         let mut g = self.lock();
         g.generation = header_gen;
         g.cool_through = 0;
@@ -1990,6 +1945,59 @@ fn open_committed_pages(
         return Err(StoreError::Corrupt("spend.pages short"));
     }
     Ok(Some(file))
+}
+
+/// Open each generation file the commit names and refuse a record that
+/// runs past that file. The header generation is `spend.pages.{n}` when
+/// that name still exists, and `spend.pages` after the rename.
+fn open_commit_images(dir: &Path, parsed: &ParsedCommit) -> Result<HashMap<u32, File>, StoreError> {
+    let header_gen = parsed.generation;
+    let gen_path = dir.join(format!("{SPEND_PAGES_NAME}.{header_gen}"));
+    let pages_path = if gen_path.exists() {
+        gen_path
+    } else {
+        dir.join(SPEND_PAGES_NAME)
+    };
+    let opened = open_committed_pages(&pages_path, parsed.committed_len, parsed.recs.is_empty())?;
+    let limit = parsed.committed_len;
+    for rec in &parsed.recs {
+        if resolved_generation(rec.generation, header_gen) != header_gen {
+            continue;
+        }
+        let end = rec.log_off.saturating_add(u64::from(rec.image_len));
+        if rec.log_off > limit || end > limit {
+            return Err(StoreError::Corrupt(
+                "spend page commit names bytes past the committed length",
+            ));
+        }
+    }
+    let mut files: HashMap<u32, File> = HashMap::new();
+    if let Some(file) = opened {
+        files.insert(header_gen, file);
+    }
+    let mut other_gens = HashSet::new();
+    for rec in &parsed.recs {
+        let generation = resolved_generation(rec.generation, header_gen);
+        if generation != header_gen {
+            other_gens.insert(generation);
+        }
+    }
+    for generation in other_gens {
+        let path = dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+        let file = open_named_image(&path)?;
+        let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
+        for rec in &parsed.recs {
+            if resolved_generation(rec.generation, header_gen) != generation {
+                continue;
+            }
+            let end = rec.log_off.saturating_add(u64::from(rec.image_len));
+            if rec.log_off > file_len || end > file_len {
+                return Err(StoreError::Corrupt("spend.pages short"));
+            }
+        }
+        files.insert(generation, file);
+    }
+    Ok(files)
 }
 
 /// Clears `compose_height` on every `prepare_commit` return, including errors.
