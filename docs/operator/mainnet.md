@@ -35,10 +35,12 @@ the first sync. Changing it later does not recheck blocks already stored.
 How this differs from Bitcoin Core’s assumevalid is in
 [`COMPAT.md`](../../COMPAT.md).
 
-Signet and testnet4 already check every script. Use them to try a wallet or
-to see that a binary connects. They are not a step you have to finish before
-mainnet. `--network testnet4` is Bitcoin Core’s testnet4: BIP94, peer port
-48333, RPC port 48332.
+Signet, testnet4, and testnet5 already check every script. Use them to try a
+wallet or to see that a binary connects. They are not a step you have to
+finish before mainnet. `--network testnet4` is Bitcoin Core’s testnet4: BIP94,
+peer port 48333, RPC port 48332. `--network testnet5` is BIP 95’s Testnet 5:
+BIP 54 from block 1, no minimum-difficulty blocks, peer port 18353, RPC port
+18352. It has no seeds yet, so name a peer with `--connect`.
 
 A 0.7 directory (schema 24) or a 0.8 directory (schema 26) opens in place.
 Schema 22 through 27 rewrite `meta` to 28 on open. That includes a datadir
@@ -56,7 +58,7 @@ point an older binary at a directory this release has opened.
   --log-level info
 ```
 
-Use a datadir that is not the signet or testnet4 directory.
+Use a datadir that is not the signet, testnet4, or testnet5 directory.
 `--listen 0.0.0.0:8333` is what accepts inbound peers. Without it the node
 dials out and does not accept them.
 

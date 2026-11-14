@@ -1367,6 +1367,10 @@ impl NodeConfig {
                         self.network = Network::Testnet4;
                         continue;
                     }
+                    if line.eq_ignore_ascii_case("testnet5") {
+                        self.network = Network::Testnet5;
+                        continue;
+                    }
                     return Err(NodeError::Config(format!(
                         "conf {}:{}: expected key=value",
                         path.display(),
@@ -2042,6 +2046,11 @@ impl NodeConfig {
             "testnet4" => {
                 if conf_bool("testnet4", val)? {
                     self.network = Network::Testnet4;
+                }
+            }
+            "testnet5" => {
+                if conf_bool("testnet5", val)? {
+                    self.network = Network::Testnet5;
                 }
             }
             _ => return Ok(ConfApply::Unknown(key.to_string())),

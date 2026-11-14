@@ -56,7 +56,7 @@ pub fn rpc_btc_network(n: Network) -> BtcNetwork {
         Network::Mainnet => BtcNetwork::Bitcoin,
         Network::Testnet => BtcNetwork::Testnet,
         Network::Signet => BtcNetwork::Signet,
-        Network::Testnet4 => BtcNetwork::Testnet4,
+        Network::Testnet4 | Network::Testnet5 => BtcNetwork::Testnet4,
         Network::Regtest => BtcNetwork::Regtest,
     }
 }
@@ -733,6 +733,10 @@ pub fn mocktime_i64(v: &Value) -> Result<i64, Value> {
 const SEGWIT_RULE_REQUIRED: &str =
     r#"getblocktemplate must be called with the segwit rule set (call with {"rules": ["segwit"]})"#;
 const SIGNET_RULE_REQUIRED: &str = r#"getblocktemplate must be called with the signet rule set (call with {"rules": ["segwit", "signet"]})"#;
+/// Core's reply when an active deployment is not an optional rule and the
+/// client did not name it. BIP 54 changes what a valid coinbase is.
+const CLEANUP_RULE_REQUIRED: &str =
+    "Support for 'consensuscleanup' rule requires explicit client support";
 
 /// Core `setClientRules`: a `rules` array of strings. Anything else is no rules.
 fn gbt_client_rules(req: Option<&serde_json::Map<String, Value>>) -> Result<Vec<&str>, Value> {
@@ -818,11 +822,15 @@ pub(crate) fn getblocktemplate(ctx: &RpcContext, params: &RpcParams) -> Result<V
             return Err(rpc_error(ERR_CLIENT_NOT_CONNECTED, "Shutting down"));
         }
     }
-    if gbt_params(ctx).signet_challenge.is_some() && !rules.contains(&"signet") {
+    let params = gbt_params(ctx);
+    if params.signet_challenge.is_some() && !rules.contains(&"signet") {
         return Err(rpc_error(ERR_INVALID_PARAMETER, SIGNET_RULE_REQUIRED));
     }
     if !rules.contains(&"segwit") {
         return Err(rpc_error(ERR_INVALID_PARAMETER, SEGWIT_RULE_REQUIRED));
+    }
+    if params.enforce_bip54 && !rules.contains(&"consensuscleanup") {
+        return Err(rpc_error(ERR_INVALID_PARAMETER, CLEANUP_RULE_REQUIRED));
     }
     gbt_template(ctx)
 }
@@ -1228,6 +1236,9 @@ fn gbt_render(ctx: &RpcContext, sketch: GbtSketch) -> Result<Value, Value> {
     }
     if params.signet_challenge.is_some() {
         rules.push("!signet");
+    }
+    if params.enforce_bip54 {
+        rules.push("!consensuscleanup");
     }
     let mut vbavailable = serde_json::Map::new();
     let mut version = ctx

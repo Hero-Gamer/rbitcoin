@@ -33,10 +33,19 @@ fn validate_header_on_parent_uses_the_caller_digest() {
     rbitcoin_consensus::grind_regtest_pow(&mut header);
     let hash = header.block_hash().to_byte_array();
     rbitcoin_consensus::clock::with_now(1_700_000_000, || {
-        validate_header_on_parent(&params, Height(1), &header, 0, 0, header.bits, hash).unwrap();
-        let err =
-            validate_header_on_parent(&params, Height(1), &header, 0, 0, header.bits, [0xff; 32])
-                .unwrap_err();
+        validate_header_on_parent(&params, Height(1), &header, 0, 0, None, header.bits, hash)
+            .unwrap();
+        let err = validate_header_on_parent(
+            &params,
+            Height(1),
+            &header,
+            0,
+            0,
+            None,
+            header.bits,
+            [0xff; 32],
+        )
+        .unwrap_err();
         assert!(matches!(err, ConsensusError::InvalidPow), "{err:?}");
         let err = validate_header_on_parent(
             &params,
@@ -44,6 +53,7 @@ fn validate_header_on_parent_uses_the_caller_digest() {
             &header,
             0,
             0,
+            None,
             CompactTarget::from_consensus(0x1d00_ffff),
             hash,
         )

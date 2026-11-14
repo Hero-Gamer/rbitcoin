@@ -6159,6 +6159,11 @@ impl MempoolHub {
         self.lock_write().set_cluster_limits(count, size_kvb);
     }
 
+    /// [`ActiveMempool::set_enforce_bip54`], from the chain's parameters.
+    pub fn set_enforce_bip54(&self, enforce_bip54: bool) {
+        self.lock_write().set_enforce_bip54(enforce_bip54);
+    }
+
     /// Core `-bytespersigop` overlay: `0` disables sigop-adjusted sizing.
     pub fn set_bytes_per_sigop(&self, bytes_per_sigop: u64) {
         self.lock_write().set_bytes_per_sigop(bytes_per_sigop);

@@ -215,10 +215,7 @@ pub fn genesis_coinbase_txid(ctx: &RpcContext) -> [u8; 32] {
     if let Some(txid) = ctx.query.genesis_coinbase_txid.get() {
         return *txid;
     }
-    use bitcoin::hashes::Hash;
-    bitcoin::blockdata::constants::genesis_block(rpc_btc_network(ctx.network)).txdata[0]
-        .compute_txid()
-        .to_byte_array()
+    rbitcoin_consensus::ChainParams::for_network(ctx.network).genesis_coinbase_txid
 }
 
 mod asm;
@@ -1251,6 +1248,7 @@ pub fn chain_name(n: Network) -> &'static str {
         Network::Testnet => "test",
         Network::Signet => "signet",
         Network::Testnet4 => "testnet4",
+        Network::Testnet5 => "testnet5",
         Network::Regtest => "regtest",
     }
 }

@@ -67,10 +67,19 @@ fn generate_commit_pad() -> &'static rbitcoin_query::testutil::TempDir {
 }
 
 fn open_generate_commit_hub(label: &str) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
+    open_generate_commit_hub_with(label, ChainParams::regtest())
+}
+
+/// A private copy of the pad under `params`, which must accept the pad as
+/// its own chain. Rules `params` adds bind the blocks mined on top.
+fn open_generate_commit_hub_with(
+    label: &str,
+    params: ChainParams,
+) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
     let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect(label);
     rbitcoin_store::testutil::copy_store_tree(generate_commit_pad().path(), dir.path());
     let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).expect("open generate copy");
-    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    let hub = ChainHub::new(q, params, Milestone::NONE);
     (dir, hub)
 }
 
@@ -1880,8 +1889,10 @@ fn min_diff_limit_starts_after_two_spacings_and_walks_back() {
                 .saturating_add((spacing as u32 / 2).saturating_mul(height))
         };
         let probe = Header { time, ..parent };
+        let none = HashMap::new();
+        let first = hub.period_first_off_tip(&parent, height - 1, &none);
         let bits = hub
-            .expected_bits_off_tip(&probe, &parent, height - 1, &HashMap::new())
+            .expected_bits_off_tip(&probe, &parent, height - 1, first, &none)
             .unwrap();
         let mut block = mine(prev.block_hash(), time, height);
         block.header.bits = bits;
@@ -2652,7 +2663,7 @@ fn ensure_header_fork_child_rejects_old_time_and_wrong_bits() {
     let mtp = hub.mtp_off_tip(&b1.header, &empty);
     assert!(mtp <= b1.header.time);
     let child_bits = hub
-        .expected_bits_off_tip(&h2, &b1.header, 1, &empty)
+        .expected_bits_off_tip(&h2, &b1.header, 1, None, &empty)
         .unwrap();
     assert_eq!(child_bits, b1.header.bits);
     let mut far_bits = h2;
@@ -3201,8 +3212,9 @@ fn header_batch_min_diff_matches_the_unremembered_walk() {
             prev_blockhash: parent.block_hash(),
             ..parent
         };
+        let first = hub.period_first_off_tip(&parent, height - 1, &batch);
         let bits = hub
-            .expected_bits_off_tip(&probe, &parent, height - 1, &batch)
+            .expected_bits_off_tip(&probe, &parent, height - 1, first, &batch)
             .unwrap_or_else(|e| panic!("height {height}: {e}"));
         let mut header = probe;
         header.version = mine(prev.block_hash(), time, height).header.version;
@@ -6756,6 +6768,319 @@ fn bip94_proposal_rejects_a_timewarp() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Regtest with BIP 54 on and a 4-block difficulty period, with one block
+/// mined at each of `times` (seconds after `BIP54_T0`).
+fn bip54_pad(label: &str, times: &[u32]) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    params.btc.pow_target_timespan = 4 * params.btc.pow_target_spacing;
+    let hub = ChainHub::new(q, params, Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    for (i, time) in times.iter().enumerate() {
+        hub.clock.set_mock(i64::from(BIP54_T0 + time));
+        bip54_mine(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+        assert_eq!(
+            bip94_header_at(&hub, i as u32 + 1).time,
+            BIP54_T0 + time,
+            "height {}",
+            i + 1
+        );
+    }
+    (dir, hub)
+}
+
+const BIP54_T0: u32 = 1_700_000_000;
+
+/// The hub's own template with the coinbase BIP 54 asks for. The regtest
+/// miner is not a BIP 54 miner: its coinbase has `nLockTime` 0 and a final
+/// `nSequence`.
+fn bip54_block(hub: &ChainHub, pay: ScriptBuf, extra: Vec<Transaction>) -> Block {
+    let mut block = hub.assemble_block_to_script(pay, extra).unwrap();
+    let height = hub.tip_height().unwrap() + 1;
+    block.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(height - 1);
+    block.txdata[0].input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    bip54_seal(&mut block);
+    block
+}
+
+fn bip54_seal(block: &mut Block) {
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+}
+
+fn bip54_mine(hub: &ChainHub, pay: ScriptBuf, extra: Vec<Transaction>) -> Block {
+    let block = bip54_block(hub, pay, extra);
+    hub.accept_block(block.clone())
+        .unwrap_or_else(|e| panic!("height {:?}: {e}", hub.tip_height().map(|h| h + 1)));
+    block
+}
+
+/// Heights 1..=3, 10,000 s apart: a height-4 header two hours before its
+/// parent is still above the median, so only the timewarp floor decides it.
+const BIP54_BEFORE_PERIOD: [u32; 3] = [10_000, 20_000, 30_000];
+
+/// Heights 1..=6. Height 4 opens a period at 100,000 s and heights 5 and 6
+/// are earlier, so a height-7 header just before height 4 is above the
+/// median and only the period's first header decides it.
+const BIP54_INSIDE_PERIOD: [u32; 6] = [10_000, 20_000, 30_000, 100_000, 40_000, 50_000];
+const BIP54_PERIOD_FIRST: u32 = BIP54_T0 + 100_000;
+
+fn is_negative_interval(err: &NetError) -> bool {
+    err.to_string().contains("time-negative-interval")
+}
+
+/// BIP 54 on header sync: a period's first header more than two hours
+/// before its in-batch parent fails, and two hours passes.
+#[test]
+fn bip54_off_tip_period_start_rejects_a_timewarp() {
+    let (dir, hub) = bip54_pad("bip54-off-tip", &BIP54_BEFORE_PERIOD);
+    let h2 = bip94_header_at(&hub, 2);
+    let fork3 = bip94_child(&h2, h2.time + 10_000, 0x31);
+    let warped = bip94_child(&fork3, fork3.time - 7201, 0x41);
+    let err = hub.ensure_headers_batch(&[fork3, warped]).unwrap_err();
+    assert!(is_timewarp(&err), "{err}");
+    let floor = bip94_child(&fork3, fork3.time - 7200, 0x42);
+    hub.ensure_headers_batch(&[fork3, floor])
+        .expect("two hours before the parent");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on header sync: a period's last header before the period's first
+/// header fails. The first header is confirmed and the parent is in the
+/// batch, then the parent is the confirmed tip.
+#[test]
+fn bip54_header_sync_rejects_a_negative_interval() {
+    let (dir, hub) = bip54_pad("bip54-neg-sync", &BIP54_INSIDE_PERIOD);
+    hub.clock.set_mock(i64::from(BIP54_PERIOD_FIRST));
+    let h5 = bip94_header_at(&hub, 5);
+    let fork6 = bip94_child(&h5, h5.time + 10_000, 0x61);
+    let early = bip94_child(&fork6, BIP54_PERIOD_FIRST - 1, 0x71);
+    let err = hub.ensure_headers_batch(&[fork6, early]).unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    let level = bip94_child(&fork6, BIP54_PERIOD_FIRST, 0x72);
+    hub.ensure_headers_batch(&[fork6, level])
+        .expect("the first header's own time");
+
+    let tip = bip94_header_at(&hub, 6);
+    let early = bip94_child(&tip, BIP54_PERIOD_FIRST - 1, 0x73);
+    let err = hub.ensure_headers_batch(&[early]).unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    let level = bip94_child(&tip, BIP54_PERIOD_FIRST, 0x74);
+    hub.ensure_headers_batch(&[level])
+        .expect("the first header's own time");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a branch: the period's last block is judged against the
+/// branch's own first header, here the fork block itself.
+#[test]
+fn bip54_branch_rejects_a_negative_interval() {
+    let (dir, hub) = bip54_pad("bip54-neg-branch", &BIP54_BEFORE_PERIOD);
+    let fork_first = BIP54_T0 + 90_000;
+    hub.clock.set_mock(i64::from(fork_first));
+    let block = |header| Block {
+        header,
+        txdata: vec![],
+    };
+    let h3 = bip94_header_at(&hub, 3);
+    let fork4 = bip94_child(&h3, fork_first, 0x41);
+    let fork5 = bip94_child(&fork4, BIP54_T0 + 40_000, 0x51);
+    let fork6 = bip94_child(&fork5, BIP54_T0 + 50_000, 0x61);
+    let branch = |last: Header| arcs(&[block(fork4), block(fork5), block(fork6), block(last)]);
+    let early = bip94_child(&fork6, fork_first - 1, 0x71);
+    let err = hub
+        .accept_branch_check_headers(&branch(early), Some(3))
+        .unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    let level = bip94_child(&fork6, fork_first, 0x72);
+    hub.accept_branch_check_headers(&branch(level), Some(3))
+        .expect("the first header's own time");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a block proposal (Core `TestBlockValidity`) and on the block a
+/// peer sends for the tip: both timestamp rules.
+#[test]
+fn bip54_proposal_and_tip_block_reject_both_time_faults() {
+    let (dir, hub) = bip54_pad("bip54-proposal-warp", &BIP54_BEFORE_PERIOD);
+    let tip = hub.header_of(&hub.tip_hash().unwrap()).unwrap();
+    let template = bip54_block(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+    let mut warped = template.clone();
+    warped.header.time = tip.time - 7201;
+    assert_eq!(
+        hub.check_block_proposal(&warped).unwrap_err(),
+        "time-timewarp-attack"
+    );
+    let mut floor = template;
+    floor.header.time = tip.time - 7200;
+    hub.check_block_proposal(&floor)
+        .expect("two hours before the parent");
+    let _ = std::fs::remove_dir_all(dir);
+
+    let (dir, hub) = bip54_pad("bip54-proposal-neg", &BIP54_INSIDE_PERIOD);
+    hub.clock.set_mock(i64::from(BIP54_PERIOD_FIRST));
+    let template = bip54_block(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
+    assert_eq!(
+        template.header.time, BIP54_PERIOD_FIRST,
+        "the template keeps to the period's first header"
+    );
+    let mut early = template.clone();
+    early.header.time = BIP54_PERIOD_FIRST - 1;
+    rbitcoin_consensus::grind_regtest_pow(&mut early.header);
+    assert_eq!(
+        hub.check_block_proposal(&early).unwrap_err(),
+        "time-negative-interval"
+    );
+    let err = hub.accept_block(early).unwrap_err();
+    assert!(is_negative_interval(&err), "{err}");
+    assert_eq!(hub.tip_height(), Some(6));
+    hub.check_block_proposal(&template)
+        .expect("the first header's own time");
+    hub.accept_block(template).expect("a valid period end");
+    assert_eq!(hub.tip_height(), Some(7));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a block proposal and on the tip block: the coinbase is
+/// timelocked to the height before its block, with a sequence that lets the
+/// locktime apply.
+#[test]
+fn bip54_coinbase_is_timelocked_to_its_height() {
+    let (dir, hub) = bip54_pad("bip54-coinbase", &[10_000]);
+    let pay = || ScriptBuf::from_bytes(vec![0x51]);
+    let rejects = |block: Block, reason: &str| {
+        assert_eq!(hub.check_block_proposal(&block).unwrap_err(), reason);
+        let err = hub.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err}");
+        assert_eq!(hub.tip_height(), Some(1));
+    };
+
+    let regtest_miner = hub.assemble_block_to_script(pay(), vec![]).unwrap();
+    rejects(regtest_miner, "bad-cb-locktime");
+    for locktime in [0, 2] {
+        let mut block = bip54_block(&hub, pay(), vec![]);
+        block.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(locktime);
+        bip54_seal(&mut block);
+        rejects(block, "bad-cb-locktime");
+    }
+    let mut final_sequence = bip54_block(&hub, pay(), vec![]);
+    final_sequence.txdata[0].input[0].sequence = bitcoin::Sequence::MAX;
+    bip54_seal(&mut final_sequence);
+    rejects(final_sequence, "bad-cb-sequence");
+
+    let mut any_other_sequence = bip54_block(&hub, pay(), vec![]);
+    any_other_sequence.txdata[0].input[0].sequence = bitcoin::Sequence::ZERO;
+    bip54_seal(&mut any_other_sequence);
+    hub.check_block_proposal(&any_other_sequence)
+        .expect("a sequence that is not final");
+    hub.accept_block(any_other_sequence)
+        .expect("a sequence that is not final");
+    assert_eq!(hub.tip_height(), Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `OP_0 OP_IF <checkmultisigs> <checksigs> OP_ENDIF OP_1`: anyone can spend
+/// it with an empty scriptSig, and BIP 54 counts 20 for each unexecuted
+/// `OP_CHECKMULTISIG` and 1 for each `OP_CHECKSIG`.
+fn bip54_sigop_script(checkmultisigs: usize, checksigs: usize) -> ScriptBuf {
+    use bitcoin::opcodes::all::{
+        OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHBYTES_0, OP_PUSHNUM_1,
+    };
+    let mut script = bitcoin::script::Builder::new()
+        .push_opcode(OP_PUSHBYTES_0)
+        .push_opcode(OP_IF);
+    for _ in 0..checkmultisigs {
+        script = script.push_opcode(OP_CHECKMULTISIG);
+    }
+    for _ in 0..checksigs {
+        script = script.push_opcode(OP_CHECKSIG);
+    }
+    script
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_PUSHNUM_1)
+        .into_script()
+}
+
+/// Spend output `vout` of `funding` with an empty scriptSig into one output.
+fn bip54_spend(funding: &Transaction, vout: u32, script_pubkey: ScriptBuf) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::new(funding.compute_txid(), vout),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: funding.output[vout as usize].value,
+            script_pubkey,
+        }],
+    }
+}
+
+/// BIP 54 on a block proposal and on the tip block: a transaction whose
+/// inputs carry more than 2,500 signature operations, and a transaction of
+/// 64 bytes, are invalid. One fewer of either is accepted. The chain is the
+/// shared mature pad with BIP 54 on from height 102. One transaction there
+/// spends a mature coinbase into the outputs under test.
+#[test]
+fn bip54_block_rejects_too_many_sigops_and_a_64_byte_tx() {
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    let (dir, hub) = open_generate_commit_hub_with("bip54-block-txs", params);
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let mut funding = mature_spend_tx(&hub, 1);
+    let each = Amount::from_sat(10_0000_0000);
+    funding.output = [
+        bip54_sigop_script(125, 0),
+        bip54_sigop_script(125, 1),
+        op_true(),
+        op_true(),
+    ]
+    .into_iter()
+    .map(|script_pubkey| TxOut {
+        value: each,
+        script_pubkey,
+    })
+    .collect();
+    bip54_mine(&hub, op_true(), vec![funding.clone()]);
+    let (at_limit, past_limit, plain, plain_too) = (0, 1, 2, 3);
+
+    let rejects = |tx: Transaction, reason: &str| {
+        let tip = hub.tip_height();
+        let block = bip54_block(&hub, op_true(), vec![tx]);
+        assert_eq!(hub.check_block_proposal(&block).unwrap_err(), reason);
+        let err = hub.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err}");
+        assert_eq!(hub.tip_height(), tip);
+    };
+    let accepts = |tx: Transaction| {
+        let block = bip54_block(&hub, op_true(), vec![tx]);
+        hub.check_block_proposal(&block).expect("proposal");
+        hub.accept_block(block).expect("tip block");
+    };
+
+    accepts(bip54_spend(&funding, at_limit, op_true()));
+    rejects(
+        bip54_spend(&funding, past_limit, op_true()),
+        "bad-txns-legacy-sigops",
+    );
+
+    let small = bip54_spend(&funding, plain, ScriptBuf::from_bytes(vec![0x51; 4]));
+    assert_eq!(small.base_size(), 64);
+    rejects(small, "bad-txns-size");
+    let next = bip54_spend(&funding, plain, ScriptBuf::from_bytes(vec![0x51; 5]));
+    assert_eq!(next.base_size(), 65);
+    accepts(next);
+    let padded = bip54_spend(&funding, plain_too, ScriptBuf::from_bytes(vec![0x51; 3]));
+    assert_eq!(padded.base_size(), 63);
+    accepts(padded);
+    assert_eq!(hub.tip_height(), Some(105));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// BIP94 on header sync: the off-tip retarget scales the period's first
 /// `nBits`, not a min-difficulty parent's. Testnet4 with a 4-block period;
 /// height 4 opens the period at `0x1c3fffc0`, height 7 is a pow-limit block
@@ -6796,7 +7121,8 @@ fn bip94_off_tip_retarget_scales_the_period_first_bits() {
         let mut next = parent;
         next.prev_blockhash = parent.block_hash();
         next.time = parent.time + 1;
-        let bits = hub.expected_bits_off_tip(&next, &parent, 7, &batch);
+        let first = hub.period_first_off_tip(&parent, 7, &batch);
+        let bits = hub.expected_bits_off_tip(&next, &parent, 7, first, &batch);
         let _ = std::fs::remove_dir_all(dir);
         bits.unwrap().to_consensus()
     };

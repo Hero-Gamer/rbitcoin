@@ -5,6 +5,7 @@ use binary_sv2::{Seq0255, B0255, B064K, U256};
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Target, Transaction, TxOut};
+use rbitcoin_consensus::block::template_coinbase_timelock;
 use rbitcoin_consensus::{
     bip34_height_script, block_subsidy, time_too_new, witness_commitment_script, MAX_BLOCK_WEIGHT,
 };
@@ -32,6 +33,10 @@ pub const MIN_COINBASE_RESERVE_WU: u64 = 2000;
 pub struct Template {
     pub version: u32,
     pub coinbase_prefix: Vec<u8>,
+    /// Coinbase input `nSequence` and `nLockTime`
+    /// ([`template_coinbase_timelock`]).
+    pub coinbase_sequence: u32,
+    pub coinbase_locktime: u32,
     pub value_remaining: u64,
     /// The witness commitment output, serialized with no count prefix.
     pub coinbase_outputs: Vec<u8>,
@@ -47,8 +52,8 @@ pub struct Template {
 }
 
 impl Template {
-    /// Coinbase fields not carried by the record are fixed: version 2, one
-    /// final input, zero locktime.
+    /// Coinbase fields not carried by the record are fixed: version 2 and
+    /// one input.
     pub fn to_message(
         &self,
         template_id: u64,
@@ -60,11 +65,11 @@ impl Template {
             version: self.version,
             coinbase_tx_version: 2,
             coinbase_prefix: B0255::try_from(&self.coinbase_prefix[..])?,
-            coinbase_tx_input_sequence: u32::MAX,
+            coinbase_tx_input_sequence: self.coinbase_sequence,
             coinbase_tx_value_remaining: self.value_remaining,
             coinbase_tx_outputs_count: 1,
             coinbase_tx_outputs: B064K::try_from(&self.coinbase_outputs[..])?,
-            coinbase_tx_locktime: 0,
+            coinbase_tx_locktime: self.coinbase_locktime,
             merkle_path: Seq0255::new(self.merkle_path.iter().map(U256::from).collect())?,
         })
     }
@@ -204,9 +209,12 @@ pub(crate) fn build_stamped(
     };
     let mut leaves = vec![[0u8; 32]];
     leaves.extend(selected.iter().map(|(_, s)| s.txid.to_byte_array()));
+    let (coinbase_locktime, coinbase_sequence) = template_coinbase_timelock(&chain.params, height);
     Ok(Some(Template {
         version: chain.gbt_block_version(testdummy) as u32,
         coinbase_prefix: bip34_height_script(height),
+        coinbase_sequence: coinbase_sequence.to_consensus_u32(),
+        coinbase_locktime: coinbase_locktime.to_consensus_u32(),
         value_remaining: (block_subsidy(height, &chain.params) as u64).saturating_add(fees),
         coinbase_outputs: serialize(&commitment),
         merkle_path: rbitcoin_store::merkle_branch(&leaves, 0),

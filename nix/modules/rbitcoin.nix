@@ -23,6 +23,7 @@ let
     mainnet = 8333;
     testnet = 18333;
     testnet4 = 48333;
+    testnet5 = 18353;
     signet = 38333;
     regtest = 18444;
   };
@@ -31,6 +32,7 @@ let
     mainnet = 8332;
     testnet = 18332;
     testnet4 = 48332;
+    testnet5 = 18352;
     signet = 38332;
     regtest = 18443;
   };
@@ -440,8 +442,8 @@ in
       example = 840000;
       description = ''
         Pass `--milestone HEIGHT`. Null omits the flag: mainnet and testnet
-        keep the anchored script-skip default, and signet and testnet4 check
-        every script.
+        keep the anchored script-skip default, and signet, testnet4, and
+        testnet5 check every script.
         An explicit height is height-only.
       '';
     };
@@ -473,6 +475,7 @@ in
         "mainnet"
         "testnet"
         "testnet4"
+        "testnet5"
         "signet"
         "regtest"
       ];
@@ -773,7 +776,7 @@ in
       example = "0x0000000000000000000000000000000000000000000000000000000100000000";
       description = ''
         Pass `--min-chain-work HEX` (optional `0x`, at most 64 hex digits).
-        Null keeps Core's minimum on mainnet, testnet3, and testnet4, and leaves signet and regtest unset.
+        Null keeps Core's minimum on mainnet, testnet3, and testnet4, and leaves signet, testnet5, and regtest unset.
       '';
     };
 

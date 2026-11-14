@@ -7,7 +7,7 @@ Listener behavior, DoS limits, and the mempool.space nginx recipe stay in
 [`COMPAT.md`](../COMPAT.md) and [`rpc.md`](./rpc.md).
 
 Chains the node actually runs: `mainnet`, `testnet` (testnet3), `testnet4`,
-`signet`, `regtest`.
+`testnet5`, `signet`, `regtest`.
 
 0.x. The Electrum and Esplora listeners are the wallet product. Core
 wallet RPC (`importdescriptors`, `walletcreatefundedpsbt`,

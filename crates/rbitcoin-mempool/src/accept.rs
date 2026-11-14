@@ -639,6 +639,8 @@ pub struct ActiveMempool {
     /// A flag-off open removes those transactions and their descendants. A
     /// removal that does not finish leaves the mark.
     pub trust_kept: HashSet<Txid>,
+    /// The chain enforces BIP 54 ([`Self::set_enforce_bip54`]).
+    pub enforce_bip54: bool,
 }
 
 impl ActiveMempool {
@@ -694,6 +696,14 @@ impl ActiveMempool {
             self.cluster_size_kvb_overlay = size_kvb;
         }
         self.graph.set_cluster_limits(count, size_kvb);
+    }
+
+    /// On a chain that enforces BIP 54, refuse what no block there can hold:
+    /// a transaction of 64 bytes without its witness (`txn-size-64`), and one
+    /// whose inputs carry more than 2,500 signature operations
+    /// (`bad-txns-legacy-sigops`). Off, both are ordinary admits.
+    pub fn set_enforce_bip54(&mut self, enforce_bip54: bool) {
+        self.enforce_bip54 = enforce_bip54;
     }
 
     /// Overlay Core `-bytespersigop` (`0` disables sigop-adjusted size).
@@ -787,6 +797,7 @@ impl ActiveMempool {
             node_clock: Arc::new(AtomicU64::new(0)),
             loaded_accept: ingested.accept_secs,
             trust_kept: ingested.trust_kept,
+            enforce_bip54: false,
         })
     }
 
@@ -1167,10 +1178,12 @@ impl ActiveMempool {
                 AcceptError::CheckTransaction(rbitcoin_consensus::block_reject_reason(&e))
             })
         };
-        check_tx(rbitcoin_consensus::block::check_tx_shape(
-            tx,
-            tx.base_size(),
-        ))?;
+        let base_size = tx.base_size();
+        check_tx(rbitcoin_consensus::block::check_tx_shape(tx, base_size))?;
+        if self.enforce_bip54 && rbitcoin_consensus::block::reject_bip54_tx_size(base_size).is_err()
+        {
+            return Err(AcceptError::CheckTransaction("txn-size-64".into()));
+        }
         let txid = tx.compute_txid();
         // Core CheckTransaction: repeated inputs after the outputs and before
         // null prevouts, and before any value sum (Finding 011: phantom fee).
@@ -1205,6 +1218,13 @@ impl ActiveMempool {
             Err(err) => kept_trust_structural(waive, err)?,
         };
 
+        if self.enforce_bip54 {
+            let spks: Vec<&[u8]> = prevouts
+                .iter()
+                .map(|o| o.script_pubkey.as_bytes())
+                .collect();
+            check_tx(rbitcoin_consensus::block::reject_bip54_sigops(tx, &spks))?;
+        }
         let sigop_cost = block_fit_sigop_cost(tx, &prevouts, self.graph.block_reserved_sigops())?;
 
         let fee_sat = checked_fee_sat(tx, input_value)?;

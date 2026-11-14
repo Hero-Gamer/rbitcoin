@@ -3524,7 +3524,9 @@ pub fn batch_context_ok(
             None => 0,
         };
         parent_hash = hash;
-        let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, st, &diff) else {
+        let first = period_first(hub, height, st, &diff);
+        let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, first, st, &diff)
+        else {
             stopped = Some((
                 height,
                 hash.to_byte_array(),
@@ -3539,6 +3541,7 @@ pub fn batch_context_ok(
             hdr,
             mtp,
             parent.time,
+            first,
             bits,
             hash.to_byte_array(),
         ) {
@@ -3583,6 +3586,7 @@ pub fn expected_lookahead_bits(
     height: u32,
     parent: &Header,
     header_time: u32,
+    first: Option<rbitcoin_consensus::PeriodFirst>,
     st: &IbdWorkState,
     diff: &DiffSnap,
 ) -> Option<CompactTarget> {
@@ -3592,7 +3596,7 @@ pub fn expected_lookahead_bits(
         parent.bits,
         parent.time,
         header_time,
-        period_first(hub, height, st, diff),
+        first,
         |h| lookahead_bits_at(diff, st, hub, h),
     )
 }
@@ -3604,12 +3608,7 @@ pub fn period_first(
     st: &IbdWorkState,
     diff: &DiffSnap,
 ) -> Option<rbitcoin_consensus::PeriodFirst> {
-    let params = &hub.params;
-    let interval = params.difficulty_adjustment_interval();
-    if interval == 0 || !height.is_multiple_of(interval) || params.no_pow_retargeting() {
-        return None;
-    }
-    let start_h = height - interval;
+    let start_h = hub.params.period_first_height(height)?;
     let first = if diff.period_height == start_h {
         diff.period_header
     } else {

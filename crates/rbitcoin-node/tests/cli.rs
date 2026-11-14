@@ -169,7 +169,7 @@ fn operator_conf_and_argv() {
     ] {
         assert!(!h.contains(concat), "help must not advertise {concat}");
     }
-    assert!(h.contains("Networks: mainnet|testnet|testnet4|signet|regtest."));
+    assert!(h.contains("Networks: mainnet|testnet|testnet4|testnet5|signet|regtest."));
     assert!(h.contains("[--signet-block-time SECS]"));
     assert!(matches!(
         operator_config_from_args(["rbitcoin-node", "-V"], &NodeEnv::default()),
@@ -258,6 +258,7 @@ fn operator_conf_and_argv() {
         ("signet", Network::Signet),
         ("testnet", Network::Testnet),
         ("testnet4", Network::Testnet4),
+        ("testnet5", Network::Testnet5),
     ] {
         let conf = dir.join(format!("{bare}.conf"));
         std::fs::write(&conf, format!("{bare}\n; also a comment\n\nno_seeds=1\n")).unwrap();
@@ -338,6 +339,15 @@ fn operator_conf_and_argv() {
         rbitcoin_consensus::default_min_chain_work_be(Network::Testnet4)
     );
     assert!(testnet4.minimum_chain_work.is_some());
+    let testnet5 = ready_config(["rbitcoin-node", "--network=testnet5"]);
+    assert_eq!(testnet5.network, Network::Testnet5);
+    assert_eq!(testnet5.milestone_height, 0);
+    assert!(testnet5.milestone().anchor.is_none());
+    assert!(testnet5.minimum_chain_work.is_none());
+    assert_eq!(
+        testnet5.chain_params().unwrap().genesis_hash,
+        rbitcoin_consensus::ChainParams::testnet5().genesis_hash
+    );
     let signet_skip = ready_config([
         "rbitcoin-node",
         "--network=signet",

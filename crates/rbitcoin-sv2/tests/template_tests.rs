@@ -486,11 +486,13 @@ async fn first_template_every(tc: &TestChain, template_interval: Duration) -> Fi
     let p: SetNewPrevHash = binary_sv2::from_bytes(&mut f.payload).expect("decode");
     let tip = tc.chain.tip_header().expect("tip").block_hash();
 
-    let coinbase = solution_coinbase(
+    let mut coinbase = solution_coinbase(
         t.coinbase_prefix.as_ref(),
         t.coinbase_tx_value_remaining,
         t.coinbase_tx_outputs.as_ref(),
     );
+    coinbase.lock_time = LockTime::from_consensus(t.coinbase_tx_locktime);
+    coinbase.input[0].sequence = bitcoin::Sequence(t.coinbase_tx_input_sequence);
     let path: Vec<[u8; 32]> = t
         .merkle_path
         .iter()
@@ -513,6 +515,53 @@ async fn first_template_every(tc: &TestChain, template_interval: Duration) -> Fi
         header,
         coinbase: serialize(&coinbase),
     }
+}
+
+/// On a chain that enforces BIP 54 the template gives the miner the coinbase
+/// `nLockTime` and `nSequence` its block needs, and the block built from
+/// them becomes the tip. The regtest pad cannot mine such a chain, so the
+/// one block under the template is the hub's own, retimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn bip54_template_timelocks_the_coinbase() {
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    let tc = padded_chain_with("sv2-bip54", 0, params);
+    let mut first = tc
+        .chain
+        .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    first.txdata[0].input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    first.header.merkle_root = first.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut first.header);
+    tc.chain.accept_block(first).expect("height 1");
+
+    let FirstTemplate {
+        tp,
+        mut c,
+        template_id,
+        version,
+        mut header,
+        coinbase,
+    } = first_template(&tc).await;
+    let timelocked: Transaction = bitcoin::consensus::deserialize(&coinbase).unwrap();
+    assert_eq!(timelocked.lock_time, LockTime::from_consensus(1));
+    assert_eq!(
+        timelocked.input[0].sequence,
+        bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF
+    );
+
+    rbitcoin_consensus::grind_regtest_pow(&mut header);
+    c.submit_solution(template_id, version, header.time, header.nonce, &coinbase)
+        .await
+        .unwrap();
+    let f = recv_in_time(&mut c).await;
+    assert_eq!(f.msg_type, MESSAGE_TYPE_NEW_TEMPLATE);
+    assert_eq!(tc.chain.tip_height(), Some(2));
+    assert_eq!(
+        tc.chain.tip_header().unwrap().block_hash(),
+        header.block_hash()
+    );
+    tp.shutdown().await;
 }
 
 /// A solution whose header misses the target is dropped before

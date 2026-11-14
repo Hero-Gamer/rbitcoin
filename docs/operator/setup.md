@@ -12,8 +12,8 @@ is block **966143**
 Bitcoin Core 32.1 `defaultAssumeValid`): script
 and signature checks skip only when that hash and the block being connected
 are the header-path occupants at their heights. Explicit `--milestone HEIGHT`
-is height-only. `--milestone 0` checks every script. Signet and testnet4
-default to **0**.
+is height-only. `--milestone 0` checks every script. Signet, testnet4, and
+testnet5 default to **0**.
 
 Architecture and confirm pipeline: [`docs/architecture.md`](../../docs/architecture.md),
 [`docs/concurrency.md`](../../docs/concurrency.md). Download defaults to **1024**

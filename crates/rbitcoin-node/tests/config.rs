@@ -871,6 +871,7 @@ fn network_names_are_recognized_and_reject_invalid() {
         ("signet", Network::Signet),
         ("testnet", Network::Testnet),
         ("testnet4", Network::Testnet4),
+        ("testnet5", Network::Testnet5),
     ] {
         let mut c = NodeConfig::default();
         assert_eq!(c.apply_kv(name, "1").unwrap(), ConfApply::Applied);

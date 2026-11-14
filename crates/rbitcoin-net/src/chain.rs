@@ -1969,6 +1969,7 @@ impl ChainHub {
 
     /// Off-tip header checks. `validate_header` is only for a confirmed parent,
     /// and that is the call which opens [`rbitcoin_consensus::TrustCollect`].
+    #[allow(clippy::too_many_arguments)] // each argument is one caller fact
     fn apply_off_tip_header(
         query: &rbitcoin_query::Query,
         params: &ChainParams,
@@ -1976,6 +1977,7 @@ impl ChainHub {
         height: u32,
         mtp: u32,
         parent_time: u32,
+        first: Option<rbitcoin_consensus::PeriodFirst>,
         expected: CompactTarget,
     ) -> Result<(), NetError> {
         soften_parent_header(query, header, height, || {
@@ -1985,6 +1987,7 @@ impl ChainHub {
                 header,
                 mtp,
                 parent_time,
+                first,
                 expected,
                 header.block_hash().to_byte_array(),
             )
@@ -2024,7 +2027,9 @@ impl ChainHub {
                 .sync_parent_height(&parent_hash, in_batch)
                 .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
             let mtp = self.mtp_off_tip(&parent, in_batch);
-            let expected = self.expected_bits_off_tip(header, &parent, parent_height, in_batch)?;
+            let first = self.period_first_off_tip(&parent, parent_height, in_batch);
+            let expected =
+                self.expected_bits_off_tip(header, &parent, parent_height, first, in_batch)?;
             // `validate_header` opens the collector, and it only runs for a confirmed parent.
             Self::apply_off_tip_header(
                 self.query.as_ref(),
@@ -2033,6 +2038,7 @@ impl ChainHub {
                 parent_height.saturating_add(1),
                 mtp,
                 parent.time,
+                first,
                 expected,
             )
         })
@@ -2130,15 +2136,34 @@ impl ChainHub {
             .unwrap_or(parent.time)
     }
 
+    /// The header at [`ChainParams::period_first_height`] for the child of
+    /// `parent`, on the branch that ends at `parent`.
+    #[doc(hidden)]
+    pub fn period_first_off_tip(
+        &self,
+        parent: &Header,
+        parent_height: u32,
+        in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
+    ) -> Option<rbitcoin_consensus::PeriodFirst> {
+        let first_h = self
+            .params
+            .period_first_height(parent_height.saturating_add(1))?;
+        self.header_along_off_tip(parent, parent_height, first_h, in_batch)
+            .map(|first| rbitcoin_consensus::PeriodFirst::of(&first))
+    }
+
+    /// `first` is [`Self::period_first_off_tip`] for the same parent.
     #[doc(hidden)]
     pub fn expected_bits_off_tip(
         &self,
         header: &Header,
         parent: &Header,
         parent_height: u32,
+        first: Option<rbitcoin_consensus::PeriodFirst>,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<CompactTarget, NetError> {
-        let bits = self.expected_bits_off_tip_base(header, parent, parent_height, in_batch)?;
+        let bits =
+            self.expected_bits_off_tip_base(header, parent, parent_height, first, in_batch)?;
         Ok(rbitcoin_consensus::header::apply_regtest_pow_overlay(
             &self.params,
             parent_height.saturating_add(1),
@@ -2153,6 +2178,7 @@ impl ChainHub {
         header: &Header,
         parent: &Header,
         parent_height: u32,
+        first: Option<rbitcoin_consensus::PeriodFirst>,
         in_batch: &HashMap<[u8; 32], HeaderSyncNode>,
     ) -> Result<CompactTarget, NetError> {
         let height = parent_height.saturating_add(1);
@@ -2166,15 +2192,13 @@ impl ChainHub {
         if self.params.no_pow_retargeting() {
             return Ok(parent.bits);
         }
-        let first_h = height.saturating_sub(interval);
-        let first = self
-            .header_along_off_tip(parent, parent_height, first_h, in_batch)
-            .ok_or_else(|| NetError::Consensus("missing retarget first header".into()))?;
+        let first =
+            first.ok_or_else(|| NetError::Consensus("missing retarget first header".into()))?;
         Ok(rbitcoin_consensus::header::retarget_bits(
             &self.params,
             parent.bits,
             parent.time,
-            rbitcoin_consensus::PeriodFirst::of(&first),
+            first,
         ))
     }
 
@@ -3792,11 +3816,14 @@ impl ChainHub {
                             .map_err(|e| header_reject(&b.header, &e))
                         } else {
                             let parent = &blocks[i - 1].header;
+                            let parent_height = height.saturating_sub(1);
                             let mtp = self.mtp_off_tip(parent, &batch);
+                            let first = self.period_first_off_tip(parent, parent_height, &batch);
                             let expected = self.expected_bits_off_tip(
                                 &b.header,
                                 parent,
-                                height.saturating_sub(1),
+                                parent_height,
+                                first,
                                 &batch,
                             )?;
                             soften_parent_header(self.query.as_ref(), &b.header, height, || {
@@ -3806,6 +3833,7 @@ impl ChainHub {
                                     &b.header,
                                     mtp,
                                     parent.time,
+                                    first,
                                     expected,
                                     hash.to_byte_array(),
                                 )
@@ -4926,12 +4954,15 @@ pub fn check_block_proposal_with(
             .map(|c| c.to_consensus())
             .unwrap_or(tip_rec.bits);
     let mtp = rbitcoin_query::median_time_past_store(query, tip_h).map_err(|e| e.to_string())?;
+    let period_first =
+        rbitcoin_query::period_first(query, params, height).map_err(|e| e.to_string())?;
     let header = ProposalHeader {
         block,
         height,
         expected_bits: expected,
         mtp,
         parent_time: tip_rec.timestamp,
+        period_first,
         now,
     };
     proposal_header_checks(params, header)?;
@@ -4968,6 +4999,10 @@ pub fn check_block_proposal_with(
     );
     for (tx, ins) in block.txdata.iter().skip(1).zip(prevouts) {
         let prev_spks: Vec<&[u8]> = ins.iter().map(|o| o.script_pubkey.as_bytes()).collect();
+        if params.enforce_bip54 {
+            rbitcoin_consensus::block::reject_bip54_sigops(tx, &prev_spks)
+                .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
+        }
         sigops = sigops.saturating_add(rbitcoin_consensus::tx_sigop_cost(
             tx,
             &prev_spks,
@@ -4990,6 +5025,7 @@ struct ProposalHeader<'a> {
     expected_bits: u32,
     mtp: u32,
     parent_time: u32,
+    period_first: Option<rbitcoin_consensus::PeriodFirst>,
     now: u32,
 }
 
@@ -5000,6 +5036,7 @@ fn proposal_header_checks(params: &ChainParams, header: ProposalHeader<'_>) -> R
         expected_bits,
         mtp,
         parent_time,
+        period_first,
         now,
     } = header;
     if block.header.bits.to_consensus() != expected_bits {
@@ -5011,10 +5048,11 @@ fn proposal_header_checks(params: &ChainParams, header: ProposalHeader<'_>) -> R
     if block.header.time < mtp {
         return Err("time-too-old".into());
     }
-    if let Err(e) = rbitcoin_consensus::header::check_timewarp(
+    if let Err(e) = rbitcoin_consensus::header::check_period_times(
         params,
         Height(height),
         parent_time,
+        period_first,
         &block.header,
     ) {
         return Err(rbitcoin_consensus::block_reject_reason(&e));

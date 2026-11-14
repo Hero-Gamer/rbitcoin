@@ -78,7 +78,7 @@ pub fn dns_seeds(network: Network) -> &'static [&'static str] {
             "seed.testnet4.bitcoin.sprovoost.nl.",
             "seed.testnet4.wiz.biz.",
         ],
-        Network::Regtest => &[],
+        Network::Testnet5 | Network::Regtest => &[],
     }
 }
 
@@ -90,7 +90,7 @@ fn fixed_seed_text(network: Network) -> &'static str {
         Network::Testnet => include_str!("../seeds/nodes_test.txt"),
         Network::Signet => include_str!("../seeds/nodes_signet.txt"),
         Network::Testnet4 => include_str!("../seeds/nodes_testnet4.txt"),
-        Network::Regtest => "",
+        Network::Testnet5 | Network::Regtest => "",
     }
 }
 
