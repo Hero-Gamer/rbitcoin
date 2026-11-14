@@ -215,10 +215,6 @@ struct PendingInstall {
     clear_hold: bool,
     /// `hold_ticks` sampled before `keep`. A later bump wins over `clear_hold`.
     hold_ticks: u64,
-    /// The commit rename's directory sync succeeded. A failure leaves the
-    /// previous commit able to reappear after a crash, so its generation
-    /// files stay.
-    dir_synced: bool,
 }
 
 struct CommitSnapshot {
@@ -296,6 +292,10 @@ struct Inner {
     hold_ticks: u64,
     open_edges: u64,
     log_bytes: u64,
+    /// The last commit rename's directory sync failed. A crash can bring the
+    /// previous commit back, so a fold must not delete the files it names.
+    /// Cleared only after a later commit directory sync succeeds.
+    commit_dir_unsynced: bool,
 }
 
 struct SpendPace {
@@ -404,6 +404,7 @@ impl SpendPageLog {
                 hold_ticks: 0,
                 open_edges: 0,
                 log_bytes: 0,
+                commit_dir_unsynced: false,
             }),
             pace: Arc::new(SpendPace::new()),
         }
@@ -751,8 +752,13 @@ impl SpendPageLog {
             buf[8..12].copy_from_slice(&tip.to_le_bytes());
         }
         // The hold is already stored. A directory sync failure after the
-        // rename stays success. A read or rename error still returns.
-        write_commit_file(&path, &buf)?;
+        // rename stays success. A read or rename error still returns. A
+        // successful sync makes this commit durable, so an older unsynced
+        // rename can no longer reappear.
+        let synced = write_commit_file(&path, &buf)?;
+        if synced {
+            self.lock().commit_dir_unsynced = false;
+        }
         Ok(())
     }
 
@@ -1116,7 +1122,6 @@ impl SpendPageLog {
             keep_only,
             clear_hold,
             hold_ticks,
-            dir_synced,
         } = pending;
         let inserted: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
         let kept_by_page: HashMap<u64, HashSet<OpenSlot>> = kept
@@ -1246,8 +1251,9 @@ impl SpendPageLog {
         };
         // The commit rename is visible to this process either way. A failed
         // directory sync can still lose that dirent, and the previous commit
-        // names files this commit dropped.
-        if dir_synced {
+        // names files this commit dropped. `publish_generation` records that
+        // failure. A hold that then syncs the same commit clears it.
+        if !self.lock().commit_dir_unsynced {
             self.unlink_unreferenced_generations(&live_gens);
         }
         self.pace.notify_room();
@@ -1419,7 +1425,7 @@ impl SpendPageLog {
         carried: &[(u64, CommittedPage)],
         plan: PublishPlan,
     ) -> Result<(), StoreError> {
-        let (generation, file, pages, dir_synced) =
+        let (generation, file, pages) =
             self.publish_generation(height, composed, carried, plan.hold, plan.hold_ticks)?;
         let written: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
         for (off, _) in composed {
@@ -1444,7 +1450,6 @@ impl SpendPageLog {
             keep_only: plan.keep_only,
             clear_hold: plan.clear_hold,
             hold_ticks: plan.hold_ticks,
-            dir_synced,
         });
         Ok(())
     }
@@ -1482,7 +1487,7 @@ impl SpendPageLog {
         carried: &[(u64, CommittedPage)],
         hold: PublishHold,
         sampled_ticks: u64,
-    ) -> Result<(u32, Arc<File>, Vec<PageRec>, bool), StoreError> {
+    ) -> Result<(u32, Arc<File>, Vec<PageRec>), StoreError> {
         let fresh: HashSet<u64> = composed.iter().map(|(off, _)| *off).collect();
         let mut carried_rows: Vec<(u64, PageLoc)> = carried
             .iter()
@@ -1538,6 +1543,9 @@ impl SpendPageLog {
         {
             let mut g = self.lock();
             g.log_bytes = disk.iter().map(|rec| u64::from(rec.2)).sum();
+            // `Ok(false)` leaves the previous commit able to reappear. A
+            // later `Ok(true)` is the first point that commit is gone.
+            g.commit_dir_unsynced = !dir_synced;
         }
         // The commit rename is already visible. Renaming this generation
         // file away before that directory entry is durable can leave the
@@ -1545,7 +1553,7 @@ impl SpendPageLog {
         if dir_synced {
             self.finish_pages_rename(&gen_path, &pages_path);
         }
-        Ok((generation, file, fresh_recs, dir_synced))
+        Ok((generation, file, fresh_recs))
     }
 
     /// Move `spend.pages` to `spend.pages.{old_generation}` before a new file
@@ -1806,7 +1814,7 @@ impl SpendPageLog {
         drop(g);
         if wipe {
             self.delete_generation_files();
-        } else {
+        } else if !self.lock().commit_dir_unsynced {
             self.unlink_unreferenced_generations(&live);
         }
         Ok(())

@@ -6,5 +6,6 @@ Changed
   refuses the datadir, and this binary rewrites schema 22 through 28.
   Fold copies the stored image, oldest generation file first, after the
   open-edge wait is released. A failed commit directory sync leaves a
-  generation file the previous commit still names. Each published image
-  is composed once.
+  generation file the previous commit still names. A fold before the next
+  durable commit leaves that file in place. Each published image is
+  composed once.
