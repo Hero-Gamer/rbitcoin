@@ -708,6 +708,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let table = config.finalized_net_perms();
     let immediate_relay = config.trusted;
     let hub = Arc::clone(&node.hub);
+    let enforce_bip54 = hub.params.enforce_bip54;
     let (mempool, mp_gen, mp_live) = tokio::task::spawn_blocking(move || {
         let _g = BlockingRegion::enter();
         let mp = MempoolHub::open_with_weight_persist_and_sigop_reserve(
@@ -718,6 +719,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             block_reserved_sigops,
         )?;
         mp.set_cluster_limits(cluster_count, cluster_kvb);
+        mp.set_enforce_bip54(enforce_bip54);
         if let Some(b) = bytes_per_sigop {
             mp.set_bytes_per_sigop(b);
         }
