@@ -279,10 +279,20 @@ pub fn validate_block_structure_with_pres(
         return Err(ConsensusError::BadBlock("block weight too large"));
     }
 
+    let bip54 = ctx.enforce_height_gates && ctx.params.enforce_bip54;
+    if bip54 {
+        for p in pres.iter() {
+            reject_bip54_tx_size(p.base_size)?;
+        }
+    }
+
     // BIP34 only after the network's buried height (mainnet 227931). From
     // height 1 this rejects mainnet block 1.
     if ctx.enforce_height_gates && ctx.params.bip34_active_at(ctx.height.0) {
         check_bip34_coinbase(&block.txdata[0], ctx.height.0)?;
+    }
+    if bip54 {
+        reject_bip54_coinbase(&block.txdata[0], ctx.height.0)?;
     }
 
     {
@@ -572,6 +582,65 @@ pub fn tx_sigop_cost(tx: &Transaction, prev_spks: &[&[u8]], bip16: bool, witness
         cost = cost.saturating_add(prevout_spk_sigops(inp, spk, bip16, witness));
     }
     cost
+}
+
+/// Core `MAX_TX_BIP54_SIGOPS`: the most BIP 54 signature operations the
+/// inputs of one transaction may carry.
+pub const MAX_TX_BIP54_SIGOPS: u64 = 2_500;
+
+/// BIP 54 signature operations of one input, counted where they can run: the
+/// scriptSig, and the P2SH redeem script for a P2SH prevout or else the
+/// scriptPubKey. Counted as BIP16 does, executed or not. Witness programs
+/// add none (Core `CheckSigopsBIP54`).
+pub fn bip54_sigops_one(inp: &bitcoin::TxIn, spk: &[u8]) -> u64 {
+    let spent = if Script::from_bytes(spk).is_p2sh() {
+        p2sh_sigops_one(inp, spk)
+    } else {
+        script_sigop_count(spk, true)
+    };
+    script_sigop_count(inp.script_sig.as_bytes(), true).saturating_add(spent)
+}
+
+/// BIP 54: the inputs of a non-coinbase `tx`, spending `prev_spks` in order,
+/// carry at most [`MAX_TX_BIP54_SIGOPS`] (`bad-txns-legacy-sigops`).
+pub fn reject_bip54_sigops(tx: &Transaction, prev_spks: &[&[u8]]) -> Result<(), ConsensusError> {
+    tx.input
+        .iter()
+        .zip(prev_spks)
+        .try_fold(0, |total, (inp, spk)| {
+            add_bip54_sigops(total, bip54_sigops_one(inp, spk))
+        })
+        .map(|_| ())
+}
+
+/// Which sigop counts a block's rules take from the prevouts it spends.
+#[derive(Clone, Copy)]
+pub struct SpendSigopRules {
+    pub bip16: bool,
+    pub witness: bool,
+    pub bip54: bool,
+}
+
+/// What one spent prevout adds under [`SpendSigopRules`].
+#[derive(Clone, Copy)]
+pub struct SpendSigops {
+    /// P2SH and witness cost toward the block limit ([`prevout_spk_sigops`]).
+    pub block_cost: u64,
+    /// [`bip54_sigops_one`]. Zero without BIP 54.
+    pub bip54: u64,
+}
+
+impl SpendSigopRules {
+    pub fn count(self, inp: &bitcoin::TxIn, spk: &[u8]) -> SpendSigops {
+        SpendSigops {
+            block_cost: prevout_spk_sigops(inp, spk, self.bip16, self.witness),
+            bip54: if self.bip54 {
+                bip54_sigops_one(inp, spk)
+            } else {
+                0
+            },
+        }
+    }
 }
 
 /// BIP141: coinbase must commit to witness merkle root when segwit is used.
@@ -1504,12 +1573,13 @@ pub fn is_anyone_can_spend(script: &Script) -> bool {
 #[doc(hidden)]
 pub mod facts;
 pub use facts::{
-    add_fee, add_sigops, add_value_in, fee_from_values, fee_sat, fee_with_waived_coinbase,
-    header_gap_on_chain, median_or_bad_header, reject_assemble_block_shape, reject_batch_starts_at,
-    reject_carried_header_hash, reject_confirm_batch, reject_csv_create_height,
-    reject_duplicate_input, reject_empty_confirm_batch, reject_genesis_coinbase_spend,
-    reject_non_final, reject_prev_link, reject_prevout_spent, reject_same_block_create,
-    reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,
+    add_bip54_sigops, add_fee, add_sigops, add_value_in, fee_from_values, fee_sat,
+    fee_with_waived_coinbase, header_gap_on_chain, median_or_bad_header,
+    reject_assemble_block_shape, reject_batch_starts_at, reject_bip54_coinbase,
+    reject_bip54_tx_size, reject_carried_header_hash, reject_confirm_batch,
+    reject_csv_create_height, reject_duplicate_input, reject_empty_confirm_batch,
+    reject_genesis_coinbase_spend, reject_non_final, reject_prev_link, reject_prevout_spent,
+    reject_same_block_create, reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,
     reject_tx_without_outputs, reject_txid_count, reject_unresolved_spend,
     reject_unspendable_prevout, reject_vout_past_n_out, reject_witness_before_segwit,
     require_linked_parent, require_next_work, require_retarget_first, require_same_block_output,

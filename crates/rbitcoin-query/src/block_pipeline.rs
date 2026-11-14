@@ -432,7 +432,13 @@ pub fn assemble_non_cb_inputs(
             ))
         };
     let edges = spend_fk.and_then(|fk| fk.get().and_then(|id| spend_edges.get(&id)));
+    let sigop_rules = rbitcoin_consensus::block::SpendSigopRules {
+        bip16: bip16_active,
+        witness: flags.witness_active,
+        bip54: params.enforce_bip54,
+    };
     let mut tx_in_sigops = 0u64;
+    let mut tx_bip54_sigops = 0u64;
     for (ii, input) in tx.input.iter().enumerate() {
         let op = input.previous_output;
         let key = (op.txid.to_byte_array(), op.vout);
@@ -469,14 +475,15 @@ pub fn assemble_non_cb_inputs(
             prev_fk,
             same_block,
             batch_parents,
-            bip16_active,
-            flags.witness_active,
+            sigop_rules,
             build_script_jobs,
             wire,
             acc,
         )?;
         let create_fk = prev_out.create_fk;
-        tx_in_sigops = tx_in_sigops.saturating_add(prev_out.input_sigops);
+        tx_in_sigops = tx_in_sigops.saturating_add(prev_out.sigops.block_cost);
+        tx_bip54_sigops =
+            rbitcoin_consensus::block::add_bip54_sigops(tx_bip54_sigops, prev_out.sigops.bip54)?;
         spends.push((
             key.0,
             key.1,
@@ -1613,8 +1620,9 @@ pub struct ResolvedPrevout {
     pub txout: TxOut,
     /// Set when the script bytes stay in a block or pin `Arc`.
     pub shared: Option<rbitcoin_consensus::block::SharedPrevout>,
-    /// P2SH+witness sigop cost for this input's prevout script (not legacy).
-    pub input_sigops: u64,
+    /// What this input's prevout script adds to the block's sigop cost (P2SH
+    /// and witness, not legacy) and to its transaction's BIP 54 count.
+    pub sigops: rbitcoin_consensus::block::SpendSigops,
     /// Class A create fk for this prevout (or `NULL` for same-block). Load pin
     /// denserels must carry identity matching wire `prev_txid` for this fk.
     pub create_fk: rbitcoin_primitives::Fk,
@@ -1628,8 +1636,7 @@ pub fn resolve_prevout(
     prev_fk_hint: Option<rbitcoin_primitives::Fk>,
     same_block: Option<EarlierIndex>,
     batch_parents: &crate::BatchParents,
-    bip16: bool,
-    witness: bool,
+    sigop_rules: rbitcoin_consensus::block::SpendSigopRules,
     need_script_buf: bool,
     wire: Option<&Arc<Block>>,
     acc: &mut AsmPrevoutAcc,
@@ -1665,12 +1672,7 @@ pub fn resolve_prevout(
                 o.clone()
             },
             shared,
-            input_sigops: rbitcoin_consensus::block::prevout_spk_sigops(
-                inp,
-                o.script_pubkey.as_bytes(),
-                bip16,
-                witness,
-            ),
+            sigops: sigop_rules.count(inp, o.script_pubkey.as_bytes()),
             create_fk: rbitcoin_primitives::Fk::NULL,
         });
     }
@@ -1699,8 +1701,7 @@ pub fn resolve_prevout(
             rbitcoin_consensus::block::reject_unspendable_prevout(
                 rbitcoin_consensus::policy::is_unspendable(script),
             )?;
-            let input_sigops =
-                rbitcoin_consensus::block::prevout_spk_sigops(inp, script, bip16, witness);
+            let sigops = sigop_rules.count(inp, script);
             acc.in_n = acc.in_n.saturating_add(1);
             acc.batch_n = acc.batch_n.saturating_add(1);
             #[cfg(debug_assertions)]
@@ -1711,7 +1712,7 @@ pub fn resolve_prevout(
                     script_pubkey: ScriptBuf::new(),
                 },
                 shared: need_script_buf.then(|| pinned.into_shared_prevout()),
-                input_sigops,
+                sigops,
                 create_fk: prev_fk,
             });
         } else if batch_parents.contains(prev_fk) {

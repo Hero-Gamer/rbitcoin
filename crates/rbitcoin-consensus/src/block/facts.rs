@@ -71,6 +71,41 @@ pub fn add_sigops(cost: u64, legacy: u64, input: u64) -> Result<u64, ConsensusEr
     Ok(next)
 }
 
+/// BIP 54: add one input's count to its transaction's total, which is at
+/// most [`super::MAX_TX_BIP54_SIGOPS`] (`bad-txns-legacy-sigops`).
+pub fn add_bip54_sigops(total: u64, input: u64) -> Result<u64, ConsensusError> {
+    let next = total.saturating_add(input);
+    if next > super::MAX_TX_BIP54_SIGOPS {
+        return Err(ConsensusError::BadTx("bad-txns-legacy-sigops"));
+    }
+    Ok(next)
+}
+
+/// BIP 54: a transaction whose witness-stripped size is 64 bytes is invalid
+/// (`bad-txns-size`). Its bytes can be read as an inner merkle node.
+pub fn reject_bip54_tx_size(base_size: usize) -> Result<(), ConsensusError> {
+    if base_size == 64 {
+        return Err(ConsensusError::BadBlock("bad-txns-size"));
+    }
+    Ok(())
+}
+
+/// BIP 54: above genesis, the coinbase `nLockTime` is the height before the
+/// block's (`bad-cb-locktime`) and its `nSequence` is not final, so that
+/// locktime is enforced (`bad-cb-sequence`).
+pub fn reject_bip54_coinbase(coinbase: &Transaction, height: u32) -> Result<(), ConsensusError> {
+    let Some(before) = height.checked_sub(1) else {
+        return Ok(());
+    };
+    if coinbase.lock_time.to_consensus_u32() != before {
+        return Err(ConsensusError::BadBlock("bad-cb-locktime"));
+    }
+    if coinbase.input[0].sequence.is_final() {
+        return Err(ConsensusError::BadBlock("bad-cb-sequence"));
+    }
+    Ok(())
+}
+
 pub fn fee_from_values(value_in: i64, value_out: i64) -> Result<i64, ConsensusError> {
     if value_out > value_in {
         return Err(ConsensusError::BadTx("in < out"));

@@ -4,6 +4,7 @@
 |------|--------|---------|
 | `*.bin` / `*.hex` / `*.txt` | Captured mainnet/signet blocks for regression | project |
 | `bip352_send_and_receive_test_vectors.json` | BIP-352 official send/receive vectors | BSD-2-Clause (BIP) |
+| `bip54/coinbases.json`, `bip54/txsize.json`, `bip54/sigops.json.zst`, `bip54/timestamps.json.zst` | BIP 54 official test vectors, `bip-0054/test_vectors/` in bitcoin/bips at `b58f8ef8`. The two large files are the same JSON under `zstd -19` | CC0-1.0 (BIP) |
 | `block_866342/raw.zst` | Floresta `crates/floresta-chain/testdata/block_866342/raw.zst` (mainnet height 866342, hash `000000000000000000014ce9ba7c6760053c3c82ce6ab43d60afb101d3c8f1f1`) | MIT OR Apache-2.0 |
 | `block_866342/spent_utxos.zst` | Same Floresta pack: JSON array of `{txout, is_coinbase, creation_height, creation_time}` in non-coinbase input order | MIT OR Apache-2.0 |
 
@@ -32,5 +33,6 @@ add a rust unit instead.
 | `sighash.json` | `cargo test -p rbitcoin-consensus --test suite core_sighash_all_rows -- --nocapture` |
 | `bip341_wallet_vectors.json` | `cargo test -p rbitcoin-consensus --test suite core_bip341 -- --nocapture` |
 | `block_866342/` (vendored zstd) | `cargo test -p rbitcoin-consensus --test suite block_866342 -- --nocapture` |
+| `bip54/` | `cargo test -p rbitcoin-consensus --test suite bip54_vectors -- --nocapture` |
 
 Success requires **fail == 0** with no allowlist (see `docs/consensus-tests.md`). Soft majority pass rates are not used.

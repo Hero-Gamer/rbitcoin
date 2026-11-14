@@ -6770,8 +6770,7 @@ fn bip54_pad(label: &str, times: &[u32]) -> (rbitcoin_query::testutil::TempDir, 
     hub.ensure_genesis().unwrap();
     for (i, time) in times.iter().enumerate() {
         hub.clock.set_mock(i64::from(BIP54_T0 + time));
-        hub.generate_to_script(1, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
+        bip54_mine(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
         assert_eq!(
             bip94_header_at(&hub, i as u32 + 1).time,
             BIP54_T0 + time,
@@ -6783,6 +6782,30 @@ fn bip54_pad(label: &str, times: &[u32]) -> (rbitcoin_query::testutil::TempDir, 
 }
 
 const BIP54_T0: u32 = 1_700_000_000;
+
+/// The hub's own template with the coinbase BIP 54 asks for. The regtest
+/// miner is not a BIP 54 miner: its coinbase has `nLockTime` 0 and a final
+/// `nSequence`.
+fn bip54_block(hub: &ChainHub, pay: ScriptBuf, extra: Vec<Transaction>) -> Block {
+    let mut block = hub.assemble_block_to_script(pay, extra).unwrap();
+    let height = hub.tip_height().unwrap() + 1;
+    block.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(height - 1);
+    block.txdata[0].input[0].sequence = bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF;
+    bip54_seal(&mut block);
+    block
+}
+
+fn bip54_seal(block: &mut Block) {
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+}
+
+fn bip54_mine(hub: &ChainHub, pay: ScriptBuf, extra: Vec<Transaction>) -> Block {
+    let block = bip54_block(hub, pay, extra);
+    hub.accept_block(block.clone())
+        .unwrap_or_else(|e| panic!("height {:?}: {e}", hub.tip_height().map(|h| h + 1)));
+    block
+}
 
 /// Heights 1..=3, 10,000 s apart: a height-4 header two hours before its
 /// parent is still above the median, so only the timewarp floor decides it.
@@ -6873,9 +6896,7 @@ fn bip54_branch_rejects_a_negative_interval() {
 fn bip54_proposal_and_tip_block_reject_both_time_faults() {
     let (dir, hub) = bip54_pad("bip54-proposal-warp", &BIP54_BEFORE_PERIOD);
     let tip = hub.header_of(&hub.tip_hash().unwrap()).unwrap();
-    let template = hub
-        .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    let template = bip54_block(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
     let mut warped = template.clone();
     warped.header.time = tip.time - 7201;
     assert_eq!(
@@ -6890,9 +6911,7 @@ fn bip54_proposal_and_tip_block_reject_both_time_faults() {
 
     let (dir, hub) = bip54_pad("bip54-proposal-neg", &BIP54_INSIDE_PERIOD);
     hub.clock.set_mock(i64::from(BIP54_PERIOD_FIRST));
-    let template = hub
-        .assemble_block_to_script(ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    let template = bip54_block(&hub, ScriptBuf::from_bytes(vec![0x51]), vec![]);
     assert_eq!(
         template.header.time, BIP54_PERIOD_FIRST,
         "the template keeps to the period's first header"
@@ -6911,6 +6930,134 @@ fn bip54_proposal_and_tip_block_reject_both_time_faults() {
         .expect("the first header's own time");
     hub.accept_block(template).expect("a valid period end");
     assert_eq!(hub.tip_height(), Some(7));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// BIP 54 on a block proposal and on the tip block: the coinbase is
+/// timelocked to the height before its block, with a sequence that lets the
+/// locktime apply.
+#[test]
+fn bip54_coinbase_is_timelocked_to_its_height() {
+    let (dir, hub) = bip54_pad("bip54-coinbase", &[10_000]);
+    let pay = || ScriptBuf::from_bytes(vec![0x51]);
+    let rejects = |block: Block, reason: &str| {
+        assert_eq!(hub.check_block_proposal(&block).unwrap_err(), reason);
+        let err = hub.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err}");
+        assert_eq!(hub.tip_height(), Some(1));
+    };
+
+    let regtest_miner = hub.assemble_block_to_script(pay(), vec![]).unwrap();
+    rejects(regtest_miner, "bad-cb-locktime");
+    for locktime in [0, 2] {
+        let mut block = bip54_block(&hub, pay(), vec![]);
+        block.txdata[0].lock_time = bitcoin::absolute::LockTime::from_consensus(locktime);
+        bip54_seal(&mut block);
+        rejects(block, "bad-cb-locktime");
+    }
+    let mut final_sequence = bip54_block(&hub, pay(), vec![]);
+    final_sequence.txdata[0].input[0].sequence = bitcoin::Sequence::MAX;
+    bip54_seal(&mut final_sequence);
+    rejects(final_sequence, "bad-cb-sequence");
+
+    let mut any_other_sequence = bip54_block(&hub, pay(), vec![]);
+    any_other_sequence.txdata[0].input[0].sequence = bitcoin::Sequence::ZERO;
+    bip54_seal(&mut any_other_sequence);
+    hub.check_block_proposal(&any_other_sequence)
+        .expect("a sequence that is not final");
+    hub.accept_block(any_other_sequence)
+        .expect("a sequence that is not final");
+    assert_eq!(hub.tip_height(), Some(2));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// `OP_0 OP_IF <checkmultisigs> <checksigs> OP_ENDIF OP_1`: anyone can spend
+/// it with an empty scriptSig, and BIP 54 counts 20 for each unexecuted
+/// `OP_CHECKMULTISIG` and 1 for each `OP_CHECKSIG`.
+fn bip54_sigop_script(checkmultisigs: usize, checksigs: usize) -> ScriptBuf {
+    use bitcoin::opcodes::all::{
+        OP_CHECKMULTISIG, OP_CHECKSIG, OP_ENDIF, OP_IF, OP_PUSHBYTES_0, OP_PUSHNUM_1,
+    };
+    let mut script = bitcoin::script::Builder::new()
+        .push_opcode(OP_PUSHBYTES_0)
+        .push_opcode(OP_IF);
+    for _ in 0..checkmultisigs {
+        script = script.push_opcode(OP_CHECKMULTISIG);
+    }
+    for _ in 0..checksigs {
+        script = script.push_opcode(OP_CHECKSIG);
+    }
+    script
+        .push_opcode(OP_ENDIF)
+        .push_opcode(OP_PUSHNUM_1)
+        .into_script()
+}
+
+/// Spend output 0 of `coinbase` with an empty scriptSig into one output.
+fn bip54_spend(coinbase: &Transaction, script_pubkey: ScriptBuf) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::new(coinbase.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: coinbase.output[0].value,
+            script_pubkey,
+        }],
+    }
+}
+
+/// BIP 54 on a block proposal and on the tip block: a transaction whose
+/// inputs carry more than 2,500 signature operations, and a transaction of
+/// 64 bytes, are invalid. One fewer of either is accepted.
+#[test]
+fn bip54_block_rejects_too_many_sigops_and_a_64_byte_tx() {
+    let (dir, hub) = bip54_pad("bip54-block-txs", &[]);
+    let op_true = || ScriptBuf::from_bytes(vec![0x51]);
+    let at_limit = bip54_mine(&hub, bip54_sigop_script(125, 0), vec![]);
+    let past_limit = bip54_mine(&hub, bip54_sigop_script(125, 1), vec![]);
+    let plain = bip54_mine(&hub, op_true(), vec![]);
+    let plain_too = bip54_mine(&hub, op_true(), vec![]);
+    for _ in 5..=100 {
+        bip54_mine(&hub, op_true(), vec![]);
+    }
+    let rejects = |tx: Transaction, reason: &str| {
+        let tip = hub.tip_height();
+        let block = bip54_block(&hub, op_true(), vec![tx]);
+        assert_eq!(hub.check_block_proposal(&block).unwrap_err(), reason);
+        let err = hub.accept_block(block).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err}");
+        assert_eq!(hub.tip_height(), tip);
+    };
+    let accepts = |tx: Transaction| {
+        let block = bip54_block(&hub, op_true(), vec![tx]);
+        hub.check_block_proposal(&block).expect("proposal");
+        hub.accept_block(block).expect("tip block");
+    };
+
+    accepts(bip54_spend(&at_limit.txdata[0], op_true()));
+    rejects(
+        bip54_spend(&past_limit.txdata[0], op_true()),
+        "bad-txns-legacy-sigops",
+    );
+    bip54_mine(&hub, op_true(), vec![]);
+
+    let four_bytes = ScriptBuf::from_bytes(vec![0x51; 4]);
+    let five_bytes = ScriptBuf::from_bytes(vec![0x51; 5]);
+    let small = bip54_spend(&plain.txdata[0], four_bytes);
+    assert_eq!(small.base_size(), 64);
+    rejects(small, "bad-txns-size");
+    let next = bip54_spend(&plain.txdata[0], five_bytes);
+    assert_eq!(next.base_size(), 65);
+    accepts(next);
+    let padded = bip54_spend(&plain_too.txdata[0], ScriptBuf::from_bytes(vec![0x51; 3]));
+    assert_eq!(padded.base_size(), 63);
+    accepts(padded);
+    assert_eq!(hub.tip_height(), Some(104));
     let _ = std::fs::remove_dir_all(dir);
 }
 

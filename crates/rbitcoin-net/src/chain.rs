@@ -4999,6 +4999,10 @@ pub fn check_block_proposal_with(
     );
     for (tx, ins) in block.txdata.iter().skip(1).zip(prevouts) {
         let prev_spks: Vec<&[u8]> = ins.iter().map(|o| o.script_pubkey.as_bytes()).collect();
+        if params.enforce_bip54 {
+            rbitcoin_consensus::block::reject_bip54_sigops(tx, &prev_spks)
+                .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
+        }
         sigops = sigops.saturating_add(rbitcoin_consensus::tx_sigop_cost(
             tx,
             &prev_spks,
