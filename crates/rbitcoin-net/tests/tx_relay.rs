@@ -2564,8 +2564,9 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
     // A block spends one parent's output. The pool's conflict strip is the
     // write the crash lost, so that parent's child is still in the sidecar.
     connect(&q, vec![block_spend]).expect("a block spends the second parent's output");
-    // The spend is checkpointed before the head pages go. Without that the
-    // reopened store reads the output as unspent.
+    // The spend is checkpointed before the head pages go. This test reopens
+    // the query alone, without the node's startup `replay_spend_annotations`,
+    // so a spend that only the RAM page directory held would read unspent.
     q.store()
         .checkpoint_observed_spend()
         .expect("spend checkpoint");
