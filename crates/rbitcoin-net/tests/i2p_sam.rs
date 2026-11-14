@@ -1071,7 +1071,7 @@ impl FakeRouter {
                             let _ = write_line(&mut s, "STREAM STATUS RESULT=OK").await;
                             if up.starts_with("STREAM FORWARD")
                                 && flap
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                                         n.checked_sub(1)
                                     })
                                     .is_ok()
