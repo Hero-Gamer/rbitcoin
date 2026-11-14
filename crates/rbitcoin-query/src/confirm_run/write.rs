@@ -374,7 +374,7 @@ fn write_phase_inner(
     let overlap = (|| -> Result<_, ConfirmError> {
         // Local Instant totals (not atomic deltas) — sample_and_reset races mid-batch.
         let t_struct = Instant::now();
-        let (struct_ph, slots) = WRITE_REUSE.with(|reuse| {
+        let (struct_ph, mut slots) = WRITE_REUSE.with(|reuse| {
             structural_run(
                 query,
                 params,
@@ -387,6 +387,12 @@ fn write_phase_inner(
                 &mut reuse.borrow_mut(),
             )
         })?;
+        push_same_block_spends_of_archived_bodies(
+            query,
+            &batch.prepared,
+            &class_a_wave,
+            &mut slots,
+        )?;
         let structural_ns = t_struct.elapsed().as_nanos() as u64;
 
         let n_blocks = batch.prepared.len();
@@ -845,6 +851,83 @@ pub fn annotate_slots_from_connected_hash(
                 (field, flags, field_vin),
             );
         }
+    }
+    Ok(())
+}
+
+/// Annotate slots for the same-block spends of each block whose body this
+/// wave did not append.
+///
+/// Structural has no job for a parent earlier in the same block. Class A
+/// pre-fills that slot only when it appends the body, and a checkpoint after
+/// a disconnect may have zeroed that pre-fill. A block connected again from
+/// the archive writes it here, as open replay does from `input_edges`.
+fn push_same_block_spends_of_archived_bodies(
+    query: &Query,
+    prepared: &[Prepared],
+    class_a_wave: &crate::block_pipeline::ClassAWave,
+    slots: &mut crate::block_pipeline::AnnotateSlots,
+) -> Result<(), ConfirmError> {
+    if !query.spend_index_enabled() {
+        return Ok(());
+    }
+    let mut edges = Vec::new();
+    for p in prepared {
+        // Class A appends a body whole, and a trimmed plan leaves the wave
+        // empty, so the coinbase stands for the block.
+        let body_appended = p
+            .tx_fks
+            .first()
+            .is_some_and(|&fk| class_a_wave.contains(fk));
+        if body_appended {
+            continue;
+        }
+        let tx_at: crate::TxidMap<usize> =
+            p.txids.iter().enumerate().map(|(i, t)| (*t, i)).collect();
+        for &(parent_txid, vout, spend_fk, create_fk, vin) in &p.spends {
+            if !create_fk.is_null() {
+                continue;
+            }
+            let parent = tx_at
+                .get(&parent_txid)
+                .and_then(|&i| p.tx_fks.get(i))
+                .copied()
+                .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                    "invariant: same-block spend parent not in its block",
+                )))?;
+            edges.push((parent, vout, spend_fk, vin));
+        }
+    }
+    if edges.is_empty() {
+        return Ok(());
+    }
+    let parents: Vec<rbitcoin_primitives::Fk> = edges.iter().map(|e| e.0).collect();
+    let ranges = query
+        .store()
+        .tx_spent_range_batch(&parents)
+        .map_err(ConfirmError::from)?;
+    let offs = edges
+        .iter()
+        .zip(ranges)
+        .map(|(&(_, vout, _, _), range)| {
+            range
+                .map(|(off, _)| rbitcoin_store::spent_abs(off, vout))
+                .ok_or(ConfirmError::Store(StoreError::Corrupt(
+                    "invariant: same-block spend parent without spent range",
+                )))
+        })
+        .collect::<Result<Vec<u64>, ConfirmError>>()?;
+    let metas = query
+        .store()
+        .get_spender_meta_at_abs_batch(&offs)
+        .map_err(ConfirmError::from)?;
+    for ((parent, vout, spend_fk, vin), (abs, meta)) in
+        edges.into_iter().zip(offs.into_iter().zip(metas))
+    {
+        let known = meta.ok_or(ConfirmError::Store(StoreError::Corrupt(
+            "invariant: same-block spent slot past the published body",
+        )))?;
+        slots.push((abs, parent, vout, spend_fk, vin), known);
     }
     Ok(())
 }

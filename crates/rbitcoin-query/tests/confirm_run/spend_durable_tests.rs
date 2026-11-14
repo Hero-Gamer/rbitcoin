@@ -1192,3 +1192,103 @@ fn replay_folds_a_full_open_directory() {
     assert_eq!(got, slot);
     let _ = dir;
 }
+
+/// Connect X, whose second tx spends the first tx's output (an in-block
+/// spend), optionally checkpoint, disconnect X, optionally checkpoint, then
+/// connect the same X again. Returns whether that in-block output reads spent
+/// and the error a block re-spending it gets.
+fn in_block_spend_after_reconnect(
+    label: &str,
+    checkpoint_while_active: bool,
+    checkpoint_after_disconnect: bool,
+) -> (bool, Result<(), ConfirmError>) {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let hx = maturity + 3;
+    let parent = spend_one(c1, Amount::from_sat(49_0000_0000));
+    let pid = parent.compute_txid();
+    let child = spend_one(pid, Amount::from_sat(48_0000_0000));
+    let x = mine(tip, tip_time + 600, hx, vec![parent, child]);
+    accept_and_connect_block(&q, &params, Height(hx), &x, ms).unwrap();
+    assert!(q.is_outpoint_spent(pid.as_byte_array(), 0).unwrap());
+
+    // What a clean shutdown, the open replay, or the 10-minute
+    // `rbtc-spend-sync` tick runs.
+    if checkpoint_while_active {
+        q.store().checkpoint_observed_spend().unwrap();
+    }
+    q.disconnect_tip().unwrap();
+    if checkpoint_after_disconnect {
+        q.store().checkpoint_observed_spend().unwrap();
+    }
+    accept_and_connect_block(&q, &params, Height(hx), &x, ms).unwrap();
+    assert_eq!(q.tip_height(), Some(Height(hx)));
+    let spent = q.is_outpoint_spent(pid.as_byte_array(), 0).unwrap();
+
+    let respend = mine(
+        x.block_hash(),
+        x.header.time + 600,
+        hx + 1,
+        vec![spend_one(pid, Amount::from_sat(47_0000_0000))],
+    );
+    let res = accept_and_connect_block(&q, &params, Height(hx + 1), &respend, ms).map(|_| ());
+    let _ = dir;
+    (spent, res)
+}
+
+/// A reconnect of an archived block has no Class A wave to pre-fill the
+/// same-block spend. A checkpoint while X was active copied that pre-filled
+/// slot into the page log, and the checkpoint after the disconnect zeroed
+/// it. The output must still read spent after X is back.
+#[test]
+fn reconnected_block_keeps_its_in_block_spend_across_checkpoints() {
+    let (spent, res) = in_block_spend_after_reconnect("spend-inblock-reconnect", true, true);
+    assert!(
+        spent,
+        "an output spent inside the reconnected block reads unspent"
+    );
+    let err = res.expect_err("a block re-spending an in-block spent output must be rejected");
+    assert!(
+        matches!(err, ConfirmError::Rules(ConsensusError::PrevoutSpent)),
+        "{err}"
+    );
+}
+
+/// The same /// The same sequence with either checkpoint left out keeps the spend.
+fn assert_in_block_spend_kept(label: &str, before: bool, after: bool) {
+    let (spent, res) = in_block_spend_after_reconnect(label, before, after);
+    assert!(spent, "{label}: in-block spend lost");
+    assert!(
+        matches!(res, Err(ConfirmError::Rules(ConsensusError::PrevoutSpent))),
+        "{label}: {res:?}"
+    );
+}
+
+#[test]
+fn reconnected_block_in_block_spend_without_checkpoints() {
+    assert_in_block_spend_kept("spend-inblock-none", false, false);
+}
+
+#[test]
+fn reconnected_block_in_block_spend_checkpoint_while_active() {
+    assert_in_block_spend_kept("spend-inblock-before", true, false);
+}
+
+#[test]
+fn reconnected_block_in_block_spend_checkpoint_after_disconnect() {
+    assert_in_block_spend_kept("spend-inblock-after", false, true);
+}
