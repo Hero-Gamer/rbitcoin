@@ -215,6 +215,10 @@ struct PendingInstall {
     clear_hold: bool,
     /// `hold_ticks` sampled before `keep`. A later bump wins over `clear_hold`.
     hold_ticks: u64,
+    /// The commit rename's directory sync succeeded. A failure leaves the
+    /// previous commit able to reappear after a crash, so its generation
+    /// files stay.
+    dir_synced: bool,
 }
 
 struct CommitSnapshot {
@@ -1112,6 +1116,7 @@ impl SpendPageLog {
             keep_only,
             clear_hold,
             hold_ticks,
+            dir_synced,
         } = pending;
         let inserted: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
         let kept_by_page: HashMap<u64, HashSet<OpenSlot>> = kept
@@ -1239,7 +1244,12 @@ impl SpendPageLog {
             g.log_bytes = committed_image_bytes(&g);
             break gc_gens(&mut g);
         };
-        self.unlink_unreferenced_generations(&live_gens);
+        // The commit rename is visible to this process either way. A failed
+        // directory sync can still lose that dirent, and the previous commit
+        // names files this commit dropped.
+        if dir_synced {
+            self.unlink_unreferenced_generations(&live_gens);
+        }
         self.pace.notify_room();
         Ok(())
     }
@@ -1409,7 +1419,7 @@ impl SpendPageLog {
         carried: &[(u64, CommittedPage)],
         plan: PublishPlan,
     ) -> Result<(), StoreError> {
-        let (generation, file, pages) =
+        let (generation, file, pages, dir_synced) =
             self.publish_generation(height, composed, carried, plan.hold, plan.hold_ticks)?;
         let written: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
         for (off, _) in composed {
@@ -1434,6 +1444,7 @@ impl SpendPageLog {
             keep_only: plan.keep_only,
             clear_hold: plan.clear_hold,
             hold_ticks: plan.hold_ticks,
+            dir_synced,
         });
         Ok(())
     }
@@ -1471,7 +1482,7 @@ impl SpendPageLog {
         carried: &[(u64, CommittedPage)],
         hold: PublishHold,
         sampled_ticks: u64,
-    ) -> Result<(u32, Arc<File>, Vec<PageRec>), StoreError> {
+    ) -> Result<(u32, Arc<File>, Vec<PageRec>, bool), StoreError> {
         let fresh: HashSet<u64> = composed.iter().map(|(off, _)| *off).collect();
         let mut carried_rows: Vec<(u64, PageLoc)> = carried
             .iter()
@@ -1534,7 +1545,7 @@ impl SpendPageLog {
         if dir_synced {
             self.finish_pages_rename(&gen_path, &pages_path);
         }
-        Ok((generation, file, fresh_recs))
+        Ok((generation, file, fresh_recs, dir_synced))
     }
 
     /// Move `spend.pages` to `spend.pages.{old_generation}` before a new file
