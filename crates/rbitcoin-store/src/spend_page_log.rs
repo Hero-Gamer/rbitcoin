@@ -1456,22 +1456,14 @@ impl SpendPageLog {
         height: u32,
         composed: ComposedFile,
         kept: &[(u64, OpenPage)],
-        mut rejected: Vec<u64>,
+        rejected: Vec<u64>,
         carried: &[(u64, CommittedPage)],
         plan: PublishPlan,
     ) -> Result<(), StoreError> {
-        let composed_offs: Vec<u64> = composed.recs.iter().map(|rec| rec.0).collect();
         let (generation, file, pages) =
             self.publish_generation(height, composed, carried, plan.hold, plan.hold_ticks)?;
-        let written: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
-        for off in composed_offs {
-            if !written.contains(&off) {
-                rejected.push(off);
-            }
-        }
         let kept_slots: Vec<KeptPage> = kept
             .iter()
-            .filter(|(off, _)| written.contains(off))
             .map(|(off, page)| (*off, page.slots.clone()))
             .collect();
         let mut g = self.lock();
