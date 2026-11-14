@@ -119,6 +119,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [113](./113-proved-header-adopt.md) | medium | A proved header walk rewrote `header.adopt` on every short batch | fixed | `proved_short_batches_do_not_rewrite_header_adopt`, `promoting_a_challenger_persists_that_chains_tip` |
 | [114](./114-respend-after-rejected-write.md) | critical | Re-spend of a same-block spend connects after a merged IBD write rejects | fixed | `respend_of_a_same_block_spend_rejects_on_single_block_retry`, `merged_respend_of_a_same_block_spend_is_rejected_alone` |
 | [115](./115-sp-scan-history.md) | medium | Silent-payment scan dropped history older than 256 blocks (follows 065) | fixed | `sp_timestamp_start_finds_a_payment_older_than_one_chunk` |
+| [116](./116-reconnected-in-block-spend.md) | critical | A reconnected block lost the outputs it spent inside itself | fixed | `reconnected_block_keeps_its_in_block_spend_across_checkpoints`, `reconnected_block_in_block_spend_without_checkpoints`, `reconnected_block_in_block_spend_checkpoint_while_active`, `reconnected_block_in_block_spend_checkpoint_after_disconnect` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30
