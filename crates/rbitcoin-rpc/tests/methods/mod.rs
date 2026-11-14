@@ -8769,6 +8769,27 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         "{on_signet}"
     );
     assert!(gbt.get("signet_challenge").is_none(), "{gbt}");
+    let mut testnet5 = ctx_without_chain(&ctx);
+    testnet5.network = Network::Testnet5;
+    assert_eq!(
+        gbt_err(&testnet5, json!({"rules": ["segwit"]})),
+        (
+            ERR_INVALID_PARAMETER,
+            "Support for 'consensuscleanup' rule requires explicit client support".to_owned()
+        ),
+        "BIP 54 changes what a valid coinbase is"
+    );
+    let on_testnet5 = dispatch(
+        &testnet5,
+        "getblocktemplate",
+        vec![json!({"rules": ["segwit", "consensuscleanup"]})],
+    )
+    .unwrap();
+    assert_eq!(
+        on_testnet5["rules"],
+        json!(["csv", "!segwit", "taproot", "!consensuscleanup"]),
+        "{on_testnet5}"
+    );
     let mut mainnet = ctx_without_chain(&ctx);
     mainnet.network = Network::Mainnet;
     mainnet.connections = Arc::new(AtomicU64::new(0));

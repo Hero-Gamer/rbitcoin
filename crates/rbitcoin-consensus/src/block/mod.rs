@@ -698,6 +698,25 @@ pub fn check_bip34_coinbase(coinbase: &Transaction, height: u32) -> Result<(), C
     Ok(())
 }
 
+/// The coinbase `nLockTime` and input `nSequence` a block template gives a
+/// miner for a block at `height`. With BIP 54 they are the ones
+/// [`reject_bip54_coinbase`] accepts. Otherwise the coinbase is not
+/// timelocked.
+#[must_use]
+pub fn template_coinbase_timelock(
+    params: &ChainParams,
+    height: u32,
+) -> (bitcoin::absolute::LockTime, bitcoin::Sequence) {
+    if params.enforce_bip54 {
+        (
+            bitcoin::absolute::LockTime::from_consensus(height.saturating_sub(1)),
+            bitcoin::Sequence::ENABLE_LOCKTIME_NO_RBF,
+        )
+    } else {
+        (bitcoin::absolute::LockTime::ZERO, bitcoin::Sequence::MAX)
+    }
+}
+
 /// Serialize `height` the same way Core pushes it into the coinbase scriptSig.
 #[must_use]
 pub fn bip34_height_script(height: u32) -> Vec<u8> {
