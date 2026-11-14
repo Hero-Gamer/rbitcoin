@@ -67,10 +67,19 @@ fn generate_commit_pad() -> &'static rbitcoin_query::testutil::TempDir {
 }
 
 fn open_generate_commit_hub(label: &str) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
+    open_generate_commit_hub_with(label, ChainParams::regtest())
+}
+
+/// A private copy of the pad under `params`, which must accept the pad as
+/// its own chain. Rules `params` adds bind the blocks mined on top.
+fn open_generate_commit_hub_with(
+    label: &str,
+    params: ChainParams,
+) -> (rbitcoin_query::testutil::TempDir, ChainHub) {
     let dir = rbitcoin_query::testutil::TempDir::labeled(label).expect(label);
     rbitcoin_store::testutil::copy_store_tree(generate_commit_pad().path(), dir.path());
     let q = rbitcoin_query::Query::open_or_create_tiny(dir.path()).expect("open generate copy");
-    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    let hub = ChainHub::new(q, params, Milestone::NONE);
     (dir, hub)
 }
 
@@ -6993,19 +7002,19 @@ fn bip54_sigop_script(checkmultisigs: usize, checksigs: usize) -> ScriptBuf {
         .into_script()
 }
 
-/// Spend output 0 of `coinbase` with an empty scriptSig into one output.
-fn bip54_spend(coinbase: &Transaction, script_pubkey: ScriptBuf) -> Transaction {
+/// Spend output `vout` of `funding` with an empty scriptSig into one output.
+fn bip54_spend(funding: &Transaction, vout: u32, script_pubkey: ScriptBuf) -> Transaction {
     Transaction {
         version: bitcoin::transaction::Version::ONE,
         lock_time: bitcoin::absolute::LockTime::ZERO,
         input: vec![bitcoin::TxIn {
-            previous_output: bitcoin::OutPoint::new(coinbase.compute_txid(), 0),
+            previous_output: bitcoin::OutPoint::new(funding.compute_txid(), vout),
             script_sig: ScriptBuf::new(),
             sequence: bitcoin::Sequence::MAX,
             witness: bitcoin::Witness::new(),
         }],
         output: vec![bitcoin::TxOut {
-            value: coinbase.output[0].value,
+            value: funding.output[vout as usize].value,
             script_pubkey,
         }],
     }
@@ -7013,18 +7022,32 @@ fn bip54_spend(coinbase: &Transaction, script_pubkey: ScriptBuf) -> Transaction 
 
 /// BIP 54 on a block proposal and on the tip block: a transaction whose
 /// inputs carry more than 2,500 signature operations, and a transaction of
-/// 64 bytes, are invalid. One fewer of either is accepted.
+/// 64 bytes, are invalid. One fewer of either is accepted. The chain is the
+/// shared mature pad with BIP 54 on from height 102. One transaction there
+/// spends a mature coinbase into the outputs under test.
 #[test]
 fn bip54_block_rejects_too_many_sigops_and_a_64_byte_tx() {
-    let (dir, hub) = bip54_pad("bip54-block-txs", &[]);
+    let mut params = ChainParams::regtest();
+    params.enforce_bip54 = true;
+    let (dir, hub) = open_generate_commit_hub_with("bip54-block-txs", params);
     let op_true = || ScriptBuf::from_bytes(vec![0x51]);
-    let at_limit = bip54_mine(&hub, bip54_sigop_script(125, 0), vec![]);
-    let past_limit = bip54_mine(&hub, bip54_sigop_script(125, 1), vec![]);
-    let plain = bip54_mine(&hub, op_true(), vec![]);
-    let plain_too = bip54_mine(&hub, op_true(), vec![]);
-    for _ in 5..=100 {
-        bip54_mine(&hub, op_true(), vec![]);
-    }
+    let mut funding = mature_spend_tx(&hub, 1);
+    let each = Amount::from_sat(10_0000_0000);
+    funding.output = [
+        bip54_sigop_script(125, 0),
+        bip54_sigop_script(125, 1),
+        op_true(),
+        op_true(),
+    ]
+    .into_iter()
+    .map(|script_pubkey| TxOut {
+        value: each,
+        script_pubkey,
+    })
+    .collect();
+    bip54_mine(&hub, op_true(), vec![funding.clone()]);
+    let (at_limit, past_limit, plain, plain_too) = (0, 1, 2, 3);
+
     let rejects = |tx: Transaction, reason: &str| {
         let tip = hub.tip_height();
         let block = bip54_block(&hub, op_true(), vec![tx]);
@@ -7039,25 +7062,22 @@ fn bip54_block_rejects_too_many_sigops_and_a_64_byte_tx() {
         hub.accept_block(block).expect("tip block");
     };
 
-    accepts(bip54_spend(&at_limit.txdata[0], op_true()));
+    accepts(bip54_spend(&funding, at_limit, op_true()));
     rejects(
-        bip54_spend(&past_limit.txdata[0], op_true()),
+        bip54_spend(&funding, past_limit, op_true()),
         "bad-txns-legacy-sigops",
     );
-    bip54_mine(&hub, op_true(), vec![]);
 
-    let four_bytes = ScriptBuf::from_bytes(vec![0x51; 4]);
-    let five_bytes = ScriptBuf::from_bytes(vec![0x51; 5]);
-    let small = bip54_spend(&plain.txdata[0], four_bytes);
+    let small = bip54_spend(&funding, plain, ScriptBuf::from_bytes(vec![0x51; 4]));
     assert_eq!(small.base_size(), 64);
     rejects(small, "bad-txns-size");
-    let next = bip54_spend(&plain.txdata[0], five_bytes);
+    let next = bip54_spend(&funding, plain, ScriptBuf::from_bytes(vec![0x51; 5]));
     assert_eq!(next.base_size(), 65);
     accepts(next);
-    let padded = bip54_spend(&plain_too.txdata[0], ScriptBuf::from_bytes(vec![0x51; 3]));
+    let padded = bip54_spend(&funding, plain_too, ScriptBuf::from_bytes(vec![0x51; 3]));
     assert_eq!(padded.base_size(), 63);
     accepts(padded);
-    assert_eq!(hub.tip_height(), Some(104));
+    assert_eq!(hub.tip_height(), Some(105));
     let _ = std::fs::remove_dir_all(dir);
 }
 
