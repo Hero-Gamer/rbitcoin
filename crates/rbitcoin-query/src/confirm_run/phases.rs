@@ -104,12 +104,9 @@ pub fn retarget_first_time(
     params: &ChainParams,
     height: u32,
 ) -> Result<Option<rbitcoin_consensus::PeriodFirst>, ConfirmError> {
-    let interval = params.difficulty_adjustment_interval();
-    let on_boundary = interval > 0 && height.is_multiple_of(interval);
-    if !on_boundary || params.no_pow_retargeting() {
+    let Some(first_height) = params.period_first_height(height).map(Height) else {
         return Ok(None);
-    }
-    let first_height = Height(height - interval);
+    };
     let first = if let Some((_fk, rec)) = query.header_at_height(first_height)? {
         Some((rec.timestamp, rec.bits))
     } else {

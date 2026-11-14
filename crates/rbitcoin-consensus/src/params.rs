@@ -76,6 +76,9 @@ pub struct ChainParams {
     /// Core `enforce_BIP94`: a retarget multiplies the period's first `nBits`,
     /// and a period's first header is at most 600 seconds before its parent.
     pub enforce_bip94: bool,
+    /// BIP 54 consensus cleanup from block 1 (Core
+    /// `DEPLOYMENT_CONSENSUSCLEANUP` at `ALWAYS_ACTIVE`).
+    pub enforce_bip54: bool,
     /// BIP 95 Testnet 5. rust-bitcoin 0.32 has no such network, so `network`
     /// is `Testnet4`, which has the same address encodings and buried
     /// heights. This selects the genesis block and the message start.
@@ -122,6 +125,7 @@ impl ChainParams {
                 threshold: 108,
             }),
             enforce_bip94: false,
+            enforce_bip54: false,
             testnet5: false,
         }
     }
@@ -146,6 +150,7 @@ impl ChainParams {
             )),
             testdummy: None,
             enforce_bip94: false,
+            enforce_bip54: false,
             testnet5: false,
         }
     }
@@ -169,6 +174,7 @@ impl ChainParams {
             )),
             testdummy: None,
             enforce_bip94: false,
+            enforce_bip54: false,
             testnet5: false,
         }
     }
@@ -192,6 +198,7 @@ impl ChainParams {
             bip34_hash: None,
             testdummy: None,
             enforce_bip94: true,
+            enforce_bip54: false,
             testnet5: false,
         }
     }
@@ -210,6 +217,7 @@ impl ChainParams {
             pow_limit,
             btc,
             enforce_bip94: false,
+            enforce_bip54: true,
             testnet5: true,
             ..Self::testnet4()
         }
@@ -246,6 +254,7 @@ impl ChainParams {
             bip34_hash: None,
             testdummy: None,
             enforce_bip94: false,
+            enforce_bip54: false,
             testnet5: false,
         })
     }
@@ -262,6 +271,41 @@ impl ChainParams {
 
     pub fn no_pow_retargeting(&self) -> bool {
         self.btc.no_pow_retargeting
+    }
+
+    /// How far before its parent a difficulty period's first header may be:
+    /// Core `MAX_TIMEWARP_TESTNET4` with BIP94, `MAX_TIMEWARP_BIP54` with
+    /// BIP 54. `None` is no rule.
+    pub fn max_timewarp(&self) -> Option<u32> {
+        if self.enforce_bip94 {
+            Some(crate::header::MAX_TIMEWARP_BIP94)
+        } else if self.enforce_bip54 {
+            Some(crate::header::MAX_TIMEWARP_BIP54)
+        } else {
+            None
+        }
+    }
+
+    /// BIP 54: `height` is the last block of a difficulty period, whose
+    /// timestamp is not before the period's first block.
+    pub fn bip54_period_last(&self, height: u32) -> bool {
+        let interval = self.difficulty_adjustment_interval();
+        self.enforce_bip54 && interval > 1 && height % interval == interval - 1
+    }
+
+    /// Height of the difficulty period's first header that the header at
+    /// `height` is checked against: the period that just ended at a retarget
+    /// height, and with BIP 54 the current period at its last height. `None`
+    /// is a height that reads no such header.
+    pub fn period_first_height(&self, height: u32) -> Option<u32> {
+        let interval = self.difficulty_adjustment_interval();
+        if self.bip54_period_last(height) {
+            return Some(height + 1 - interval);
+        }
+        if interval == 0 || !height.is_multiple_of(interval) || self.no_pow_retargeting() {
+            return None;
+        }
+        height.checked_sub(interval)
     }
 
     pub fn allow_min_difficulty_blocks(&self) -> bool {

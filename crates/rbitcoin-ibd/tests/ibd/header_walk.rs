@@ -6368,6 +6368,56 @@ fn bip94_lookahead_rejects_a_timewarped_period_start() {
     ));
 }
 
+/// BIP 54 on the IBD header walk, with a 4-block period. A height-4 header
+/// more than two hours before its parent fails the batch. A height-7 header
+/// before the height-4 header fails it too, whether height 4 came in this
+/// batch or an earlier one.
+#[test]
+fn bip54_lookahead_rejects_both_period_edge_time_faults() {
+    let (_dir, q) = rbitcoin_query::testutil::tiny_query_labeled("header-walk-bip54");
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.enforce_bip54 = true;
+    params.btc.pow_target_timespan = 4 * params.btc.pow_target_spacing;
+    let hub = ChainHub::new(q, params, rbitcoin_consensus::Milestone::NONE);
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let child = |parent: &Header, time: u32, salt: u8| {
+        let mut h = *parent;
+        h.version = bitcoin::block::Version::from_consensus(4);
+        h.prev_blockhash = parent.block_hash();
+        h.time = time;
+        h.merkle_root = TxMerkleNode::from_byte_array([salt; 32]);
+        rbitcoin_consensus::grind_regtest_pow(&mut h);
+        h
+    };
+    let t0 = 1_700_000_000u32;
+    hub.clock.set_mock(i64::from(t0 + 100_000));
+    let mut chain = vec![hub.header_of(&gen).unwrap()];
+    for salt in 1..=3u8 {
+        let parent = *chain.last().unwrap();
+        chain.push(child(&parent, t0 + 10_000 * u32::from(salt), salt));
+    }
+    let h3 = chain[3];
+    let (s0, _rx) = slot(0);
+    let st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    let ok = |batch: &[Header], diff: &DiffSnap| batch_context_ok(&st, &hub, batch, diff);
+    let fresh = DiffSnap::default();
+
+    let warped = child(&h3, h3.time - 7201, 0x41);
+    assert!(!ok(&[chain[1], chain[2], h3, warped], &fresh));
+    let floor = child(&h3, h3.time - 7200, 0x42);
+    assert!(ok(&[chain[1], chain[2], h3, floor], &fresh));
+
+    let first = child(&h3, t0 + 100_000, 0x43);
+    let h5 = child(&first, t0 + 40_000, 0x51);
+    let h6 = child(&h5, t0 + 50_000, 0x61);
+    let early = child(&h6, first.time - 1, 0x71);
+    let level = child(&h6, first.time, 0x72);
+    let whole = |last: Header| [chain[1], chain[2], h3, first, h5, h6, last];
+    assert!(!ok(&whole(early), &fresh));
+    assert!(ok(&whole(level), &fresh));
+}
+
 fn floor_milestone(height: u32) -> rbitcoin_consensus::Milestone {
     rbitcoin_consensus::Milestone {
         height,
