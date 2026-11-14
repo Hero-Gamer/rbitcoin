@@ -7364,7 +7364,8 @@ fn hb_relay_message(hub: &ChainHub, block: &Block, height: u32) -> Option<Networ
 /// in the block hash, so a peer can change a witness or the coinbase nonce
 /// and keep the header. That check (Core `IsBlockMutated` with the witness
 /// root, which reads the coinbase) runs here on the wtxids the short ids
-/// use, so they are hashed once.
+/// use, so the check does not hash the transactions again. With compact
+/// prefill on, `hb_relay_prepare` still hashes them for the prefill plan.
 fn hb_relay_cmpct(
     hub: &ChainHub,
     block: &Block,

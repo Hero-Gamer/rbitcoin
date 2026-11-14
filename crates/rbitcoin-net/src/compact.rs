@@ -55,8 +55,11 @@ pub fn short_id_hashes(block: &Block, version: u32) -> Vec<[u8; 32]> {
 
 /// `HeaderAndShortIds::from_block` from hashes already in hand: `ids` is
 /// [`short_id_hashes`] for `version`. The coinbase is always prefilled.
-/// `None` for a version other than 1 or 2, or a `prefill` that is not
-/// ascending indexes into the block.
+/// `None` for a version other than 1 or 2, an `ids` length that is not the
+/// block's transaction count, a `prefill` that is not ascending indexes
+/// into the block, or a gap between prefilled transactions that does not
+/// fit the `u16` differential index. On `None` an announce retries with
+/// the coinbase alone and a compact `getdata` is served the full block.
 pub fn header_and_short_ids(
     block: &Block,
     ids: &[[u8; 32]],
