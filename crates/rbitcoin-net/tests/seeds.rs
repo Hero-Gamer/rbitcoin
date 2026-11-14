@@ -92,7 +92,7 @@ fn inject_drops_unroutable_and_add_learned_keeps_it() {
         "2001:2:1::/48 is outside the benchmarking prefix"
     );
     let lan: SocketAddr = "10.0.0.1:8333".parse().unwrap();
-    assert!(book.add_learned(lan, 64));
+    assert!(book.add_learned(lan, lan, 64));
     assert!(book
         .entry_of(&rbitcoin_net::NetAddr::from_socket(lan))
         .is_some());
@@ -456,7 +456,7 @@ fn add_learned_evicts_failed_when_at_cap() {
         am.add(addr(i));
         am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(addr(i)), i == 1);
     }
-    assert!(am.add_learned(addr(9), 3));
+    assert!(am.add_learned(addr(9), addr(9), 3));
     assert_eq!(am.len(), 3);
     assert!(am
         .entry_of(&rbitcoin_net::NetAddr::from_socket(addr(9)))
@@ -475,12 +475,12 @@ fn add_learned_keeps_good_when_full() {
         am.add(addr(i));
         am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(addr(i)));
     }
-    assert!(!am.add_learned(addr(9), 3));
+    assert!(!am.add_learned(addr(9), addr(9), 3));
     assert_eq!(am.len(), 3);
     assert!(am
         .entry_of(&rbitcoin_net::NetAddr::from_socket(addr(9)))
         .is_none());
-    assert!(!am.add_learned(addr(1), 3));
+    assert!(!am.add_learned(addr(1), addr(1), 3));
 }
 
 #[test]
@@ -489,7 +489,7 @@ fn add_learned_evicts_oldest_new_when_at_cap() {
     for i in 1..=3 {
         am.add(addr(i));
     }
-    assert!(am.add_learned(addr(9), 3));
+    assert!(am.add_learned(addr(9), addr(9), 3));
     assert_eq!(am.len(), 3);
     assert!(am
         .entry_of(&rbitcoin_net::NetAddr::from_socket(addr(9)))
@@ -514,12 +514,154 @@ fn add_learned_fills_past_getaddr_cache_pct() {
     let mut am = AddrMan::new();
     for i in 0..=NEED {
         assert!(
-            am.add_learned(addr_n(i as u32), MAX_ADDR_MAN),
+            am.add_learned(addr_n(i as u32), addr_n(i as u32), MAX_ADDR_MAN),
             "MAX_ADDR_MAN={} rejected insert {i} (need len > {NEED})",
             MAX_ADDR_MAN
         );
     }
     assert!(am.len() > NEED, "len={} need > {NEED}", am.len());
+}
+
+/// Attacker address `i`, spread over two /16s (44.1 and 44.2), never in
+/// [`addr_n`]'s 11/8.
+fn attacker_addr(i: u32) -> SocketAddr {
+    SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(
+            44,
+            1 + (i & 1) as u8,
+            ((i >> 9) & 0xff) as u8,
+            ((i >> 1) & 0xff) as u8,
+        )),
+        8333,
+    )
+}
+
+/// Book size for the flood tests: four shares, so the eviction scans stay
+/// cheap in a debug build. The share is the same at [`MAX_ADDR_MAN`].
+const BOOK: usize = 4 * MAX_ROWS_PER_SOURCE_GROUP;
+
+/// A full book of honest rows, each taught by itself as `addpeeraddress` does.
+fn full_honest_book() -> AddrMan {
+    let mut am = AddrMan::new();
+    for i in 0..BOOK as u32 {
+        assert!(am.add_learned(addr_n(i), addr_n(i), BOOK));
+    }
+    am
+}
+
+fn honest_rows(am: &AddrMan) -> usize {
+    am.entries()
+        .iter()
+        .filter(|e| matches!(e.addr, NetAddr::Ip(s) if s.ip().to_string().starts_with("11.")))
+        .count()
+}
+
+/// Four books' worth of addresses, from `first` on, taught by `source(i)`.
+fn flood(am: &mut AddrMan, first: u32, source: impl Fn(u32) -> SocketAddr) -> usize {
+    (first..first + 4 * BOOK as u32)
+        .filter(|&i| am.add_learned(attacker_addr(i), source(i), BOOK))
+        .count()
+}
+
+#[test]
+fn one_source_group_replaces_at_most_its_share_of_a_full_book() {
+    let mut am = full_honest_book();
+    let one_ip = SocketAddr::from(([44, 1, 0, 1], 8333));
+    assert_eq!(flood(&mut am, 0, |_| one_ip), MAX_ROWS_PER_SOURCE_GROUP);
+    assert_eq!(am.len(), BOOK);
+    assert_eq!(honest_rows(&am), BOOK - MAX_ROWS_PER_SOURCE_GROUP);
+
+    // The bound is per group: a second /16 takes its own share, no more.
+    let other_group = SocketAddr::from(([45, 9, 0, 1], 8333));
+    let more = flood(&mut am, 4 * BOOK as u32, |_| other_group);
+    assert_eq!(more, MAX_ROWS_PER_SOURCE_GROUP);
+    assert_eq!(honest_rows(&am), BOOK - 2 * MAX_ROWS_PER_SOURCE_GROUP);
+}
+
+#[test]
+fn many_sources_in_one_group_share_one_bound() {
+    let mut am = full_honest_book();
+    // Every address from a different IP, all inside 44.1/16.
+    let taught = flood(&mut am, 0, |i| {
+        SocketAddr::from(([44, 1, (i >> 8) as u8, i as u8], 8333))
+    });
+    assert_eq!(taught, MAX_ROWS_PER_SOURCE_GROUP);
+    assert_eq!(honest_rows(&am), BOOK - MAX_ROWS_PER_SOURCE_GROUP);
+}
+
+#[test]
+fn one_peer_fills_an_empty_book() {
+    // A seed or addr-fetch reply, and a fresh node's first peers, may fill
+    // the whole book from one source: nothing is displaced until it is full.
+    let mut am = AddrMan::new();
+    let seed = SocketAddr::from(([44, 1, 0, 1], 8333));
+    let taught = (0..MAX_ADDR_MAN as u32)
+        .filter(|&i| am.add_learned(addr_n(i), seed, MAX_ADDR_MAN))
+        .count();
+    assert_eq!(taught, MAX_ADDR_MAN);
+    assert!(!am.add_learned(attacker_addr(0), seed, MAX_ADDR_MAN));
+    let other = SocketAddr::from(([45, 9, 0, 1], 8333));
+    assert!(
+        am.add_learned(attacker_addr(0), other, MAX_ADDR_MAN),
+        "another group still replaces the oldest untried row"
+    );
+}
+
+#[test]
+fn a_source_teaches_again_once_its_rows_leave() {
+    // A small cap so the share is crossed in a few hundred rows.
+    let cap = MAX_ROWS_PER_SOURCE_GROUP + 88;
+    let mut am = AddrMan::new();
+    let seed = SocketAddr::from(([44, 1, 0, 1], 8333));
+    for i in 0..cap as u32 {
+        assert!(am.add_learned(addr_n(i), seed, cap));
+    }
+    let next = |i: u32| addr_n(cap as u32 + i);
+    assert!(!am.add_learned(next(0), seed, cap));
+
+    // Another group evicts the seed's oldest rows, one per insert.
+    let other = SocketAddr::from(([45, 9, 0, 1], 8333));
+    for i in 0..88 {
+        assert!(am.add_learned(attacker_addr(i), other, cap));
+    }
+    assert!(!am.add_learned(next(0), seed, cap), "still at its share");
+    assert!(am.add_learned(attacker_addr(88), other, cap));
+    assert!(
+        am.add_learned(next(0), seed, cap),
+        "one row under its share"
+    );
+
+    // A trim (shutdown merge, `peers` load) drops the seed's rows too.
+    let mut trimmed = AddrMan::new();
+    for i in 0..cap as u32 {
+        assert!(trimmed.add_learned(addr_n(i), seed, cap));
+    }
+    let share = MAX_ROWS_PER_SOURCE_GROUP;
+    trimmed.trim_to_cap(share);
+    assert!(!trimmed.add_learned(next(0), seed, share), "kept its share");
+    trimmed.trim_to_cap(share - 1);
+    assert!(trimmed.add_learned(next(0), seed, share - 1));
+}
+
+#[test]
+fn a_source_group_leaves_with_its_last_row() {
+    // The source tallies' bound: an evicted row takes its source with it, and
+    // a group with no row left is dropped.
+    let mut am = AddrMan::new();
+    let seed = SocketAddr::from(([44, 1, 0, 1], 8333));
+    let other = SocketAddr::from(([45, 9, 0, 1], 8333));
+    for i in 0..4 {
+        assert!(am.add_learned(addr_n(i), seed, 4));
+    }
+    assert_eq!(am.source_tally(), (4, 1));
+    for i in 0..4 {
+        assert!(am.add_learned(attacker_addr(i), other, 4));
+    }
+    assert_eq!(
+        am.source_tally(),
+        (4, 1),
+        "the seed's last row took its group"
+    );
 }
 
 #[test]
@@ -539,7 +681,11 @@ fn add_keeps_tried_and_may_exceed_cap() {
     assert!(am
         .entry_of(&rbitcoin_net::NetAddr::from_socket(addr_n(0)))
         .is_some());
-    assert!(!am.add_learned(addr_n(MAX_ADDR_MAN as u32 + 1), MAX_ADDR_MAN));
+    assert!(!am.add_learned(
+        addr_n(MAX_ADDR_MAN as u32 + 1),
+        addr_n(MAX_ADDR_MAN as u32 + 1),
+        MAX_ADDR_MAN
+    ));
     assert_eq!(am.len(), MAX_ADDR_MAN + 1);
     assert!(am
         .entry_of(&rbitcoin_net::NetAddr::from_socket(extra))
@@ -564,6 +710,80 @@ fn add_evicts_oldest_new_at_cap() {
     assert!(am
         .entry_of(&rbitcoin_net::NetAddr::from_socket(addr_n(1)))
         .is_some());
+}
+
+/// A merged row keeps the source group that taught it. A row both books
+/// hold keeps this book's source, and a row this book cannot dial is left
+/// out with its source.
+#[test]
+fn merge_from_keeps_each_rows_source() {
+    let mut a = AddrMan::new();
+    let mut b = AddrMan::new();
+    b.set_onion_reachable(true);
+    let src = |o: u8| SocketAddr::from(([44, o, 0, 1], 8333));
+    assert!(a.add_learned(addr_n(0), src(1), MAX_ADDR_MAN));
+    assert!(b.add_learned(addr_n(0), src(2), MAX_ADDR_MAN));
+    assert!(b.add_learned(addr_n(1), src(3), MAX_ADDR_MAN));
+    let src4 = NetAddr::from_socket(src(4));
+    assert!(b.add_learned_addr(onion(), src4, MAX_ADDR_MAN));
+    b.add(addr_n(2));
+    let (both, only_b) = (
+        NetAddr::from_socket(addr_n(0)),
+        NetAddr::from_socket(addr_n(1)),
+    );
+    let (own, others) = (a.source_group_of(both), b.source_group_of(both));
+    assert!(own.is_some() && own != others);
+    a.merge_from(&b);
+    assert_eq!(a.len(), 3);
+    assert_eq!(a.source_tally(), (2, 2));
+    assert_eq!(
+        a.source_group_of(both),
+        own,
+        "a shared row keeps this book's source"
+    );
+    assert_eq!(a.source_group_of(only_b), b.source_group_of(only_b));
+}
+
+/// The share binds only in a full book, for a copy as for a learned
+/// address: a book with room takes another row from a group already at its
+/// share.
+#[test]
+fn merge_into_a_book_with_room_is_not_bound_by_the_share() {
+    let src = SocketAddr::from(([44, 1, 0, 1], 8333));
+    let mut a = AddrMan::new();
+    for i in 0..MAX_ROWS_PER_SOURCE_GROUP as u32 {
+        assert!(a.add_learned(addr_n(i), src, MAX_ADDR_MAN));
+    }
+    let mut b = AddrMan::new();
+    assert!(b.add_learned(addr_n(MAX_ADDR_MAN as u32), src, MAX_ADDR_MAN));
+    a.merge_from(&b);
+    assert_eq!(a.source_tally(), (MAX_ROWS_PER_SOURCE_GROUP + 1, 1));
+}
+
+/// The shutdown merge runs into the book as it stood at catch-up, which
+/// still charges a group for rows the live book has since evicted. A row
+/// the live book connected to is kept whatever its teacher's share: a
+/// restart keeps connected rows first.
+#[test]
+fn merge_keeps_a_connected_row_from_a_group_at_its_share() {
+    let src = SocketAddr::from(([44, 1, 0, 1], 8333));
+    let mut stale = AddrMan::new();
+    for i in 0..MAX_ADDR_MAN as u32 {
+        if (i as usize) < MAX_ROWS_PER_SOURCE_GROUP {
+            assert!(stale.add_learned(addr_n(i), src, MAX_ADDR_MAN));
+        } else {
+            stale.add(addr_n(i));
+        }
+    }
+    let mut live = stale.clone();
+    let other = SocketAddr::from(([45, 1, 0, 1], 8333));
+    assert!(live.add_learned(addr_n(100_000), other, MAX_ADDR_MAN));
+    let connected = NetAddr::from_socket(addr_n(100_001));
+    assert!(live.add_learned_addr(connected, NetAddr::from_socket(src), MAX_ADDR_MAN));
+    live.note_connected_addr(connected);
+    stale.merge_from(&live);
+    assert!(stale.flags_of(&connected).has_connected());
+    assert_eq!(stale.len(), MAX_ADDR_MAN);
 }
 
 #[test]
@@ -1047,17 +1267,17 @@ fn add_with_flags_drops_a_net_only_net_excludes() {
 #[test]
 fn learned_cjdns_stays_out_until_the_node_can_dial_it() {
     let mut am = AddrMan::new();
-    assert!(!am.add_learned_addr(cjdns(), 8));
+    assert!(!am.add_learned_addr(cjdns(), cjdns(), 8));
     assert!(am.is_empty());
     am.set_cjdns_reachable(true);
-    assert!(am.add_learned_addr(cjdns(), 8));
+    assert!(am.add_learned_addr(cjdns(), cjdns(), 8));
 }
 
 #[test]
 fn onion_and_i2p_stay_out_until_this_process_can_dial_them() {
     let mut am = AddrMan::new();
     am.add_addr(onion());
-    assert!(!am.add_learned_addr(i2p(), 8));
+    assert!(!am.add_learned_addr(i2p(), i2p(), 8));
     am.add_with_flags_addr(onion(), PeerFlags::empty());
     assert!(
         am.is_empty(),
@@ -1067,7 +1287,7 @@ fn onion_and_i2p_stay_out_until_this_process_can_dial_them() {
     am.add_addr(onion());
     assert!(am.entries().iter().any(|e| e.addr == onion()));
     am.set_i2p_reachable(true);
-    assert!(am.add_learned_addr(i2p(), 8));
+    assert!(am.add_learned_addr(i2p(), i2p(), 8));
 }
 
 #[test]

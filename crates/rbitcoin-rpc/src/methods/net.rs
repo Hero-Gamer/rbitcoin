@@ -270,10 +270,12 @@ pub fn addpeeraddress(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
     };
     // RAM-only: do not rewrite peers on every call (p2p_getaddr_caching fills
     // via this RPC). The node still persists addrman on shutdown / catch-up.
-    let added = am
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .add_learned(addr, rbitcoin_net::MAX_ADDR_MAN);
+    // The address is its own source, as in Core.
+    let added = am.lock().unwrap_or_else(|e| e.into_inner()).add_learned(
+        addr,
+        addr,
+        rbitcoin_net::MAX_ADDR_MAN,
+    );
     Ok(json!({ "success": added }))
 }
 

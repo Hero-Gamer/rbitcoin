@@ -324,6 +324,7 @@ fn test_ctx(
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     let ctx = IbdReadCtx {
         id: 3,
+        net: FROM,
         out_tx,
         sinks: PeerEventSinks {
             body: body_tx,
@@ -727,9 +728,14 @@ fn sinks() -> (
     )
 }
 
+/// The endpoint of test peer 3.
+const FROM: rbitcoin_net::NetAddr =
+    rbitcoin_net::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 8333));
+
 fn apply(msg: NetworkMessage, sinks: &PeerEventSinks) {
     apply_decoded_message(
         3,
+        FROM,
         sinks,
         bitcoin::p2p::message::RawNetworkMessage::new(Magic::from(bitcoin::Network::Regtest), msg),
     );
@@ -782,7 +788,7 @@ fn decoded_messages_fan_out_blocks_and_addrs_only() {
         NetworkMessage::Addr(vec![(1, Address::new(&good, flags))]),
         &sinks,
     );
-    assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { .. })));
+    assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { from, .. }) if from == FROM));
 
     apply(NetworkMessage::AddrV2(vec![]), &sinks);
     assert!(ctrl_rx.try_recv().is_err());
@@ -795,7 +801,7 @@ fn decoded_messages_fan_out_blocks_and_addrs_only() {
         }]),
         &sinks,
     );
-    assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { .. })));
+    assert!(matches!(ctrl_rx.try_recv(), Ok(PeerEvent::Addrs { from, .. }) if from == FROM));
 
     apply(NetworkMessage::SendAddrV2, &sinks);
     apply(
@@ -970,7 +976,13 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
 
     let local = SocketAddr::from(([127, 0, 0, 1], 18444));
     let mut off = rbitcoin_net::seeds::AddrMan::new();
-    rbitcoin_ibd::ibd::events::inject_learned_addrs(&mut off, &rows, local, 1);
+    rbitcoin_ibd::ibd::events::inject_learned_addrs(
+        &mut off,
+        &rows,
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        1,
+    );
     assert!(
         off.entries()
             .iter()
@@ -985,7 +997,13 @@ fn v1_addr_fc00_is_cjdns_not_clearnet() {
 
     let mut on = rbitcoin_net::seeds::AddrMan::new();
     on.set_cjdns_reachable(true);
-    rbitcoin_ibd::ibd::events::inject_learned_addrs(&mut on, &rows, local, 1);
+    rbitcoin_ibd::ibd::events::inject_learned_addrs(
+        &mut on,
+        &rows,
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        1,
+    );
     assert!(
         on.entries().iter().any(|e| matches!(
             e.addr,

@@ -220,8 +220,22 @@ fn trust_peer_ignores_learned_addrs() {
     let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
     let learned =
         rbitcoin_net::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333));
-    rbitcoin_ibd::ibd::events::learn_peer_addrs(true, &mut book, &[learned], local, 0);
+    rbitcoin_ibd::ibd::events::learn_peer_addrs(
+        true,
+        &mut book,
+        &[learned],
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        0,
+    );
     assert!(book.is_empty(), "trust-peer must not keep gossip");
-    rbitcoin_ibd::ibd::events::learn_peer_addrs(false, &mut book, &[learned], local, 0);
+    rbitcoin_ibd::ibd::events::learn_peer_addrs(
+        false,
+        &mut book,
+        &[learned],
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        0,
+    );
     assert_eq!(book.len(), 1, "flag off still learns addresses");
 }

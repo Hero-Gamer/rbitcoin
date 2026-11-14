@@ -9,6 +9,7 @@
 
 use bitcoin::p2p::ServiceFlags;
 use rbitcoin_primitives::Network;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -19,7 +20,7 @@ use tokio::sync::Notify;
 
 use crate::asmap::AsMap;
 use crate::netaddr::{parse_net_addr, strip_i2p_suffix, strip_onion_suffix, NetAddr, OnlyNet};
-use crate::netgroup::{outbound_group, select_diverse};
+use crate::netgroup::{netgroup_net, outbound_group, select_diverse};
 
 #[doc(hidden)]
 pub fn net_addr_unspecified(addr: NetAddr) -> bool {
@@ -345,6 +346,14 @@ pub struct PeerEntry {
 /// (`1000 / 0.23`) so a reply can still be 1000 addresses.
 pub const MAX_ADDR_MAN: usize = 8192;
 
+/// Rows a source netgroup has taught after which, in a full book, its
+/// addresses evict nothing: 1/16 of [`MAX_ADDR_MAN`] (512). A group can hold
+/// more when it taught them while the book had room.
+///
+/// The same share Core gives one source group: its addresses land in at most
+/// `ADDRMAN_NEW_BUCKETS_PER_SOURCE_GROUP` (64) of the 1,024 new buckets.
+pub const MAX_ROWS_PER_SOURCE_GROUP: usize = MAX_ADDR_MAN / 16;
+
 /// Shared wake for a new dialable row. Clones of one book share it.
 #[derive(Clone)]
 struct AddrAdded(Arc<Notify>);
@@ -375,6 +384,15 @@ pub struct AddrMan {
     /// `--i2p-sam`. Default off.
     pub i2p_reachable: bool,
     pub cjdns_reachable: bool,
+    /// Netgroup of the peer that taught each learned row. RAM only: a row
+    /// loaded from the `peers` file, a seed, or a row first added by a dial
+    /// has none; a learned row keeps its source after the node connects to
+    /// it, and a copy from another live book keeps it. At most one entry per
+    /// row; it leaves with the row.
+    learned_from: HashMap<NetAddr, u64>,
+    /// Rows in `learned_from` per source netgroup. A group leaves with its
+    /// last row, so this never holds more entries than `learned_from`.
+    taught_by_group: HashMap<u64, usize>,
     /// Wakes a catch-up wait when a new row is stored.
     added: AddrAdded,
 }
@@ -638,16 +656,22 @@ impl AddrMan {
         self.note_added();
     }
 
-    /// Insert a newly learned addr, evicting last-resort then oldest new at `cap`.
+    /// Insert `addr`, taught by `source`, evicting last-resort then oldest new at `cap`.
     ///
     /// Returns true when `addr` is now in the book. Duplicates, an already
     /// over-cap book (`add` exceed), and a full book of only tried addrs
-    /// return false. Never exceeds `cap`.
-    pub fn add_learned(&mut self, addr: SocketAddr, cap: usize) -> bool {
-        self.add_learned_addr(NetAddr::from_socket(addr), cap)
+    /// return false. Never exceeds `cap`. In a full book, a source netgroup
+    /// that already taught [`MAX_ROWS_PER_SOURCE_GROUP`] of the rows evicts
+    /// nothing, so one sender cannot replace the rest of the book.
+    pub fn add_learned(&mut self, addr: SocketAddr, source: SocketAddr, cap: usize) -> bool {
+        self.add_learned_addr(
+            NetAddr::from_socket(addr),
+            NetAddr::from_socket(source),
+            cap,
+        )
     }
 
-    pub fn add_learned_addr(&mut self, addr: NetAddr, cap: usize) -> bool {
+    pub fn add_learned_addr(&mut self, addr: NetAddr, source: NetAddr, cap: usize) -> bool {
         if !self.dialable(addr) {
             return false;
         }
@@ -657,19 +681,80 @@ impl AddrMan {
         if self.order.len() > cap {
             return false;
         }
-        if self.order.len() == cap && !self.evict_for_learn() {
+        let group = netgroup_net(source, self.asmap());
+        if self.order.len() == cap && (self.at_share(group) || !self.evict_for_learn()) {
             return false;
         }
         self.by_addr.insert(addr, PeerFlags::empty());
         self.order.push(addr);
+        self.charge(addr, group);
         self.note_added();
         true
+    }
+
+    /// `group` already taught its share of the rows.
+    fn at_share(&self, group: u64) -> bool {
+        self.taught_by_group.get(&group).copied().unwrap_or(0) >= MAX_ROWS_PER_SOURCE_GROUP
+    }
+
+    /// Record `group` as the source of `addr`, a row with no source yet.
+    fn charge(&mut self, addr: NetAddr, group: u64) {
+        self.learned_from.insert(addr, group);
+        *self.taught_by_group.entry(group).or_insert(0) += 1;
+    }
+
+    /// Copy `other`'s row `addr` with its flags. A row this book lacks also
+    /// takes `other`'s source, so a copy between live books keeps each
+    /// group's share. A row both books hold keeps this book's source. A full
+    /// book takes no new untried row from a group at its share, as
+    /// [`Self::add_learned_addr`] refuses it: a group that taught its share
+    /// in each of two live books does not hold both after they are
+    /// reconciled. A row `other` connected to is always taken: a peer that
+    /// answered a dial is not gossip.
+    pub fn copy_row_from(&mut self, other: &AddrMan, addr: NetAddr) {
+        let held = self.by_addr.contains_key(&addr);
+        let group = other.learned_from.get(&addr).copied();
+        let flags = other.flags_of(&addr);
+        if !held
+            && !flags.has_connected()
+            && self.order.len() >= MAX_ADDR_MAN
+            && group.is_some_and(|g| self.at_share(g))
+        {
+            return;
+        }
+        self.add_with_flags_addr(addr, flags);
+        if held || !self.by_addr.contains_key(&addr) {
+            return;
+        }
+        if let Some(group) = group {
+            self.charge(addr, group);
+        }
+    }
+
+    /// Source netgroup charged for `addr`, if a peer taught it.
+    #[doc(hidden)]
+    pub fn source_group_of(&self, addr: NetAddr) -> Option<u64> {
+        self.learned_from.get(&addr).copied()
+    }
+
+    /// Rows with a known source, and the source netgroups that taught them.
+    #[doc(hidden)]
+    pub fn source_tally(&self) -> (usize, usize) {
+        (self.learned_from.len(), self.taught_by_group.len())
     }
 
     #[doc(hidden)]
     pub fn evict_one(&mut self, addr: NetAddr) {
         self.by_addr.remove(&addr);
         self.last_attempt.remove(&addr);
+        if let Some(group) = self.learned_from.remove(&addr) {
+            if let Entry::Occupied(mut n) = self.taught_by_group.entry(group) {
+                *n.get_mut() -= 1;
+                if *n.get() == 0 {
+                    n.remove();
+                }
+            }
+        }
         self.order.retain(|a| *a != addr);
     }
 
@@ -729,14 +814,21 @@ impl AddrMan {
         self.order = keep;
         self.by_addr.retain(|a, _| keep_set.contains(a));
         self.last_attempt.retain(|a, _| keep_set.contains(a));
+        self.learned_from.retain(|a, _| keep_set.contains(a));
+        self.taught_by_group.clear();
+        for group in self.learned_from.values() {
+            *self.taught_by_group.entry(*group).or_insert(0) += 1;
+        }
     }
 
     /// Merge another book into this one (flag bits OR'd for shared addrs).
     ///
-    /// Rows this process cannot dial are left out. Trim after the union.
+    /// Rows this process cannot dial are left out, and a full book leaves out
+    /// an untried row from a source group at its share. Trim after.
+    /// Sources follow [`Self::copy_row_from`].
     pub fn merge_from(&mut self, other: &AddrMan) {
         for e in other.entries() {
-            self.add_with_flags_addr(e.addr, e.flags);
+            self.copy_row_from(other, e.addr);
         }
         self.trim_to_cap(MAX_ADDR_MAN);
         self.sort_order_ipv4_first();

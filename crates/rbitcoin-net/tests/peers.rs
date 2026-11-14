@@ -1636,7 +1636,8 @@ fn getaddr_omits_unroutable_clearnet() {
     hub.set_mock_now(1_700_000_000);
     let mut am = rbitcoin_net::seeds::AddrMan::new();
     for addr in ["10.0.0.1:8333", "100.64.0.1:8333", "127.0.0.1:8333"] {
-        assert!(am.add_learned(addr.parse().unwrap(), 64));
+        let addr: SocketAddr = addr.parse().unwrap();
+        assert!(am.add_learned(addr, addr, 64));
     }
     hub.set_addrman(Arc::new(Mutex::new(am)));
     let got = hub.addr_response_for_bind(SocketAddr::from(([127, 0, 0, 1], 18444)));

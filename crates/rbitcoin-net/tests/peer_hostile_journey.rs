@@ -744,6 +744,52 @@ fn addrv2_flood_is_rate_limited_before_addrman() {
     }
 }
 
+/// A full book charges each `addrv2` to the sending peer's netgroup: once
+/// that group taught its share, its addresses replace nothing, inbound or
+/// addr-fetch alike. A peer in another group still replaces the oldest row.
+#[test]
+fn addrv2_into_a_full_book_is_charged_to_the_sender_group() {
+    use rbitcoin_net::peers::PeerConnType;
+    use rbitcoin_net::seeds::{AddrMan, MAX_ADDR_MAN};
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let loopback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let mut book = AddrMan::new();
+    for i in 0..MAX_ADDR_MAN as u32 {
+        let [_, b, c, d] = i.to_be_bytes();
+        let row = SocketAddr::from(([11, b, c, d], 8333));
+        assert!(book.add_learned(row, loopback, MAX_ADDR_MAN));
+    }
+    let am = std::sync::Arc::new(std::sync::Mutex::new(book));
+    peers.set_addrman(am.clone());
+    let ver = hostile_ver(loopback);
+    let gossip = |last: u8| AddrV2Message {
+        time: 1_700_000_000,
+        services: ServiceFlags::NETWORK,
+        addr: AddrV2::Ipv4(Ipv4Addr::new(93, 184, 216, last)),
+        port: 8333,
+    };
+    let stored = |last: u8| {
+        let row = SocketAddr::from(([93, 184, 216, last], 8333));
+        am.lock().unwrap().entry_of(&rbitcoin_net::NetAddr::from_socket(row)).is_some()
+    };
+    let other_ip = SocketAddr::from(([203, 0, 113, 9], 40000));
+    for (n, (from, conn_type, want)) in [
+        (loopback, PeerConnType::Inbound, false),
+        (loopback, PeerConnType::AddrFetch, false),
+        (other_ip, PeerConnType::Inbound, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let inbound = conn_type == PeerConnType::Inbound;
+        let peer = peers.register(from, loopback, &ver, inbound, conn_type);
+        let mut follow = PeerFollowState::new();
+        on_addrv2(&mut follow, Some(peer.as_ref()), &[gossip(n as u8)]).unwrap();
+        assert_eq!(stored(n as u8), want, "{conn_type:?} from {from}");
+        assert_eq!(am.lock().unwrap().len(), MAX_ADDR_MAN);
+    }
+}
+
 fn regtest_child(parent: &bitcoin::block::Header, tag: u8) -> bitcoin::block::Header {
     pow_child(parent, u32::from(tag))
 }

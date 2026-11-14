@@ -877,6 +877,84 @@ fn apply_peer_event_body_and_control_surface() {
             task,
         }
     }
+
+    /// An addr event charges the netgroup of the endpoint it carries: past
+    /// its share of a full book it replaces nothing, while another group
+    /// still does, with or without a slot. Own state: one addr token per
+    /// peer.
+    fn addrs_charge_the_sending_slot(
+        hub: &rbitcoin_net::chain::ChainHub,
+        gen: BlockHash,
+        local: SocketAddr,
+        write_next: &AtomicU32,
+    ) {
+        let teacher = SocketAddr::from(([10, 3, 0, 1], 18444));
+        let other = SocketAddr::from(([10, 2, 0, 3], 18444));
+        let mut addr_st = IbdWorkState::new(
+            vec![dummy_slot(1, teacher), dummy_slot(3, other)],
+            Some(gen),
+            Some(0),
+        );
+        let mut full = AddrMan::new();
+        let rows: Vec<rbitcoin_net::NetAddr> = (0..rbitcoin_ibd::ibd::MAX_PEER_POOL as u32)
+            .map(|i| {
+                let [_, b, c, d] = i.to_be_bytes();
+                rbitcoin_net::NetAddr::Ip(SocketAddr::from(([11, b, c, d], 8333)))
+            })
+            .collect();
+        let teacher_net = rbitcoin_net::NetAddr::Ip(teacher);
+        inject_learned_addrs(&mut full, &rows, local, teacher_net, 1);
+        assert_eq!(full.len(), rbitcoin_ibd::ibd::MAX_PEER_POOL);
+        // Peer 7 has no slot yet and shares the teacher's /16; peer 8 has
+        // no slot and its own group.
+        let pending_teacher = SocketAddr::from(([10, 3, 9, 9], 18444));
+        let pending_other = SocketAddr::from(([10, 4, 0, 1], 18444));
+        for (peer, from, want) in [
+            (1, teacher, false),
+            (7, pending_teacher, false),
+            (3, other, true),
+            (8, pending_other, true),
+        ] {
+            let fresh = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([8, 8, 4, peer as u8], 8333)));
+            let ev = PeerEvent::Addrs {
+                peer,
+                from: rbitcoin_net::NetAddr::Ip(from),
+                addrs: vec![fresh],
+            };
+            apply_peer_event(&mut addr_st, hub, ev, write_next, &mut full, local, None);
+            assert_eq!(full.entry_of(&fresh).is_some(), want, "peer {peer}");
+        }
+    }
+
+    /// A redial installs its slots only after the whole batch returns, but
+    /// a peer's reader runs as soon as its handshake ends. Its gossip still
+    /// reaches the book. Own state: no slot at all.
+    fn addrs_from_a_pending_slot(
+        hub: &rbitcoin_net::chain::ChainHub,
+        gen: BlockHash,
+        local: SocketAddr,
+        write_next: &AtomicU32,
+    ) {
+        let mut pending_st = IbdWorkState::new(vec![], Some(gen), Some(0));
+        let mut empty = AddrMan::new();
+        let fresh = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([8, 8, 4, 9], 8333)));
+        let ev = PeerEvent::Addrs {
+            peer: 9,
+            from: rbitcoin_net::NetAddr::Ip(SocketAddr::from(([10, 5, 0, 1], 18444))),
+            addrs: vec![fresh],
+        };
+        apply_peer_event(
+            &mut pending_st,
+            hub,
+            ev,
+            write_next,
+            &mut empty,
+            local,
+            None,
+        );
+        assert!(empty.entry_of(&fresh).is_some(), "pending peer's gossip");
+        assert_eq!(empty.source_tally(), (1, 1));
+    }
     fn dummy_header(prev: BlockHash, n: u8) -> Header {
         let mut h = Header {
             version: Version::from_consensus(4),
@@ -1067,7 +1145,7 @@ fn apply_peer_event_body_and_control_surface() {
         "notfound hash is below the densify cursor"
     );
 
-    inject_learned_addrs(&mut book, &[], local, 1);
+    inject_learned_addrs(&mut book, &[], local, rbitcoin_net::NetAddr::Ip(local), 1);
     let routable = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
     inject_learned_addrs(
         &mut book,
@@ -1078,6 +1156,7 @@ fn apply_peer_event_body_and_control_surface() {
             rbitcoin_net::NetAddr::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 1)),
         ],
         local,
+        rbitcoin_net::NetAddr::Ip(local),
         1,
     );
     assert!(
@@ -1094,17 +1173,32 @@ fn apply_peer_event_body_and_control_surface() {
         "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
             .parse()
             .unwrap();
-    inject_learned_addrs(&mut book, &[onion], local, 1);
+    inject_learned_addrs(
+        &mut book,
+        &[onion],
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        1,
+    );
     assert!(
         book.entries().iter().all(|e| e.addr != onion),
         "IBD must not store an onion this process cannot dial"
     );
     book.set_onion_reachable(true);
-    inject_learned_addrs(&mut book, &[onion], local, 1);
+    inject_learned_addrs(
+        &mut book,
+        &[onion],
+        local,
+        rbitcoin_net::NetAddr::Ip(local),
+        1,
+    );
     assert!(
         book.entries().iter().any(|e| e.addr == onion),
         "IBD addrv2 onion enters the book once SOCKS is configured"
     );
+
+    addrs_charge_the_sending_slot(&hub, gen, local, &write_next);
+    addrs_from_a_pending_slot(&hub, gen, local, &write_next);
 
     // Dead releases work and reopens its heights for densify.
     st.slots[0].in_flight.insert(h(4));
@@ -1422,6 +1516,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
             8333,
         ))],
         local,
+        rbitcoin_net::NetAddr::Ip(local),
         1,
     );
     assert_eq!(book.len(), n0);
@@ -1437,6 +1532,7 @@ fn apply_peer_event_block_framed_bq_horizon_and_headers_done() {
     ctrl_tx
         .send(PeerEvent::Addrs {
             peer: 1,
+            from: rbitcoin_net::NetAddr::Ip(local),
             addrs: vec![rbitcoin_net::NetAddr::Ip(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
                 8333,
