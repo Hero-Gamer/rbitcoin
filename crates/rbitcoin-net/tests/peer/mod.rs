@@ -2056,11 +2056,16 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
 /// A compact body whose witness commitment does not match is not cached as
 /// an invalid header, and the announcing peer is not the only one asked
 /// for the body.
+///
+/// On the same chain, a `blocktxn` that completes a body failing its
+/// witness commitment is not announced to a high-bandwidth peer. A real
+/// completion still is. That `blocktxn` feeds the extra pool, so the real
+/// `a` then rebuilds without one; the next block is the `blocktxn` control.
 #[tokio::test]
 async fn witness_reconstruct_fail_asks_another_peer() {
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
 
-    let (dir, hub, [a, _]) = compact_spend_pair("cmpct-witness-fail");
+    let (dir, hub, [a, mut b]) = compact_spend_pair("cmpct-witness-fail");
     let mut spend = a.txdata[1].clone();
     spend.input[0].witness = bitcoin::Witness::from_slice(&[vec![1u8]]);
     let block = rbitcoin_consensus::mine_regtest_paying(
@@ -2108,6 +2113,45 @@ async fn witness_reconstruct_fail_asks_another_peer() {
         !hub.already_have_or_asked_block(&hash),
         "the announcing peer's claim is dropped"
     );
+
+    let (good_a, bad_a) = witness_committed_pair(&a);
+    let hash_a = good_a.block_hash();
+    b.header.prev_blockhash = hash_a;
+    let (good_b, _) = witness_committed_pair(&b);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18497);
+
+    cmpct_then_blocktxn(&hub, &peers, 18498, &bad_a).await;
+    assert!(
+        !announced(&sent(&mut target_rx), hash_a),
+        "a blocktxn fill that fails its witness commitment is not announced"
+    );
+    assert_ne!(hub.tip_hash(), Some(hash_a));
+
+    let peer = inbound_test_peer(&peers, 18499);
+    let (tx, _rx) = mpsc::unbounded_channel();
+    peer.attach_out(tx.clone());
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    let hsi = HeaderAndShortIds::from_block(&good_a, 0xbeef, 2, &[]).unwrap();
+    on_cmpctblock(
+        &hub,
+        &tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &CmpctBlock { compact_block: hsi },
+    )
+    .await
+    .unwrap();
+    assert!(sent_cmpct(&sent(&mut target_rx), hash_a));
+    assert_eq!(hub.tip_hash(), Some(hash_a));
+
+    cmpct_then_blocktxn(&hub, &peers, 18500, &good_b).await;
+    assert!(
+        sent_cmpct(&sent(&mut target_rx), good_b.block_hash()),
+        "a real blocktxn fill is announced"
+    );
+    assert_eq!(hub.tip_hash(), Some(good_b.block_hash()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2243,6 +2287,37 @@ async fn witness_mutated_cmpct_reconstruct_is_not_relayed() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Core `NewPoWValidBlock` sends no compact block while segwit is not
+/// active at the block's height. The same block is sent once it is.
+#[tokio::test]
+async fn compact_relay_waits_for_segwit_height() {
+    let (dir, mut hub) = open_genesis_announce("relay-segwit-gate", true);
+    hub.params
+        .apply_test_activation_height("segwit", 2)
+        .unwrap();
+    let block = hb_tip_child(&hub);
+    let hash = block.block_hash();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18501);
+    let from = outbound_test_peer(&peers, 18502);
+
+    relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())).await;
+    assert!(
+        !sent_cmpct(&sent(&mut target_rx), hash),
+        "no compact block before segwit is active at its height"
+    );
+
+    hub.params
+        .apply_test_activation_height("segwit", 1)
+        .unwrap();
+    relay_new_pow_valid_block(&hub, &block, Some(from.as_ref())).await;
+    assert!(
+        sent_cmpct(&sent(&mut target_rx), hash),
+        "the same block is sent once segwit is active at its height"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// `cmpctblock` that waits on one transaction, then the `blocktxn` with it.
 async fn cmpct_then_blocktxn(
     hub: &ChainHub,
@@ -2278,54 +2353,6 @@ async fn cmpct_then_blocktxn(
     on_blocktxn(hub, &tx, &mut follow, Some(peer.as_ref()), &bt)
         .await
         .unwrap();
-}
-
-/// A `blocktxn` that completes a body failing its witness commitment is not
-/// announced. A real completion still is. That `blocktxn` feeds the extra
-/// pool, so the real `a` then rebuilds without one; the next block is the
-/// `blocktxn` control.
-#[tokio::test]
-async fn witness_mutated_blocktxn_fill_is_not_relayed() {
-    let (dir, hub, [a, mut b]) = compact_spend_pair("relay-wit-blocktxn");
-    let (good_a, bad_a) = witness_committed_pair(&a);
-    let hash_a = good_a.block_hash();
-    b.header.prev_blockhash = hash_a;
-    let (good_b, _) = witness_committed_pair(&b);
-    let peers = rbitcoin_net::peers::PeerHub::new();
-    let (_target, mut target_rx) = hb_relay_target(&peers, &hub, 18497);
-
-    cmpct_then_blocktxn(&hub, &peers, 18498, &bad_a).await;
-    assert!(
-        !announced(&sent(&mut target_rx), hash_a),
-        "a blocktxn fill that fails its witness commitment is not announced"
-    );
-    assert_ne!(hub.tip_hash(), Some(hash_a));
-
-    let peer = inbound_test_peer(&peers, 18499);
-    let (tx, _rx) = mpsc::unbounded_channel();
-    peer.attach_out(tx.clone());
-    let mut follow = PeerFollowState::new();
-    follow.cmpct_version = 2;
-    let hsi = HeaderAndShortIds::from_block(&good_a, 0xbeef, 2, &[]).unwrap();
-    on_cmpctblock(
-        &hub,
-        &tx,
-        &mut follow,
-        Some(peer.as_ref()),
-        &CmpctBlock { compact_block: hsi },
-    )
-    .await
-    .unwrap();
-    assert!(sent_cmpct(&sent(&mut target_rx), hash_a));
-    assert_eq!(hub.tip_hash(), Some(hash_a));
-
-    cmpct_then_blocktxn(&hub, &peers, 18500, &good_b).await;
-    assert!(
-        sent_cmpct(&sent(&mut target_rx), good_b.block_hash()),
-        "a real blocktxn fill is announced"
-    );
-    assert_eq!(hub.tip_hash(), Some(good_b.block_hash()));
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A header-path body ask stays with the announcing peer. Another
