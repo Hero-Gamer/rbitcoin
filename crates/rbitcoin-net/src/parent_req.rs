@@ -667,7 +667,7 @@ impl ParentTracker {
 
 /// Upper bound of every index entry at or before `now`.
 fn through(now: u64) -> (u64, [u8; 32], bool) {
-    (now, [0xff; 32], true)
+    (now, [u8::MAX; 32], true)
 }
 
 #[doc(hidden)]
