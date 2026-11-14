@@ -2959,9 +2959,8 @@ fn directory_sync_failure_keeps_a_generation_the_old_commit_names() {
     rbitcoin_store::file::arm_fail_dir_sync_after(2, 1);
     log.commit_open(4, 12288, zeros, |_| Ok(true)).unwrap();
     rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
-    // The next fold is not a wipe: this page stays open. `finish_cooled`
-    // still unlinks generation 1, which the visible commit no longer names.
-    // Restoring the previous commit must keep serving that image.
+    // The next fold is not a wipe: this page stays open. finish_cooled
+    // must not unlink generation 1: the commit directory sync has not succeeded.
     log.note_slots(&[(12288, [5u8, 1, 2, 3, 4, 5, 6, 7])])
         .unwrap();
     log.widen_cool_through();
