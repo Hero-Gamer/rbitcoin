@@ -3096,3 +3096,316 @@ async fn a_later_ask_keeps_the_earlier_block() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Regtest-PoW headers on `parent`, timed after it.
+fn regtest_headers_after(parent: &bitcoin::block::Header, n: u32) -> Vec<bitcoin::block::Header> {
+    let mut out = Vec::with_capacity(n as usize);
+    let mut prev = *parent;
+    for i in 1..=n {
+        let mut header = bitcoin::block::Header {
+            version: bitcoin::block::Version::from_consensus(4),
+            prev_blockhash: prev.block_hash(),
+            merkle_root: bitcoin::TxMerkleNode::from_byte_array([0x70 ^ i as u8; 32]),
+            time: prev.time + 1,
+            bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+            nonce: 0,
+        };
+        rbitcoin_consensus::grind_regtest_pow(&mut header);
+        prev = header;
+        out.push(header);
+    }
+    out
+}
+
+/// A peer's parked headers are scored once per message, not once per item.
+/// Duplicates of one tip, every hash on a chain, a disjoint chain, forks off
+/// a shared prefix, a re-sent chain, a body we already have, and a compact
+/// block under `-minimumchainwork` each cost items plus parked headers. A
+/// header that does not connect reads nothing from the header store.
+#[tokio::test]
+async fn parked_headers_are_walked_once_per_message() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-once");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    let have = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18621, 61, true);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let trunk = regtest_header_chain(BlockHash::from_byte_array([0xab; 32]), 150);
+    let other = regtest_header_chain(BlockHash::from_byte_array([0xcd; 32]), 50);
+    for chain in [&trunk, &other] {
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(chain.clone()),
+        )
+        .await;
+    }
+    let mut forks = Vec::new();
+    let _ = hub.take_stored_header_lookups();
+    for at in (0..trunk.len()).step_by(10) {
+        let fork = regtest_headers_after(&trunk[at], 1);
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(fork.clone()),
+        )
+        .await;
+        forks.extend(fork);
+    }
+    let lookups = hub.take_stored_header_lookups();
+    assert!(
+        lookups <= 4 * forks.len() as u64,
+        "a one-header fork that does not connect is not walked in the store: {lookups} reads"
+    );
+    let parked = follow.pending_headers.len() as u64;
+    assert_eq!(parked, 215, "every chain and fork is parked");
+    assert!(peer.best_known().is_none(), "a parked chain is not best known");
+
+    let mut items = vec![Inventory::Block(trunk[149].block_hash()); 300];
+    for h in trunk.iter().chain(&other).chain(&forks) {
+        items.push(Inventory::WitnessBlock(h.block_hash()));
+    }
+    let _ = hub.take_path_work_steps();
+    on_inv(&hub, &out_tx, &mut follow, Some(peer.as_ref()), &items).unwrap();
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps <= 3 * (items.len() as u64 + parked),
+        "an inv scores each parked header once: {steps} steps for {} items",
+        items.len()
+    );
+    assert!(peer.best_known().is_none());
+
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(trunk.clone()),
+    )
+    .await;
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps <= 3 * (trunk.len() as u64 + parked),
+        "re-sent parked headers score the chain once: {steps} steps"
+    );
+
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Block(have),
+    )
+    .await;
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps <= 4 * parked,
+        "a body we have scores every parked leaf once: {steps} steps"
+    );
+
+    hub.set_minimum_chain_work(Some([0x7f; 32]));
+    follow.send_cmpct = true;
+    follow.cmpct_version = 2;
+    let mut block = orphan_body(BlockHash::from_byte_array([0xef; 32]), 0);
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::CmpctBlock(CmpctBlock {
+            compact_block: hsi,
+        }),
+    )
+    .await;
+    assert!(follow.pending_headers.contains_key(&block.block_hash()));
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps <= 4 * (parked + 1),
+        "under the work floor a compact block scores each parked header once: {steps} steps"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A parked chain that later connects becomes best known through `inv`, and
+/// an indexed lower block does not replace it. Many items naming that chain
+/// score it once.
+#[tokio::test]
+async fn parked_chain_that_connects_becomes_best_known() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-connects");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(2, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let low = hub.query.reconstruct_block_at_height(Height(1)).unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18622, 62, true);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let chain = regtest_headers_after(&tip, 40);
+    let last = chain[39].block_hash();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(chain[1..].to_vec()),
+    )
+    .await;
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::Block(last)],
+    )
+    .unwrap();
+    assert!(
+        peer.best_known().is_none(),
+        "a chain that does not connect is not best known"
+    );
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![chain[0]]),
+    )
+    .await;
+    assert_eq!(peer.best_known(), Some(chain[0].block_hash()));
+    let parked = follow.pending_headers.len() as u64;
+    let mut items = vec![Inventory::Block(last); 200];
+    items.extend(chain.iter().map(|h| Inventory::Block(h.block_hash())));
+    items.push(Inventory::Block(low.block_hash()));
+    let _ = hub.take_path_work_steps();
+    on_inv(&hub, &out_tx, &mut follow, Some(peer.as_ref()), &items).unwrap();
+    let steps = hub.take_path_work_steps();
+    assert_eq!(
+        peer.best_known(),
+        Some(last),
+        "the connected parked tip is best known; a lower indexed block does not replace it"
+    );
+    assert!(
+        steps <= 3 * (items.len() as u64 + parked),
+        "the connected chain is scored once: {steps} steps"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Header-only forks the store holds are outside the pending cap. A memo
+/// keeps a bounded number of their hashes, and scores every leaf above them
+/// as a memo that keeps them all does.
+#[tokio::test]
+async fn path_work_memo_keeps_a_bounded_number_of_stored_headers() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-stored-cap");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18624, 64, true);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let mut pending = std::collections::HashMap::new();
+    let mut leaves = Vec::new();
+    for fork in 0..3u8 {
+        let mut first = regtest_headers_after(&tip, 1)[0];
+        first.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x40 + fork; 32]);
+        first.nonce = 0;
+        rbitcoin_consensus::grind_regtest_pow(&mut first);
+        let mut stored = vec![first];
+        stored.extend(regtest_headers_after(&first, 5));
+        let top = stored[5];
+        push(
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(stored),
+        )
+        .await;
+        assert!(hub.header_of(&top.block_hash()).is_some());
+        assert!(!hub.is_connected(&top.block_hash()));
+        let leaf = regtest_headers_after(&top, 1)[0];
+        pending.insert(leaf.block_hash(), leaf);
+        leaves.push(leaf.block_hash());
+    }
+
+    let mut all = rbitcoin_net::peer::PathWorkMemo::default();
+    let mut capped = rbitcoin_net::peer::PathWorkMemo::with_stored_cap(4);
+    for leaf in &leaves {
+        let work = all.work_of_header_path(&hub, &pending, *leaf);
+        assert!(work.is_some(), "a leaf on a stored fork reaches our chain");
+        assert_eq!(capped.work_of_header_path(&hub, &pending, *leaf), work);
+    }
+    assert_eq!(
+        all.entries(),
+        leaves.len() + 18,
+        "every stored header walked is kept under the default cap"
+    );
+    assert!(
+        capped.entries() <= leaves.len() + 4,
+        "a capped memo keeps the parked leaves and four stored headers: {}",
+        capped.entries()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A connecting batch that needs room in a full pending map scores each
+/// parked fork once, however many leaves share its trunk.
+#[tokio::test]
+async fn full_pending_map_eviction_walks_each_header_once() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("parked-walk-evict");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    let tip = hub.tip_header().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer(&peers, 18623, 63, true);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let trunk = regtest_headers_after(&tip, 100);
+    let trunk_tip = trunk[99];
+    for hdr in &trunk {
+        follow.pending_headers.insert(hdr.block_hash(), *hdr);
+    }
+    let mut leaf = 0u32;
+    while follow.pending_headers.len() < MAX_PENDING_HEADERS {
+        let mut merkle = [0x5au8; 32];
+        merkle[..4].copy_from_slice(&leaf.to_le_bytes());
+        let mut hdr = trunk_tip;
+        hdr.prev_blockhash = trunk_tip.block_hash();
+        hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+        hdr.time = trunk_tip.time + 1;
+        hdr.nonce = 0;
+        rbitcoin_consensus::grind_regtest_pow(&mut hdr);
+        follow.pending_headers.insert(hdr.block_hash(), hdr);
+        leaf += 1;
+    }
+    let mut lighter = trunk[0];
+    lighter.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x33; 32]);
+    rbitcoin_consensus::grind_regtest_pow(&mut lighter);
+    let _ = hub.take_path_work_steps();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(vec![lighter]),
+    )
+    .await;
+    let steps = hub.take_path_work_steps();
+    assert!(
+        steps <= 6 * MAX_PENDING_HEADERS as u64,
+        "eviction walks each parked header a fixed number of times: {steps} steps"
+    );
+    assert!(
+        follow.pending_headers.contains_key(&trunk_tip.block_hash()),
+        "a heavier connected fork is not evicted for a lighter batch"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
