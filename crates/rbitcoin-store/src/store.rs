@@ -749,7 +749,7 @@ impl Store {
 
     /// Txids of `sorted` that `txid.body` holds at a connected fk at or
     /// above `from_fk` ([`Self::head_unsynced_first_fk`], read before the
-    /// head read that missed them). After a power loss the head can miss a
+    /// head read that missed them), each with that fk. After a power loss the head can miss a
     /// connected create there while its synced count still covers it; open
     /// does not see that. `stop` is polled before each chunk: a stopped scan
     /// is `Cancelled`, never a result.
@@ -763,7 +763,7 @@ impl Store {
         from_fk: u64,
         sorted: &[[u8; 32]],
         stop: impl Fn() -> bool,
-    ) -> Result<Vec<[u8; 32]>, StoreError> {
+    ) -> Result<Vec<([u8; 32], Fk)>, StoreError> {
         const CHUNK: u64 = 65_536;
         debug_assert!(sorted.is_sorted(), "binary_search needs a sorted slice");
         let fence = self.height_fence_snapshot();
@@ -777,7 +777,7 @@ impl Store {
             let end = cur.saturating_add(CHUNK - 1).min(last);
             for (fk, txid) in (cur..=end).zip(self.txs.body_txid_range(cur, end)?) {
                 if sorted.binary_search(&txid).is_ok() && fence.height_of(Fk(fk)).is_some() {
-                    out.push(txid);
+                    out.push((txid, Fk(fk)));
                 }
             }
             cur = end + 1;

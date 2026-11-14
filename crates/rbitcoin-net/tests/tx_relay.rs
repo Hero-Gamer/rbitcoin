@@ -2490,7 +2490,9 @@ fn purge_fault_unindexes_txs_that_already_left() {
 /// confirmed and left the pool, tip-mode entry looks it up by txid. While the `tx.head` drain is behind the
 /// fence the purge is a store fault and maintenance stays off for the next
 /// call. After a power loss drops the head's unsynced slot pages, the parent
-/// is still on the connected chain in `txid.body`, and the child stays.
+/// is still on the connected chain in `txid.body`, and the child stays. A
+/// child whose parent's output a block has spent since is dropped: the scan
+/// returns the parent's create, so the spend check still runs.
 #[test]
 fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
     use rbitcoin_consensus::{mine_regtest_paying, ChainParams, Milestone};
@@ -2506,35 +2508,44 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
         },
         parent.output[0].value.to_sat() - 2_000,
     );
+    let spent_parent = spend_true(cbs[1], 1_000, spk.clone());
+    let spent_at = OutPoint {
+        txid: spent_parent.compute_txid(),
+        vout: 0,
+    };
+    let spent_child = spend_vout(spent_at, spent_parent.output[0].value.to_sat() - 2_000);
+    let block_spend = spend_vout(spent_at, spent_parent.output[0].value.to_sat() - 3_000);
     let dir = tmp();
     {
         let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
-        hub.accept_tx(&parent).expect("admit the parent");
-        hub.accept_tx(&child)
-            .expect("admit the child of a pooled parent");
-        // The parent's block strips it from the pool. The child stays.
+        for tx in [&parent, &child, &spent_parent, &spent_child] {
+            hub.accept_tx(tx).expect("admit parents and their children");
+        }
+        // The parents' block strips them from the pool. The children stay.
         let mut g = hub.lock_write();
-        g.remove_live_txids(&[parent.compute_txid()])
-            .expect("strip the confirmed parent");
+        g.remove_live_txids(&[parent.compute_txid(), spent_parent.compute_txid()])
+            .expect("strip the confirmed parents");
         g.flush().expect("persist the pool");
     }
-    let tip_h = q.tip_height().unwrap().0;
-    let rec = q.get_header(q.tip_header_fk().unwrap().unwrap()).unwrap();
-    let block = mine_regtest_paying(
-        bitcoin::BlockHash::from_byte_array(rec.hash),
-        rec.timestamp + 600,
-        tip_h + 1,
-        spk,
-        vec![parent.clone()],
-    );
-    accept_and_connect_block(
-        &q,
-        &ChainParams::regtest(),
-        Height(tip_h + 1),
-        &block,
-        Milestone::NONE,
-    )
-    .expect("confirm the parent");
+    let connect = |q: &Query, txs: Vec<Transaction>| {
+        let tip_h = q.tip_height().unwrap().0;
+        let rec = q.get_header(q.tip_header_fk().unwrap().unwrap()).unwrap();
+        let block = mine_regtest_paying(
+            bitcoin::BlockHash::from_byte_array(rec.hash),
+            rec.timestamp + 600,
+            tip_h + 1,
+            spk.clone(),
+            txs,
+        );
+        accept_and_connect_block(
+            q,
+            &ChainParams::regtest(),
+            Height(tip_h + 1),
+            &block,
+            Milestone::NONE,
+        )
+    };
+    connect(&q, vec![parent.clone(), spent_parent.clone()]).expect("confirm the parents");
     {
         // Every lookup hits, so a lagging drain is no fault. The catch-up
         // cancel is still set at tip-mode entry and must not stop the purge.
@@ -2550,6 +2561,14 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
         drop(g);
         q.head_drain_fk.store(drained, Ordering::Release);
     }
+    // A block spends one parent's output. The pool's conflict strip is the
+    // write the crash lost, so that parent's child is still in the sidecar.
+    connect(&q, vec![block_spend]).expect("a block spends the second parent's output");
+    // The spend is checkpointed before the head pages go. Without that the
+    // reopened store reads the output as unspent.
+    q.store()
+        .checkpoint_observed_spend()
+        .expect("spend checkpoint");
     q.flush().unwrap();
     drop(Arc::into_inner(q).expect("the test holds the only query"));
     rbitcoin_store::testutil::drop_unsynced_tx_head_pages(&store);
@@ -2571,12 +2590,17 @@ fn maintenance_keeps_a_child_whose_confirmed_parent_the_head_lost() {
         "a miss while the head drain is behind the fence is a store fault"
     );
     assert!(hub.contains(&child.compute_txid()) && !hub.pool_maintained());
+    assert!(hub.contains(&spent_child.compute_txid()));
     q.head_drain_fk.store(drained, Ordering::Release);
     q.request_confirm_cancel();
     assert!(hub.begin_pool_maintenance());
     assert!(
         hub.contains(&child.compute_txid()),
         "a parent on the connected chain is not missing because the head lost its row"
+    );
+    assert!(
+        !hub.contains(&spent_child.compute_txid()),
+        "a parent the head lost is still checked for a spent output"
     );
     drop(hub);
     let _ = std::fs::remove_dir_all(&dir);

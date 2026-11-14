@@ -2328,7 +2328,8 @@ impl MempoolHub {
     /// connected create. While its drain is behind the fence the call is a
     /// store fault, and the caller retries. After a power loss the head can
     /// miss a create that `txid.body` still holds on the connected chain;
-    /// that prevout is not reported, as before this check existed.
+    /// that scan returns the create, so the prevout is checked for a spend
+    /// like any other.
     #[doc(hidden)]
     #[allow(clippy::result_unit_err, clippy::type_complexity)] // store fault is (); creates + missing
     pub fn chain_create_fks(
@@ -2404,10 +2405,18 @@ impl MempoolHub {
         // No stop: the query's confirm cancel stays set once catch-up ends,
         // and a stopped scan is not a result. The read is the unsynced head
         // tail of `txid.body`, once, only when a lookup missed.
-        let held = store
+        let held: HashMap<[u8; 32], Fk> = store
             .connected_in_unsynced_head(unsynced_from, &lost, || false)
-            .map_err(|_| ())?;
-        missing.retain(|op| !held.contains(&op.txid.to_byte_array()));
+            .map_err(|_| ())?
+            .into_iter()
+            .collect();
+        missing.retain(|op| match held.get(&op.txid.to_byte_array()) {
+            Some(&fk) => {
+                op_fk.insert(*op, fk);
+                false
+            }
+            None => true,
+        });
         Ok((op_fk, missing))
     }
 
