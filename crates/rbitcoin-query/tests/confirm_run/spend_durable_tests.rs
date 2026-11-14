@@ -1268,7 +1268,7 @@ fn reconnected_block_keeps_its_in_block_spend_across_checkpoints() {
     );
 }
 
-/// The same /// The same sequence with either checkpoint left out keeps the spend.
+/// The same sequence with either checkpoint left out keeps the spend.
 fn assert_in_block_spend_kept(label: &str, before: bool, after: bool) {
     let (spent, res) = in_block_spend_after_reconnect(label, before, after);
     assert!(spent, "{label}: in-block spend lost");

@@ -906,24 +906,27 @@ fn push_same_block_spends_of_archived_bodies(
         .store()
         .tx_spent_range_batch(&parents)
         .map_err(ConfirmError::from)?;
-    let offs = edges
-        .iter()
-        .zip(ranges)
-        .map(|(&(_, vout, _, _), range)| {
-            range
-                .map(|(off, _)| rbitcoin_store::spent_abs(off, vout))
-                .ok_or(ConfirmError::Store(StoreError::Corrupt(
-                    "invariant: same-block spend parent without spent range",
-                )))
-        })
-        .collect::<Result<Vec<u64>, ConfirmError>>()?;
+    let mut abs_slots = Vec::with_capacity(edges.len());
+    for (&(parent, vout, spend_fk, vin), range) in edges.iter().zip(ranges) {
+        let (off, len) = range.ok_or(ConfirmError::Store(StoreError::Corrupt(
+            "invariant: same-block spend parent without spent range",
+        )))?;
+        let abs = rbitcoin_store::spent_abs(off, vout);
+        if abs.saturating_add(rbitcoin_store::OutputRecord::SPENT_SLOT_LEN as u64)
+            > off.saturating_add(len)
+        {
+            return Err(ConfirmError::Store(StoreError::Corrupt(
+                "invariant: same-block spent slot OOB",
+            )));
+        }
+        abs_slots.push((parent, vout, spend_fk, vin, abs));
+    }
+    let offs: Vec<u64> = abs_slots.iter().map(|&(_, _, _, _, abs)| abs).collect();
     let metas = query
         .store()
         .get_spender_meta_at_abs_batch(&offs)
         .map_err(ConfirmError::from)?;
-    for ((parent, vout, spend_fk, vin), (abs, meta)) in
-        edges.into_iter().zip(offs.into_iter().zip(metas))
-    {
+    for ((parent, vout, spend_fk, vin, abs), meta) in abs_slots.into_iter().zip(metas) {
         let known = meta.ok_or(ConfirmError::Store(StoreError::Corrupt(
             "invariant: same-block spent slot past the published body",
         )))?;
