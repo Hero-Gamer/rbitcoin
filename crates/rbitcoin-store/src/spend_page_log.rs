@@ -18,6 +18,7 @@ use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{
     le_u16, le_u32, le_u64, schema_file_openable, SCHEMA_VERSION, STORE_MAGIC,
 };
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -2222,6 +2223,27 @@ fn note_composed_hold(held: usize) {
     let _ = held;
 }
 
+/// One composed page image. It counts toward the composed-hold peak from
+/// compose until it is dropped.
+struct HeldImage<'a> {
+    buf: Vec<u8>,
+    held: &'a Cell<usize>,
+}
+
+impl<'a> HeldImage<'a> {
+    fn new(buf: Vec<u8>, held: &'a Cell<usize>) -> Self {
+        held.set(held.get() + 1);
+        note_composed_hold(held.get());
+        Self { buf, held }
+    }
+}
+
+impl Drop for HeldImage<'_> {
+    fn drop(&mut self) {
+        self.held.set(self.held.get() - 1);
+    }
+}
+
 fn compose_offs(kept: &[(u64, OpenPage)], clears: &[BodyClear]) -> Vec<u64> {
     let mut offs: Vec<u64> = kept.iter().map(|(off, _)| *off).collect();
     offs.extend(clears.iter().map(|clear| clear.page_off));
@@ -2282,17 +2304,21 @@ impl SpendPageLog {
         let clear_at = clears_by_page(clears);
         let kept_at: HashMap<u64, &OpenPage> =
             kept.iter().map(|(off, page)| (*off, page)).collect();
+        let held = Cell::new(0usize);
+        let compose = |read_page: &mut F, page_off: u64| {
+            let buf =
+                self.compose_at(read_page, published, page_off, &kept_at, &stored, &clear_at)?;
+            Ok::<_, StoreError>(buf.map(|buf| HeldImage::new(buf, &held)))
+        };
         let mut offs = compose_offs(kept, clears).into_iter();
-        let mut first: Option<(u64, Vec<u8>)> = None;
+        let mut first: Option<(u64, HeldImage<'_>)> = None;
         for page_off in offs.by_ref() {
-            if let Some(buf) =
-                self.compose_at(read_page, published, page_off, &kept_at, &stored, &clear_at)?
-            {
-                first = Some((page_off, buf));
+            if let Some(image) = compose(read_page, page_off)? {
+                first = Some((page_off, image));
                 break;
             }
         }
-        let Some((first_off, first_buf)) = first else {
+        let Some((first_off, first_image)) = first else {
             return Ok(ComposedFile::empty());
         };
         let pending_offs: Vec<u64> = offs.collect();
@@ -2300,27 +2326,21 @@ impl SpendPageLog {
         let gen_path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
         let mut recs: Vec<PageRec> = Vec::new();
         let mut committed_len = 0u64;
-        let mut held = 0usize;
         let write = write_synced_tmp_file(&gen_path, |f| {
             use std::io::Write;
             let mut write_image =
-                |f: &mut File, page_off: u64, buf: Vec<u8>| -> Result<(), StoreError> {
-                    held += 1;
-                    note_composed_hold(held);
-                    f.write_all(&buf)
+                |f: &mut File, page_off: u64, image: HeldImage<'_>| -> Result<(), StoreError> {
+                    f.write_all(&image.buf)
                         .map_err(|e| StoreError::io(&gen_path, e))?;
-                    let image_len = buf.len() as u32;
+                    let image_len = image.buf.len() as u32;
                     recs.push((page_off, committed_len, image_len));
                     committed_len = committed_len.saturating_add(u64::from(image_len));
-                    held -= 1;
                     Ok(())
                 };
-            write_image(f, first_off, first_buf)?;
+            write_image(f, first_off, first_image)?;
             for page_off in &pending_offs {
-                if let Some(buf) = self.compose_at(
-                    read_page, published, *page_off, &kept_at, &stored, &clear_at,
-                )? {
-                    write_image(f, *page_off, buf)?;
+                if let Some(image) = compose(read_page, *page_off)? {
+                    write_image(f, *page_off, image)?;
                 }
             }
             Ok(())
