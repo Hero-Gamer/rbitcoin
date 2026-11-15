@@ -721,6 +721,13 @@ pub struct ChainHub {
     /// rewalk to the retarget boundary on every header.
     #[cfg(debug_assertions)]
     pub min_diff_walk_steps: AtomicU64,
+    /// Hashes visited by walks over a peer's pending headers. A message
+    /// must not rewalk a parked chain once per item.
+    #[cfg(debug_assertions)]
+    pub path_work_steps: AtomicU64,
+    /// Store reads asking whether a header is stored.
+    #[cfg(debug_assertions)]
+    pub stored_header_lookups: AtomicU64,
 }
 
 /// One `getchaintips` row. Status is a Core-shaped string (`active`,
@@ -867,6 +874,10 @@ impl ChainHub {
             stored_height_walk_steps: AtomicU64::new(0),
             #[cfg(debug_assertions)]
             min_diff_walk_steps: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            path_work_steps: AtomicU64::new(0),
+            #[cfg(debug_assertions)]
+            stored_header_lookups: AtomicU64::new(0),
         }
     }
 
@@ -4774,6 +4785,26 @@ impl ChainHub {
     #[cfg(debug_assertions)]
     pub fn take_min_diff_walk_steps(&self) -> u64 {
         self.min_diff_walk_steps.swap(0, Ordering::Relaxed)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn note_path_work_step(&self) {
+        self.path_work_steps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn take_path_work_steps(&self) -> u64 {
+        self.path_work_steps.swap(0, Ordering::Relaxed)
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn note_stored_header_lookup(&self) {
+        self.stored_header_lookups.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn take_stored_header_lookups(&self) -> u64 {
+        self.stored_header_lookups.swap(0, Ordering::Relaxed)
     }
 
     #[cfg(debug_assertions)]

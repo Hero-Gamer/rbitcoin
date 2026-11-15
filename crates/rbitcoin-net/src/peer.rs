@@ -5005,13 +5005,14 @@ pub fn on_inv(
     let relay = !hub.in_ibd()
         && (hub.mempool().map(|m| m.relay_enabled()).unwrap_or(false)
             || session.is_some_and(|s| s.session_relay_perm()));
+    let mut path_work = PathWorkMemo::default();
     for item in items {
         match item {
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 if let Some(s) = session {
                     s.note_block_from_peer(*h);
                 }
-                note_advanced_best_known(hub, &follow.pending_headers, session, *h);
+                note_advanced_best_known(hub, &mut path_work, &follow.pending_headers, session, *h);
                 if on_inv_block_needs_headers(hub, follow, session, h) {
                     need_headers = true;
                 }
@@ -5286,9 +5287,10 @@ fn evict_pending_for_room(
     if !pending_over_cap(pending, slots) {
         return;
     }
+    let mut memo = PathWorkMemo::default();
     let failed_forks: Vec<BlockHash> = pending_tips(pending)
         .into_iter()
-        .filter(|tip| pending_path_fails_claimed_pow(hub, pending, *tip))
+        .filter(|tip| memo.path_fails_claimed_pow(hub, pending, *tip))
         .collect();
     drop_tips_until_fit(pending, &protected, slots, &failed_forks);
     if !pending_over_cap(pending, slots) {
@@ -5368,30 +5370,6 @@ fn pending_tips(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<Blo
         .copied()
         .filter(|hash| !has_child.contains(hash))
         .collect()
-}
-
-fn pending_path_fails_claimed_pow(
-    hub: &ChainHub,
-    pending: &HashMap<BlockHash, bitcoin::block::Header>,
-    tip: BlockHash,
-) -> bool {
-    let mut hash = tip;
-    for _ in 0..PENDING_WALK_LIMIT {
-        if hub.is_connected(&hash) {
-            return false;
-        }
-        let Some(hdr) = pending.get(&hash).copied().or_else(|| hub.header_of(&hash)) else {
-            return false;
-        };
-        if !hub.header_claimed_pow_ok(&hdr) {
-            return true;
-        }
-        hash = hdr.prev_blockhash;
-        if hash.to_byte_array() == [0u8; 32] {
-            return false;
-        }
-    }
-    false
 }
 
 fn disconnected_pending(
@@ -5541,13 +5519,14 @@ fn evict_forks_with_work(
     }
     let mut keep = protected.clone();
     let mut victims = Vec::new();
+    let mut memo = PathWorkMemo::default();
     for tip in pending_tips(pending) {
-        if pending_path_fails_claimed_pow(hub, pending, tip) {
+        if memo.path_fails_claimed_pow(hub, pending, tip) {
             continue;
         }
-        match work_of_header_path(hub, pending, tip) {
+        match memo.work_of_header_path(hub, pending, tip) {
             Some(work) if work.cmp(&incoming_work) == want => victims.push(tip),
-            _ => keep.extend(pending_ancestors(pending, tip)),
+            _ => add_pending_ancestors(&mut keep, pending, tip),
         }
     }
     drop_tips_until_fit(pending, &keep, incoming, &victims);
@@ -5560,15 +5539,27 @@ fn pending_ancestors(
     start: BlockHash,
 ) -> HashSet<BlockHash> {
     let mut out = HashSet::new();
+    add_pending_ancestors(&mut out, pending, start);
+    out
+}
+
+/// Add `start` and its pending ancestors to `out`. A hash already in `out`
+/// ends the walk: `out` holds whole ancestor chains, so the rest is there.
+fn add_pending_ancestors(
+    out: &mut HashSet<BlockHash>,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    start: BlockHash,
+) {
     let mut h = start;
     for _ in 0..PENDING_WALK_LIMIT {
         let Some(hdr) = pending.get(&h) else {
             break;
         };
-        out.insert(h);
+        if !out.insert(h) {
+            break;
+        }
         h = hdr.prev_blockhash;
     }
-    out
 }
 
 /// The oldest pending ancestor of `hash` (whose parent is not pending),
@@ -5662,7 +5653,12 @@ fn classify_headers(
         let connecting = prev != BlockHash::all_zeros()
             && header_announcement_connects(hub, pending_before, prev);
         apply.answers_getheaders = connecting;
-        let slots = newly_stored_slot_count(hub, &pending, headers);
+        // Only a connecting batch is stored, so only it needs room.
+        let slots = if connecting {
+            newly_stored_slot_count(hub, &pending, headers)
+        } else {
+            0
+        };
         let mut staged_evicts = Vec::new();
         if connecting && pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
             // Claimed proof of work includes the chain pow limit. Evictions
@@ -5838,16 +5834,17 @@ fn hash_meets_work_floor(
 /// greater or equal. Unknown work does not replace a stored header.
 fn best_known_moves_forward(
     hub: &ChainHub,
+    memo: &mut PathWorkMemo,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     current: Option<BlockHash>,
     next: BlockHash,
     remembered_old: Option<bitcoin::Work>,
 ) -> Option<bitcoin::Work> {
-    let next_work = pending_path_work(hub, pending, next)?;
+    let next_work = memo.pending_path_work(hub, pending, next)?;
     let Some(old) = current else {
         return Some(next_work);
     };
-    let old_work = pending_path_work(hub, pending, old).or(remembered_old);
+    let old_work = memo.pending_path_work(hub, pending, old).or(remembered_old);
     match old_work {
         Some(old_work) if next_work >= old_work => Some(next_work),
         Some(_) => None,
@@ -5855,8 +5852,11 @@ fn best_known_moves_forward(
     }
 }
 
+/// `memo` may be shared by the items of one message. The pending map must
+/// not change while it is.
 fn note_advanced_best_known(
     hub: &ChainHub,
+    memo: &mut PathWorkMemo,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -5864,9 +5864,14 @@ fn note_advanced_best_known(
     let Some(s) = session else {
         return;
     };
-    if let Some(work) =
-        best_known_moves_forward(hub, pending, s.best_known(), hash, s.best_known_work())
-    {
+    if let Some(work) = best_known_moves_forward(
+        hub,
+        memo,
+        pending,
+        s.best_known(),
+        hash,
+        s.best_known_work(),
+    ) {
         s.note_best_known_with_work(hash, work);
     }
 }
@@ -5900,8 +5905,9 @@ fn apply_headers(
     for (hash, hdr) in apply.admits {
         admit_pending_header(&mut follow.pending_headers, hash, hdr);
     }
+    let mut path_work = PathWorkMemo::default();
     for hash in apply.best_known {
-        note_advanced_best_known(hub, &follow.pending_headers, session, hash);
+        note_advanced_best_known(hub, &mut path_work, &follow.pending_headers, session, hash);
     }
     if let Some((announced_h, our_tip)) = apply.disconnect {
         rbitcoin_log::info!("p2p: disconnect stale fork tip announced={announced_h} our={our_tip}");
@@ -6116,7 +6122,13 @@ pub async fn on_block(
     if let Some(s) = session {
         s.note_block_from_peer(hash);
     }
-    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
+    note_advanced_best_known(
+        hub,
+        &mut PathWorkMemo::default(),
+        &follow.pending_headers,
+        session,
+        hash,
+    );
     // One frame at a time: the ping behind this body is not read until we
     // return. A duplicate must not take the process-wide tip-accept lane.
     if hub.already_have(hash) {
@@ -6432,7 +6444,13 @@ pub fn on_cmpctblock_reject_early(
     if let Some(s) = session {
         s.note_block_from_peer(hash);
     }
-    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
+    note_advanced_best_known(
+        hub,
+        &mut PathWorkMemo::default(),
+        &follow.pending_headers,
+        session,
+        hash,
+    );
     Ok(false)
 }
 
@@ -7586,33 +7604,292 @@ pub fn pending_path_work(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> Option<bitcoin::Work> {
-    let mut extra: Vec<bitcoin::Work> = Vec::new();
-    let mut h = tip;
-    for _ in 0..PENDING_WALK_LIMIT {
-        if is_genesis_hash(&h) {
-            extra.reverse();
-            return crate::most_work::sum_work(extra.into_iter()).ok();
-        }
-        if hub.tip_hash() == Some(h) {
-            let base = hub.cached_chain_work()?;
-            extra.reverse();
-            return crate::most_work::sum_work(std::iter::once(base).chain(extra)).ok();
-        }
-        let Some(hdr) = pending.get(&h).copied() else {
-            // An indexed ancestor is our chain. Do not walk the header store
-            // to discover a parent this batch did not connect.
-            let height = hub.query.published_height_of_hash(&h.to_byte_array())?;
-            let base = hub.work_through_height(height.0).ok()?;
-            extra.reverse();
-            return crate::most_work::sum_work(std::iter::once(base).chain(extra)).ok();
-        };
-        if !hub.header_claimed_pow_ok(&hdr) {
-            return None;
-        }
-        extra.push(hdr.work());
-        h = hdr.prev_blockhash;
+    PathWorkMemo::default().pending_path_work(hub, pending, tip)
+}
+
+/// One hash on a work walk toward our chain.
+enum WorkStep {
+    /// The walk ends here with this much chain work.
+    Base(bitcoin::Work),
+    Header(bitcoin::block::Header),
+    Dead,
+}
+
+/// Work of header paths, memoised for one message or one pass over the
+/// pending map. Each hash on a shared path is scored once, so a message pays
+/// for its items plus the parked headers, not their product. It does not
+/// see a pending-map change made after a walk: build a new one after the
+/// map changes.
+///
+/// Each map holds at most one entry per parked header, which the pending
+/// cap bounds. A stored header is outside that cap. `header_path` and
+/// `fails_pow` each keep at most `stored_cap` of them and walk the rest
+/// again. They do not share that count: the failure walk must not spend
+/// the slots the work walk caches.
+#[doc(hidden)]
+pub struct PathWorkMemo {
+    pending_path: HashMap<BlockHash, Option<(bitcoin::Work, usize)>>,
+    header_path: HashMap<BlockHash, Option<(bitcoin::Work, usize)>>,
+    fails_pow: HashMap<BlockHash, bool>,
+    header_stored: usize,
+    fails_stored: usize,
+    stored_cap: usize,
+}
+
+impl Default for PathWorkMemo {
+    fn default() -> Self {
+        Self::with_stored_cap(PENDING_WALK_LIMIT)
     }
-    None
+}
+
+/// Whether a walked hash is memoised: a parked header always, a stored one
+/// while the memo is under its cap.
+fn memo_keeps(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    stored_kept: &mut usize,
+    stored_cap: usize,
+    hash: &BlockHash,
+) -> bool {
+    if pending.contains_key(hash) {
+        return true;
+    }
+    if *stored_kept >= stored_cap {
+        return false;
+    }
+    *stored_kept += 1;
+    true
+}
+
+impl PathWorkMemo {
+    pub fn with_stored_cap(stored_cap: usize) -> Self {
+        Self {
+            pending_path: HashMap::new(),
+            header_path: HashMap::new(),
+            fails_pow: HashMap::new(),
+            header_stored: 0,
+            fails_stored: 0,
+            stored_cap,
+        }
+    }
+
+    /// Entries held over the three maps.
+    pub fn entries(&self) -> usize {
+        self.pending_path.len() + self.header_path.len() + self.fails_pow.len()
+    }
+
+    /// Pending headers plus our tip or another indexed block's cached chain
+    /// work. It does not walk parent headers in the store. `None` means the
+    /// walk never reached an indexed block.
+    pub fn pending_path_work(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+    ) -> Option<bitcoin::Work> {
+        let our_tip = hub.tip_hash();
+        memo_path_work(
+            &mut self.pending_path,
+            hub,
+            tip,
+            |h| {
+                if is_genesis_hash(&h) {
+                    return WorkStep::Base(bitcoin::Work::from_be_bytes([0u8; 32]));
+                }
+                if our_tip == Some(h) {
+                    return hub
+                        .cached_chain_work()
+                        .map_or(WorkStep::Dead, WorkStep::Base);
+                }
+                if let Some(hdr) = pending.get(&h) {
+                    return WorkStep::Header(*hdr);
+                }
+                hub.query
+                    .published_height_of_hash(&h.to_byte_array())
+                    .and_then(|height| hub.work_through_height(height.0).ok())
+                    .map_or(WorkStep::Dead, WorkStep::Base)
+            },
+            |_| true,
+        )
+    }
+
+    /// Pending or stored headers down to a connected block.
+    pub fn work_of_header_path(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+    ) -> Option<bitcoin::Work> {
+        let Self {
+            header_path,
+            header_stored,
+            stored_cap,
+            ..
+        } = self;
+        let step = |h: BlockHash| {
+            if hub.is_connected(&h) {
+                return hub
+                    .query
+                    .published_height_of_hash(&h.to_byte_array())
+                    .and_then(|height| hub.work_through_height(height.0).ok())
+                    .map_or(WorkStep::Dead, WorkStep::Base);
+            }
+            let Some(hdr) = pending.get(&h).copied().or_else(|| hub.header_of(&h)) else {
+                return WorkStep::Dead;
+            };
+            if hdr.prev_blockhash != BlockHash::all_zeros() {
+                return WorkStep::Header(hdr);
+            }
+            if hub.header_claimed_pow_ok(&hdr) {
+                WorkStep::Base(hdr.work())
+            } else {
+                WorkStep::Dead
+            }
+        };
+        memo_path_work(header_path, hub, tip, step, |h| {
+            memo_keeps(pending, header_stored, *stored_cap, h)
+        })
+    }
+
+    /// Core: do not download/connect a peer's chain until its best-known work
+    /// meets `-minimumchainwork` (`feature_minchainwork.py`).
+    pub fn header_path_meets_minwork(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+    ) -> bool {
+        let Some(min) = hub.min_chain_work_floor() else {
+            return true;
+        };
+        if hub.meets_minimum_chain_work() {
+            return true;
+        }
+        let Some(work) = self.work_of_header_path(hub, pending, tip) else {
+            return false;
+        };
+        work.to_be_bytes() >= min
+    }
+
+    /// `tip` joins our chain and meets `-minimumchainwork`.
+    fn path_connects(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+    ) -> bool {
+        self.header_path_meets_minwork(hub, pending, tip)
+            && self.work_of_header_path(hub, pending, tip).is_some()
+    }
+
+    /// A header on `tip`'s path fails its claimed proof of work before the
+    /// path reaches a connected block or a header we do not have.
+    #[doc(hidden)]
+    pub fn path_fails_claimed_pow(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+    ) -> bool {
+        let mut path = Vec::new();
+        let mut hash = tip;
+        let fails = loop {
+            if let Some(known) = self.fails_pow.get(&hash) {
+                break *known;
+            }
+            if path.len() >= PENDING_WALK_LIMIT {
+                break false;
+            }
+            #[cfg(debug_assertions)]
+            hub.note_path_work_step();
+            if hub.is_connected(&hash) {
+                break false;
+            }
+            let Some(hdr) = pending.get(&hash).copied().or_else(|| hub.header_of(&hash)) else {
+                break false;
+            };
+            if !hub.header_claimed_pow_ok(&hdr) {
+                break true;
+            }
+            path.push(hash);
+            hash = hdr.prev_blockhash;
+            if hash == BlockHash::all_zeros() {
+                break false;
+            }
+        };
+        // Stored headers passed proof of work, so a failing header is a
+        // pending one and lies within the walk limit of every hash above it.
+        for h in path {
+            if memo_keeps(pending, &mut self.fails_stored, self.stored_cap, &h) {
+                self.fails_pow.insert(h, fails);
+            }
+        }
+        fails
+    }
+
+    /// [`Self::path_connects`] and not weaker than our tip.
+    fn better_path_connects(
+        &mut self,
+        hub: &ChainHub,
+        pending: &HashMap<BlockHash, bitcoin::block::Header>,
+        tip: BlockHash,
+    ) -> bool {
+        let weaker = self
+            .work_of_header_path(hub, pending, tip)
+            .zip(hub.chain_work().ok())
+            .is_some_and(|(announced, ours)| announced < ours);
+        !weaker && self.path_connects(hub, pending, tip)
+    }
+}
+
+/// Walk from `tip` until `step` ends the path or a memoised hash, then score
+/// every new hash on the way back up and memoise the ones `keep` takes.
+/// Claimed proof of work is checked only on a path that reaches a base. A
+/// path of more than `PENDING_WALK_LIMIT - 1` headers has no work.
+fn memo_path_work(
+    known: &mut HashMap<BlockHash, Option<(bitcoin::Work, usize)>>,
+    hub: &ChainHub,
+    tip: BlockHash,
+    mut step: impl FnMut(BlockHash) -> WorkStep,
+    mut keep: impl FnMut(&BlockHash) -> bool,
+) -> Option<bitcoin::Work> {
+    let mut path: Vec<(BlockHash, bitcoin::block::Header)> = Vec::new();
+    let mut h = tip;
+    let mut below = loop {
+        if let Some(scored) = known.get(&h) {
+            break *scored;
+        }
+        #[cfg(debug_assertions)]
+        hub.note_path_work_step();
+        match step(h) {
+            WorkStep::Base(work) => break Some((work, 0)),
+            WorkStep::Dead => break None,
+            WorkStep::Header(_) if path.len() + 1 >= PENDING_WALK_LIMIT => {
+                // Only `tip` is known to be too deep. A lower hash on this
+                // path may still reach a base within its own limit.
+                if keep(&tip) {
+                    known.insert(tip, None);
+                }
+                return None;
+            }
+            WorkStep::Header(hdr) => {
+                path.push((h, hdr));
+                h = hdr.prev_blockhash;
+            }
+        }
+    };
+    for (hash, hdr) in path.into_iter().rev() {
+        below = below.and_then(|(work, depth)| {
+            if depth + 1 >= PENDING_WALK_LIMIT || !hub.header_claimed_pow_ok(&hdr) {
+                return None;
+            }
+            let work = crate::most_work::checked_add_work(work, hdr.work()).ok()?;
+            Some((work, depth + 1))
+        });
+        if keep(&hash) {
+            known.insert(hash, below);
+        }
+    }
+    below.map(|(work, _)| work)
 }
 
 /// Height of a pending path that reaches genesis. No header-store read.
@@ -7721,6 +7998,8 @@ pub fn persist_pending_header_path(
 
 #[doc(hidden)]
 pub fn header_is_stored(hub: &ChainHub, hash: &BlockHash) -> bool {
+    #[cfg(debug_assertions)]
+    hub.note_stored_header_lookup();
     hub.query
         .get_header_by_hash(&hash.to_byte_array())
         .ok()
@@ -7804,24 +8083,14 @@ pub fn header_branch_vs_tip(
     None
 }
 
-/// Core: do not download/connect a peer's chain until its best-known work
-/// meets `-minimumchainwork` (`feature_minchainwork.py`).
+/// See [`PathWorkMemo::header_path_meets_minwork`].
 #[doc(hidden)]
 pub fn header_path_meets_minwork(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> bool {
-    let Some(min) = hub.min_chain_work_floor() else {
-        return true;
-    };
-    if hub.meets_minimum_chain_work() {
-        return true;
-    }
-    let Some(work) = work_of_header_path(hub, pending, tip) else {
-        return false;
-    };
-    work.to_be_bytes() >= min
+    PathWorkMemo::default().header_path_meets_minwork(hub, pending, tip)
 }
 
 #[doc(hidden)]
@@ -7830,12 +8099,13 @@ pub fn any_header_path_meets_minwork(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     extra_tip: BlockHash,
 ) -> bool {
-    if header_path_meets_minwork(hub, pending, extra_tip) {
+    let mut memo = PathWorkMemo::default();
+    if memo.header_path_meets_minwork(hub, pending, extra_tip) {
         return true;
     }
     pending
         .keys()
-        .any(|h| *h != extra_tip && header_path_meets_minwork(hub, pending, *h))
+        .any(|h| *h != extra_tip && memo.header_path_meets_minwork(hub, pending, *h))
 }
 
 #[doc(hidden)]
@@ -7844,27 +8114,7 @@ pub fn work_of_header_path(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> Option<bitcoin::Work> {
-    let mut extra: Vec<bitcoin::Work> = Vec::new();
-    let mut h = tip;
-    for _ in 0..PENDING_WALK_LIMIT {
-        if hub.is_connected(&h) {
-            let height = hub.query.published_height_of_hash(&h.to_byte_array())?.0;
-            let base = hub.work_through_height(height).ok()?;
-            extra.reverse();
-            return crate::most_work::sum_work(std::iter::once(base).chain(extra)).ok();
-        }
-        let hdr = pending.get(&h).copied().or_else(|| hub.header_of(&h))?;
-        if !hub.header_claimed_pow_ok(&hdr) {
-            return None;
-        }
-        extra.push(hdr.work());
-        h = hdr.prev_blockhash;
-        if h.to_byte_array() == [0u8; 32] {
-            extra.reverse();
-            return crate::most_work::sum_work(extra.into_iter()).ok();
-        }
-    }
-    None
+    PathWorkMemo::default().work_of_header_path(hub, pending, tip)
 }
 
 /// Connecting header path from `tip` back to our chain, oldest first.
@@ -7876,16 +8126,25 @@ pub fn connecting_header_path(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> Vec<BlockHash> {
-    if !header_path_meets_minwork(hub, pending, tip) {
+    if !PathWorkMemo::default().path_connects(hub, pending, tip) {
         return Vec::new();
     }
-    if work_of_header_path(hub, pending, tip).is_none() {
-        return Vec::new();
-    }
+    header_path_above(hub, pending, tip, &HashSet::new())
+}
+
+/// Hashes from `tip` down to our chain, oldest first, cut above the first
+/// hash in `given`. Callers put whole connecting paths in `given`, so every
+/// hash under a given one is given too and the cut drops only those.
+fn header_path_above(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+    given: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
     let mut path = Vec::new();
     let mut h = tip;
     for _ in 0..PENDING_WALK_LIMIT {
-        if hub.is_connected(&h) {
+        if hub.is_connected(&h) || given.contains(&h) {
             break;
         }
         path.push(h);
@@ -7905,23 +8164,6 @@ pub fn connecting_header_path(
     path
 }
 
-/// Connecting header path from `tip` back to our chain, oldest first.
-/// Empty when the path is weaker than tip or below `-minimumchainwork`.
-#[doc(hidden)]
-pub fn better_connecting_header_path(
-    hub: &ChainHub,
-    pending: &HashMap<BlockHash, bitcoin::block::Header>,
-    tip: BlockHash,
-) -> Vec<BlockHash> {
-    if matches!(
-        announced_work_cmp(hub, pending, tip),
-        Some(std::cmp::Ordering::Less)
-    ) {
-        return Vec::new();
-    }
-    connecting_header_path(hub, pending, tip)
-}
-
 /// Bodies on `tip`'s connecting header path that we may `getdata`.
 /// Weaker-than-tip and below `-minimumchainwork` stay header-only.
 #[doc(hidden)]
@@ -7932,8 +8174,46 @@ pub fn fetchable_header_path_bodies(
     pending_blocks: &PendingBlocks,
     requested: &HashSet<BlockHash>,
 ) -> Vec<BlockHash> {
-    better_connecting_header_path(hub, pending, tip)
-        .into_iter()
+    if !PathWorkMemo::default().better_path_connects(hub, pending, tip) {
+        return Vec::new();
+    }
+    let path = header_path_above(hub, pending, tip, &HashSet::new());
+    fetchable_bodies(hub, path, pending_blocks, requested)
+}
+
+/// Connecting paths of the pending leaves that `wanted` accepts, oldest
+/// first per leaf, each hash once. One memo scores every leaf.
+fn pending_leaf_paths(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    wanted: impl Fn(
+        &mut PathWorkMemo,
+        &ChainHub,
+        &HashMap<BlockHash, bitcoin::block::Header>,
+        BlockHash,
+    ) -> bool,
+) -> Vec<BlockHash> {
+    let mut memo = PathWorkMemo::default();
+    let mut given = HashSet::new();
+    let mut out = Vec::new();
+    for last in pending_header_leaves(pending) {
+        if !wanted(&mut memo, hub, pending, last) {
+            continue;
+        }
+        let path = header_path_above(hub, pending, last, &given);
+        given.extend(path.iter().copied());
+        out.extend(path);
+    }
+    out
+}
+
+fn fetchable_bodies(
+    hub: &ChainHub,
+    path: Vec<BlockHash>,
+    pending_blocks: &PendingBlocks,
+    requested: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
+    path.into_iter()
         .filter(|h| {
             !pending_blocks.contains_key(h)
                 && !requested.contains(h)
@@ -8143,15 +8423,7 @@ pub fn keep_pending_connecting_paths(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
 ) -> Vec<BlockHash> {
-    let mut keep: Vec<BlockHash> = Vec::new();
-    for last in pending_header_leaves(pending) {
-        for h in connecting_header_path(hub, pending, last) {
-            if !keep.contains(&h) {
-                keep.push(h);
-            }
-        }
-    }
-    keep
+    pending_leaf_paths(hub, pending, PathWorkMemo::path_connects)
 }
 
 #[doc(hidden)]
@@ -8194,20 +8466,8 @@ pub async fn drain_pending(
     }
 
     let keep = keep_pending_connecting_paths(hub, pending_headers);
-    let mut missing: Vec<BlockHash> = Vec::new();
-    for last in pending_header_leaves(pending_headers) {
-        for h in fetchable_header_path_bodies(
-            hub,
-            pending_headers,
-            last,
-            pending_blocks,
-            requested_blocks,
-        ) {
-            if !missing.contains(&h) {
-                missing.push(h);
-            }
-        }
-    }
+    let better = pending_leaf_paths(hub, pending_headers, PathWorkMemo::better_path_connects);
+    let mut missing = fetchable_bodies(hub, better, pending_blocks, requested_blocks);
     release_asks_off_path(hub, requested_blocks, &keep);
     missing.retain(|h| !requested_blocks.contains(h));
     for h in hub.held_missing_parents() {
