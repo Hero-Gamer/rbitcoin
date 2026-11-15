@@ -503,13 +503,17 @@ pub fn apply_peer_event(
                 }
             }
         }
-        PeerEvent::Addrs { peer, addrs } => {
+        PeerEvent::Addrs { peer, from, addrs } => {
+            // The sender's netgroup bounds what it may replace. The event
+            // names the sender: a redial installs its slots only after the
+            // whole batch returns, and the peer's reader is already running.
             let allow = take_addr_tokens(st, peer, addrs.len());
             learn_peer_addrs(
                 hub.query.trust_peer(),
                 peer_book,
                 &addrs[..allow],
                 local_addr,
+                from,
                 peer,
             );
         }
@@ -1190,19 +1194,24 @@ pub fn learn_peer_addrs(
     book: &mut AddrMan,
     addrs: &[rbitcoin_net::NetAddr],
     local_addr: SocketAddr,
+    source: rbitcoin_net::NetAddr,
     from_peer: usize,
 ) {
     if trust_peer {
         return;
     }
-    inject_learned_addrs(book, addrs, local_addr, from_peer);
+    inject_learned_addrs(book, addrs, local_addr, source, from_peer);
 }
 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).
+///
+/// `source` is the peer at `from_peer`; its netgroup bounds how much of a
+/// full book it may replace.
 pub fn inject_learned_addrs(
     book: &mut AddrMan,
     addrs: &[rbitcoin_net::NetAddr],
     local_addr: SocketAddr,
+    source: rbitcoin_net::NetAddr,
     from_peer: usize,
 ) {
     if addrs.is_empty() {
@@ -1217,7 +1226,7 @@ pub fn inject_learned_addrs(
             rbitcoin_net::NetAddr::Ip(s) if s == local_addr => continue,
             _ => {}
         }
-        if book.add_learned_addr(a, MAX_PEER_POOL) {
+        if book.add_learned_addr(a, source, MAX_PEER_POOL) {
             tally_learned_addr(&mut added);
         }
     }

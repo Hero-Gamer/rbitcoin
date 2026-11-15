@@ -2671,7 +2671,13 @@ impl PeerHub {
     ///
     /// Rows for a net this process cannot dial are not stored. Unroutable
     /// clearnet is not stored. Relaying is separate and drops the same rows.
-    pub fn learn_addrv2(&self, list: &[bitcoin::p2p::address::AddrV2Message]) {
+    /// `source` is the sending peer; its netgroup bounds how much of a full
+    /// book it may replace.
+    pub fn learn_addrv2(
+        &self,
+        source: crate::NetAddr,
+        list: &[bitcoin::p2p::address::AddrV2Message],
+    ) {
         let g = self.addrman.lock().unwrap_or_else(|e| e.into_inner());
         let Some(am) = g.as_ref() else {
             return;
@@ -2682,7 +2688,7 @@ impl PeerHub {
                 if crate::netaddr::netaddr_unroutable_gossip(addr) {
                     continue;
                 }
-                book.add_learned_addr(addr, crate::seeds::MAX_ADDR_MAN);
+                book.add_learned_addr(addr, source, crate::seeds::MAX_ADDR_MAN);
             }
         }
     }

@@ -1936,7 +1936,9 @@ fn getaddr_reply_omits_own_addresses() {
     let rbitcoin_net::NetAddr::Onion { pk: wallet_pk, .. } = wallet_onion else {
         unreachable!()
     };
-    peers.learn_addrv2(&[
+    peers.learn_addrv2(
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        &[
         gossip(AddrV2::TorV3(pk), 8333),
         gossip(AddrV2::TorV3(wallet_pk), 8333),
         gossip(AddrV2::I2p([0x11; 32]), 0),

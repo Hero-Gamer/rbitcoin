@@ -34,7 +34,9 @@ fn dial_targets_roundtrip() {
 }
 
 fn learn_overlay(hub: &Arc<PeerHub>, addr: AddrV2, port: u16, time: u32) {
-    hub.learn_addrv2(&[AddrV2Message {
+    hub.learn_addrv2(
+        rbitcoin_net::NetAddr::Ip(SocketAddr::from(([198, 51, 100, 7], 8333))),
+        &[AddrV2Message {
         time,
         services: ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
         addr,

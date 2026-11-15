@@ -77,8 +77,10 @@ pub enum PeerEvent {
         hashes: Vec<BlockHash>,
     },
     /// Addresses learned from `addr` / `addrv2` (for IBD redial pool growth).
+    /// `from` is the peer's endpoint: its slot may not be installed yet.
     Addrs {
         peer: usize,
+        from: rbitcoin_net::NetAddr,
         addrs: Vec<rbitcoin_net::NetAddr>,
     },
     /// Peer failed or closed.
@@ -531,24 +533,34 @@ pub fn relay_notfound(id: usize, sinks: &PeerEventSinks, inv: &[Inventory]) {
 #[doc(hidden)]
 pub fn relay_addr(
     id: usize,
+    from: rbitcoin_net::NetAddr,
     sinks: &PeerEventSinks,
     list: &[(u32, bitcoin::p2p::address::Address)],
 ) {
     let addrs = net_addrs_from_addr(list);
     if !addrs.is_empty() {
-        sinks.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
+        sinks.send_ctrl(PeerEvent::Addrs {
+            peer: id,
+            from,
+            addrs,
+        });
     }
 }
 
 #[doc(hidden)]
 pub fn relay_addrv2(
     id: usize,
+    from: rbitcoin_net::NetAddr,
     sinks: &PeerEventSinks,
     list: &[bitcoin::p2p::address::AddrV2Message],
 ) {
     let addrs = net_addrs_from_addrv2(list);
     if !addrs.is_empty() {
-        sinks.send_ctrl(PeerEvent::Addrs { peer: id, addrs });
+        sinks.send_ctrl(PeerEvent::Addrs {
+            peer: id,
+            from,
+            addrs,
+        });
     }
 }
 
@@ -563,14 +575,15 @@ pub fn relay_blocks_inv(id: usize, sinks: &PeerEventSinks, inv: &[Inventory]) {
 #[doc(hidden)]
 pub fn apply_decoded_message(
     id: usize,
+    from: rbitcoin_net::NetAddr,
     sinks: &PeerEventSinks,
     msg: bitcoin::p2p::message::RawNetworkMessage,
 ) {
     match msg.into_payload() {
         NetworkMessage::Headers(h) => relay_headers(id, sinks, h),
         NetworkMessage::NotFound(inv) => relay_notfound(id, sinks, &inv),
-        NetworkMessage::Addr(list) => relay_addr(id, sinks, &list),
-        NetworkMessage::AddrV2(list) => relay_addrv2(id, sinks, &list),
+        NetworkMessage::Addr(list) => relay_addr(id, from, sinks, &list),
+        NetworkMessage::AddrV2(list) => relay_addrv2(id, from, sinks, &list),
         NetworkMessage::SendAddrV2 => {}
         NetworkMessage::Block(_) => {}
         NetworkMessage::Inv(inv) => relay_blocks_inv(id, sinks, &inv),
@@ -793,6 +806,8 @@ impl IbdPong {
 #[doc(hidden)]
 pub struct IbdReadCtx {
     pub id: usize,
+    /// The peer's endpoint, carried by its address events.
+    pub net: rbitcoin_net::NetAddr,
     pub out_tx: mpsc::UnboundedSender<NetworkMessage>,
     pub sinks: PeerEventSinks,
     pub requested: Arc<Mutex<HashSet<BlockHash>>>,
@@ -824,13 +839,14 @@ pub fn is_eof_or_reset(err: &std::io::Error) -> bool {
 
 pub async fn decode_light_frame(
     id: usize,
+    from: rbitcoin_net::NetAddr,
     sinks: PeerEventSinks,
     frame: FramedMessage,
     permit: OwnedSemaphorePermit,
 ) {
     let _permit = permit;
     match frame.try_decode() {
-        Ok(msg) => apply_decoded_message(id, &sinks, msg),
+        Ok(msg) => apply_decoded_message(id, from, &sinks, msg),
         Err(e) => {
             sinks.send_body(PeerEvent::Dead {
                 peer: id,
@@ -843,10 +859,11 @@ pub async fn decode_light_frame(
 #[doc(hidden)]
 pub fn on_heavy_decoded(
     id: usize,
+    from: rbitcoin_net::NetAddr,
     sinks: &PeerEventSinks,
     msg: bitcoin::p2p::message::RawNetworkMessage,
 ) {
-    apply_decoded_message(id, sinks, msg);
+    apply_decoded_message(id, from, sinks, msg);
 }
 
 #[doc(hidden)]
@@ -950,7 +967,7 @@ impl IbdReadCtx {
             Some(permit) => {
                 let sinks = self.sinks.clone();
                 let id = self.id;
-                let task = tokio::spawn(decode_light_frame(id, sinks, frame, permit));
+                let task = tokio::spawn(decode_light_frame(id, self.net, sinks, frame, permit));
                 self.light.push(task);
                 false
             }
@@ -962,11 +979,12 @@ impl IbdReadCtx {
     #[doc(hidden)]
     pub fn on_heavy(&self, frame: FramedMessage) {
         let id = self.id;
+        let net = self.net;
         let sinks_ok = self.sinks.clone();
         let sinks_err = self.sinks.clone();
         spawn_decode_then_with_err(
             frame,
-            move |msg| on_heavy_decoded(id, &sinks_ok, msg),
+            move |msg| on_heavy_decoded(id, net, &sinks_ok, msg),
             move |err| on_heavy_err(id, &sinks_err, err),
         );
     }
@@ -1015,6 +1033,7 @@ impl IbdReadCtx {
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub async fn read_ibd_peer(
     id: usize,
+    net: rbitcoin_net::NetAddr,
     magic: Magic,
     mut reader: V2Reader,
     out_tx: mpsc::UnboundedSender<NetworkMessage>,
@@ -1032,6 +1051,7 @@ pub async fn read_ibd_peer(
     let requested_progress = Arc::clone(&requested);
     let mut ctx = IbdReadCtx {
         id,
+        net,
         out_tx,
         sinks: sinks_r,
         requested,
@@ -1295,6 +1315,7 @@ pub async fn spawn_peer(
         let sinks_r = sinks.clone();
         let reader_task = tokio::spawn(read_ibd_peer(
             id,
+            addr,
             magic,
             reader,
             out_tx,

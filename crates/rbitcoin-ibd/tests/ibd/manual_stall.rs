@@ -269,6 +269,7 @@ fn reader_of(st: &IbdWorkState, id: usize) -> (IbdReadCtx, mpsc::UnboundedReceiv
     let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel();
     let ctx = IbdReadCtx {
         id,
+        net: slot.net,
         out_tx,
         sinks: PeerEventSinks {
             body: body_tx,

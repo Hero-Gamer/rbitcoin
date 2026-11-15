@@ -338,7 +338,9 @@ pub const PRE_HOLE_MAX_PEERS: usize = 2;
 /// Mainnet DNS seeds already return ~300–400 addrs. 256 refused all getaddr
 /// once the seed book was larger than the cap. [`rbitcoin_net::seeds::MAX_ADDR_MAN`]
 /// holds seeds plus learned addrs; `AddrMan::add_learned` evicts
-/// incompatible/failed then oldest new when full so discovery continues.
+/// incompatible/failed then oldest new when full so discovery continues,
+/// until the sender's netgroup holds its
+/// [`rbitcoin_net::seeds::MAX_ROWS_PER_SOURCE_GROUP`] share.
 /// `--connect` / DNS `AddrMan::add` may briefly exceed the cap when only
 /// tried addrs remain.
 pub const MAX_PEER_POOL: usize = rbitcoin_net::seeds::MAX_ADDR_MAN;
@@ -438,7 +440,10 @@ impl IbdConfig {
 
 /// Local IBD peer book that flushes back into [`IbdConfig::peers`] on drop.
 /// Rows another writer adds to the shared book later (the deferred DNS
-/// seeds) are pulled in before each redial and kept by the flush.
+/// seeds) are pulled in before each redial and kept by the flush, except an
+/// untried row a full book refuses from a source group at its share. Both
+/// copies keep each row's source group
+/// ([`rbitcoin_net::seeds::AddrMan::copy_row_from`]).
 #[doc(hidden)]
 pub struct PeerBookSession {
     pub book: rbitcoin_net::seeds::AddrMan,
@@ -484,7 +489,7 @@ impl PeerBookSession {
         let shared = s.lock().unwrap_or_else(|e| e.into_inner());
         for e in shared.entries() {
             if self.seen.insert(e.addr) {
-                self.book.add_with_flags_addr(e.addr, e.flags);
+                self.book.copy_row_from(&shared, e.addr);
             }
         }
     }
@@ -496,7 +501,7 @@ impl PeerBookSession {
                 let mut book = self.book.clone();
                 for e in g.entries() {
                     if !self.seen.contains(&e.addr) {
-                        book.add_with_flags_addr(e.addr, e.flags);
+                        book.copy_row_from(&g, e.addr);
                     }
                 }
                 *g = book;

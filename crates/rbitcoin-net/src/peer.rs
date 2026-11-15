@@ -4355,7 +4355,7 @@ fn learn_addrfetch_reply(
         // Node time, as the bucket's start (`connected_at`) is.
         let now_ms = s.clock_now().saturating_mul(1000);
         let allow = s.take_addr_tokens(list.len(), now_ms);
-        ph.learn_addrv2(&list[..allow]);
+        ph.learn_addrv2(s.net, &list[..allow]);
         if n > 1 {
             ph.note_addrfetch_reply();
         }
@@ -4390,7 +4390,7 @@ pub fn on_addrv2(
             // Node time, as the bucket's start (`connected_at`) is.
             let now_ms = s.clock_now().saturating_mul(1000);
             let allow = s.take_addr_tokens(list.len(), now_ms);
-            ph.learn_addrv2(&list[..allow]);
+            ph.learn_addrv2(s.net, &list[..allow]);
             let mut neighbors: Vec<_> = ph
                 .live_peers()
                 .into_iter()
