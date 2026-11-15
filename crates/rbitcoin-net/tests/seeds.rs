@@ -589,6 +589,31 @@ fn many_sources_in_one_group_share_one_bound() {
     assert_eq!(honest_rows(&am), BOOK - MAX_ROWS_PER_SOURCE_GROUP);
 }
 
+/// An inbound peer accepted on a dual-stack `[::]` listener arrives as
+/// `::ffff:a.b.c.d`. It is charged to the /16 of `a.b`: two such peers in
+/// different /16s do not share one group, and a mapped peer shares its
+/// group with the same /16 seen natively.
+#[test]
+fn a_mapped_ipv4_source_is_charged_to_its_slash16() {
+    let mapped = |a: u8, b: u8| {
+        SocketAddr::from((std::net::Ipv4Addr::new(a, b, 0, 1).to_ipv6_mapped(), 8333))
+    };
+    let mut am = full_honest_book();
+    assert_eq!(
+        flood(&mut am, 0, |_| mapped(44, 1)),
+        MAX_ROWS_PER_SOURCE_GROUP
+    );
+    assert!(
+        am.add_learned(attacker_addr(9 * BOOK as u32), mapped(45, 9), BOOK),
+        "a mapped peer in another /16 has its own share"
+    );
+    let native = SocketAddr::from(([44, 1, 0, 2], 8333));
+    assert!(
+        !am.add_learned(attacker_addr(9 * BOOK as u32 + 1), native, BOOK),
+        "the same /16 seen natively is at its share"
+    );
+}
+
 #[test]
 fn one_peer_fills_an_empty_book() {
     // A seed or addr-fetch reply, and a fresh node's first peers, may fill
