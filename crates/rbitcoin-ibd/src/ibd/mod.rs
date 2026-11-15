@@ -730,7 +730,7 @@ pub async fn ibd_cancellable(
             peer_sess.book(),
             initial_dial_n,
             tried.clone(),
-            &[],
+            &alive_dial_addrs(&[], perms.as_deref()),
             false,
             magic,
             local_addr,
@@ -1171,6 +1171,7 @@ pub async fn ibd_cancellable(
                     &mut st.addr_strikes,
                     now,
                     peer_sess.book(),
+                    st.perms.as_deref(),
                     &mut st.relative_slow_suspect,
                     &mut st.relative_slow_last_kick_ms,
                 ));
@@ -1268,7 +1269,7 @@ pub async fn ibd_cancellable(
                 peer_sess.pull_shared();
                 let want = redial_want(alive_n, target);
                 let mut already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
-                let occupied = alive_dial_addrs(&st.slots);
+                let occupied = alive_dial_addrs(&st.slots, st.perms.as_deref());
                 let live: HashSet<_> = st.slots.iter().map(|s| s.net).collect();
                 let overlay_live = st
                     .slots

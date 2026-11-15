@@ -173,7 +173,7 @@ pub fn protect_by_netgroup(cands: &mut Vec<InboundEvictCandidate>, k: usize) {
     cands.retain(|c| !protect_ids.contains(&c.id));
 }
 
-/// Stable netgroup key for eviction (IPv4 `/16`, IPv6 `/32`; no asmap).
+/// Stable netgroup key for eviction: [`crate::netgroup::netgroup`] without asmap.
 pub fn eviction_netgroup(addr: std::net::SocketAddr) -> u64 {
     crate::netgroup::netgroup(addr, None)
 }

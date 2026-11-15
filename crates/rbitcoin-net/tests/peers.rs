@@ -1767,6 +1767,31 @@ fn try_evict_inbound_disconnects_one_peer() {
     );
 }
 
+/// Thirty CJDNS inbound peers share one four-bit eviction group and sit in
+/// thirty `/32`s. The pause after a slot eviction refuses the evicted
+/// peer's `/32` only, not the sixteenth of CJDNS its group covers.
+#[test]
+fn slot_eviction_pauses_a_cjdns_slash32_not_its_group() {
+    use std::net::Ipv6Addr;
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let cjdns = |net: u16, host: u16| {
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfc10, net, 0, 0, 0, 0, 0, host)),
+            8333,
+        )
+    };
+    for net in 1..=30u16 {
+        hub.register_connecting(cjdns(net, 1), bind, true, PeerConnType::Inbound);
+    }
+    assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
+    let paused = (1..=30u16)
+        .filter(|net| hub.inbound_discouraged(cjdns(*net, 2)))
+        .count();
+    assert_eq!(paused, 1, "only the evicted peer's /32 waits");
+    assert!(!hub.inbound_discouraged(cjdns(0xffff, 1)));
+}
+
 #[test]
 fn tx_relay_room_ignores_outbound_and_non_relay() {
     let hub = PeerHub::new();

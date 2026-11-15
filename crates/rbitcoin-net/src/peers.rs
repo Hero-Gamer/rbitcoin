@@ -3148,7 +3148,7 @@ impl PeerHub {
         if self.key_refused(DiscourageKey::Ip(addr.ip())) {
             return true;
         }
-        let group = crate::eviction::eviction_netgroup(addr);
+        let group = crate::netgroup::slot_pause_group(addr);
         self.discouraged_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4328,6 +4328,29 @@ impl PeerHub {
             .collect()
     }
 
+    /// Nets whose netgroup an automatic outbound dial may not share, as
+    /// Core's `outbound_ipv46_peer_netgroups`: live outbound full-relay,
+    /// block-relay, and manual sessions, and in-flight dials. Inbound,
+    /// addr-fetch, and feeler sessions take no group: an attacker can open
+    /// inbound connections for free.
+    pub fn outbound_group_nets(&self) -> Vec<crate::NetAddr> {
+        let mut nets: Vec<crate::NetAddr> = self
+            .live_peers()
+            .into_iter()
+            .filter(|p| {
+                matches!(
+                    p.conn_type,
+                    PeerConnType::OutboundFullRelay
+                        | PeerConnType::BlockRelay
+                        | PeerConnType::Manual
+                )
+            })
+            .map(|p| p.net)
+            .collect();
+        nets.extend(self.in_flight_nets());
+        nets
+    }
+
     /// Overlay identity of live outbound full-relay peers (exclude for redial).
     pub fn live_outbound_full_relay_nets(&self) -> Vec<crate::NetAddr> {
         let mut rows: Vec<(u64, crate::NetAddr)> = self
@@ -4406,7 +4429,7 @@ impl PeerHub {
             return false;
         };
         if let Some(p) = self.get(id) {
-            self.note_slot_evict(p.netgroup());
+            self.note_slot_evict(crate::netgroup::slot_pause_group(p.addr));
         }
         rbitcoin_log::info!("p2p: evict inbound peer={id} ({why})");
         self.disconnect_id(id)

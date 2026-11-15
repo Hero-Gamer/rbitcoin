@@ -19,7 +19,7 @@ use tokio::sync::Notify;
 
 use crate::asmap::AsMap;
 use crate::netaddr::{parse_net_addr, strip_i2p_suffix, strip_onion_suffix, NetAddr, OnlyNet};
-use crate::netgroup::{netgroup, select_diverse};
+use crate::netgroup::{outbound_group, select_diverse};
 
 #[doc(hidden)]
 pub fn net_addr_unspecified(addr: NetAddr) -> bool {
@@ -493,7 +493,9 @@ impl AddrMan {
     /// `overlay_live` says an outbound onion or I2P peer is already live. A
     /// batch of two or more always keeps one slot for an eligible overlay row.
     /// A one-peer batch takes that slot only when `overlay_live` is false, so
-    /// a lost onion peer is replaced by the next single redial.
+    /// a lost onion peer is replaced by the next single redial. Onion and I2P
+    /// rows take no netgroup: Core's one-outbound-per-group rule leaves those
+    /// networks out.
     pub fn take_dial_candidates_net(
         &self,
         max: usize,
@@ -506,11 +508,11 @@ impl AddrMan {
             .copied()
             .filter_map(NetAddr::socket_addr)
             .collect();
-        let ip: Vec<NetAddr> = self
-            .take_dial_candidates(max, &ip_ex, occupied)
-            .into_iter()
-            .map(NetAddr::from_socket)
-            .collect();
+        // `ip_paced`: every eligible IP row was tried recently, so `ip` is
+        // the one paced redial. Overlay rows must not take the slots the
+        // other IP rows are due on later passes: this pass adds one at most.
+        let (ip, ip_paced) = self.pick_dial_candidates(max, &ip_ex, occupied);
+        let ip: Vec<NetAddr> = ip.into_iter().map(NetAddr::from_socket).collect();
         let now = Instant::now();
         let mut overlay: Vec<(u8, NetAddr)> = self
             .order
@@ -551,8 +553,13 @@ impl AddrMan {
         if overlay_fresh && out.len() >= max && (max >= 2 || !overlay_live) {
             out.pop();
         }
+        let room = if ip_paced {
+            max.min(out.len() + 1)
+        } else {
+            max
+        };
         for (_, a) in overlay {
-            if out.len() >= max {
+            if out.len() >= room {
                 break;
             }
             if !out.contains(&a) {
@@ -885,20 +892,38 @@ impl AddrMan {
     /// book does not burn outbound slots on known-v1. If every remaining addr
     /// is incompatible, those are returned as last-resort.
     ///
-    /// [`select_diverse`] runs **per tier**: unused netgroups of `occupied`
-    /// (live peers) first, then fill. An occupied-group tier-0 addr always
-    /// beats an unused-group last-resort addr.
+    /// [`select_diverse`] runs **per tier** and is strict, as Core's
+    /// automatic outbound is: no pick shares a netgroup with `occupied` or
+    /// with another pick, so a book that spans fewer groups than `max`
+    /// returns fewer than `max`. `occupied` is the live outbound peers whose
+    /// groups are taken (Core counts full-relay, block-relay and manual,
+    /// never inbound). Tor, I2P, CJDNS and unroutable rows are exempt
+    /// ([`outbound_group`]).
     ///
     /// Addrs attempted within [`DIAL_ATTEMPT_RECENT`] are omitted while any
-    /// other candidate remains.
+    /// other candidate remains; when none remains, only the one attempted
+    /// longest ago is returned. Rows in an `occupied` group are dropped
+    /// first, so neither fallback waits on a row the rule will not dial.
     pub fn take_dial_candidates(
         &self,
         max: usize,
         exclude: &HashSet<SocketAddr>,
         occupied: &[SocketAddr],
     ) -> Vec<SocketAddr> {
+        self.pick_dial_candidates(max, exclude, occupied).0
+    }
+
+    /// [`Self::take_dial_candidates`], and whether the pick is the paced
+    /// redial of a recently attempted row. The caller gets the decision, not
+    /// a second reading of the clock.
+    fn pick_dial_candidates(
+        &self,
+        max: usize,
+        exclude: &HashSet<SocketAddr>,
+        occupied: &[SocketAddr],
+    ) -> (Vec<SocketAddr>, bool) {
         if max == 0 || self.order.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let mut ranked: Vec<(u8, bool, bool, SocketAddr)> = self
             .order
@@ -916,20 +941,35 @@ impl AddrMan {
                 Some((f.dial_tier(), sock.is_ipv6(), f.is_incompatible(), sock))
             })
             .collect();
+        let asmap = self.asmap.as_deref();
+        let mut occupied_groups: HashSet<u64> = occupied
+            .iter()
+            .filter_map(|a| outbound_group(*a, asmap))
+            .collect();
+        // The rule never dials these, so they must not suppress a fallback.
+        ranked.retain(|(_, _, _, a)| {
+            outbound_group(*a, asmap).is_none_or(|g| !occupied_groups.contains(&g))
+        });
         ranked.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
         if ranked.iter().any(|(_, _, incompat, _)| !*incompat) {
             ranked.retain(|(_, _, incompat, _)| !*incompat);
         }
         let now = Instant::now();
-        if ranked
-            .iter()
-            .any(|(_, _, _, a)| !self.recently_attempted(*a, now))
-        {
+        let paced = !ranked.is_empty()
+            && ranked
+                .iter()
+                .all(|(_, _, _, a)| self.recently_attempted(*a, now));
+        if !paced {
             ranked.retain(|(_, _, _, a)| !self.recently_attempted(*a, now));
+        } else {
+            // Every row was attempted recently: dial only the one tried
+            // longest ago, so a refill pass does not redial each dead row.
+            let oldest = ranked
+                .iter()
+                .min_by_key(|(_, _, _, a)| self.last_attempt_of(NetAddr::from_socket(*a)))
+                .copied();
+            ranked = oldest.into_iter().collect();
         }
-        let asmap = self.asmap.as_deref();
-        let mut occupied_groups: HashSet<u64> =
-            occupied.iter().map(|a| netgroup(*a, asmap)).collect();
         let mut out = Vec::new();
         for tier in 0u8..=2 {
             if out.len() >= max {
@@ -944,13 +984,12 @@ impl AddrMan {
                 continue;
             }
             let need = max - out.len();
-            let picked = select_diverse(&slice, need, &occupied_groups, |a| netgroup(a, asmap));
-            for &a in &picked {
-                occupied_groups.insert(netgroup(a, asmap));
-            }
+            let picked =
+                select_diverse(&slice, need, &occupied_groups, |a| outbound_group(a, asmap));
+            occupied_groups.extend(picked.iter().filter_map(|a| outbound_group(*a, asmap)));
             out.extend(picked);
         }
-        out
+        (out, paced)
     }
 
     /// Round-robin-ish: take up to `max` peers starting at `offset`.

@@ -2265,6 +2265,113 @@ fn refill_skips_an_address_that_is_already_live() {
     );
 }
 
+fn version_for(addr: SocketAddr) -> bitcoin::p2p::message_network::VersionMessage {
+    bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&addr, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    }
+}
+
+/// Eclipse F2: a book whose rows sit in two /16s filled all sixteen
+/// outbound slots with them. Core opens one automatic outbound per /16 and
+/// leaves the other slots empty.
+#[test]
+fn refill_opens_one_outbound_per_slash16() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let mut rows = Vec::new();
+    for host in 1..=8u8 {
+        rows.push(SocketAddr::from(([44, 1, 0, host], 18444)));
+        rows.push(SocketAddr::from(([44, 2, 0, host], 18444)));
+    }
+    let shared = book_of(&rows);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 16);
+    // Hold the requests: each keeps its dial in flight until dropped.
+    let held: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    let dialed: Vec<String> = held.iter().map(|r| r.target.to_string()).collect();
+    assert_eq!(dialed, vec![rows[0].to_string(), rows[1].to_string()]);
+    // An in-flight dial holds its /16: the next pass adds none.
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 16);
+    assert!(dial_sockets(&mut rx).is_empty());
+    drop(held);
+}
+
+/// Core counts manual, full-relay and block-relay peers toward the group
+/// rule, and not inbound peers, which anyone can open.
+#[test]
+fn refill_group_is_held_by_manual_not_inbound() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let inbound: SocketAddr = "45.1.0.1:18444".parse().unwrap();
+    let manual: SocketAddr = "45.2.0.1:18444".parse().unwrap();
+    let _in = peers.register(
+        inbound,
+        inbound,
+        &version_for(inbound),
+        true,
+        PeerConnType::Inbound,
+    );
+    let _manual = peers.register(
+        manual,
+        manual,
+        &version_for(manual),
+        false,
+        PeerConnType::Manual,
+    );
+    let beside_inbound: SocketAddr = "45.1.0.2:18444".parse().unwrap();
+    let beside_manual: SocketAddr = "45.2.0.2:18444".parse().unwrap();
+    let shared = book_of(&[beside_manual, beside_inbound]);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 4);
+    assert_eq!(dial_sockets(&mut rx), vec![beside_inbound]);
+}
+
+/// The stale-tip replacement is an automatic outbound too: it never shares a
+/// /16 with a live outbound peer, the evicted one included (Core opens its
+/// extra outbound while every peer is still connected).
+#[test]
+fn stale_rotation_replacement_skips_occupied_groups() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let a: SocketAddr = "45.1.0.1:8333".parse().unwrap();
+    let b: SocketAddr = "45.2.0.1:8333".parse().unwrap();
+    let evicted = peers.register(
+        a,
+        a,
+        &version_for(a),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let _b = peers.register(
+        b,
+        b,
+        &version_for(b),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let shared = book_of(&[
+        "45.2.0.2:8333".parse().unwrap(),
+        "45.1.0.2:8333".parse().unwrap(),
+    ]);
+    assert!(
+        stale_follow_replacement(&peers, &shared, evicted.id).is_empty(),
+        "every book row shares a /16 with a live outbound peer"
+    );
+    let free: SocketAddr = "45.3.0.1:8333".parse().unwrap();
+    shared.lock().unwrap().add(free);
+    assert_eq!(
+        stale_follow_replacement(&peers, &shared, evicted.id),
+        vec![rbitcoin_net::NetAddr::Ip(free)]
+    );
+}
+
 fn onion_book(
     clearnet: &[SocketAddr],
     onion: rbitcoin_net::NetAddr,

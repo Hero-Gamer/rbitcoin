@@ -6,6 +6,7 @@ use rbitcoin_ibd::ibd::peer_io::solicit_track;
 use rbitcoin_ibd::ibd::peer_io::{ibd_mono_ms, PeerEventSinks, PeerSlot};
 use rbitcoin_ibd::ibd::rate::RELSLOW_ACTIVE_MS;
 use rbitcoin_net::error::NetError;
+use rbitcoin_net::peers::{PeerConnType, PeerHub};
 use rbitcoin_net::seeds::AddrMan;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -315,7 +316,7 @@ fn cooldown_selection_and_successful_redial_preserve_network_identity() {
         let mut strikes = HashMap::new();
         record_stall_kick(&mut cooldown, &mut strikes, a, now);
         let mut exclude = dial_blocked_addrs(&[], &cooldown, now);
-        assert!(replacement_available(&book, &[], &cooldown, now));
+        assert!(replacement_available(&book, &[], None, &cooldown, now));
         assert_eq!(
             admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new()),
             None
@@ -323,7 +324,7 @@ fn cooldown_selection_and_successful_redial_preserve_network_identity() {
         assert!(exclude.contains(&a));
         book.note_attempt_addr(a);
         record_stall_kick(&mut cooldown, &mut strikes, b, now);
-        assert!(!replacement_available(&book, &[], &cooldown, now));
+        assert!(!replacement_available(&book, &[], None, &cooldown, now));
         exclude = dial_blocked_addrs(&[], &cooldown, now);
         assert_eq!(
             admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new()),
@@ -367,6 +368,7 @@ fn cooldown_selection_and_successful_redial_preserve_network_identity() {
         assert!(replacement_available(
             &book,
             &[],
+            None,
             &cooldown,
             now + STALL_ADDR_COOLDOWN
         ));
@@ -424,6 +426,7 @@ fn onion_relative_slow_eviction_requires_an_uncooled_replacement() {
         &mut strikes,
         now,
         &book,
+        None,
         &mut suspect,
         &mut last_kick,
         warm
@@ -442,6 +445,7 @@ fn onion_relative_slow_eviction_requires_an_uncooled_replacement() {
             &mut strikes,
             later,
             &book,
+            None,
             &mut suspect,
             &mut last_kick,
             mono,
@@ -941,6 +945,115 @@ fn release_peer_block_work_returns_hashes_left_unrequested() {
     assert!(inflight.contains_key(&shared));
 }
 
+fn routable(a: u8, b: u8, host: u8) -> rbitcoin_net::NetAddr {
+    rbitcoin_net::NetAddr::from_socket(SocketAddr::from(([a, b, 0, host], 8333)))
+}
+
+/// `--connect` targets are manual: Core holds them to no netgroup rule, so
+/// two in one /16 are both dialled. The book's automatic picks still take
+/// one per /16 and skip the /16s those targets hold. The batch is cancelled
+/// before any connect, so nothing is dialled; `attempted` is the pick.
+#[test]
+fn dial_batch_exempts_connect_targets_from_the_group_rule() {
+    let pinned = [routable(45, 1, 1), routable(45, 1, 2)];
+    let mut book = AddrMan::new();
+    for a in [
+        pinned[0],
+        routable(45, 1, 3),
+        pinned[1],
+        routable(45, 2, 1),
+        routable(45, 2, 2),
+    ] {
+        book.add_addr(a);
+    }
+    let (body_tx, _body_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (ctrl_tx, _ctrl_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sinks = PeerEventSinks {
+        body: body_tx,
+        ctrl: ctrl_tx,
+        header_fks: rbitcoin_ibd::ibd::peer_io::empty_header_fk_bus(),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let r = rt.block_on(dial_batch(
+        &book,
+        8,
+        HashSet::new(),
+        &[],
+        false,
+        Magic::REGTEST,
+        addr(1),
+        Some(0),
+        sinks,
+        Duration::from_millis(50),
+        Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        rbitcoin_net::socks::Dialer::Direct,
+        &rbitcoin_consensus::NodeClock::new(),
+        None,
+        &pinned,
+    ));
+    assert!(r.slots.is_empty() && r.failed.is_empty());
+    assert_eq!(r.attempted, vec![pinned[0], pinned[1], routable(45, 2, 1)]);
+}
+
+/// A relative-slow kick needs a replacement the redial will dial: a free
+/// address in a /16 a live peer holds is not one.
+#[test]
+fn replacement_must_sit_in_a_free_group() {
+    let now = Instant::now();
+    let live = routable(45, 1, 1);
+    let mut slot = dummy_slot(1, live.socket_addr().unwrap(), true);
+    slot.net = live;
+    let slots = [slot];
+    let mut book = AddrMan::new();
+    book.add_addr(routable(45, 1, 2));
+    assert!(!replacement_available(
+        &book,
+        &slots,
+        None,
+        &HashMap::new(),
+        now
+    ));
+    book.add_addr(routable(45, 2, 1));
+    assert!(replacement_available(
+        &book,
+        &slots,
+        None,
+        &HashMap::new(),
+        now
+    ));
+}
+
+/// The cooling fallback admits only an address the redial will dial.
+#[test]
+fn cooldown_fallback_skips_an_occupied_group() {
+    let now = Instant::now();
+    let cooling = routable(45, 1, 2);
+    let mut book = AddrMan::new();
+    book.add_addr(cooling);
+    let cooldown = HashMap::from([(cooling, now + Duration::from_secs(60))]);
+    let occupied = [routable(45, 1, 1).socket_addr().unwrap()];
+    let mut exclude = dial_blocked_addrs(&[], &cooldown, now);
+    assert_eq!(
+        admit_cooldown_fallback(
+            &book,
+            &mut exclude,
+            &occupied,
+            &cooldown,
+            now,
+            &HashSet::new()
+        ),
+        None
+    );
+    assert!(exclude.contains(&cooling));
+    assert_eq!(
+        admit_cooldown_fallback(&book, &mut exclude, &[], &cooldown, now, &HashSet::new()),
+        Some(cooling)
+    );
+}
+
 #[test]
 fn dial_batch_empty_count_or_book() {
     let book = AddrMan::new();
@@ -1045,7 +1158,135 @@ fn alive_dial_addrs_skips_dead() {
     let a = addr(1);
     let b = addr(2);
     let slots = vec![dummy_slot(1, a, true), dummy_slot(2, b, false)];
-    assert_eq!(alive_dial_addrs(&slots), vec![a]);
+    assert_eq!(alive_dial_addrs(&slots, None), vec![a]);
+}
+
+/// Core counts manual peers before it picks automatic ones. An `addnode`
+/// session made during IBD lives in the PeerHub, not in IBD's slots, and
+/// still holds its /16, so the redial does not pick 45.1.0.2. An inbound
+/// session holds no group.
+#[test]
+fn alive_dial_addrs_counts_hub_outbound_sessions() {
+    let hub = PeerHub::new();
+    let manual = SocketAddr::from(([45, 1, 0, 1], 8333));
+    let _manual = hub_peer(&hub, [45, 1, 0, 1], false, PeerConnType::Manual);
+    let _inbound = hub_peer(&hub, [46, 1, 0, 1], true, PeerConnType::Inbound);
+    let slot = addr(1);
+    let slots = vec![dummy_slot(1, slot, true)];
+    let occupied = alive_dial_addrs(&slots, Some(&hub));
+    assert_eq!(occupied, vec![slot, manual]);
+
+    let mut book = AddrMan::new();
+    book.add_addr(routable(45, 1, 2));
+    book.add_addr(routable(46, 1, 2));
+    assert_eq!(
+        book.take_dial_candidates_net(2, &HashSet::new(), &occupied, false),
+        vec![routable(46, 1, 2)]
+    );
+}
+
+/// The relative-slow kick counts groups as the redial does. With an
+/// `addnode` peer at 45.1.0.1 and the only spare row at 45.1.0.2, the
+/// redial dials nothing, so the slow peer stays. A row in a free /16 lets
+/// the kick through.
+#[test]
+fn relative_slow_replacement_counts_hub_outbound_sessions() {
+    let hub = PeerHub::new();
+    let _manual = hub_peer(&hub, [45, 1, 0, 1], false, PeerConnType::Manual);
+    let now = Instant::now();
+    let mut book = AddrMan::new();
+    book.add_addr(routable(45, 1, 2));
+    assert!(replacement_available(
+        &book,
+        &[],
+        None,
+        &HashMap::new(),
+        now
+    ));
+    assert!(!replacement_available(
+        &book,
+        &[],
+        Some(&hub),
+        &HashMap::new(),
+        now
+    ));
+
+    let h = BlockHash::from_byte_array([0x72; 32]);
+    let mut pack = relative_slow_pack(h);
+    let slow = rbitcoin_net::NetAddr::from_socket(addr(60));
+    let mut cooldown = HashMap::new();
+    let mut strikes = HashMap::new();
+    let mut inflight = HashMap::new();
+    let mut body = rbitcoin_ibd::ibd::body::BodyPresence::new();
+    let warm = 1_000 + RELATIVE_SLOW_GLOBAL_WARMUP_MS;
+    let mut kick = |book: &AddrMan, cooldown: &mut HashMap<rbitcoin_net::NetAddr, Instant>| {
+        let mut suspect = None;
+        let mut last_kick_ms = 0u64;
+        for mono in [warm, warm + RELATIVE_SLOW_HYSTERESIS_MS] {
+            disconnect_relative_slow_block_peers_at(
+                &mut pack,
+                &mut inflight,
+                &mut body,
+                cooldown,
+                &mut strikes,
+                now,
+                book,
+                Some(&hub),
+                &mut suspect,
+                &mut last_kick_ms,
+                mono,
+            );
+        }
+    };
+    kick(&book, &mut cooldown);
+    assert!(
+        !cooldown.contains_key(&slow),
+        "no row the redial would dial"
+    );
+    book.add_addr(routable(46, 1, 2));
+    kick(&book, &mut cooldown);
+    assert!(
+        cooldown.contains_key(&slow),
+        "a free /16 row allows the kick"
+    );
+}
+
+/// Registers a session at `ip`:8333 in `hub`.
+fn hub_peer(
+    hub: &Arc<PeerHub>,
+    ip: [u8; 4],
+    inbound: bool,
+    conn: PeerConnType,
+) -> Arc<rbitcoin_net::peers::LivePeer> {
+    let a = SocketAddr::from((ip, 8333));
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: 70016,
+        services: bitcoin::p2p::ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: bitcoin::p2p::address::Address::new(&a, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::address::Address::new(&a, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: u64::from(ip[1]),
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    hub.register(a, a, &ver, inbound, conn)
+}
+
+/// Eight live slots at 10.0.0.60.. sharing block `h`; slot 0 runs at a
+/// tenth of the others' rate.
+fn relative_slow_pack(h: BlockHash) -> Vec<PeerSlot> {
+    (0..8)
+        .map(|i| {
+            let mut s = dummy_slot(i, addr(60 + i as u8), true);
+            s.first_data_ms = 1_000;
+            s.rate.sample(0, 0, true);
+            let bytes = if i == 0 { 4_500_000 } else { 45_000_000 };
+            s.rate.sample(RELSLOW_ACTIVE_MS, bytes, true);
+            s.in_flight.insert(h);
+            s
+        })
+        .collect()
 }
 
 #[test]
@@ -1680,12 +1921,12 @@ fn relative_slow_pure_edges_and_mature_sample_filters() {
     book.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(addr(41)), false);
     let now = Instant::now();
     assert!(
-        !replacement_available(&book, &slots, &cooldown, now),
+        !replacement_available(&book, &slots, None, &cooldown, now),
         "a failed last connect is not a replacement"
     );
     book.add(addr(42));
     assert!(
-        replacement_available(&book, &slots, &cooldown, now),
+        replacement_available(&book, &slots, None, &cooldown, now),
         "an untried address can replace a kicked peer"
     );
     cooldown.insert(
@@ -1693,7 +1934,7 @@ fn relative_slow_pure_edges_and_mature_sample_filters() {
         now + Duration::from_secs(60),
     );
     assert!(
-        !replacement_available(&book, &slots, &cooldown, now),
+        !replacement_available(&book, &slots, None, &cooldown, now),
         "cooling the only clean address leaves no replacement"
     );
     cooldown.clear();
@@ -1705,6 +1946,7 @@ fn relative_slow_pure_edges_and_mature_sample_filters() {
         &mut strikes,
         now,
         &book,
+        None,
         &mut suspect,
         &mut last_kick_ms,
     );
@@ -1724,7 +1966,7 @@ fn relative_slow_kick_needs_a_replacement() {
     cooldown.insert(rbitcoin_net::NetAddr::from_socket(addr(42)), now);
     let idle = [dummy_slot(1, addr(40), true)];
     assert!(
-        replacement_available(&book, &idle, &cooldown, now),
+        replacement_available(&book, &idle, None, &cooldown, now),
         "a cooldown that ends at now is not still cooling"
     );
     let live_peer = dummy_slot(7, addr(42), true);
@@ -1732,6 +1974,7 @@ fn relative_slow_kick_needs_a_replacement() {
         !replacement_available(
             &book,
             std::slice::from_ref(&live_peer),
+            None,
             &HashMap::new(),
             now
         ),
@@ -1739,16 +1982,7 @@ fn relative_slow_kick_needs_a_replacement() {
     );
 
     let h = BlockHash::from_byte_array([0x71; 32]);
-    let mut pack = Vec::new();
-    for i in 0..8 {
-        let mut s = dummy_slot(i, addr(60 + i as u8), true);
-        s.first_data_ms = 1_000;
-        s.rate.sample(0, 0, true);
-        let bytes = if i == 0 { 4_500_000 } else { 45_000_000 };
-        s.rate.sample(RELSLOW_ACTIVE_MS, bytes, true);
-        s.in_flight.insert(h);
-        pack.push(s);
-    }
+    let mut pack = relative_slow_pack(h);
     let slow_addr = addr(60);
     let mut kicked_book = AddrMan::new();
     kicked_book.add(addr(80));
@@ -1768,6 +2002,7 @@ fn relative_slow_kick_needs_a_replacement() {
         &mut strikes,
         now,
         &kicked_book,
+        None,
         &mut suspect,
         &mut last_kick_ms,
         t_warm,
@@ -1780,6 +2015,7 @@ fn relative_slow_kick_needs_a_replacement() {
         &mut strikes,
         now,
         &kicked_book,
+        None,
         &mut suspect,
         &mut last_kick_ms,
         t_warm + RELATIVE_SLOW_HYSTERESIS_MS,
@@ -1799,6 +2035,7 @@ fn relative_slow_kick_needs_a_replacement() {
         &mut strikes,
         now,
         &kicked_book,
+        None,
         &mut suspect,
         &mut last_kick_ms,
         t_warm,
@@ -1812,6 +2049,7 @@ fn relative_slow_kick_needs_a_replacement() {
         &mut strikes,
         now,
         &kicked_book,
+        None,
         &mut suspect,
         &mut last_kick_ms,
         t_warm + RELATIVE_SLOW_HYSTERESIS_MS,

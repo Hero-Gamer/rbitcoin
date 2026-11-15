@@ -171,4 +171,10 @@ fn eviction_netgroup_ipv4_slash16() {
     let c: std::net::SocketAddr = "1.3.0.1:1".parse().unwrap();
     assert_eq!(eviction_netgroup(a), eviction_netgroup(b));
     assert_ne!(eviction_netgroup(a), eviction_netgroup(c));
+    let mapped: std::net::SocketAddr = "[::ffff:1.2.3.4]:1".parse().unwrap();
+    assert_eq!(
+        eviction_netgroup(mapped),
+        eviction_netgroup(b),
+        "a dual-stack accept of 1.2.3.4 is still 1.2/16"
+    );
 }
