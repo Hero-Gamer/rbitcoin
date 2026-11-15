@@ -4328,6 +4328,29 @@ impl PeerHub {
             .collect()
     }
 
+    /// Nets whose netgroup an automatic outbound dial may not share, as
+    /// Core's `outbound_ipv46_peer_netgroups`: live outbound full-relay,
+    /// block-relay, and manual sessions, and in-flight dials. Inbound,
+    /// addr-fetch, and feeler sessions take no group: an attacker can open
+    /// inbound connections for free.
+    pub fn outbound_group_nets(&self) -> Vec<crate::NetAddr> {
+        let mut nets: Vec<crate::NetAddr> = self
+            .live_peers()
+            .into_iter()
+            .filter(|p| {
+                matches!(
+                    p.conn_type,
+                    PeerConnType::OutboundFullRelay
+                        | PeerConnType::BlockRelay
+                        | PeerConnType::Manual
+                )
+            })
+            .map(|p| p.net)
+            .collect();
+        nets.extend(self.in_flight_nets());
+        nets
+    }
+
     /// Overlay identity of live outbound full-relay peers (exclude for redial).
     pub fn live_outbound_full_relay_nets(&self) -> Vec<crate::NetAddr> {
         let mut rows: Vec<(u64, crate::NetAddr)> = self

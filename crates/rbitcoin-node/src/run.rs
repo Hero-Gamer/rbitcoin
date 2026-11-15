@@ -3567,14 +3567,16 @@ pub fn refill_outbound_full_relay(
         peers.note_outbound_pass(OutboundPass::SkippedPinned);
         return;
     }
-    let (occupied, live, pending) = outbound_slots(peers);
-    if live >= max_out {
+    let slots = outbound_slots(peers);
+    if slots.live >= max_out {
         peers.note_outbound_pass(OutboundPass::NoSpare);
         return;
     }
-    let room = max_out.saturating_sub(live).saturating_sub(pending);
-    let overlay_live = overlay_outbound_live(&occupied);
-    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied, overlay_live);
+    let room = max_out
+        .saturating_sub(slots.live)
+        .saturating_sub(slots.pending);
+    let overlay_live = overlay_outbound_live(&slots.busy);
+    let picked = outbound_full_relay_candidates(shared_peers, room, &slots, overlay_live);
     if picked.is_empty() {
         peers.note_outbound_pass(OutboundPass::NoSpare);
         return;
@@ -3585,57 +3587,78 @@ pub fn refill_outbound_full_relay(
 /// One full-relay replacement for the stale-tip rotation, picked before
 /// `evict_id` is disconnected. The evicted net stays excluded, but it does
 /// not count as a live overlay: when it is the only onion or I2P session,
-/// the replacement may take the overlay slot.
+/// the replacement may take the overlay slot. Its netgroup still counts as
+/// taken, as every outbound peer's does when Core opens its extra outbound.
 #[doc(hidden)]
 pub fn stale_follow_replacement(
     peers: &rbitcoin_net::PeerHub,
     shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
     evict_id: u64,
 ) -> Vec<NetAddr> {
-    let (occupied, _, _) = outbound_slots(peers);
+    let slots = outbound_slots(peers);
     let evicted = peers.get(evict_id).map(|p| p.net);
-    let overlay_live = occupied
+    let overlay_live = slots
+        .busy
         .iter()
         .any(|a| a.is_overlay() && Some(*a) != evicted);
-    outbound_full_relay_candidates(shared_peers, 1, &occupied, overlay_live)
+    outbound_full_relay_candidates(shared_peers, 1, &slots, overlay_live)
 }
 
-/// Live outbound full-relay nets, every other live session (so a full-relay
-/// dial does not stick on an address that is already inbound, manual, or
-/// addr-fetch), and in-flight dials. `live` is the quota count. `pending`
-/// is in-flight dials that are not already one of those sessions.
-fn outbound_slots(peers: &rbitcoin_net::PeerHub) -> (Vec<rbitcoin_net::NetAddr>, usize, usize) {
-    let mut occupied = peers.live_outbound_full_relay_nets();
-    let live = occupied.len();
+/// What a full-relay refill or replacement must leave alone.
+struct OutboundSlots {
+    /// Every live session (so a full-relay dial does not stick on an address
+    /// that is already inbound, manual, or addr-fetch) and every in-flight
+    /// dial. None of these is dialed again.
+    busy: Vec<NetAddr>,
+    /// [`rbitcoin_net::PeerHub::outbound_group_nets`].
+    groups: Vec<NetAddr>,
+    /// Live outbound full-relay sessions: the quota count.
+    live: usize,
+    /// In-flight dials that are not already a live session.
+    pending: usize,
+}
+
+fn outbound_slots(peers: &rbitcoin_net::PeerHub) -> OutboundSlots {
+    let mut busy = peers.live_outbound_full_relay_nets();
+    let live = busy.len();
     for peer in peers.live_peers() {
-        if !occupied.contains(&peer.net) {
-            occupied.push(peer.net);
+        if !busy.contains(&peer.net) {
+            busy.push(peer.net);
         }
     }
     let inflight = peers.in_flight_nets();
-    let pending = inflight
-        .iter()
-        .filter(|net| !occupied.contains(net))
-        .count();
+    let pending = inflight.iter().filter(|net| !busy.contains(net)).count();
     for net in inflight {
-        if !occupied.contains(&net) {
-            occupied.push(net);
+        if !busy.contains(&net) {
+            busy.push(net);
         }
     }
-    (occupied, live, pending)
+    OutboundSlots {
+        busy,
+        groups: peers.outbound_group_nets(),
+        live,
+        pending,
+    }
 }
 
 fn outbound_full_relay_candidates(
     shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
     room: usize,
-    occupied: &[NetAddr],
+    slots: &OutboundSlots,
     overlay_live: bool,
 ) -> Vec<NetAddr> {
     if room == 0 {
         return Vec::new();
     }
+    let exclude: std::collections::HashSet<NetAddr> = slots.busy.iter().copied().collect();
+    let groups: Vec<SocketAddr> = slots
+        .groups
+        .iter()
+        .copied()
+        .filter_map(NetAddr::socket_addr)
+        .collect();
     let book = shared_peers.lock().unwrap_or_else(|e| e.into_inner());
-    follow_dial_targets(&[], &book, room, occupied, overlay_live)
+    book.take_dial_candidates_net(room, &exclude, &groups, overlay_live)
 }
 
 fn queue_outbound_full_relay(

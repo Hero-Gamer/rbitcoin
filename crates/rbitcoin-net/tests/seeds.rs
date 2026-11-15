@@ -7,8 +7,9 @@ use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
+/// One /16 per `o`, so ranking tests are not cut by the one-per-group rule.
 fn addr(o: u8) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, o)), 8333)
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, o, 3, 4)), 8333)
 }
 
 #[test]
@@ -207,14 +208,47 @@ fn slash16(a: u8, b: u8, host: u8) -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, 0, host)), 8333)
 }
 
+/// Core never opens two automatic outbound connections into one /16. A
+/// book whose rows sit in two /16s yields two picks for sixteen slots, not
+/// sixteen (eclipse F2: 16 of 16 outbound in an attacker's two /16s).
 #[test]
-fn take_dial_same_slash16_still_fills() {
+fn take_dial_two_slash16s_yield_two_picks() {
     let mut am = AddrMan::new();
-    for i in 1..=16 {
-        am.add(slash16(1, 2, i));
+    for i in 1..=8 {
+        am.add(slash16(44, 1, i));
+        am.add(slash16(44, 2, i));
     }
     let got = am.take_dial_candidates(16, &HashSet::new(), &[]);
-    assert_eq!(got.len(), 16);
+    assert_eq!(got, vec![slash16(44, 1, 1), slash16(44, 2, 1)]);
+}
+
+/// A /16 that already has a live outbound peer yields no pick.
+#[test]
+fn take_dial_occupied_slash16_yields_none() {
+    let mut am = AddrMan::new();
+    for i in 1..=8 {
+        am.add(slash16(44, 1, i));
+    }
+    let occupied = [slash16(44, 1, 99)];
+    assert!(am
+        .take_dial_candidates(8, &HashSet::new(), &occupied)
+        .is_empty());
+}
+
+/// Loopback and other unroutable rows only reach the book from the operator
+/// (`addpeeraddress`, `--connect`); Core never dials them automatically.
+/// They take no group, so a local test network still fills.
+#[test]
+fn take_dial_loopback_rows_take_no_group() {
+    let mut am = AddrMan::new();
+    for port in 1..=8 {
+        am.add(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+    }
+    let occupied = [SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 99)];
+    assert_eq!(
+        am.take_dial_candidates(8, &HashSet::new(), &occupied).len(),
+        8
+    );
 }
 
 #[test]
@@ -239,8 +273,10 @@ fn take_dial_skips_occupied_group() {
     assert_eq!(got, vec![slash16(1, 3, 1)]);
 }
 
+/// The group rule is not a preference: a better-tier addr in an occupied
+/// group is skipped, and a last-resort addr in a free group is taken.
 #[test]
-fn take_dial_occupied_group_tier0_beats_unused_group_last_resort() {
+fn take_dial_occupied_group_tier0_loses_to_free_group_last_resort() {
     let mut am = AddrMan::new();
     let good_same = slash16(1, 2, 1);
     let lemon = slash16(9, 9, 1);
@@ -249,12 +285,88 @@ fn take_dial_occupied_group_tier0_beats_unused_group_last_resort() {
     am.note_connected_addr(rbitcoin_net::NetAddr::from_socket(good_same));
     am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(lemon), false);
     let occupied = [slash16(1, 2, 9)];
-    let got = am.take_dial_candidates(1, &HashSet::new(), &occupied);
+    let got = am.take_dial_candidates(2, &HashSet::new(), &occupied);
+    assert_eq!(got, vec![lemon]);
+}
+
+/// The recent-attempt fallback looks only at rows the group rule would
+/// dial. A fresh row in an occupied /16 must not hide a recently attempted
+/// row in a free /16 for the ten-minute window.
+#[test]
+fn take_dial_recent_free_group_beats_fresh_occupied_group() {
+    let mut am = AddrMan::new();
+    let blocked = slash16(45, 1, 2);
+    let free = slash16(45, 2, 1);
+    am.add(blocked);
+    am.add(free);
+    am.note_attempt_at(free, Instant::now());
+    let occupied = [slash16(45, 1, 1)];
     assert_eq!(
-            got,
-            vec![good_same],
-            "diversity must not pick a last-resort unused group ahead of a preferred occupied-group addr"
-        );
+        am.take_dial_candidates(1, &HashSet::new(), &occupied),
+        vec![free]
+    );
+}
+
+/// When every row the rule would dial was attempted inside the recent
+/// window, a call returns one row, the least recently attempted, so a
+/// refill pass does not redial every dead address. Once that attempt is
+/// noted, the next call moves on. A fresh row brings back the full batch.
+#[test]
+fn take_dial_all_recent_returns_least_recent_one() {
+    let mut am = AddrMan::new();
+    let (a, b, c) = (slash16(45, 1, 1), slash16(45, 2, 1), slash16(45, 3, 1));
+    am.inject([a, b, c]);
+    let now = Instant::now();
+    let ago = |s| now.checked_sub(Duration::from_secs(s)).expect("clock");
+    am.note_attempt_at(a, ago(3));
+    am.note_attempt_at(b, ago(5));
+    am.note_attempt_at(c, ago(1));
+    assert_eq!(am.take_dial_candidates(3, &HashSet::new(), &[]), vec![b]);
+    am.note_attempt_at(b, now);
+    assert_eq!(am.take_dial_candidates(3, &HashSet::new(), &[]), vec![a]);
+    let (d, e) = (slash16(45, 4, 1), slash16(45, 5, 1));
+    am.inject([d, e]);
+    assert_eq!(am.take_dial_candidates(3, &HashSet::new(), &[]), vec![d, e]);
+}
+
+/// The same holds for the known-v1 fallback: a compatible row in an
+/// occupied /16 must not hide an incompatible row in a free /16.
+#[test]
+fn take_dial_incompatible_free_group_beats_compatible_occupied_group() {
+    let mut am = AddrMan::new();
+    let blocked = slash16(45, 1, 2);
+    let v1 = slash16(45, 2, 1);
+    am.add(blocked);
+    am.add(v1);
+    am.note_connect_failed_addr(rbitcoin_net::NetAddr::from_socket(v1), true);
+    let occupied = [slash16(45, 1, 1)];
+    assert_eq!(
+        am.take_dial_candidates(1, &HashSet::new(), &occupied),
+        vec![v1]
+    );
+}
+
+/// Core's `GetGroup` puts an IPv6 address that embeds an IPv4 (6to4 here)
+/// in that IPv4's /16, so the pair yields one pick.
+#[test]
+fn take_dial_6to4_shares_its_ipv4_slash16() {
+    let mut am = AddrMan::new();
+    let v4: SocketAddr = "45.1.0.1:8333".parse().unwrap();
+    let six_to_four: SocketAddr = "[2002:2d01:2::]:8333".parse().unwrap();
+    am.inject([v4, six_to_four]);
+    assert_eq!(am.len(), 2);
+    assert_eq!(am.take_dial_candidates(2, &HashSet::new(), &[]), vec![v4]);
+}
+
+/// Core groups Hurricane Electric `2001:470::/32` by /36, so two /36s in
+/// that /32 are two groups.
+#[test]
+fn take_dial_henet_groups_by_slash36() {
+    let mut am = AddrMan::new();
+    let a: SocketAddr = "[2001:470:1000::1]:8333".parse().unwrap();
+    let b: SocketAddr = "[2001:470:2000::1]:8333".parse().unwrap();
+    am.inject([a, b]);
+    assert_eq!(am.take_dial_candidates(2, &HashSet::new(), &[]), vec![a, b]);
 }
 
 #[test]

@@ -255,11 +255,13 @@ fn ibd_conn_type(connect: &[NetAddr], addr: NetAddr) -> PeerConnType {
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-/// Dial up to `count` ranked candidates from `book`. `already` is exclude
-/// (slots + cooldown). `occupied` is live addrs whose netgroups are skipped
-/// while unused-group candidates remain. `overlay_live` says an onion or I2P
-/// slot is alive, so a one-peer batch stays on clearnet. A `connect` target is
-/// dialled as [`PeerConnType::Manual`].
+/// Dial up to `count` candidates. `already` is exclude (slots + cooldown).
+/// `connect` targets come first and are dialled as [`PeerConnType::Manual`]:
+/// Core holds manual connections to no netgroup rule. The rest are ranked
+/// book picks, at most one per netgroup, never in the group of an
+/// `occupied` (live) addr or of a `connect` target in this batch.
+/// `overlay_live` says an onion or I2P slot is alive, so a one-peer batch
+/// stays on clearnet.
 pub async fn dial_batch(
     book: &AddrMan,
     count: usize,
@@ -292,7 +294,22 @@ pub async fn dial_batch(
             .unwrap_or(false)
     };
 
-    let candidates = book.take_dial_candidates_net(count, &already, occupied, overlay_live);
+    let mut candidates: Vec<NetAddr> = connect
+        .iter()
+        .copied()
+        .filter(|a| book.is_dialable(*a) && !already.contains(a))
+        .take(count)
+        .collect();
+    let mut book_ex = already.clone();
+    book_ex.extend(candidates.iter().copied());
+    let mut taken = occupied.to_vec();
+    taken.extend(candidates.iter().filter_map(|a| a.socket_addr()));
+    candidates.extend(book.take_dial_candidates_net(
+        count - candidates.len(),
+        &book_ex,
+        &taken,
+        overlay_live,
+    ));
     out.attempted = candidates.clone();
     let mut handles = Vec::new();
     for addr in candidates {
@@ -394,24 +411,44 @@ pub fn apply_dial_result(
     }
 }
 
-/// True when some dialable address is neither live nor cooling and did not
-/// fail its last connect. Relative-slow must not drop a peer when this is
-/// false: the only redials would be dead seeds or addresses already banned.
+/// True when some dialable address is neither live nor cooling, did not
+/// fail its last connect, and sits in a netgroup that no live slot and no
+/// `hub` session holds ([`alive_dial_addrs`], as the redial counts them).
+/// Relative-slow must not drop a peer when this is false: the only redials
+/// would be dead seeds, addresses already banned, or addresses the
+/// one-per-group rule will not dial.
 pub fn replacement_available(
     book: &AddrMan,
     slots: &[PeerSlot],
+    hub: Option<&rbitcoin_net::peers::PeerHub>,
     cooldown: &HashMap<NetAddr, Instant>,
     now: Instant,
 ) -> bool {
     let live: HashSet<rbitcoin_net::NetAddr> =
         slots.iter().filter(|s| s.alive).map(|s| s.net).collect();
+    let occupied = alive_dial_addrs(slots, hub);
+    let groups = live_groups(book, occupied.into_iter().map(NetAddr::from_socket));
     book.dial_order().iter().copied().any(|addr| {
         if !book.is_dialable(addr) || live.contains(&addr) {
             return false;
         }
         let cooling = cooldown.get(&addr).is_some_and(|until| *until > now);
-        !cooling && !book.connect_failed(addr)
+        !cooling && !book.connect_failed(addr) && group_free(book, addr, &groups)
     })
+}
+
+/// Netgroups the live addrs hold ([`rbitcoin_net::netgroup::outbound_group`]).
+fn live_groups(book: &AddrMan, live: impl Iterator<Item = NetAddr>) -> HashSet<u64> {
+    live.filter_map(NetAddr::socket_addr)
+        .filter_map(|a| rbitcoin_net::netgroup::outbound_group(a, book.asmap()))
+        .collect()
+}
+
+/// An automatic dial to `addr` may join peers holding `groups`.
+fn group_free(book: &AddrMan, addr: NetAddr, groups: &HashSet<u64>) -> bool {
+    addr.socket_addr()
+        .and_then(|a| rbitcoin_net::netgroup::outbound_group(a, book.asmap()))
+        .is_none_or(|g| !groups.contains(&g))
 }
 
 pub fn request_headers_from(
@@ -516,7 +553,9 @@ fn release_block_requests(
 
 /// When every dialable address is live or cooling, drop the cooling address
 /// we tried least recently from `exclude` so one redial can proceed.
-/// Never-attempted sorts first. A free candidate suppresses this.
+/// Never-attempted sorts first. A free candidate suppresses this. A cooling
+/// address in a netgroup that `occupied` holds is not admitted: the redial
+/// would not dial it.
 pub fn admit_cooldown_fallback(
     book: &AddrMan,
     exclude: &mut HashSet<rbitcoin_net::NetAddr>,
@@ -531,12 +570,14 @@ pub fn admit_cooldown_fallback(
     {
         return None;
     }
+    let groups = live_groups(book, occupied.iter().copied().map(NetAddr::from_socket));
     let cooling: Vec<rbitcoin_net::NetAddr> = book
         .dial_order()
         .iter()
         .copied()
         .filter(|a| book.is_dialable(*a) && !live.contains(a))
         .filter(|a| cooldown.get(a).is_some_and(|until| *until > now))
+        .filter(|a| group_free(book, *a, &groups))
         .collect();
     let pick = cooling
         .iter()
@@ -569,12 +610,21 @@ pub fn dial_blocked_addrs(
     blocked
 }
 
-/// Live slot addrs whose netgroups occupy outbound diversity (cooldown is exclude-only).
-pub fn alive_dial_addrs(slots: &[PeerSlot]) -> Vec<SocketAddr> {
+/// Addrs whose netgroups an automatic IBD dial may not share: live slots,
+/// and the `hub` sessions that hold a group outside IBD's slots (an
+/// `addnode` peer, [`rbitcoin_net::PeerHub::outbound_group_nets`]).
+/// Cooldown is exclude-only.
+pub fn alive_dial_addrs(
+    slots: &[PeerSlot],
+    hub: Option<&rbitcoin_net::peers::PeerHub>,
+) -> Vec<SocketAddr> {
+    let hub_nets = hub.map(|h| h.outbound_group_nets()).unwrap_or_default();
     slots
         .iter()
         .filter(|s| s.alive)
-        .filter_map(|s| s.net.socket_addr())
+        .map(|s| s.net)
+        .chain(hub_nets)
+        .filter_map(|n| n.socket_addr())
         .collect()
 }
 
@@ -838,6 +888,7 @@ pub fn disconnect_relative_slow_block_peers(
     addr_strikes: &mut HashMap<NetAddr, u8>,
     now: Instant,
     book: &AddrMan,
+    hub: Option<&rbitcoin_net::peers::PeerHub>,
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
 ) -> Vec<bitcoin::BlockHash> {
@@ -849,6 +900,7 @@ pub fn disconnect_relative_slow_block_peers(
         addr_strikes,
         now,
         book,
+        hub,
         suspect,
         last_kick_ms,
         ibd_mono_ms(),
@@ -864,6 +916,7 @@ pub fn disconnect_relative_slow_block_peers_at(
     addr_strikes: &mut HashMap<NetAddr, u8>,
     now: Instant,
     book: &AddrMan,
+    hub: Option<&rbitcoin_net::peers::PeerHub>,
     suspect: &mut Option<(usize, u64)>,
     last_kick_ms: &mut u64,
     now_ms: u64,
@@ -872,7 +925,7 @@ pub fn disconnect_relative_slow_block_peers_at(
         *suspect = None;
         return Vec::new();
     }
-    if !replacement_available(book, slots, addr_cooldown, now) {
+    if !replacement_available(book, slots, hub, addr_cooldown, now) {
         *suspect = None;
         return Vec::new();
     }
