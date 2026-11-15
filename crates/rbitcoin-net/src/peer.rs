@@ -329,12 +329,13 @@ pub fn rate_limit_disconnect(session: Option<&crate::peers::LivePeer>) -> NetErr
 }
 
 /// Heavy frames (`block`, `headers`, `notfound`) already read while a decode
-/// permit is held. Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies, and the
-/// reader can take one more message before that front decode is popped.
-/// Cheap frames (`tx`, `inv`, ping) use [`DECODE_Q_MAX_CHEAP_FRAMES`], so a
-/// burst behind one block is not a disconnect. Heavy bytes also share a
-/// process cap of the blocking-pool size times [`DECODE_Q_MAX_BYTES`].
-pub const DECODE_Q_MAX_FRAMES: usize = 32;
+/// permit is held. Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies, and a
+/// Core versionbits test sends a period of unsolicited bodies (144), so the
+/// cap leaves room for both without treating that burst as a flood. Cheap
+/// frames (`tx`, `inv`, ping) use [`DECODE_Q_MAX_CHEAP_FRAMES`], so a burst
+/// behind one block is not a disconnect. Heavy bytes also share a process
+/// cap of the blocking-pool size times [`DECODE_Q_MAX_BYTES`].
+pub const DECODE_Q_MAX_FRAMES: usize = 256;
 pub const DECODE_Q_MAX_CHEAP_FRAMES: usize = 1024;
 pub const DECODE_Q_MAX_BYTES: usize =
     (MAX_SERVE_BLOCKS + 1) * crate::codec::MAX_PROTOCOL_MESSAGE_LENGTH;
@@ -522,6 +523,19 @@ mod decode_queue_cap {
     fn parked() -> super::DecodeRx {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         rx
+    }
+
+    /// Core's `feature_versionbits_warning` sends a period of unsolicited
+    /// bodies before the node applies them all. That burst is not a flood.
+    #[test]
+    fn a_versionbits_period_of_unsolicited_bodies_fits() {
+        let mut q = DecodeQueue::new();
+        for i in 0..144 {
+            assert!(
+                !q.push(parked(), 1, true, None),
+                "unsolicited body {i} of a versionbits period hit the cap"
+            );
+        }
     }
 
     /// Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies and can read one more
@@ -6680,7 +6694,7 @@ pub async fn on_blocktxn(
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
-        Err(()) => on_blocktxn_apply_fail(hub, follow, session, &pc, hash),
+        Err(()) => on_blocktxn_apply_fail(hub, out_tx, follow, session, &pc, hash),
     }
 }
 
@@ -6753,13 +6767,14 @@ pub async fn on_blocktxn_got_block(
             )
             .await
         }
-        Err(_) => on_blocktxn_unconnectable(hub, follow, session, hash),
+        Err(_) => on_blocktxn_unconnectable(hub, out_tx, follow, session, hash),
     }
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
     hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     pc: &PendingCmpct,
@@ -6774,12 +6789,16 @@ pub fn on_blocktxn_apply_fail(
     hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    Ok(())
+    queue_out(
+        out_tx,
+        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+    )
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
     hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6792,7 +6811,10 @@ pub fn on_blocktxn_unconnectable(
     hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    Ok(())
+    queue_out(
+        out_tx,
+        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

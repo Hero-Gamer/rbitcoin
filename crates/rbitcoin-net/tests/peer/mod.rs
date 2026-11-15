@@ -2430,7 +2430,11 @@ async fn compact_body_is_asked_of_another_peer_once() {
         asked_witness(&sent(&mut other_rx), hash),
         "the first short-id miss asks another high-bandwidth peer"
     );
-    on_blocktxn_unconnectable(&hub, &mut follow, Some(announcer.as_ref()), hash).unwrap();
+    on_blocktxn_unconnectable(&hub, &ann_tx, &mut follow, Some(announcer.as_ref()), hash).unwrap();
+    assert!(
+        asked_witness(&sent(&mut ann_rx), hash),
+        "a failed blocktxn asks the announcing peer for the body"
+    );
     assert!(
         !asked_witness(&sent(&mut other_rx), hash),
         "the same hash is not asked of that peer again"
@@ -3948,10 +3952,18 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
         .await
         .unwrap();
         assert!(follow.ban_score >= 10, "solicited bad blocktxn bans");
-        assert!(
-            out_rx.try_recv().is_err(),
-            "a failed blocktxn does not ask this peer for the body"
-        );
+        match out_rx
+            .try_recv()
+            .expect("a failed blocktxn asks this peer for the body")
+            .expect_msg()
+        {
+            NetworkMessage::GetData(inv) => assert_eq!(
+                inv,
+                vec![Inventory::WitnessBlock(block.block_hash())],
+                "a failed blocktxn is followed by a full-block getdata on this peer"
+            ),
+            other => panic!("expected getdata, got {other:?}"),
+        }
         let ban_after_fail = follow.ban_score;
         handle_peer_frame(
             frame_for(NetworkMessage::BlockTxn(BlockTxn {
