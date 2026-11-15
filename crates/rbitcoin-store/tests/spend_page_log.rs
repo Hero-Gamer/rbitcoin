@@ -2129,6 +2129,39 @@ fn missing_or_short_pages_file_refuses_open() {
 }
 
 #[test]
+fn missing_or_short_older_generation_file_refuses_open() {
+    let d = dir();
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let two_commits = || {
+        std::fs::create_dir_all(&d).unwrap();
+        let log = SpendPageLog::create(&d);
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+        log.note_slots(&[(4096, slot)]).unwrap();
+        log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    };
+    let older = d.join(format!("{SPEND_PAGES_NAME}.1"));
+    two_commits();
+    assert!(older.exists(), "first page must stay in spend.pages.1");
+    let mut bytes = std::fs::read(&older).unwrap();
+    bytes.pop();
+    std::fs::write(&older, &bytes).unwrap();
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    two_commits();
+    assert!(older.exists(), "first page must stay in spend.pages.1");
+    std::fs::remove_file(&older).unwrap();
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn explode_keeps_the_commit_when_keep_fails() {
     let d = dir();
     let log = SpendPageLog::create(&d);
