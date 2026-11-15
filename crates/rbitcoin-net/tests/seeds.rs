@@ -329,6 +329,35 @@ fn take_dial_all_recent_returns_least_recent_one() {
     assert_eq!(am.take_dial_candidates(3, &HashSet::new(), &[]), vec![d, e]);
 }
 
+/// When the IP pick is the paced redial, onion and I2P rows do not take the
+/// slots the other IP rows are due on later passes: the pass adds one
+/// overlay row at most. With a fresh IP row the batch fills as before.
+#[test]
+fn take_dial_net_paced_ip_adds_one_overlay_row() {
+    let mut am = AddrMan::new();
+    am.set_onion_reachable(true);
+    let (a, b) = (slash16(45, 1, 1), slash16(45, 2, 1));
+    am.inject([a, b]);
+    let now = Instant::now();
+    let ago = |s| now.checked_sub(Duration::from_secs(s)).expect("clock");
+    am.note_attempt_at(a, ago(3));
+    am.note_attempt_at(b, ago(5));
+    for i in 1..=4u8 {
+        am.add_addr(NetAddr::Onion {
+            pk: [i; 32],
+            port: 8333,
+        });
+    }
+    let got = am.take_dial_candidates_net(8, &HashSet::new(), &[], false);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(got[0], NetAddr::from_socket(b));
+    assert!(got[1].is_overlay());
+
+    am.inject([slash16(45, 3, 1)]);
+    let got = am.take_dial_candidates_net(8, &HashSet::new(), &[], false);
+    assert_eq!(got.len(), 5, "a fresh IP row and every onion row: {got:?}");
+}
+
 /// The same holds for the known-v1 fallback: a compatible row in an
 /// occupied /16 must not hide an incompatible row in a free /16.
 #[test]

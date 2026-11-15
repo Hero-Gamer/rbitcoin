@@ -3148,7 +3148,7 @@ impl PeerHub {
         if self.key_refused(DiscourageKey::Ip(addr.ip())) {
             return true;
         }
-        let group = crate::eviction::eviction_netgroup(addr);
+        let group = crate::netgroup::slot_pause_group(addr);
         self.discouraged_groups
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4429,7 +4429,7 @@ impl PeerHub {
             return false;
         };
         if let Some(p) = self.get(id) {
-            self.note_slot_evict(p.netgroup());
+            self.note_slot_evict(crate::netgroup::slot_pause_group(p.addr));
         }
         rbitcoin_log::info!("p2p: evict inbound peer={id} ({why})");
         self.disconnect_id(id)

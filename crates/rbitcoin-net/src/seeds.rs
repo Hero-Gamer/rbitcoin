@@ -514,6 +514,10 @@ impl AddrMan {
             .map(NetAddr::from_socket)
             .collect();
         let now = Instant::now();
+        // Every eligible IP row was tried recently, so `ip` is the one paced
+        // redial. Overlay rows must not take the slots the other IP rows are
+        // due on later passes: this pass adds one at most.
+        let ip_paced = ip.iter().any(|a| self.recently_attempted_addr(*a, now));
         let mut overlay: Vec<(u8, NetAddr)> = self
             .order
             .iter()
@@ -553,8 +557,13 @@ impl AddrMan {
         if overlay_fresh && out.len() >= max && (max >= 2 || !overlay_live) {
             out.pop();
         }
+        let room = if ip_paced {
+            max.min(out.len() + 1)
+        } else {
+            max
+        };
         for (_, a) in overlay {
-            if out.len() >= max {
+            if out.len() >= room {
                 break;
             }
             if !out.contains(&a) {

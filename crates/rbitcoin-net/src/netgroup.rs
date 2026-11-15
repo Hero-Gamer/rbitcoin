@@ -29,6 +29,17 @@ pub fn netgroup(addr: SocketAddr, asmap: Option<&AsMap>) -> u64 {
     }
 }
 
+/// Key for the ten-minute inbound pause after a slot eviction: the
+/// eviction group, except for CJDNS. Core uses its sixteen CJDNS groups only
+/// to pick an eviction victim and has no pause. Pausing one would refuse a
+/// sixteenth of CJDNS, so the pause keys a CJDNS peer on its `/32`.
+pub fn slot_pause_group(addr: SocketAddr) -> u64 {
+    match addr.ip() {
+        IpAddr::V6(v6) if crate::netaddr::is_cjdns_ip(v6) => ipv6_group(v6),
+        _ => netgroup(addr, None),
+    }
+}
+
 /// The address the asmap looks up (`None`: not looked up) and the prefix
 /// group. Core keys CJDNS by the four bits after its constant `fc` byte and
 /// never looks it up.

@@ -6955,7 +6955,7 @@ fn slot_evict_does_not_block_an_outbound_dial() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     peers.set_mock_now(1_800_000_000);
     let evicted = "8.8.1.1:8333".parse().unwrap();
-    peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(evicted));
+    peers.note_slot_evict(rbitcoin_net::netgroup::slot_pause_group(evicted));
     let neighbor: std::net::SocketAddr = "8.8.9.9:8333".parse().unwrap();
     assert!(
         peers.inbound_discouraged(neighbor),
@@ -6967,10 +6967,10 @@ fn slot_evict_does_not_block_an_outbound_dial() {
     );
     let cjdns_ip = std::net::Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 1);
     let cjdns_sock = std::net::SocketAddr::from((cjdns_ip, 8333));
-    peers.note_slot_evict(rbitcoin_net::eviction::eviction_netgroup(cjdns_sock));
+    peers.note_slot_evict(rbitcoin_net::netgroup::slot_pause_group(cjdns_sock));
     assert!(
         peers.inbound_discouraged(cjdns_sock),
-        "the slot wait still refuses another inbound from that cjdns group"
+        "the slot wait still refuses another inbound from that cjdns /32"
     );
     assert!(
         !peers.net_discouraged(rbitcoin_net::NetAddr::Cjdns {
