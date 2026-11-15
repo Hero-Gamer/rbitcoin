@@ -1590,6 +1590,10 @@ impl SpendPageLog {
         // lands during the image stream bumps `hold_ticks`. Clear still
         // writes the held bit when those ticks differ. A hold that arrives
         // after this lock patches the commit just written.
+        #[cfg(debug_assertions)]
+        if let Some(probe) = take_publish_probe() {
+            probe(self);
+        }
         let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let (held, sealed_tip) = {
             let g = self.lock();
@@ -2213,8 +2217,33 @@ fn clears_by_page(clears: &[BodyClear]) -> HashMap<u64, Vec<(u16, [u8; SLOT])>> 
 }
 
 #[cfg(debug_assertions)]
+type PublishProbe = fn(&SpendPageLog);
+
+#[cfg(debug_assertions)]
 thread_local! {
     static COMPOSED_HOLD_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PUBLISH_PROBE: std::cell::Cell<Option<PublishProbe>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run once in the commit write, after the hold choice and before
+/// `commit_io` is taken.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_publish_probe(probe: PublishProbe) {
+    PUBLISH_PROBE.with(|slot| slot.set(Some(probe)));
+}
+
+/// Drop a probe [`arm_publish_probe`] has not consumed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn disarm_publish_probe() {
+    PUBLISH_PROBE.with(|slot| slot.set(None));
+}
+
+#[cfg(debug_assertions)]
+fn take_publish_probe() -> Option<PublishProbe> {
+    PUBLISH_PROBE.with(|slot| slot.take())
 }
 
 /// Forget the high-water mark of composed images held at once.

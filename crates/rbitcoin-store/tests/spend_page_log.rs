@@ -4329,3 +4329,40 @@ fn a_commit_that_stops_naming_a_generation_unlinks_its_file() {
     assert_eq!(loaded.slot(4096), Some(second));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[cfg(debug_assertions)]
+#[test]
+fn hold_after_the_clear_choice_keeps_the_commit_bit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::spend_page_log::disarm_publish_probe();
+        }
+    }
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16u64, stale)];
+    let _disarm = Disarm;
+    // No hold lands before `publish_hold`, so it picks Clear. The probe
+    // holds after that choice and before `commit_io` is taken.
+    rbitcoin_store::spend_page_log::arm_publish_probe(|log| {
+        FIRED.store(true, Ordering::Relaxed);
+        log.hold_fold_above(0).unwrap();
+    });
+    log.commit_open(4, 8192, body_with(&planted), |_| Ok(false))
+        .unwrap();
+    assert!(FIRED.load(Ordering::Relaxed), "the publish probe must run");
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+        1,
+        "a hold after the clear choice must stay on the new commit"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
