@@ -1135,19 +1135,31 @@ impl SpendPageLog {
         }
     }
 
-    /// Publish the composed generation into the directory.
+    /// Publish the composed generation, then unlink generation files it no
+    /// longer names.
+    ///
+    /// A caller that holds the utxo view uses [`Self::install_directory`]
+    /// under it and [`Self::unlink_if_synced`] after it drops.
+    #[doc(hidden)]
+    pub fn install_commit(&self) -> Result<(), StoreError> {
+        if let Some(live) = self.install_directory() {
+            self.unlink_if_synced(&live);
+        }
+        Ok(())
+    }
+
+    /// Install the composed generation in RAM and wake an edge-cap waiter.
     ///
     /// Call under `hold_utxo_view` so a reader cannot observe the swap. A hold
     /// taken while the generation was composed stays set: this does not clear it.
-    #[doc(hidden)]
-    pub fn install_commit(&self) -> Result<(), StoreError> {
+    /// Returns the live generation set, or `None` when nothing was pending.
+    /// This does not list the directory.
+    pub(crate) fn install_directory(&self) -> Option<HashSet<u32>> {
         let pending = {
             let mut g = self.lock();
             g.pending.take()
         };
-        let Some(pending) = pending else {
-            return Ok(());
-        };
+        let pending = pending?;
         let PendingInstall {
             generation,
             height,
@@ -1285,15 +1297,22 @@ impl SpendPageLog {
             g.log_bytes = committed_image_bytes(&g);
             break gc_gens(&mut g);
         };
-        // The commit rename is visible to this process either way. A failed
-        // directory sync can still lose that dirent, and the previous commit
-        // names files this commit dropped. `publish_generation` records that
-        // failure. A hold that then syncs the same commit clears it.
-        if !self.lock().commit_dir_unsynced {
-            self.unlink_unreferenced_generations(&live_gens);
-        }
         self.pace.notify_room();
-        Ok(())
+        Some(live_gens)
+    }
+
+    /// Unlink generation files outside `live` unless the last commit rename's
+    /// directory sync failed.
+    ///
+    /// The commit rename is visible to this process either way. A failed
+    /// directory sync can still lose that dirent, and the previous commit
+    /// names files this commit dropped. `publish_generation` records that
+    /// failure. A hold that then syncs the same commit clears it. The flag is
+    /// read here, not when `live` was captured.
+    pub(crate) fn unlink_if_synced(&self, live: &HashSet<u32>) {
+        if !self.lock().commit_dir_unsynced {
+            self.unlink_unreferenced_generations(live);
+        }
     }
 
     /// A disconnect left this commit above the tip. Do not copy it onto the body.
@@ -1857,8 +1876,8 @@ impl SpendPageLog {
         drop(g);
         if wipe {
             self.delete_generation_files();
-        } else if !self.lock().commit_dir_unsynced {
-            self.unlink_unreferenced_generations(&live);
+        } else {
+            self.unlink_if_synced(&live);
         }
         Ok(())
     }

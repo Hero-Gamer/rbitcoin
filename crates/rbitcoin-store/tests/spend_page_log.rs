@@ -3846,6 +3846,80 @@ fn early_freeze_does_not_seal_the_tip_before_the_cooled_copy() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static INSTALL_STORE: std::cell::RefCell<Option<std::sync::Arc<rbitcoin_store::Store>>> =
+        const { std::cell::RefCell::new(None) };
+    static INSTALL_PROBE_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+fn install_unlink_probe() {
+    INSTALL_PROBE_RAN.with(|ran| ran.set(true));
+    INSTALL_STORE.with(|slot| {
+        let store = slot.borrow();
+        let store = store.as_ref().expect("store");
+        assert!(
+            store.utxo_view_stamp().is_some(),
+            "generation files are listed and removed after the utxo view drops"
+        );
+    });
+}
+
+#[cfg(debug_assertions)]
+struct ClearInstallProbe;
+
+#[cfg(debug_assertions)]
+impl Drop for ClearInstallProbe {
+    fn drop(&mut self) {
+        rbitcoin_store::Store::disarm_spend_install_probe();
+        INSTALL_STORE.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+/// A checkpoint unlinks old generation files outside the utxo view.
+///
+/// Readers and confirm wait on that view. A directory listing under it
+/// stalls them.
+#[cfg(debug_assertions)]
+#[test]
+fn install_unlinks_generations_after_the_utxo_view_drops() {
+    let d = dir();
+    let store = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&d).unwrap());
+    let nbytes = 8192usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
+    store.note_open_spend_slots(&[(16, slot)]).unwrap();
+    {
+        let _clear = ClearInstallProbe;
+        INSTALL_PROBE_RAN.with(|ran| ran.set(false));
+        INSTALL_STORE.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&store)));
+        rbitcoin_store::Store::arm_spend_install_probe(install_unlink_probe);
+        store.checkpoint_spend_through(5).unwrap();
+        assert!(
+            INSTALL_PROBE_RAN.with(|ran| ran.get()),
+            "the checkpoint installs a generation and reaches the unlink"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A disconnect to 7 during the cooled copy still folds a generation sealed at 5.
 ///
 /// The early freeze must not stamp tip 8. `hold_fold_above(7)` then sees no
