@@ -125,8 +125,8 @@ pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 /// Where an immutable generation file holds one page image.
 ///
 /// `generation` is the file. `admitted` on the committed entry is the
-/// checkpoint that made the page cool, and stays put when a later file
-/// carries the same bytes forward.
+/// checkpoint that cooled the page. A later checkpoint leaves that field
+/// and the old generation file alone.
 #[derive(Clone, Copy, Debug)]
 struct PageLoc {
     generation: u32,
