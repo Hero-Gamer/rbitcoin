@@ -329,12 +329,13 @@ pub fn rate_limit_disconnect(session: Option<&crate::peers::LivePeer>) -> NetErr
 }
 
 /// Heavy frames (`block`, `headers`, `notfound`) already read while a decode
-/// permit is held. Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies, and the
-/// reader can take one more message before that front decode is popped.
-/// Cheap frames (`tx`, `inv`, ping) use [`DECODE_Q_MAX_CHEAP_FRAMES`], so a
-/// burst behind one block is not a disconnect. Heavy bytes also share a
-/// process cap of the blocking-pool size times [`DECODE_Q_MAX_BYTES`].
-pub const DECODE_Q_MAX_FRAMES: usize = 32;
+/// permit is held. Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies, and a
+/// Core versionbits test sends a period of unsolicited bodies (144), so the
+/// cap leaves room for both without treating that burst as a flood. Cheap
+/// frames (`tx`, `inv`, ping) use [`DECODE_Q_MAX_CHEAP_FRAMES`], so a burst
+/// behind one block is not a disconnect. Heavy bytes also share a process
+/// cap of the blocking-pool size times [`DECODE_Q_MAX_BYTES`].
+pub const DECODE_Q_MAX_FRAMES: usize = 256;
 pub const DECODE_Q_MAX_CHEAP_FRAMES: usize = 1024;
 pub const DECODE_Q_MAX_BYTES: usize =
     (MAX_SERVE_BLOCKS + 1) * crate::codec::MAX_PROTOCOL_MESSAGE_LENGTH;
@@ -522,6 +523,19 @@ mod decode_queue_cap {
     fn parked() -> super::DecodeRx {
         let (_tx, rx) = tokio::sync::oneshot::channel();
         rx
+    }
+
+    /// Core's `feature_versionbits_warning` sends a period of unsolicited
+    /// bodies before the node applies them all. That burst is not a flood.
+    #[test]
+    fn a_versionbits_period_of_unsolicited_bodies_fits() {
+        let mut q = DecodeQueue::new();
+        for i in 0..144 {
+            assert!(
+                !q.push(parked(), 1, true, None),
+                "unsolicited body {i} of a versionbits period hit the cap"
+            );
+        }
     }
 
     /// Tip-follow asks for [`MAX_SERVE_BLOCKS`] bodies and can read one more
