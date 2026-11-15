@@ -2199,7 +2199,8 @@ impl MempoolHub {
     }
 
     /// Drop live mempool entries that are confirmed-strong on tip, then live
-    /// txs whose inputs are confirmed-spent by a different txid.
+    /// txs whose inputs are confirmed-spent by a different txid or come from
+    /// neither the active chain nor the pool.
     ///
     /// Used once when enabling relay after catch-up. Same-txid hits keep
     /// in-mempool descendants; conflicts drop the loser tree. Persists DEAD
@@ -2232,7 +2233,7 @@ impl MempoolHub {
             .map(|(t, _)| *t)
             .filter(|t| !drop_set.contains(t))
             .collect();
-        let spent_ops = self.spent_chain_prevouts(&g, &remain, &drop_set)?;
+        let spent_ops = self.dead_chain_prevouts(&g, &remain, &drop_set)?;
         let confirmed: Vec<Txid> = drop_set.into_iter().collect();
         // A store fault still unlinks conflicts before it returns, and that
         // error drops the conflict list. Snapshot the graph and unindex the
@@ -2272,18 +2273,19 @@ impl MempoolHub {
         Ok(to_drop)
     }
 
+    /// Chain prevouts of `remain` that no block on the tip can spend: spent on
+    /// the active chain, or with no confirmed create. A reloaded child whose
+    /// parent's re-admit was lost after a reorg has the second kind; Core's
+    /// reload rejects it as `missing-inputs`.
     #[doc(hidden)]
     #[allow(clippy::result_unit_err)] // a store fault is (); confirm-drop keeps the pool
-    pub fn spent_chain_prevouts(
+    pub fn dead_chain_prevouts(
         &self,
         g: &ActiveMempool,
         remain: &[Txid],
         confirmed_resident: &HashSet<Txid>,
     ) -> Result<Vec<OutPoint>, ()> {
-        let op_fk = self.chain_create_fks(g, remain, confirmed_resident)?;
-        if op_fk.is_empty() {
-            return Ok(Vec::new());
-        }
+        let (op_fk, missing) = self.chain_create_fks(g, remain, confirmed_resident)?;
         let mut fk_vouts: HashMap<Fk, Vec<u32>> = HashMap::new();
         for (op, fk) in &op_fk {
             fk_vouts.entry(*fk).or_default().push(op.vout);
@@ -2313,17 +2315,30 @@ impl MempoolHub {
             .into_iter()
             .filter(|(op, fk)| spent_pair.contains(&(fk.0, op.vout)))
             .map(|(op, _)| op)
+            .chain(missing)
             .collect())
     }
 
+    /// Confirmed create of each chain prevout of `remain`, and the prevouts
+    /// that have none. The txid lookup returns connected rows only. A cached
+    /// create a reorg disconnected is looked up again by txid, so a parent
+    /// mined again in another block still counts.
+    ///
+    /// A lookup miss is a missing parent only when `tx.head` holds every
+    /// connected create. While its drain is behind the fence the call is a
+    /// store fault, and the caller retries. After a power loss the head can
+    /// miss a create that `txid.body` still holds on the connected chain;
+    /// that scan returns the create, so the prevout is checked for a spend
+    /// like any other.
     #[doc(hidden)]
-    #[allow(clippy::result_unit_err)] // a store fault is (); confirm-drop keeps the pool
+    #[allow(clippy::result_unit_err, clippy::type_complexity)] // store fault is (); creates + missing
     pub fn chain_create_fks(
         &self,
         g: &ActiveMempool,
         remain: &[Txid],
         confirmed_resident: &HashSet<Txid>,
-    ) -> Result<HashMap<OutPoint, Fk>, ()> {
+    ) -> Result<(HashMap<OutPoint, Fk>, Vec<OutPoint>), ()> {
+        let store = self.query.store();
         let mut op_fk: HashMap<OutPoint, Fk> = HashMap::new();
         let mut need_id: Vec<[u8; 32]> = Vec::new();
         for tid in remain {
@@ -2337,29 +2352,30 @@ impl MempoolHub {
                 if g.graph.contains(&op.txid) && !confirmed_resident.contains(&op.txid) {
                     continue;
                 }
-                if let Some(fk) = aux.get(i).and_then(|a| a.create_fk) {
-                    op_fk.insert(op, fk);
-                } else {
-                    need_id.push(op.txid.to_byte_array());
+                match aux.get(i).and_then(|a| a.create_fk) {
+                    Some(fk) if store.is_confirmed_strong(fk).map_err(|_| ())? => {
+                        op_fk.insert(op, fk);
+                    }
+                    _ => need_id.push(op.txid.to_byte_array()),
                 }
             }
         }
         if need_id.is_empty() {
-            return Ok(op_fk);
+            return Ok((op_fk, Vec::new()));
         }
         need_id.sort_unstable();
         need_id.dedup();
-        let rows = self
-            .query
-            .store()
-            .get_fk_by_txid_batch(&need_id)
-            .map_err(|_| ())?;
+        // Both read before the head read, so they bound what it probed.
+        let head_complete = self.query.head_covers_fence();
+        let unsynced_from = store.head_unsynced_first_fk();
+        let rows = store.get_fk_by_txid_batch(&need_id).map_err(|_| ())?;
         let mut fk_of: HashMap<[u8; 32], Fk> = HashMap::new();
         for (tid, row) in rows {
             if let Some((fk, _)) = row {
                 fk_of.insert(tid, fk);
             }
         }
+        let mut missing = Vec::new();
         for tid in remain {
             let Some(tx) = g.get_tx(tid) else { continue };
             for inp in &tx.input {
@@ -2369,12 +2385,39 @@ impl MempoolHub {
                 {
                     continue;
                 }
-                if let Some(&fk) = fk_of.get(&op.txid.to_byte_array()) {
-                    op_fk.insert(op, fk);
+                match fk_of.get(&op.txid.to_byte_array()) {
+                    Some(&fk) => {
+                        op_fk.insert(op, fk);
+                    }
+                    None => missing.push(op),
                 }
             }
         }
-        Ok(op_fk)
+        if missing.is_empty() {
+            return Ok((op_fk, missing));
+        }
+        if !head_complete {
+            return Err(());
+        }
+        let mut lost: Vec<[u8; 32]> = missing.iter().map(|op| op.txid.to_byte_array()).collect();
+        lost.sort_unstable();
+        lost.dedup();
+        // No stop: the query's confirm cancel stays set once catch-up ends,
+        // and a stopped scan is not a result. The read is the unsynced head
+        // tail of `txid.body`, once, only when a lookup missed.
+        let held: HashMap<[u8; 32], Fk> = store
+            .connected_in_unsynced_head(unsynced_from, &lost, || false)
+            .map_err(|_| ())?
+            .into_iter()
+            .collect();
+        missing.retain(|op| match held.get(&op.txid.to_byte_array()) {
+            Some(&fk) => {
+                op_fk.insert(*op, fk);
+                false
+            }
+            None => true,
+        });
+        Ok((op_fk, missing))
     }
 
     pub fn subscribe_announces(&self) -> broadcast::Receiver<MempoolAnnounce> {
