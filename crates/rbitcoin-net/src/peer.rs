@@ -6680,7 +6680,7 @@ pub async fn on_blocktxn(
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
-        Err(()) => on_blocktxn_apply_fail(hub, follow, session, &pc, hash),
+        Err(()) => on_blocktxn_apply_fail(hub, out_tx, follow, session, &pc, hash),
     }
 }
 
@@ -6753,13 +6753,14 @@ pub async fn on_blocktxn_got_block(
             )
             .await
         }
-        Err(_) => on_blocktxn_unconnectable(hub, follow, session, hash),
+        Err(_) => on_blocktxn_unconnectable(hub, out_tx, follow, session, hash),
     }
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
     hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     pc: &PendingCmpct,
@@ -6774,12 +6775,16 @@ pub fn on_blocktxn_apply_fail(
     hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    Ok(())
+    queue_out(
+        out_tx,
+        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+    )
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
     hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6792,7 +6797,10 @@ pub fn on_blocktxn_unconnectable(
     hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
     ask_other_hb_for_block(session, hash);
-    Ok(())
+    queue_out(
+        out_tx,
+        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
