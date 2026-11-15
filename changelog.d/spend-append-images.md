@@ -9,5 +9,6 @@ Changed
   generation file the previous commit still names. A fold before the next
   durable commit leaves that file in place. Each published image is
   composed once and written before the next page is composed. A return
-  before the commit rename removes that file. A checkpoint lists and
-  removes old generation files after it drops the utxo view.
+  before the commit rename removes that file. The publish path lists and
+  removes old generation files after it drops the utxo view. The fold
+  still does that while the view is held.
