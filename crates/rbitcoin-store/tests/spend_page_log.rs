@@ -4299,3 +4299,33 @@ fn spend_commit_reload_serves_the_slot_and_rejects_short() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn a_commit_that_stops_naming_a_generation_unlinks_its_file() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let second = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    // Page 4096 stays open, so the fold is not a full wipe. It drops page 0
+    // from RAM, and the commit on disk still names generation 1.
+    log.note_slots(&[(4096, second)]).unwrap();
+    log.widen_cool_through();
+    log.fold_into(|_off, _image| Ok(()), || Ok(())).unwrap();
+    assert_eq!(log.slot(16), None, "the fold must drop page 0");
+    assert!(
+        d.join(SPEND_PAGES_NAME).is_file(),
+        "the old commit names this file"
+    );
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let gen1 = d.join(format!("{SPEND_PAGES_NAME}.1"));
+    assert!(
+        !gen1.exists(),
+        "a generation the new commit does not name must be unlinked"
+    );
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(second));
+    let _ = std::fs::remove_dir_all(&d);
+}
