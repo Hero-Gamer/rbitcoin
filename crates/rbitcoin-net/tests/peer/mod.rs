@@ -6006,7 +6006,7 @@ fn snapshot_omits_peer_after_tcp_fin() {
 
 /// Burst tip advances (> tip broadcast capacity) must still reach a follow peer
 /// without waiting for the 120s headers poll (`sync_blocks` is 60s).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "current_thread")]
 async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     use bitcoin::ScriptBuf;
     use rbitcoin_net::P2PNode;
@@ -6046,9 +6046,20 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     .unwrap();
 
     na.follow_from(nb.local_addr).await.unwrap();
+    // Each side must have the reply to its initial getheaders while both tips
+    // are genesis. A reply built after the burst would sync B, and a broken
+    // lagged announce would still pass.
+    let read_headers = |n: &P2PNode| {
+        n.peers
+            .snapshot()
+            .iter()
+            .any(|p| p.bytesrecv_per_msg.contains_key("headers"))
+    };
     let mut linked = false;
-    for _ in 0..100 {
-        if na.follow_live_count() >= 1 && !nb.peers.snapshot().is_empty() {
+    for _ in 0..500 {
+        if na.follow_live_count() >= 1 && read_headers(&na) && read_headers(&nb) {
+            assert_eq!(na.tip_height().unwrap_or(0), 0, "miner tip before burst");
+            assert_eq!(nb.tip_height().unwrap_or(0), 0, "peer tip before burst");
             linked = true;
             break;
         }
@@ -6056,8 +6067,11 @@ async fn tip_burst_past_broadcast_capacity_still_syncs_peer() {
     }
     assert!(linked, "follow session must be live before tip burst");
 
-    // Capacity is 64; sync generate without await fills the ring so the
-    // announce task sees Lagged instead of every TipEvent.
+    // Capacity is 64. The runtime has one thread, so the sync generate below
+    // cannot be interleaved with the session tasks: the ring overflows and the
+    // announce task sees Lagged instead of every TipEvent. On a multi-thread
+    // runtime the sessions raced the miner and B was flooded with per-block
+    // traffic it could not decode in time under load ("decode queue full").
     const BURST: u32 = 80;
     na.hub
         .generate_to_script(BURST, ScriptBuf::from_bytes(vec![0x51]), vec![])
