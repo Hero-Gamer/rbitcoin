@@ -508,16 +508,12 @@ impl AddrMan {
             .copied()
             .filter_map(NetAddr::socket_addr)
             .collect();
-        let ip: Vec<NetAddr> = self
-            .take_dial_candidates(max, &ip_ex, occupied)
-            .into_iter()
-            .map(NetAddr::from_socket)
-            .collect();
+        // `ip_paced`: every eligible IP row was tried recently, so `ip` is
+        // the one paced redial. Overlay rows must not take the slots the
+        // other IP rows are due on later passes: this pass adds one at most.
+        let (ip, ip_paced) = self.pick_dial_candidates(max, &ip_ex, occupied);
+        let ip: Vec<NetAddr> = ip.into_iter().map(NetAddr::from_socket).collect();
         let now = Instant::now();
-        // Every eligible IP row was tried recently, so `ip` is the one paced
-        // redial. Overlay rows must not take the slots the other IP rows are
-        // due on later passes: this pass adds one at most.
-        let ip_paced = ip.iter().any(|a| self.recently_attempted_addr(*a, now));
         let mut overlay: Vec<(u8, NetAddr)> = self
             .order
             .iter()
@@ -914,8 +910,20 @@ impl AddrMan {
         exclude: &HashSet<SocketAddr>,
         occupied: &[SocketAddr],
     ) -> Vec<SocketAddr> {
+        self.pick_dial_candidates(max, exclude, occupied).0
+    }
+
+    /// [`Self::take_dial_candidates`], and whether the pick is the paced
+    /// redial of a recently attempted row. The caller gets the decision, not
+    /// a second reading of the clock.
+    fn pick_dial_candidates(
+        &self,
+        max: usize,
+        exclude: &HashSet<SocketAddr>,
+        occupied: &[SocketAddr],
+    ) -> (Vec<SocketAddr>, bool) {
         if max == 0 || self.order.is_empty() {
-            return Vec::new();
+            return (Vec::new(), false);
         }
         let mut ranked: Vec<(u8, bool, bool, SocketAddr)> = self
             .order
@@ -947,10 +955,11 @@ impl AddrMan {
             ranked.retain(|(_, _, incompat, _)| !*incompat);
         }
         let now = Instant::now();
-        if ranked
-            .iter()
-            .any(|(_, _, _, a)| !self.recently_attempted(*a, now))
-        {
+        let paced = !ranked.is_empty()
+            && ranked
+                .iter()
+                .all(|(_, _, _, a)| self.recently_attempted(*a, now));
+        if !paced {
             ranked.retain(|(_, _, _, a)| !self.recently_attempted(*a, now));
         } else {
             // Every row was attempted recently: dial only the one tried
@@ -980,7 +989,7 @@ impl AddrMan {
             occupied_groups.extend(picked.iter().filter_map(|a| outbound_group(*a, asmap)));
             out.extend(picked);
         }
-        out
+        (out, paced)
     }
 
     /// Round-robin-ish: take up to `max` peers starting at `offset`.
