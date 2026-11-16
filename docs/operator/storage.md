@@ -72,7 +72,7 @@ counts, ingest OA, and refuse lines: [`SCHEMA.md`](../../SCHEMA.md) and
 
 ## Schema upgrade
 
-Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 28`). This section is
+Live bytes: [`SCHEMA.md`](../../SCHEMA.md) (`SCHEMA_VERSION = 29`). This section is
 the operator copy-paste only — do not treat it as a second layout map.
 
 Open **never silently wipes** a populated store (policy:
@@ -82,14 +82,15 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
-| **28** | Open. Historical spend slots live in `spend.pages` until fold. |
-| **27** | Rewrite `meta` to 28 and sync the store directory. No table rewrite. A schema-27 binary then refuses the directory. |
-| **26** | Rewrite `meta` to 28 and sync the store directory. No table rewrite. A 0.9.0 binary then refuses the directory. |
-| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 28. |
-| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 28. |
-| **23** | Headers stay 88 B. Rewrite `meta` to 28. `txstat.body` is created and aligned to the loc count when it is missing or short. |
+| **29** | Open. Each historical spend page stays in the generation file that holds it until fold. |
+| **28** | Rewrite `meta` to 29 and sync the store directory. No table rewrite. A schema-28 binary then refuses the directory. |
+| **27** | Rewrite `meta` to 29 and sync the store directory. No table rewrite. A schema-27 binary then refuses the directory. |
+| **26** | Rewrite `meta` to 29 and sync the store directory. No table rewrite. A 0.9.0 binary then refuses the directory. |
+| **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 29. |
+| **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 29. |
+| **23** | Headers stay 88 B. Rewrite `meta` to 29. `txstat.body` is created and aligned to the loc count when it is missing or short. |
 | **22**, occupied Class A | Rewrite `create.loc.ovf` 12 B→16 B. Headers stay 88 B. Then the same `meta` rewrite and `txstat` align as 23. |
-| **22**, empty Class A | Rewrite `meta` to 28, then open. |
+| **22**, empty Class A | Rewrite `meta` to 29, then open. |
 | **Below 22**, empty or occupied | **Refuse.** One line: `schema before 22 refuses this datadir; wipe datadir and redo IBD`. Wipe the datadir and redo IBD. No per-version rewrite. |
 
 On every open of meta 22–25 the node also renames leftover `inwit.*` to `seqsigwit.*` and `inputs.*` to `input.*`. A missing `input.loc` with seqsigwit prevouts backfills parent edges. A crash during the 96 B→88 B rewrite leaves the old `meta`; the next open retries the shrink. Size and weight after that come from `txstat`.

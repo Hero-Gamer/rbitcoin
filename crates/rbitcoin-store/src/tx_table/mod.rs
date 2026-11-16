@@ -2661,8 +2661,14 @@ impl TxTable {
         )
     }
 
-    pub(crate) fn install_open_spend_pages(&self) -> Result<(), StoreError> {
-        self.spend_pages.install_commit()
+    /// RAM install only. The caller unlinks with the returned set after it
+    /// drops the utxo view.
+    pub(crate) fn install_open_spend_pages(&self) -> Option<std::collections::HashSet<u32>> {
+        self.spend_pages.install_directory()
+    }
+
+    pub(crate) fn unlink_spend_generations_if_synced(&self, live: &std::collections::HashSet<u32>) {
+        self.spend_pages.unlink_if_synced(live);
     }
 
     pub(crate) fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
@@ -2679,6 +2685,11 @@ impl TxTable {
 
     pub(crate) fn wait_spend_edge_room(&self) {
         self.spend_pages.wait_open_edge_room();
+    }
+
+    #[doc(hidden)]
+    pub fn open_spend_edge_count(&self) -> u64 {
+        self.spend_pages.open_edge_count()
     }
 
     #[doc(hidden)]

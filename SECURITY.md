@@ -12,7 +12,7 @@ planned. In-tree is **0.9.99** (pre-0.10.0). **0.9.x** (tag 0.9.0) is the
 published line. **`v0.9.x`** is the patch line.
 Occupied **0.6.x** stores refuse
 (wipe and sync again). Schema 24 and 25 open in place. A published 0.8
-directory is schema 26. This binary rewrites that `meta` to 28, and a 0.9.0
+directory is schema 26. This binary rewrites that `meta` to 29, and a 0.9.0
 binary then refuses the directory. The runbook is
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md). Day-to-day flags
 are [`docs/operator/`](./docs/operator/).

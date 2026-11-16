@@ -210,15 +210,122 @@ fn second_generation_keeps_the_first_image_bytes() {
     let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
     log.note_slots(&[(16, slot)]).unwrap();
     log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let commit = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let generation = u32::from_le_bytes(commit[12..16].try_into().unwrap());
     let first = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
     log.note_slots(&[(4096, slot)]).unwrap();
     log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let parked = d.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+    let kept = std::fs::read(&parked).expect("the first generation file stays on disk");
+    assert_eq!(
+        kept, first,
+        "an unchanged page stays in the generation file that already holds it"
+    );
     let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
-    assert_eq!(&file[..first.len()], first.as_slice());
-    assert_eq!(&file[16..24], &slot);
+    assert_eq!(file.len(), first.len(), "the new file is only the new page");
+    assert!(
+        !file
+            .windows(first.len())
+            .any(|window| window == first.as_slice()),
+        "the new generation blob does not copy the carried page"
+    );
+    assert_eq!(&file[..8], &slot);
     let loaded = SpendPageLog::load(&d).unwrap();
     assert_eq!(loaded.slot(16), Some(slot));
     assert_eq!(loaded.slot(4096), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Quiet pages fold oldest generation file first. Page offset is the tie break.
+#[test]
+fn fold_order_copies_the_oldest_generation_first() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(4096, older)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(16, newer)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    log.widen_cool_through();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        wrote,
+        vec![4096, 16],
+        "fold copies the older generation file before the newer page"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// One checkpoint writes each composed image before it composes the next.
+#[cfg(debug_assertions)]
+#[test]
+fn checkpoint_holds_one_composed_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[
+        (16, [1u8, 1, 2, 3, 4, 5, 6, 7]),
+        (4096, [2u8, 1, 2, 3, 4, 5, 6, 7]),
+    ])
+    .unwrap();
+    rbitcoin_store::spend_page_log::reset_composed_hold_peak();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(
+        rbitcoin_store::spend_page_log::composed_hold_peak(),
+        1,
+        "a checkpoint writes each image before composing the next"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// One checkpoint composes a newly touched page once. A quiet page is not composed.
+#[test]
+fn checkpoint_composes_a_published_page_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let quiet = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, quiet)]).unwrap();
+    log.commit_open(3, 100, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, fresh)]).unwrap();
+    let fresh_reads = AtomicUsize::new(0);
+    let quiet_reads = AtomicUsize::new(0);
+    log.commit_open(
+        4,
+        8192,
+        |off, len| {
+            if off == 4096 {
+                fresh_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            if off == 0 {
+                quiet_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(vec![0u8; len])
+        },
+        |_| Ok(true),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh_reads.load(Ordering::SeqCst),
+        1,
+        "the newly touched page is composed once"
+    );
+    assert_eq!(
+        quiet_reads.load(Ordering::SeqCst),
+        0,
+        "a quiet carried page is not composed"
+    );
+    assert_eq!(log.slot(16), Some(quiet));
+    assert_eq!(log.slot(4096), Some(fresh));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -1928,7 +2035,7 @@ fn hold_during_the_clearing_image_keeps_the_commit_bit() {
         4,
         8192,
         |off, len| {
-            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
                 log.hold_fold_above(1)?;
             }
             read(off, len)
@@ -2014,6 +2121,39 @@ fn missing_or_short_pages_file_refuses_open() {
         Err(StoreError::Corrupt("spend.pages short"))
     ));
     std::fs::remove_file(&pages).unwrap();
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn missing_or_short_older_generation_file_refuses_open() {
+    let d = dir();
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let two_commits = || {
+        std::fs::create_dir_all(&d).unwrap();
+        let log = SpendPageLog::create(&d);
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+        log.note_slots(&[(4096, slot)]).unwrap();
+        log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    };
+    let older = d.join(format!("{SPEND_PAGES_NAME}.1"));
+    two_commits();
+    assert!(older.exists(), "first page must stay in spend.pages.1");
+    let mut bytes = std::fs::read(&older).unwrap();
+    bytes.pop();
+    std::fs::write(&older, &bytes).unwrap();
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+    two_commits();
+    assert!(older.exists(), "first page must stay in spend.pages.1");
+    std::fs::remove_file(&older).unwrap();
     assert!(matches!(
         SpendPageLog::load(&d),
         Err(StoreError::Corrupt("spend.pages short"))
@@ -2833,6 +2973,70 @@ fn directory_sync_failure_after_commit_rename_keeps_the_generation() {
 
 #[cfg(all(unix, debug_assertions))]
 #[test]
+fn directory_sync_failure_keeps_a_generation_the_old_commit_names() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let kept = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(4096, first)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(16, kept)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let previous = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    log.fold_into(|_off, _image| Ok(()), || Ok(())).unwrap();
+    log.note_slots(&[(8192, [3u8, 1, 2, 3, 4, 5, 6, 7])])
+        .unwrap();
+    let _reset = ResetDirSync;
+    // Park and the new image sync. The commit sync fails, so a crash can
+    // still reload the previous commit, which names generation 1.
+    rbitcoin_store::file::arm_fail_dir_sync_after(2, 1);
+    log.commit_open(4, 12288, zeros, |_| Ok(true)).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    // The next fold is not a wipe: this page stays open. finish_cooled
+    // must not unlink generation 1: the commit directory sync has not succeeded.
+    log.note_slots(&[(12288, [5u8, 1, 2, 3, 4, 5, 6, 7])])
+        .unwrap();
+    log.widen_cool_through();
+    log.fold_into(|_off, _image| Ok(()), || Ok(())).unwrap();
+    std::fs::write(d.join(SPEND_PAGES_COMMIT_NAME), &previous).unwrap();
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(
+        loaded.slot(4096),
+        Some(first),
+        "a failed commit directory sync must keep the file the previous commit names"
+    );
+    assert_eq!(loaded.slot(16), Some(kept));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn directory_sync_failure_before_the_commit_removes_the_new_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, [3u8, 1, 2, 3, 4, 5, 6, 7])])
+        .unwrap();
+    let _reset = ResetDirSync;
+    // The new image's directory sync succeeds. Park's sync is next and
+    // fails before the commit rename, so generation 2 must not stay.
+    rbitcoin_store::file::arm_fail_dir_sync_after(1, 1);
+    assert!(log.commit_open(3, 8192, zeros, |_| Ok(true)).is_err());
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    assert!(
+        !d.join(format!("{SPEND_PAGES_NAME}.2")).exists(),
+        "a return before the commit rename must remove the new image"
+    );
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
 fn directory_sync_failure_leaves_the_generation_file() {
     let d = dir();
     let log = SpendPageLog::create(&d);
@@ -3208,6 +3412,46 @@ fn review_1501_fold_probe() {
 }
 
 #[cfg(debug_assertions)]
+struct StoredImageProbe {
+    store: std::sync::Arc<rbitcoin_store::Store>,
+    pages: PathBuf,
+    body: PathBuf,
+    image: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static STORED_IMAGE_PROBE: std::cell::RefCell<Option<StoredImageProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The edge count has already dropped. The body still has the pre-fold byte.
+#[cfg(debug_assertions)]
+fn stored_image_fold_probe() {
+    let probe = STORED_IMAGE_PROBE.with(|slot| slot.borrow_mut().take());
+    let Some(probe) = probe else {
+        return;
+    };
+    assert!(
+        probe.store.open_spend_edge_count() < OPEN_EDGE_CAP,
+        "the open-edge count drops before the cooled copy"
+    );
+    assert_eq!(
+        probe.store.spend_directory_slot(24),
+        Some([0u8; 8]),
+        "an explicit zero stays in the log until the copy is durable"
+    );
+    let body = std::fs::read(&probe.body).unwrap();
+    assert_eq!(
+        &body[24..32],
+        &[0xabu8; 8],
+        "the cooled copy has not written the stored image yet"
+    );
+    *probe.image.lock().unwrap_or_else(|e| e.into_inner()) = std::fs::read(&probe.pages).unwrap();
+    review_1501_fold_probe();
+}
+
+#[cfg(debug_assertions)]
 struct ClearFoldProbe;
 
 #[cfg(debug_assertions)]
@@ -3422,7 +3666,7 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     use std::time::Duration;
 
     let d = dir();
-    let store = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let store = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&d).unwrap());
     let nbytes = 4096usize;
     let prep = store
         .txs
@@ -3438,11 +3682,20 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
         .write_body_blob_bulk(prep.start, &prep.body_blob)
         .unwrap();
     store.txs.spent.finish_prepared(prep).unwrap();
+    store.txs.spent.write_body_pwrite(24, &[0xabu8; 8]).unwrap();
     let slot =
         rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
     store.note_open_spend_slots(&[(16, slot)]).unwrap();
     store.checkpoint_spend_through(0).unwrap();
     assert_eq!(store.spend_directory_slot(16), Some(slot));
+    let zero = [0u8; 8];
+    store.note_open_spend_slots(&[(24, zero)]).unwrap();
+    store.checkpoint_spend_through(0).unwrap();
+    assert_eq!(
+        store.spend_directory_slot(24),
+        Some(zero),
+        "the explicit zero is served from the log"
+    );
 
     let mut batch = Vec::with_capacity(4096);
     let mut n = 0u64;
@@ -3461,6 +3714,7 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     }
     let wake = Arc::new((Mutex::new(false), Condvar::new()));
     store.bind_spend_sync_wake(Arc::clone(&wake));
+    let folded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let (lock, cv) = &*wake;
     let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let released = AtomicBool::new(false);
@@ -3487,7 +3741,15 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
                     release: release_rx,
                 });
             });
-            rbitcoin_store::Store::arm_spend_fold_probe(review_1501_fold_probe);
+            STORED_IMAGE_PROBE.with(|slot| {
+                *slot.borrow_mut() = Some(StoredImageProbe {
+                    store: std::sync::Arc::clone(&store),
+                    pages: d.join(SPEND_PAGES_NAME),
+                    body: d.join("spent.body"),
+                    image: std::sync::Arc::clone(&folded),
+                });
+            });
+            rbitcoin_store::Store::arm_spend_fold_probe(stored_image_fold_probe);
             store.checkpoint_spend_through(0)
         });
         entered_rx
@@ -3508,6 +3770,16 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
         None,
         "the cooled page is copied from the generation file before the next one is assembled"
     );
+    assert_eq!(store.spend_directory_slot(24), None);
+    let image = folded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    assert!(image.len() > 32, "the probe saved the stored page image");
+    let body = std::fs::read(d.join("spent.body")).unwrap();
+    assert_eq!(
+        &body[16..image.len()],
+        &image[16..],
+        "the cooled copy writes the stored image, including an explicit zero"
+    );
+    assert_eq!(&body[24..32], &[0u8; 8]);
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -3602,6 +3874,80 @@ fn early_freeze_does_not_seal_the_tip_before_the_cooled_copy() {
         assert!(
             SEAL_PROBE_RAN.with(|ran| ran.get()),
             "the cooled copy must run while the tip is still unsealed"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static INSTALL_STORE: std::cell::RefCell<Option<std::sync::Arc<rbitcoin_store::Store>>> =
+        const { std::cell::RefCell::new(None) };
+    static INSTALL_PROBE_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+fn install_unlink_probe() {
+    INSTALL_PROBE_RAN.with(|ran| ran.set(true));
+    INSTALL_STORE.with(|slot| {
+        let store = slot.borrow();
+        let store = store.as_ref().expect("store");
+        assert!(
+            store.utxo_view_stamp().is_some(),
+            "generation files are listed and removed after the utxo view drops"
+        );
+    });
+}
+
+#[cfg(debug_assertions)]
+struct ClearInstallProbe;
+
+#[cfg(debug_assertions)]
+impl Drop for ClearInstallProbe {
+    fn drop(&mut self) {
+        rbitcoin_store::Store::disarm_spend_install_probe();
+        INSTALL_STORE.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+/// A checkpoint unlinks old generation files outside the utxo view.
+///
+/// Readers and confirm wait on that view. A directory listing under it
+/// stalls them.
+#[cfg(debug_assertions)]
+#[test]
+fn install_unlinks_generations_after_the_utxo_view_drops() {
+    let d = dir();
+    let store = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&d).unwrap());
+    let nbytes = 8192usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
+    store.note_open_spend_slots(&[(16, slot)]).unwrap();
+    {
+        let _clear = ClearInstallProbe;
+        INSTALL_PROBE_RAN.with(|ran| ran.set(false));
+        INSTALL_STORE.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&store)));
+        rbitcoin_store::Store::arm_spend_install_probe(install_unlink_probe);
+        store.checkpoint_spend_through(5).unwrap();
+        assert!(
+            INSTALL_PROBE_RAN.with(|ran| ran.get()),
+            "the checkpoint installs a generation and reaches the unlink"
         );
     }
     let _ = std::fs::remove_dir_all(&d);
@@ -3951,5 +4297,72 @@ fn spend_commit_reload_serves_the_slot_and_rejects_short() {
         Err(err) => panic!("{err}"),
         Ok(_) => panic!("a short commit loaded"),
     }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn a_commit_that_stops_naming_a_generation_unlinks_its_file() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let second = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    // Page 4096 stays open, so the fold is not a full wipe. It drops page 0
+    // from RAM, and the commit on disk still names generation 1.
+    log.note_slots(&[(4096, second)]).unwrap();
+    log.widen_cool_through();
+    log.fold_into(|_off, _image| Ok(()), || Ok(())).unwrap();
+    assert_eq!(log.slot(16), None, "the fold must drop page 0");
+    assert!(
+        d.join(SPEND_PAGES_NAME).is_file(),
+        "the old commit names this file"
+    );
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let gen1 = d.join(format!("{SPEND_PAGES_NAME}.1"));
+    assert!(
+        !gen1.exists(),
+        "a generation the new commit does not name must be unlinked"
+    );
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(second));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn hold_after_the_clear_choice_keeps_the_commit_bit() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FIRED: AtomicBool = AtomicBool::new(false);
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            rbitcoin_store::spend_page_log::disarm_publish_probe();
+        }
+    }
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16u64, stale)];
+    let _disarm = Disarm;
+    // No hold lands before `publish_hold`, so it picks Clear. The probe
+    // holds after that choice and before `commit_io` is taken.
+    rbitcoin_store::spend_page_log::arm_publish_probe(|log| {
+        FIRED.store(true, Ordering::Relaxed);
+        log.hold_fold_above(0).unwrap();
+    });
+    log.commit_open(4, 8192, body_with(&planted), |_| Ok(false))
+        .unwrap();
+    assert!(FIRED.load(Ordering::Relaxed), "the publish probe must run");
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+        1,
+        "a hold after the clear choice must stay on the new commit"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }

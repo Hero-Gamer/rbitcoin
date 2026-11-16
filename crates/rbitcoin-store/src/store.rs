@@ -457,10 +457,15 @@ type SpendFreezeProbe = fn(&SpenderTable, &crate::spend_page_log::SpendPageLog);
 type SpendFoldProbe = fn();
 
 #[cfg(debug_assertions)]
+type SpendInstallProbe = fn();
+
+#[cfg(debug_assertions)]
 thread_local! {
     static SPEND_FREEZE_PROBE: std::cell::Cell<Option<SpendFreezeProbe>> =
         const { std::cell::Cell::new(None) };
     static SPEND_FOLD_PROBE: std::cell::Cell<Option<SpendFoldProbe>> =
+        const { std::cell::Cell::new(None) };
+    static SPEND_INSTALL_PROBE: std::cell::Cell<Option<SpendInstallProbe>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -1982,6 +1987,12 @@ impl Store {
         self.txs.spend_log_slot(abs)
     }
 
+    /// Open slot deltas the edge-cap wait is blocked on.
+    #[doc(hidden)]
+    pub fn open_spend_edge_count(&self) -> u64 {
+        self.txs.open_spend_edge_count()
+    }
+
     pub fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
         self.txs.bind_spend_sync_wake(wake);
     }
@@ -2040,6 +2051,25 @@ impl Store {
         SPEND_FOLD_PROBE.with(|slot| slot.take())
     }
 
+    /// Run once beside the checkpoint's generation-file unlink.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn arm_spend_install_probe(probe: SpendInstallProbe) {
+        SPEND_INSTALL_PROBE.with(|slot| slot.set(Some(probe)));
+    }
+
+    /// Drop a probe [`arm_spend_install_probe`] has not consumed.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn disarm_spend_install_probe() {
+        SPEND_INSTALL_PROBE.with(|slot| slot.set(None));
+    }
+
+    #[cfg(debug_assertions)]
+    fn take_spend_install_probe() -> Option<SpendInstallProbe> {
+        SPEND_INSTALL_PROBE.with(|slot| slot.take())
+    }
+
     fn publish_open_spend_pages(
         &self,
         height: u32,
@@ -2090,8 +2120,20 @@ impl Store {
     }
 
     fn install_prepared_spend_pages(&self) -> Result<(), StoreError> {
-        let _g = hold_view(&self.utxo_publish, &self.utxo_view);
-        self.txs.install_open_spend_pages()
+        // Readers and confirm wait on the view. List and unlink generation
+        // files after it drops, with the live set captured under it.
+        let live = {
+            let _g = hold_view(&self.utxo_publish, &self.utxo_view);
+            self.txs.install_open_spend_pages()
+        };
+        if let Some(live) = live {
+            #[cfg(debug_assertions)]
+            if let Some(probe) = Self::take_spend_install_probe() {
+                probe();
+            }
+            self.txs.unlink_spend_generations_if_synced(&live);
+        }
+        Ok(())
     }
 
     fn fold_sealed_spend_pages(&self) -> Result<(), StoreError> {
