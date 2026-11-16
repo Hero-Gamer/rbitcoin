@@ -149,13 +149,13 @@ async fn expect_prev_hash(c: &mut TpClient, tc: &TestChain, template_id: u64, ne
     let tip = tc.chain.tip_header().expect("tip header");
     assert_eq!(p.prev_hash.as_ref(), tip.block_hash().to_byte_array());
     let mtp = median_time_past(&tc.chain.query, Height(next_h - 1)).unwrap();
-    assert!(p.header_timestamp > mtp, "header_timestamp above MTP");
-    assert!(u64::from(p.header_timestamp) <= tc.chain.clock.now_secs());
+    assert!(p.ntime_start > mtp, "ntime_start above MTP");
+    assert!(u64::from(p.ntime_start) <= tc.chain.clock.now_secs());
     let bits = expected_next_bits(
         &tc.chain.query,
         &tc.chain.params,
         Height(next_h),
-        p.header_timestamp,
+        p.ntime_start,
     )
     .unwrap();
     assert_eq!(p.n_bits, bits.to_consensus());
@@ -503,7 +503,7 @@ async fn first_template_every(tc: &TestChain, template_interval: Duration) -> Fi
         version: bitcoin::block::Version::from_consensus(t.version as i32),
         prev_blockhash: tip,
         merkle_root: bitcoin::TxMerkleNode::from_byte_array(root),
-        time: p.header_timestamp,
+        time: p.ntime_start,
         bits: CompactTarget::from_consensus(p.n_bits),
         nonce: 0,
     };
@@ -695,7 +695,7 @@ async fn submit_solution_without_witness_commitment_is_accepted() {
 }
 
 /// A miner whose clock runs a few seconds ahead of the TP rolls
-/// `header_timestamp` past the wall time since `SetNewPrevHash`. The block is
+/// `ntime` past the wall time since `SetNewPrevHash`. The block is
 /// still consensus-valid (above MTP, under now + 2h), so it becomes the tip.
 #[tokio::test(flavor = "multi_thread")]
 async fn submit_solution_ahead_of_the_rolled_time_is_accepted() {

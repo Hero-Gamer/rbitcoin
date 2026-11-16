@@ -78,7 +78,7 @@ pub struct FeePush {
 pub struct Templates {
     pub last_id: u64,
     pub current_prev: Option<[u8; 32]>,
-    /// `SetNewPrevHash.header_timestamp` sent for `current_prev`, and when.
+    /// `SetNewPrevHash.ntime_start` sent for `current_prev`, and when.
     pub prev_sent: Option<(u32, Instant)>,
     /// `SetNewPrevHash.n_bits` and `target` sent for `current_prev`.
     pub sent_bits: Option<(u32, [u8; 32])>,
@@ -558,9 +558,9 @@ impl Session {
             version: block::Version::from_consensus(m.version as i32),
             prev_blockhash: BlockHash::from_byte_array(r.t.prev_hash),
             merkle_root: TxMerkleNode::from_byte_array(root),
-            time: m.header_timestamp,
+            time: m.ntime,
             bits: CompactTarget::from_consensus(r.t.n_bits),
-            nonce: m.header_nonce,
+            nonce: m.nonce,
         };
         if header.validate_pow(header.target()).is_err() {
             rbitcoin_log::info!(
@@ -595,13 +595,13 @@ impl Session {
         let (sent_ts, sent_at) = r.prev_sent;
         let rolled =
             u64::try_from(sent_at.elapsed().as_millis().div_ceil(1000)).unwrap_or(u64::MAX);
-        if u64::from(m.header_timestamp) < u64::from(sent_ts)
-            || u64::from(m.header_timestamp) > u64::from(sent_ts).saturating_add(rolled)
+        if u64::from(m.ntime) < u64::from(sent_ts)
+            || u64::from(m.ntime) > u64::from(sent_ts).saturating_add(rolled)
         {
             rbitcoin_log::info!(
-                "sv2: SubmitSolution template {} header_timestamp {} outside [{sent_ts}, +{rolled}s]; submitting",
+                "sv2: SubmitSolution template {} ntime {} outside [{sent_ts}, +{rolled}s]; submitting",
                 m.template_id,
-                m.header_timestamp
+                m.ntime
             );
         }
         let mut txdata = Vec::with_capacity(1 + r.t.txs.len());

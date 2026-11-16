@@ -67,14 +67,15 @@ arc-swap = "1"
 # Process-wide heap for product binaries (musl static + glibc). Replaces the
 # platform default (musl/glibc malloc) via #[global_allocator] in each bin.
 mimalloc = "0.1"
-# Stratum v2 wire crates, pinned to the Step 0 spike set
-# (docs/sv2-template-provider.md). Messages decode with `binary_sv2::from_bytes`
-# on the known types; `parsers_sv2` is not needed.
+# Stratum v2 wire crates, pinned exactly. They move as one set: `codec_sv2`,
+# `common_messages_sv2`, and `template_distribution_sv2` each name the
+# `binary_sv2` major they build on. Messages decode with
+# `binary_sv2::from_bytes` on the known types; `parsers_sv2` is not needed.
 noise_sv2 = "=2.1.0"
-codec_sv2 = { version = "=7.0.0", features = ["noise_sv2"] }
-binary_sv2 = "=7.0.0"
-common_messages_sv2 = "=9.0.0"
-template_distribution_sv2 = "=7.0.0"
+codec_sv2 = { version = "=8.1.0", features = ["noise_sv2"] }
+binary_sv2 = "=8.0.0"
+common_messages_sv2 = "=10.0.0"
+template_distribution_sv2 = "=8.0.0"
 
 # Fail the build on rustc warnings (unused imports, dead code, …).
 [workspace.lints.rust]

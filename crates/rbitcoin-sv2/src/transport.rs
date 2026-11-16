@@ -64,6 +64,16 @@ pub fn codec_err(e: codec_sv2::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("sv2 codec: {e:?}"))
 }
 
+/// Reads the bytes the decoder is waiting for: the rest of one handshake
+/// message, encrypted header, or encrypted chunk.
+async fn fill<R: AsyncReadExt + Unpin>(
+    stream: &mut R,
+    decoder: &mut NoiseDecoder,
+) -> io::Result<()> {
+    let n = stream.read_exact(decoder.read_buf()).await?;
+    decoder.advance(n).map_err(codec_err)
+}
+
 impl NoiseConn {
     pub async fn accept(
         mut stream: TcpStream,
@@ -78,7 +88,7 @@ impl NoiseConn {
                 .map_err(codec_err)?
             {
                 Decoded::Frame(m) => break m,
-                Decoded::Incomplete(_) => stream.read_exact(decoder.writable()).await?,
+                Decoded::Incomplete => fill(&mut stream, &mut decoder).await?,
             };
         };
         let re_pub = first
@@ -123,7 +133,7 @@ impl NoiseConn {
                 .map_err(codec_err)?
             {
                 Decoded::Frame(m) => break m,
-                Decoded::Incomplete(_) => stream.read_exact(decoder.writable()).await?,
+                Decoded::Incomplete => fill(&mut stream, &mut decoder).await?,
             };
         };
         let reply = reply
@@ -230,21 +240,21 @@ impl NoiseReader {
                         payload: frame.payload().to_vec(),
                     });
                 }
-                Decrypted::Incomplete(n, state) => {
+                Decrypted::Incomplete(state) => {
                     self.rx = Some(state);
                     // codec_sv2 keeps the decrypted header private and asks
                     // for at most one chunk per read, so the declared length
                     // is not visible. Reads never cross a frame boundary, so
                     // the running count closes an oversized frame before the
                     // chunk that would exceed the cap is read.
-                    self.frame_read += n;
+                    self.frame_read += self.decoder.read_len();
                     if self.frame_read > self.max_frame {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "sv2: frame over the size cap",
                         ));
                     }
-                    self.stream.read_exact(self.decoder.writable()).await?;
+                    fill(&mut self.stream, &mut self.decoder).await?;
                 }
             }
         }

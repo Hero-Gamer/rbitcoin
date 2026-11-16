@@ -4122,7 +4122,7 @@ async fn sv2_tp_bootstrap() {
     c.submit_solution(
         pushed.template_id,
         pushed.version,
-        p.header_timestamp,
+        p.ntime_start,
         0,
         &[0xff; 8],
     )
@@ -4155,7 +4155,7 @@ async fn sv2_tp_bootstrap() {
         version: bitcoin::block::Version::from_consensus(pushed.version as i32),
         prev_blockhash: mined,
         merkle_root: bitcoin::TxMerkleNode::from_byte_array(root),
-        time: p.header_timestamp,
+        time: p.ntime_start,
         bits: bitcoin::CompactTarget::from_consensus(p.n_bits),
         nonce: 0,
     };
