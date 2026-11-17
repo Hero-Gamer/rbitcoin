@@ -106,8 +106,8 @@ impl TpClient {
         &mut self,
         template_id: u64,
         version: u32,
-        header_timestamp: u32,
-        header_nonce: u32,
+        ntime: u32,
+        nonce: u32,
         coinbase_tx: &[u8],
     ) -> io::Result<()> {
         let coinbase_tx = B064K::try_from(coinbase_tx)
@@ -115,8 +115,8 @@ impl TpClient {
         let msg = SubmitSolution {
             template_id,
             version,
-            header_timestamp,
-            header_nonce,
+            ntime,
+            nonce,
             coinbase_tx,
         };
         self.conn.send(MESSAGE_TYPE_SUBMIT_SOLUTION, msg).await

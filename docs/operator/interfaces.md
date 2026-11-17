@@ -327,7 +327,7 @@ once for that previous-block hash, coinbase budget, and template-update
 counter. Another session with the same key waits and reuses that build. A
 different coinbase budget builds again. An undecodable
 `SubmitSolution` or one
-that misses the template target is logged and dropped. A `header_timestamp`
+that misses the template target is logged and dropped. An `ntime`
 outside the sv2 rolling window (a miner clock running ahead) is logged and
 still submitted; block validation applies the consensus time rules.
 

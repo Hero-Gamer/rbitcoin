@@ -78,7 +78,7 @@ impl Template {
         SetNewPrevHash {
             template_id,
             prev_hash: U256::from(&self.prev_hash),
-            header_timestamp: self.header_timestamp,
+            ntime_start: self.header_timestamp,
             n_bits: self.n_bits,
             target: U256::from(&self.target),
         }
