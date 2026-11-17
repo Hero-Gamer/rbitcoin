@@ -2,7 +2,7 @@
 # status=run only when an unmodified script is green against rbitcoin.
 # Do not use reason=unknown.
 pin = "v32.1"
-core_commit = "d206226b4993f0330d809ca81851fb6976574ee7"
+core_commit = "e211dd0186e9646167d063a16f0da88e5f72e05f"
 
 [release]
 base_url = "https://bitcoincore.org/bin/bitcoin-core-32.1"

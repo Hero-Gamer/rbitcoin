@@ -1,7 +1,7 @@
 # Compatibility with Bitcoin Core
 
 Pinned reference version: **Bitcoin Core v32.1** (the release nightly fuzz
-runs). Core's tests run from master `d206226b`, after v32.1
+runs). Core's tests run from master `e211dd01`, after v32.1
 ([`docs/core-functional.md`](./docs/core-functional.md)).
 BIP324 v2 interop. Package wire tracks BIP331 when rust-bitcoin exposes the
 messages (**Q-48** / RB-007).

@@ -1,6 +1,6 @@
 Changed
 
-- **Core's tests run from Bitcoin Core master `d206226b`, after v32.1.**
+- **Core's tests run from Bitcoin Core master, after v32.1.**
   The consensus suites gain the vectors Core added since v32.1, including
   bitcoin/bitcoin#36458's interpreter edges (CSV with -2, IFDUP on negative
   zero, ROLL with repeated values, a taproot key that is not on the curve,

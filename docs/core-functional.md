@@ -1,7 +1,7 @@
 # Bitcoin Core functional tests (rbitcoin)
 
-Pin: Bitcoin Core master `d206226b` (after v32.1, at bitcoin/bitcoin#36458),
-`d206226b4993f0330d809ca81851fb6976574ee7`. Official binaries and the
+Pin: Bitcoin Core master `e211dd01` (after v32.1, at bitcoin/bitcoin#36869),
+`e211dd0186e9646167d063a16f0da88e5f72e05f`. Official binaries and the
 release check stay on **v32.1** (`[release]` below).
 
 `scripts/core-functional/` holds the inventory, checkers, runner, and
@@ -123,7 +123,7 @@ python3 scripts/core-functional/check_inventory.py
 ```
 
 `--tests-dir PATH` compares against a Core checkout’s `test/functional`.
-Without it, the checker uses `scripts/core-functional/d206226b-tests.txt`
+Without it, the checker uses `scripts/core-functional/e211dd01-tests.txt`
 (the pin's filename list).
 
 ## Inventory schema
@@ -146,7 +146,7 @@ inventory checker only reads `[[test]]` rows and ignores `[release]`.
 | `analog` | required when `reason` is `no-prune`, `core-internal`, `no-utxo-set`, `rpc-missing`, or `rpc-dialect` (`none` if we will not re-home; otherwise a scenario name or follow-up); for `node-behavior` it must cite the follow-up issue (`#N`) |
 | `log_map` | optional; later `debuglog_map.toml` keys |
 
-A file on disk (or in `d206226b-tests.txt`) that is missing from the inventory,
+A file on disk (or in `e211dd01-tests.txt`) that is missing from the inventory,
 or an inventory row with no file, **fails the checker**.
 
 `run` means an **unmodified** Core script is green against rbitcoin **and**
