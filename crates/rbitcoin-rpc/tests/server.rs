@@ -471,6 +471,32 @@ async fn jsonrpc_v2_batch_and_http_codes() {
     assert_eq!(arr[1]["error"]["message"], "Method not found");
     assert_eq!(arr[2]["error"]["message"], "Missing method");
 
+    // A non-object element answers on its own, whatever came before it.
+    let invalid = serde_json::json!({
+        "result": null,
+        "error": {"code": -32600, "message": "Invalid Request object"},
+        "id": null,
+    });
+    let (st, body) = post_raw(
+        tcp_addr(&handle),
+        &handle.auth,
+        br#"[{"jsonrpc":"2.0","method":"getblockcount","id":"X"},"not an object"]"#,
+    )
+    .await;
+    assert_eq!(st, 200, "{body:?}");
+    assert_eq!(
+        body.unwrap(),
+        serde_json::json!([{"jsonrpc":"2.0","result":0,"id":"X"}, invalid])
+    );
+    let (st, body) = post_raw(
+        tcp_addr(&handle),
+        &handle.auth,
+        br#"[{"jsonrpc":"2.0","method":"getblockcount"},"not an object"]"#,
+    )
+    .await;
+    assert_eq!(st, 200, "{body:?}");
+    assert_eq!(body.unwrap(), serde_json::json!([invalid]));
+
     let (st, body) = post_raw(
         tcp_addr(&handle),
         &handle.auth,

@@ -1465,6 +1465,15 @@ pub enum OneOut {
 
 #[doc(hidden)]
 pub fn exec_one(ctx: &RpcContext, req: &serde_json::Value) -> OneOut {
+    // A non-object batch element: Core's `JSONRPCRequest::parse` throws
+    // before it reads an id or version, so the reply is v1 with `id: null`.
+    if !req.is_object() {
+        return OneOut::Reply(reply_v1(
+            Some(serde_json::Value::Null),
+            None,
+            Some(serde_json::json!({ "code": -32600, "message": "Invalid Request object" })),
+        ));
+    }
     let ver = match parse_jsonrpc_ver(req) {
         Ok(v) => v,
         Err((code, msg)) => {
