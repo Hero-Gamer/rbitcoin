@@ -33,10 +33,22 @@ updates:
       prefix: "deps(cargo)"
     # Bundle routine bumps; leave majors as individual PRs for review.
     groups:
+      # Stratum v2 wire crates are pinned exactly and share one `binary_sv2`
+      # major, so one moved alone does not build. Dependabot gives a crate to
+      # the group whose pattern is most specific, not the first listed, and a
+      # group with no pattern outranks a wildcard. So the two catch-alls name
+      # `*`, the least specific, and `*_sv2` keeps these at every semver level.
+      sv2-wire:
+        patterns:
+          - "*_sv2"
       cargo-patch:
+        patterns:
+          - "*"
         update-types:
           - "patch"
       cargo-minor:
+        patterns:
+          - "*"
         update-types:
           - "minor"
     # Optional cooldown (Dependabot default is short); keep patches responsive.

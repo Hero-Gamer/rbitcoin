@@ -38,6 +38,7 @@ pinned flake (or `default.nix` + `flake.lock`) musl package.
 |--------|-------|-----|
 | Cargo **patch** / safe **minor** | Yes if CI green | Dependabot PR or hand `cargo update` |
 | Cargo **major** with API or dual-graph risk | Human PR only | Full suite; prefer one stack (e.g. axum + tower-http + tungstenite) |
+| Stratum **`*_sv2`** crates | One pull for the set | Dependabot group `sv2-wire`. They are pinned exactly and share one `binary_sv2` major. A new major can still need source changes: push them onto that pull, or open a human one that replaces it |
 | **`bitcoin_hashes`** | **Ignore in Dependabot** | Co-bump with **`bitcoin` / bip324 / rust-bitcoin** only (must match `bitcoin`’s hashes major) |
 | Actions (`checkout`, `setup-uv`, `codeql-action/upload-sarif`, `rust-cache`) | Yes after CI smoke | Prefer full semver or commit SHA. The zizmor crate version is the `uvx` pin in `zizmor.yml` |
 | **nixpkgs / crane** | Deliberate only | Monthly Dependabot is a proposal; co-bump CI rustc + docs |
