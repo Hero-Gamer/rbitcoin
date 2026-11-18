@@ -328,23 +328,24 @@ pub fn rate_limit_disconnect(session: Option<&crate::peers::LivePeer>) -> NetErr
     NetError::Protocol("peer rate limit")
 }
 
-/// Count one tip-follow frame in the session's rate window. A `block` this
-/// session asked for stays off it, as in IBD: the getdata window already
-/// bounds those bytes, and a full window of large bodies served at link
-/// speed is more than a second of budget.
+/// Count one tip-follow frame in the session's rate window. The first
+/// `block` frame for a hash this session asked for stays off it, as in IBD:
+/// the getdata window already bounds those bytes, and a full window of large
+/// bodies served at link speed is more than a second of budget. One ask, one
+/// unmetered frame. This runs before decode, so a resend while the ask is
+/// still open counts.
 #[doc(hidden)]
 pub fn note_frame_rate(
     rate: &mut PeerRateLimiter,
-    requested_blocks: &HashSet<BlockHash>,
+    follow: &mut PeerFollowState,
     frame: &FramedMessage,
 ) -> bool {
-    if frame
+    let requested = &follow.requested_blocks;
+    follow.unmetered_bodies.retain(|h| requested.contains(h));
+    let first_body = frame
         .block_hash_from_header()
-        .is_some_and(|h| requested_blocks.contains(&h))
-    {
-        return true;
-    }
-    rate.note(frame.payload_len())
+        .is_some_and(|h| requested.contains(&h) && follow.unmetered_bodies.insert(h));
+    first_body || rate.note(frame.payload_len())
 }
 
 /// Heavy frames (`block`, `headers`, `notfound`) already read while a decode
@@ -2597,7 +2598,7 @@ pub async fn peer_session_with(
                     if let Some(ref sess) = session {
                         sess.note_recv(&framed_cmd(&frame), frame.payload_len() as u64);
                     }
-                    if !note_frame_rate(&mut rate, &follow.requested_blocks, &frame) {
+                    if !note_frame_rate(&mut rate, follow, &frame) {
                         follow.ban_score = follow.ban_score.saturating_add(RATE_LIMIT_BAN_SCORE);
                         rbitcoin_log::warn!(
                             "p2p: {peer_s} rate limit exceeded misbehavior={}",
@@ -3600,6 +3601,11 @@ pub struct PeerFollowState {
     pub pending_cmpct: HashMap<BlockHash, PendingCmpct>,
     pub from_this_peer: CappedSet<bitcoin::Txid>,
     pub requested_blocks: HashSet<BlockHash>,
+    /// Asks in `requested_blocks` whose one rate-exempt `block` frame has
+    /// arrived ([`note_frame_rate`]). Pruned to `requested_blocks` on every
+    /// frame, so it never outgrows the open asks, and a later ask for the
+    /// same hash is exempt again.
+    pub unmetered_bodies: HashSet<BlockHash>,
     pub ban_score: u32,
     /// Unserved rest of an inbound `getdata` paused on the writer (Core
     /// `m_getdata_requests`). The session reads no frame while it is
@@ -3657,6 +3663,7 @@ impl PeerFollowState {
             pending_cmpct: HashMap::new(),
             from_this_peer: CappedSet::new(),
             requested_blocks: HashSet::new(),
+            unmetered_bodies: HashSet::new(),
             ban_score: 0,
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
