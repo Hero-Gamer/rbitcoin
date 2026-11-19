@@ -6913,6 +6913,61 @@ fn exempt_peer_rate_limit_leaves_no_strike_on_its_address() {
     }
 }
 
+/// A full getdata window of 1 MB bodies is more than a second of the byte
+/// budget. A peer that serves it at link speed stays connected. A second
+/// frame with a requested header still counts while the ask is open (a
+/// body that decodes as `Unknown`, or one parked on a missing parent), and
+/// so does an unsolicited body. Once those asks close, a new ask for the
+/// same hash is exempt again.
+#[test]
+fn requested_block_bodies_stay_off_the_tip_follow_rate_window() {
+    use rbitcoin_net::peer_dos::{PeerRateLimiter, DEFAULT_MAX_BYTES_PER_SEC};
+
+    const BODY: usize = 1_000_080;
+    assert!((MAX_SERVE_BLOCKS * BODY) as u64 > DEFAULT_MAX_BYTES_PER_SEC);
+    let body = |nonce: u32| {
+        let mut payload = vec![0u8; BODY];
+        payload[76..80].copy_from_slice(&nonce.to_le_bytes());
+        FramedMessage {
+            magic: Magic::from(Network::Regtest),
+            command: *b"block\0\0\0\0\0\0\0",
+            payload,
+        }
+    };
+    let window: Vec<FramedMessage> = (0..MAX_SERVE_BLOCKS as u32).map(body).collect();
+    let asks: HashSet<BlockHash> = window
+        .iter()
+        .map(|f| f.block_hash_from_header().unwrap())
+        .collect();
+    let mut follow = PeerFollowState::new();
+    follow.requested_blocks = asks.clone();
+    let mut rate = PeerRateLimiter::default_limits();
+    for (i, f) in window.iter().enumerate() {
+        assert!(
+            note_frame_rate(&mut rate, &mut follow, f),
+            "requested body {i} must not hit the rate limit"
+        );
+    }
+    let resends_fit = window
+        .iter()
+        .all(|f| note_frame_rate(&mut rate, &mut follow, f));
+    assert!(!resends_fit, "a resent requested body still counts");
+
+    follow.requested_blocks.clear();
+    let mut rate = PeerRateLimiter::default_limits();
+    let unsolicited_fits = (0..MAX_SERVE_BLOCKS as u32)
+        .map(|i| body(MAX_SERVE_BLOCKS as u32 + i))
+        .all(|f| note_frame_rate(&mut rate, &mut follow, &f));
+    assert!(!unsolicited_fits, "unsolicited bodies still count");
+
+    follow.requested_blocks = asks;
+    let mut rate = PeerRateLimiter::default_limits();
+    let reasked_fits = window
+        .iter()
+        .all(|f| note_frame_rate(&mut rate, &mut follow, f));
+    assert!(reasked_fits, "a new ask for the same hash is exempt again");
+}
+
 #[test]
 fn evicted_netgroup_waits_less_than_a_day_and_the_set_is_capped() {
     let peers = rbitcoin_net::peers::PeerHub::new();
