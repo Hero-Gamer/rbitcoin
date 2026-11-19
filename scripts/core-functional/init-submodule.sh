@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shallow, sparse checkout of bitcoin/bitcoin @ the inventory core_commit
-# (master at bitcoin/bitcoin#36458, after v32.1).
+# (master at bitcoin/bitcoin#36869, after v32.1).
 # cargo test stages script_tests.json / tx_*.json from src/test/data each run.
 #
 # A git checkout already at PIN_SHA, with the corpus files and the functional
@@ -17,7 +17,7 @@ fi
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DEST="${1:-${ROOT}/third_party/bitcoin}"
-PIN_SHA="d206226b4993f0330d809ca81851fb6976574ee7"
+PIN_SHA="e211dd0186e9646167d063a16f0da88e5f72e05f"
 URL="https://github.com/bitcoin/bitcoin.git"
 
 # Corpus names stage_core_json reads, plus the functional runner core-functional

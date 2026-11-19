@@ -28,7 +28,7 @@ cargo test -p rbitcoin-test --test suite scenarios::consensus_
 ## Core consensus corpora (1:1 surface)
 
 Staged each `cargo test` run from the Bitcoin Core submodule (master
-**`d206226b`**, after v32.1)
+**`e211dd01`**, after v32.1)
 `third_party/bitcoin/src/test/data/` (MIT). Offline after
 `./scripts/core-functional/init-submodule.sh`. Bump the gitlink pin when
 refreshing; do not check copies into `tests/fixtures/`.
@@ -61,7 +61,7 @@ refreshing; do not check copies into `tests/fixtures/`.
 - There is **no** row skip inventory. A mismatch fails the test; fix the engine or
   the fixture interpretation before commit.
 - **Status:** Core JSON corpora green on the shipped path
-  (`script_tests` 1280/1280 on Core master `d206226b`, `tx_valid` 122/122,
+  (`script_tests` 1280/1280 on Core master `e211dd01`, `tx_valid` 122/122,
   `tx_invalid` 97/97,
   `sighash` 500/500, `bip341_wallet_vectors` 9/9).
 
